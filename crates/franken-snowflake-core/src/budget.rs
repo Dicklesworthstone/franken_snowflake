@@ -23,7 +23,9 @@ pub fn query_budget(
     cost_quota: Option<u64>,
     priority: u8,
 ) -> Budget {
-    let mut budget = Budget::new().with_poll_quota(poll_quota).with_priority(priority);
+    let mut budget = Budget::new()
+        .with_poll_quota(poll_quota)
+        .with_priority(priority);
     if let Some(deadline) = deadline {
         budget = budget.with_deadline(deadline);
     }

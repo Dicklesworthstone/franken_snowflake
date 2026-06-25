@@ -163,10 +163,7 @@ impl EnvelopeMeta {
 
     /// A successful envelope (`ok = true`, `outcome_kind = success`).
     #[must_use]
-    pub fn success(
-        command_id: impl Into<String>,
-        output_contract_id: impl Into<String>,
-    ) -> Self {
+    pub fn success(command_id: impl Into<String>, output_contract_id: impl Into<String>) -> Self {
         Self::new(command_id, output_contract_id, true, OutcomeKind::Success)
     }
 
@@ -261,14 +258,14 @@ mod tests {
 
     #[test]
     fn serialization_is_deterministic_and_ordered() -> Result<(), serde_json::Error> {
-        let meta =
-            EnvelopeMeta::success("doctor", "doctor.v1").with_data_source(DataSource::Live);
+        let meta = EnvelopeMeta::success("doctor", "doctor.v1").with_data_source(DataSource::Live);
         let first = meta.to_json_string()?;
         let second = meta.to_json_string()?;
         assert_eq!(first, second, "serialization must be deterministic");
         // Field order is fixed by struct declaration, so the prefix is stable.
         assert!(
-            first.starts_with("{\"ok\":true,\"outcome_kind\":\"success\",\"command_id\":\"doctor\""),
+            first
+                .starts_with("{\"ok\":true,\"outcome_kind\":\"success\",\"command_id\":\"doctor\""),
             "unexpected key order: {first}"
         );
         assert!(first.contains("\"schema_version\":1"));

@@ -12,8 +12,8 @@
 //! Narrowing is monotone and widening is a compile error (`SubsetOf`), so the
 //! `const _` proofs below fail to compile if any layer is mis-scoped.
 
-use asupersync::Cx;
 use asupersync::cx::cap::{CapSet, SubsetOf};
+use asupersync::Cx;
 
 /// Pure planner layer: zero capabilities (no IO). Equivalent to Asupersync
 /// `cx_readonly()` = `Cx<cap::None>`.

@@ -111,7 +111,7 @@ impl<T> SnowflakeOutcomeExt for SnowflakeOutcome<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cancel::{CancelPolicy, cancel_policy};
+    use crate::cancel::{cancel_policy, CancelPolicy};
     use crate::error::{SnowflakeError, SnowflakeErrorCode};
     use asupersync::{CancelKind, CancelReason, Outcome, PanicPayload};
 
@@ -192,16 +192,34 @@ mod tests {
 
     #[test]
     fn cancel_policy_routes_by_kind() {
-        assert_eq!(cancel_policy(CancelKind::Deadline), CancelPolicy::RetryOrDegrade);
-        assert_eq!(cancel_policy(CancelKind::CostBudget), CancelPolicy::RetryOrDegrade);
-        assert_eq!(cancel_policy(CancelKind::Timeout), CancelPolicy::RetryOrDegrade);
-        assert_eq!(cancel_policy(CancelKind::PollQuota), CancelPolicy::RetryOrDegrade);
+        assert_eq!(
+            cancel_policy(CancelKind::Deadline),
+            CancelPolicy::RetryOrDegrade
+        );
+        assert_eq!(
+            cancel_policy(CancelKind::CostBudget),
+            CancelPolicy::RetryOrDegrade
+        );
+        assert_eq!(
+            cancel_policy(CancelKind::Timeout),
+            CancelPolicy::RetryOrDegrade
+        );
+        assert_eq!(
+            cancel_policy(CancelKind::PollQuota),
+            CancelPolicy::RetryOrDegrade
+        );
         assert_eq!(
             cancel_policy(CancelKind::User),
             CancelPolicy::RemoteCancelAndReceipt
         );
-        assert_eq!(cancel_policy(CancelKind::Shutdown), CancelPolicy::BoundedDrain);
-        assert_eq!(cancel_policy(CancelKind::RaceLost), CancelPolicy::QuietDrain);
+        assert_eq!(
+            cancel_policy(CancelKind::Shutdown),
+            CancelPolicy::BoundedDrain
+        );
+        assert_eq!(
+            cancel_policy(CancelKind::RaceLost),
+            CancelPolicy::QuietDrain
+        );
         assert_eq!(
             cancel_policy(CancelKind::ParentCancelled),
             CancelPolicy::QuietDrain
