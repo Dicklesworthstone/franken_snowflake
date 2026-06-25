@@ -1,0 +1,21 @@
+[package]
+name = "franken-snowflake-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Feature-gated MCP server surface (mcp serve) for franken_snowflake, sharing the CLI read-verb handlers."
+publish.workspace = true
+
+[features]
+default = []
+mcp = []
+
+[lints]
+workspace = true
+
+[dependencies]
+franken-snowflake-core = { path = "../franken-snowflake-core" }
