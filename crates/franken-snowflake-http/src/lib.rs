@@ -1746,10 +1746,32 @@ impl PartitionStreamRequest {
                 "partition fetch concurrency must be at least one",
             ));
         }
+        let mut previous_seed = None;
+        for seed in &self.seed_partitions {
+            if seed.partition >= self.first_partition {
+                return Err(TransportError::new(
+                    TransportErrorCode::InvalidPartitionPlan,
+                    "seed partitions must precede the fetch range",
+                ));
+            }
+            if previous_seed.is_some_and(|previous| seed.partition <= previous) {
+                return Err(TransportError::new(
+                    TransportErrorCode::InvalidPartitionPlan,
+                    "seed partitions must be strictly increasing",
+                ));
+            }
+            previous_seed = Some(seed.partition);
+        }
+        let accepted_seed_partitions = u32::try_from(self.seed_partitions.len()).map_err(|_| {
+            TransportError::new(
+                TransportErrorCode::InvalidPartitionPlan,
+                "too many seed partitions",
+            )
+        })?;
         Ok(PartitionStreamSummary {
             statement_handle: self.statement_handle.clone(),
             planned_partitions: self.end_partition_exclusive - self.first_partition,
-            accepted_seed_partitions: self.seed_partitions.len() as u32,
+            accepted_seed_partitions,
             max_concurrent_fetches: self.max_concurrent_fetches,
         })
     }
@@ -2886,5 +2908,52 @@ mod tests {
             ..request
         };
         assert!(invalid.plan().is_err());
+    }
+
+    #[test]
+    fn partition_stream_plan_rejects_seed_overlap_and_reordering() {
+        let request = PartitionStreamRequest {
+            auth: auth(),
+            statement_handle: StatementHandle::new("stmt-1"),
+            first_partition: 2,
+            end_partition_exclusive: 4,
+            max_concurrent_fetches: 2,
+            child_budget: Budget::unlimited(),
+            remote_cancel_on_local_cancel: true,
+            seed_partitions: vec![decoded_partition(0), decoded_partition(1)],
+        };
+        let summary = request.plan().expect("valid seeds before fetch range");
+        assert_eq!(summary.accepted_seed_partitions, 2);
+
+        let overlaps = PartitionStreamRequest {
+            first_partition: 1,
+            seed_partitions: vec![decoded_partition(1)],
+            ..request.clone()
+        };
+        assert!(overlaps.plan().is_err());
+
+        let duplicate = PartitionStreamRequest {
+            seed_partitions: vec![decoded_partition(0), decoded_partition(0)],
+            ..request.clone()
+        };
+        assert!(duplicate.plan().is_err());
+
+        let out_of_order = PartitionStreamRequest {
+            seed_partitions: vec![decoded_partition(1), decoded_partition(0)],
+            ..request
+        };
+        assert!(out_of_order.plan().is_err());
+    }
+
+    fn decoded_partition(partition: u32) -> DecodedPartition {
+        DecodedPartition {
+            partition,
+            body: b"[]".to_vec(),
+            compression: CompressionEvidence {
+                content_encoding: ContentEncoding::Identity,
+                compressed_bytes: 2,
+                uncompressed_bytes: 2,
+            },
+        }
     }
 }
