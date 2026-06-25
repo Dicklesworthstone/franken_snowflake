@@ -1,0 +1,52 @@
+{
+  "resultSetMetaData": {
+    "numRows": 1,
+    "format": "jsonv2",
+    "rowType": [
+      { "name": "N_SCALE", "type": "FIXED", "scale": 2, "precision": 38, "nullable": false },
+      { "name": "N_BIG", "type": "NUMBER", "scale": 0, "precision": 38, "nullable": false },
+      { "name": "REAL_VALUE", "type": "REAL", "nullable": false },
+      { "name": "DECFLOAT_VALUE", "type": "DECFLOAT", "nullable": false },
+      { "name": "BOOL_TRUE", "type": "BOOLEAN", "nullable": false },
+      { "name": "EVENT_DATE", "type": "DATE", "nullable": false },
+      { "name": "EVENT_TIME", "type": "TIME", "scale": 9, "nullable": false },
+      { "name": "TS_NTZ", "type": "TIMESTAMP_NTZ", "scale": 9, "nullable": false },
+      { "name": "TS_LTZ", "type": "TIMESTAMP_LTZ", "scale": 9, "nullable": false },
+      { "name": "TS_TZ", "type": "TIMESTAMP_TZ", "scale": 9, "nullable": false },
+      { "name": "BIN_VALUE", "type": "BINARY", "nullable": false },
+      { "name": "VARIANT_VALUE", "type": "VARIANT", "nullable": false },
+      { "name": "OBJECT_VALUE", "type": "OBJECT", "nullable": false },
+      { "name": "ARRAY_VALUE", "type": "ARRAY", "nullable": false },
+      { "name": "NULL_TEXT", "type": "TEXT", "nullable": true }
+    ],
+    "partitionInfo": [
+      { "rowCount": 1, "compressedSize": 512, "uncompressedSize": 1024 }
+    ]
+  },
+  "data": [
+    [
+      "12345678901234567.89",
+      "99999999999999999999",
+      "1.25",
+      "1.2345678901234567890123456789012345678E+39",
+      "true",
+      "18262",
+      "82919.000000000",
+      "1611871777.123456789",
+      "1611871777.123456789",
+      "1616173619.000000000 1500",
+      "DEADBEEF",
+      "{\"k\":[1,2]}",
+      "{\"nested\":{\"ok\":true}}",
+      "[1,\"two\",null]",
+      null
+    ]
+  ],
+  "code": "090001",
+  "statementHandle": "01b2c3d4-0000-0000-0000-000000000013",
+  "statementStatusUrl": "/api/v2/statements/01b2c3d4-0000-0000-0000-000000000013",
+  "sqlState": "00000",
+  "message": "Statement executed successfully.",
+  "requestId": "13131313-1313-1313-1313-131313131313",
+  "createdOn": 1700000013000
+}

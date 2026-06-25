@@ -17,6 +17,7 @@ use franken_snowflake_sqlapi::request::SubmitStatementRequest;
 use franken_snowflake_sqlapi::response::{
     QueryFailureStatus, QueryStatus, ResultSet, StatementCancelResponse,
 };
+use franken_snowflake_sqlapi::wire::{CellValue, decode_cell};
 use franken_snowflake_testkit::harness::golden::{GoldenConfig, assert_lf_only, compare};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -115,5 +116,97 @@ fn multi_statement_fan_out_is_detected() -> Result<(), String> {
         .statement_handles
         .ok_or("expected statementHandles fan-out")?;
     assert_eq!(handles.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn jsonv2_codec_cells_fixture_pins_documented_wire_shape() -> Result<(), String> {
+    let source_note = fixtures_dir().join("jsonv2_codec_cells.source.md");
+    let source_bytes =
+        std::fs::read(&source_note).map_err(|error| format!("read jsonv2 source note: {error}"))?;
+    assert_lf_only(&source_bytes)
+        .map_err(|violation| format!("jsonv2 source note: {violation}"))?;
+    let source_text = String::from_utf8(source_bytes)
+        .map_err(|_| "jsonv2 source note: not valid UTF-8".to_owned())?;
+    assert!(source_text.contains("Consulted: 2026-06-25"));
+    assert!(
+        source_text
+            .contains("https://docs.snowflake.com/en/developer-guide/sql-api/handling-responses")
+    );
+    assert!(source_text.contains("document-derived rather than"));
+
+    let result = assert_roundtrip::<ResultSet>("jsonv2_codec_cells.json")?;
+    assert_eq!(result.result_set_meta_data.format, "jsonv2");
+    assert_eq!(result.total_rows(), 1);
+    assert_eq!(result.partition_count(), 1);
+    assert_eq!(result.result_set_meta_data.partition_info[0].row_count, 1);
+
+    let row = result.data.first().ok_or("expected one jsonv2 row")?;
+    let row_type = &result.result_set_meta_data.row_type;
+    assert_eq!(row.len(), row_type.len());
+
+    assert_cell(row, 0, Some("12345678901234567.89"))?;
+    assert_cell(row, 1, Some("99999999999999999999"))?;
+    assert_cell(row, 2, Some("1.25"))?;
+    assert_cell(row, 3, Some("1.2345678901234567890123456789012345678E+39"))?;
+    assert_cell(row, 4, Some("true"))?;
+    assert_cell(row, 5, Some("18262"))?;
+    assert_cell(row, 6, Some("82919.000000000"))?;
+    assert_cell(row, 7, Some("1611871777.123456789"))?;
+    assert_cell(row, 8, Some("1611871777.123456789"))?;
+    assert_cell(row, 9, Some("1616173619.000000000 1500"))?;
+    assert_cell(row, 10, Some("DEADBEEF"))?;
+    assert_cell(row, 11, Some(r#"{"k":[1,2]}"#))?;
+    assert_cell(row, 12, Some(r#"{"nested":{"ok":true}}"#))?;
+    assert_cell(row, 13, Some(r#"[1,"two",null]"#))?;
+    assert_cell(row, 14, None)?;
+
+    assert_eq!(
+        decode_cell(row[0].as_deref(), &row_type[0]).map_err(|error| error.to_string())?,
+        CellValue::Number("12345678901234567.89".to_owned())
+    );
+    assert_eq!(
+        decode_cell(row[5].as_deref(), &row_type[5]).map_err(|error| error.to_string())?,
+        CellValue::Date(18262)
+    );
+    assert_eq!(
+        decode_cell(row[6].as_deref(), &row_type[6]).map_err(|error| error.to_string())?,
+        CellValue::Timestamp {
+            seconds: 82919,
+            nanos: 0
+        }
+    );
+    assert_eq!(
+        decode_cell(row[7].as_deref(), &row_type[7]).map_err(|error| error.to_string())?,
+        CellValue::Timestamp {
+            seconds: 1_611_871_777,
+            nanos: 123_456_789
+        }
+    );
+    assert_eq!(
+        decode_cell(row[9].as_deref(), &row_type[9]).map_err(|error| error.to_string())?,
+        CellValue::TimestampTz {
+            seconds: 1_616_173_619,
+            nanos: 0,
+            offset_minutes: 60
+        }
+    );
+    assert_eq!(
+        decode_cell(row[10].as_deref(), &row_type[10]).map_err(|error| error.to_string())?,
+        CellValue::Binary(vec![0xde, 0xad, 0xbe, 0xef])
+    );
+    assert_eq!(
+        decode_cell(row[14].as_deref(), &row_type[14]).map_err(|error| error.to_string())?,
+        CellValue::Null
+    );
+
+    Ok(())
+}
+
+fn assert_cell(row: &[Option<String>], index: usize, expected: Option<&str>) -> Result<(), String> {
+    let actual = row
+        .get(index)
+        .ok_or_else(|| format!("missing jsonv2 cell {index}"))?;
+    assert_eq!(actual.as_deref(), expected, "jsonv2 cell {index}");
     Ok(())
 }
