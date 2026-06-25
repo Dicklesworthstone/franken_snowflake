@@ -64,6 +64,7 @@ mod fastmcp_surface {
         DatasetDescribeOperator,
         QueryPlan,
         QueryRun,
+        QueryCancel,
         ReceiptShow,
         ExportPlan,
     }
@@ -83,6 +84,7 @@ mod fastmcp_surface {
         ReadVerb::DatasetDescribeOperator,
         ReadVerb::QueryPlan,
         ReadVerb::QueryRun,
+        ReadVerb::QueryCancel,
         ReadVerb::ReceiptShow,
         ReadVerb::ExportPlan,
     ];
@@ -107,6 +109,7 @@ mod fastmcp_surface {
         name: &'static str,
         description: &'static str,
         open_world_hint: &'static str,
+        read_only: bool,
         params: Vec<ParamSpec>,
         tags: &'static [&'static str],
     }
@@ -118,6 +121,7 @@ mod fastmcp_surface {
                     name: "capabilities",
                     description: "Return the franken-snowflake read-only capability registry as the CLI JSON envelope.",
                     open_world_hint: "offline",
+                    read_only: true,
                     params: Vec::new(),
                     tags: &["discovery", "offline"],
                 },
@@ -125,6 +129,7 @@ mod fastmcp_surface {
                     name: "doctor",
                     description: "Run local, non-live readiness checks through the CLI doctor handler.",
                     open_world_hint: "offline",
+                    read_only: true,
                     params: Vec::new(),
                     tags: &["diagnostics", "offline"],
                 },
@@ -132,6 +137,7 @@ mod fastmcp_surface {
                     name: "agent_handbook",
                     description: "Return the embedded agent handbook with envelope, exit-code, and recovery contract details.",
                     open_world_hint: "offline",
+                    read_only: true,
                     params: Vec::new(),
                     tags: &["discovery", "offline"],
                 },
@@ -139,6 +145,7 @@ mod fastmcp_surface {
                     name: "robot_docs_guide",
                     description: "Return the first-contact robot guide through the CLI robot-docs handler.",
                     open_world_hint: "offline",
+                    read_only: true,
                     params: Vec::new(),
                     tags: &["discovery", "offline"],
                 },
@@ -146,6 +153,7 @@ mod fastmcp_surface {
                     name: "selftest",
                     description: "Run the offline selftest surface and return the same CLI envelope.",
                     open_world_hint: "offline",
+                    read_only: true,
                     params: Vec::new(),
                     tags: &["diagnostics", "offline"],
                 },
@@ -153,6 +161,7 @@ mod fastmcp_surface {
                     name: "profile_validate",
                     description: "Validate a profile shape without reading secret values or performing live I/O.",
                     open_world_hint: "offline",
+                    read_only: true,
                     params: vec![ParamSpec::string(
                         "profile",
                         "Profile id or profile path to validate.",
@@ -164,6 +173,7 @@ mod fastmcp_surface {
                     name: "profile_doctor",
                     description: "Inspect profile readiness using the CLI profile doctor contract; online probes remain explicit.",
                     open_world_hint: "snowflake",
+                    read_only: true,
                     params: vec![
                         ParamSpec::string(
                             "profile",
@@ -182,6 +192,7 @@ mod fastmcp_surface {
                     name: "catalog_scan",
                     description: "Scan catalog metadata through the CLI catalog scan handler and return its envelope.",
                     open_world_hint: "snowflake",
+                    read_only: true,
                     params: vec![
                         ParamSpec::string(
                             "profile",
@@ -197,6 +208,7 @@ mod fastmcp_surface {
                     name: "catalog_graph",
                     description: "Render the catalog graph through the CLI catalog graph handler; format may be json, mermaid, or svg.",
                     open_world_hint: "offline",
+                    read_only: true,
                     params: vec![
                         ParamSpec::string(
                             "profile",
@@ -216,6 +228,7 @@ mod fastmcp_surface {
                     name: "dataset_inspect",
                     description: "Return the dataset manifest surface through the CLI dataset inspect handler.",
                     open_world_hint: "offline",
+                    read_only: true,
                     params: vec![ParamSpec::string(
                         "dataset_id",
                         "Dataset identifier to inspect.",
@@ -227,6 +240,7 @@ mod fastmcp_surface {
                     name: "dataset_profile",
                     description: "Plan pushed-down dataset profiling through the CLI dataset profile handler.",
                     open_world_hint: "snowflake",
+                    read_only: true,
                     params: vec![ParamSpec::string(
                         "dataset_id",
                         "Dataset identifier to profile.",
@@ -238,6 +252,7 @@ mod fastmcp_surface {
                     name: "dataset_describe_operator",
                     description: "Return JSON Schema for a supported dataset predicate operator.",
                     open_world_hint: "offline",
+                    read_only: true,
                     params: vec![ParamSpec::string(
                         "operator",
                         "Dataset predicate operator to describe.",
@@ -249,6 +264,7 @@ mod fastmcp_surface {
                     name: "query_plan",
                     description: "Validate and explain a read-only SQL plan without submitting it.",
                     open_world_hint: "offline",
+                    read_only: true,
                     params: vec![
                         ParamSpec::string("profile", "Profile id to plan against.", true),
                         ParamSpec::string("sql", "Single read-only SQL statement.", true),
@@ -259,16 +275,30 @@ mod fastmcp_surface {
                     name: "query_run",
                     description: "Run a read-only SQL query through the CLI query run handler; write tools are not exposed here.",
                     open_world_hint: "snowflake",
+                    read_only: true,
                     params: vec![
                         ParamSpec::string("profile", "Profile id to query with.", true),
                         ParamSpec::string("sql", "Single read-only SQL statement.", true),
                     ],
                     tags: &["query", "snowflake"],
                 },
+                Self::QueryCancel => ToolSpec {
+                    name: "query_cancel",
+                    description: "Cancel a Snowflake SQL API statement handle through the CLI query cancel handler.",
+                    open_world_hint: "snowflake",
+                    read_only: false,
+                    params: vec![ParamSpec::string(
+                        "statement_handle",
+                        "Statement handle returned by query run.",
+                        true,
+                    )],
+                    tags: &["query", "snowflake", "cancel"],
+                },
                 Self::ReceiptShow => ToolSpec {
                     name: "receipt_show",
                     description: "Look up a content-addressed query receipt through the CLI receipt show handler.",
                     open_world_hint: "offline",
+                    read_only: true,
                     params: vec![ParamSpec::string(
                         "receipt_hash",
                         "Content-addressed receipt hash to look up.",
@@ -280,6 +310,7 @@ mod fastmcp_surface {
                     name: "export_plan",
                     description: "Draft export plans through the CLI export plan handler; execution is not exposed.",
                     open_world_hint: "offline",
+                    read_only: true,
                     params: Vec::new(),
                     tags: &["export", "offline"],
                 },
@@ -372,6 +403,12 @@ mod fastmcp_surface {
                     required_string(arguments, "sql")?,
                     "--json".to_string(),
                 ]),
+                Self::QueryCancel => Ok(vec![
+                    "query".to_string(),
+                    "cancel".to_string(),
+                    required_string(arguments, "statement_handle")?,
+                    "--json".to_string(),
+                ]),
                 Self::ReceiptShow => Ok(json_args_with(
                     &["receipt", "show"],
                     vec![required_string(arguments, "receipt_hash")?],
@@ -442,7 +479,7 @@ mod fastmcp_surface {
                 tags: spec.tags.iter().map(|tag| (*tag).to_string()).collect(),
                 annotations: Some(
                     ToolAnnotations::new()
-                        .read_only(true)
+                        .read_only(spec.read_only)
                         .idempotent(true)
                         .open_world_hint(spec.open_world_hint),
                 ),
@@ -639,17 +676,43 @@ mod fastmcp_surface {
         }
 
         #[test]
-        fn read_only_tools_are_annotated() {
+        fn tool_annotations_match_cli_contract_safety() {
             let tools = build_mcp_server(fake_runner).tools();
             assert!(tools.len() >= 10);
-            assert!(tools.iter().all(|tool| {
-                tool.annotations
+            for tool in &tools {
+                let read_only = tool
+                    .annotations
                     .as_ref()
-                    .and_then(|annotations| annotations.read_only)
-                    .unwrap_or(false)
-            }));
+                    .and_then(|annotations| annotations.read_only);
+                if tool.name == "query_cancel" {
+                    assert_eq!(read_only, Some(false));
+                } else {
+                    assert_eq!(
+                        read_only,
+                        Some(true),
+                        "tool {} must be read-only",
+                        tool.name
+                    );
+                }
+            }
             assert!(tools.iter().any(|tool| tool.name == "query_run"));
-            assert!(!tools.iter().any(|tool| tool.name == "query_cancel"));
+            assert!(tools.iter().any(|tool| tool.name == "query_cancel"));
+        }
+
+        #[test]
+        fn query_cancel_routes_to_the_cli_cancel_contract() {
+            let args = ReadVerb::QueryCancel
+                .cli_args(&json!({"statement_handle": "01bcaafe-0000"}))
+                .expect("query_cancel cli args");
+            assert_eq!(
+                args,
+                vec![
+                    "query".to_string(),
+                    "cancel".to_string(),
+                    "01bcaafe-0000".to_string(),
+                    "--json".to_string()
+                ]
+            );
         }
 
         #[test]
