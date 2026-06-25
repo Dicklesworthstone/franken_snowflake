@@ -1085,6 +1085,39 @@ fn success(
     }
 }
 
+/// A successful envelope that also carries the top-level `profile_id`.
+///
+/// The envelope contract (`docs/agent_cli_contract.md`) defines `profile_id` as
+/// "Profile used", so any command that ran against a profile must populate it —
+/// not only the refusal/error paths. Commands like `query plan` and `catalog
+/// graph` previously surfaced the profile only inside `data` on success, leaving
+/// the top-level field `null` exactly when the command succeeded (while their
+/// refusal paths set it), so an agent keyed on `profile_id` lost it on success.
+fn success_with_profile(
+    format: OutputFormat,
+    command_id: &'static str,
+    output_contract_id: &'static str,
+    request_id: String,
+    profile_id: Option<String>,
+    data: Json,
+    warnings: Vec<Json>,
+    safe_next_commands: Vec<String>,
+) -> Outcome {
+    let mut outcome = success(
+        format,
+        command_id,
+        output_contract_id,
+        request_id,
+        data,
+        warnings,
+        safe_next_commands,
+    );
+    if let Body::Envelope { envelope, .. } = &mut outcome.body {
+        envelope.profile_id = profile_id;
+    }
+    outcome
+}
+
 fn findings(
     format: OutputFormat,
     command_id: &'static str,
@@ -2169,11 +2202,12 @@ fn query_plan_outcome(
         );
     }
 
-    success(
+    success_with_profile(
         format,
         "query.plan",
         "fsnow.query.plan.v1",
         request_id,
+        profile.clone(),
         json_object(vec![
             ("profile_id", option_json(profile.clone())),
             ("statement_kind", json_string("read")),
@@ -2314,7 +2348,7 @@ fn catalog_graph_outcome(
                     .to_string(),
             },
         },
-        GraphOutput::Json | GraphOutput::Toon => success(
+        GraphOutput::Json | GraphOutput::Toon => success_with_profile(
             if graph_output == GraphOutput::Toon {
                 OutputFormat::Toon
             } else {
@@ -2323,6 +2357,7 @@ fn catalog_graph_outcome(
             "catalog.graph",
             "fsnow.catalog.graph.v1",
             request_id,
+            Some(profile.clone()),
             json_object(vec![
                 ("profile_id", json_string(profile)),
                 ("nodes", json_array(vec![])),
@@ -3157,6 +3192,38 @@ mod tests {
         assert!(rendered.contains("FSNOW-3002"));
     }
 
+    fn top_level_profile_id(args: &[&str]) -> Option<String> {
+        match execute(args.iter().map(|arg| (*arg).to_string()).collect()).body {
+            Body::Envelope { envelope, .. } => envelope.profile_id,
+            Body::Raw { .. } => None,
+        }
+    }
+
+    #[test]
+    fn successful_query_plan_and_catalog_graph_carry_top_level_profile_id() {
+        // Regression: the envelope contract defines `profile_id` as "Profile
+        // used". Previously the success paths for `query plan` and `catalog graph`
+        // surfaced the profile only inside `data`, leaving the top-level field
+        // null exactly when the command succeeded — while their refusal paths set
+        // it — so an agent keyed on `profile_id` lost it on success.
+        assert_eq!(
+            top_level_profile_id(&["query", "plan", "--profile", "demo", "--sql", "select 1"]),
+            Some("demo".to_string()),
+            "query plan success must set top-level profile_id"
+        );
+        assert_eq!(
+            top_level_profile_id(&["catalog", "graph", "demo", "--json"]),
+            Some("demo".to_string()),
+            "catalog graph success must set top-level profile_id"
+        );
+        // The refusal path already set it; success must agree, not diverge.
+        assert_eq!(
+            top_level_profile_id(&["query", "plan", "--profile", "demo", "--sql", "delete from t"]),
+            Some("demo".to_string()),
+            "query plan refusal still sets top-level profile_id"
+        );
+    }
+
     #[test]
     fn cte_fronted_selects_are_read_but_cte_fronted_dml_is_not() {
         assert!(is_select_like("with cte as (select 1) select * from cte"));
@@ -3310,8 +3377,10 @@ mod tests {
             Body::Raw { data } => data,
         };
         assert!(rendered.contains("Conflicting catalog graph output formats"));
-        assert!(rendered.contains("franken-snowflake catalog graph &lt;profile&gt; --toon")
-            || rendered.contains("franken-snowflake catalog graph <profile> --toon"));
+        assert!(
+            rendered.contains("franken-snowflake catalog graph &lt;profile&gt; --toon")
+                || rendered.contains("franken-snowflake catalog graph <profile> --toon")
+        );
 
         let json_mermaid = execute(vec![
             "catalog".to_string(),
