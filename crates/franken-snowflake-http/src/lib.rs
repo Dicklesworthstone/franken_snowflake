@@ -1335,7 +1335,7 @@ pub enum AttemptOutcome {
 }
 
 /// Compression metadata and decoded body.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DecodedPartition {
     /// Partition index.
     pub partition: u32,
@@ -1343,6 +1343,16 @@ pub struct DecodedPartition {
     pub body: Vec<u8>,
     /// Compression metadata.
     pub compression: CompressionEvidence,
+}
+
+impl fmt::Debug for DecodedPartition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DecodedPartition")
+            .field("partition", &self.partition)
+            .field("body_len", &self.body.len())
+            .field("compression", &self.compression)
+            .finish()
+    }
 }
 
 /// Compression metadata captured for evidence.
@@ -1724,7 +1734,7 @@ pub struct PartitionStreamSummary {
 }
 
 /// Request body wrapper for submit.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SubmitHttpRequest {
     /// Submit route.
     pub route: TransportRoute,
@@ -1736,13 +1746,33 @@ pub struct SubmitHttpRequest {
     pub retry_resubmit: bool,
 }
 
+impl fmt::Debug for SubmitHttpRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SubmitHttpRequest")
+            .field("route", &self.route)
+            .field("auth", &self.auth)
+            .field("body_len", &self.body.len())
+            .field("retry_resubmit", &self.retry_resubmit)
+            .finish()
+    }
+}
+
 /// Submit response body.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SubmitHttpResponse {
     /// HTTP status class.
     pub status: StatusClass,
     /// Raw response body.
     pub body: Vec<u8>,
+}
+
+impl fmt::Debug for SubmitHttpResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SubmitHttpResponse")
+            .field("status", &self.status)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 /// Poll request.
@@ -1755,12 +1785,21 @@ pub struct PollHttpRequest {
 }
 
 /// Poll response body.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PollHttpResponse {
     /// HTTP status class.
     pub status: StatusClass,
     /// Raw response body.
     pub body: Vec<u8>,
+}
+
+impl fmt::Debug for PollHttpResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PollHttpResponse")
+            .field("status", &self.status)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 /// Partition fetch request.
@@ -1775,7 +1814,7 @@ pub struct PartitionHttpRequest {
 }
 
 /// Partition response body.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PartitionBody {
     /// HTTP status class.
     pub status: StatusClass,
@@ -1783,6 +1822,16 @@ pub struct PartitionBody {
     pub body: Vec<u8>,
     /// Compression evidence from the wire response.
     pub compression: CompressionEvidence,
+}
+
+impl fmt::Debug for PartitionBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PartitionBody")
+            .field("status", &self.status)
+            .field("body_len", &self.body.len())
+            .field("compression", &self.compression)
+            .finish()
+    }
 }
 
 /// Cancel request.
@@ -1797,12 +1846,21 @@ pub struct CancelHttpRequest {
 }
 
 /// Cancel response body.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CancelHttpResponse {
     /// HTTP status class.
     pub status: StatusClass,
     /// Raw response body.
     pub body: Vec<u8>,
+}
+
+impl fmt::Debug for CancelHttpResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CancelHttpResponse")
+            .field("status", &self.status)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 struct PlannedTransportRequest {
@@ -2186,6 +2244,85 @@ mod tests {
                 "diagnostic surface leaked bearer token: {rendered}"
             );
             assert!(rendered.contains(REDACTION_PLACEHOLDER));
+        }
+    }
+
+    #[test]
+    fn body_bearing_debug_surfaces_only_report_lengths() {
+        let secret_body = b"sfpat_http_body_secret_123".to_vec();
+        let decimal_secret_prefix = "115, 102, 112, 97, 116";
+        let compression = CompressionEvidence {
+            content_encoding: ContentEncoding::Identity,
+            compressed_bytes: secret_body.len() as u64,
+            uncompressed_bytes: secret_body.len() as u64,
+        };
+        let decoded = DecodedPartition {
+            partition: 0,
+            body: secret_body.clone(),
+            compression,
+        };
+        let stream = PartitionStreamRequest {
+            auth: auth(),
+            statement_handle: StatementHandle::new("stmt-1"),
+            first_partition: 1,
+            end_partition_exclusive: 1,
+            max_concurrent_fetches: 1,
+            child_budget: Budget::unlimited(),
+            remote_cancel_on_local_cancel: false,
+            seed_partitions: vec![decoded.clone()],
+        };
+
+        for rendered in [
+            format!(
+                "{:?}",
+                SubmitHttpRequest {
+                    route: TransportRoute::Submit,
+                    auth: auth(),
+                    body: secret_body.clone(),
+                    retry_resubmit: false,
+                }
+            ),
+            format!(
+                "{:?}",
+                SubmitHttpResponse {
+                    status: StatusClass::Completed,
+                    body: secret_body.clone(),
+                }
+            ),
+            format!(
+                "{:?}",
+                PollHttpResponse {
+                    status: StatusClass::Running,
+                    body: secret_body.clone(),
+                }
+            ),
+            format!(
+                "{:?}",
+                PartitionBody {
+                    status: StatusClass::Completed,
+                    body: secret_body.clone(),
+                    compression,
+                }
+            ),
+            format!(
+                "{:?}",
+                CancelHttpResponse {
+                    status: StatusClass::Completed,
+                    body: secret_body.clone(),
+                }
+            ),
+            format!("{decoded:?}"),
+            format!("{stream:?}"),
+        ] {
+            assert!(
+                !rendered.contains("sfpat_http_body_secret_123"),
+                "debug surface leaked body as text: {rendered}"
+            );
+            assert!(
+                !rendered.contains(decimal_secret_prefix),
+                "debug surface leaked body as reconstructable bytes: {rendered}"
+            );
+            assert!(rendered.contains("body_len"));
         }
     }
 
