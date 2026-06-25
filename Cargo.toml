@@ -26,6 +26,7 @@ members = [
     "crates/franken-snowflake-text-indexing",
     "crates/franken-snowflake-testkit",
     "crates/franken-snowflake-cli",
+    "crates/franken-snowflake-mcp",
 ]
 
 [workspace.package]

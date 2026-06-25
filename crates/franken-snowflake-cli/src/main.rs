@@ -985,16 +985,25 @@ fn dispatch(invocation: Invocation) -> Outcome {
             "The TUI is default-off until its cargo-tree and cross-platform proofs land.",
             vec!["franken-snowflake capabilities --json".to_string()],
         ),
-        Command::McpServe { mode } => feature_disabled(
-            invocation.output,
-            "mcp.serve",
-            "fsnow.mcp.serve.v1",
-            request_id,
-            mode,
-            SnowflakeErrorCode::UsageError,
-            "The MCP server is feature-gated and not linked in this CLI slice.",
-            vec!["franken-snowflake capabilities --json".to_string()],
-        ),
+        Command::McpServe { mode } => {
+            #[cfg(feature = "mcp")]
+            {
+                run_mcp_serve_process(mode)
+            }
+            #[cfg(not(feature = "mcp"))]
+            {
+                feature_disabled(
+                    invocation.output,
+                    "mcp.serve",
+                    "fsnow.mcp.serve.v1",
+                    request_id,
+                    mode,
+                    SnowflakeErrorCode::UsageError,
+                    "The MCP server is feature-gated and not linked in this CLI slice.",
+                    vec!["franken-snowflake capabilities --json".to_string()],
+                )
+            }
+        }
     }
 }
 
@@ -2902,6 +2911,62 @@ fn render_toon(value: &Json) -> String {
         }),
     )
 }
+
+/// Rendered output from the shared CLI contract path.
+///
+/// MCP tools use this instead of reimplementing command behavior; the returned
+/// `stdout` is exactly the deterministic envelope/body the CLI would print.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CliContractOutput {
+    /// Numeric process-style exit code.
+    pub exit_code: i32,
+    /// Rendered stdout payload, without the trailing newline the binary adds.
+    pub stdout: String,
+    /// Rendered diagnostic line, when the CLI would write one to stderr.
+    pub stderr: Option<String>,
+}
+
+/// Execute the existing CLI command contract and render its body.
+#[must_use]
+pub fn execute_cli_contract(args: Vec<String>) -> CliContractOutput {
+    let outcome = execute(args);
+    let exit_code = outcome.status.code();
+    match outcome.body {
+        Body::Envelope { envelope, format } => {
+            let stderr = if envelope.ok {
+                None
+            } else {
+                Some(match &envelope.error {
+                    Some(error) => format!("{}: {}", error.code.stable_code(), error.message),
+                    None => format!(
+                        "{}: command failed",
+                        SnowflakeErrorCode::Internal.stable_code()
+                    ),
+                })
+            };
+            let stdout = match format {
+                OutputFormat::Json => render_json(&envelope_json(&envelope)),
+                OutputFormat::Toon => render_toon(&envelope_json(&envelope)),
+            };
+            CliContractOutput {
+                exit_code,
+                stdout,
+                stderr,
+            }
+        }
+        Body::Raw { data } => CliContractOutput {
+            exit_code,
+            stdout: data,
+            stderr: None,
+        },
+    }
+}
+
+#[cfg(feature = "mcp")]
+mod mcp_surface;
+
+#[cfg(feature = "mcp")]
+pub use mcp_surface::run_mcp_serve_process;
 
 fn toon_json_value(value: &Json) -> toon::JsonValue {
     match value {
