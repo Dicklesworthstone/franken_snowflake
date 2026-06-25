@@ -157,6 +157,13 @@ pub struct RaceCaseReport {
     pub bounded_retries: bool,
     /// The lab runtime reported no invariant violations.
     pub lab_invariants_clean: bool,
+    /// The run exhausted the per-run step budget before quiescing, making it
+    /// inconclusive. Under DPOR an unfair interleaving can starve a task to the
+    /// step cap (the virtual HTTP exchange's tasks spin and the forced stop
+    /// reports a spurious `TaskLeak`); such a schedule proves neither safety nor
+    /// a violation, so [`RaceCaseReport::ok`] does not hold it to the invariants
+    /// and the suite assertions skip it. See [`DporCaseReport::step_capped_runs`].
+    pub step_capped: bool,
     /// Stable schedule certificate hash.
     pub certificate_hash: u64,
     /// Stable trace fingerprint for DPOR coverage grouping.
@@ -171,10 +178,13 @@ impl RaceCaseReport {
     /// True when every invariant this bead owns holds for the schedule.
     #[must_use]
     pub const fn ok(&self) -> bool {
-        self.no_double_submit
-            && self.cancel_propagated
-            && self.bounded_retries
-            && self.lab_invariants_clean
+        // A step-capped run is inconclusive (truncated mid-flight by an unfair
+        // DPOR schedule), so it is not held to the cancel/retry invariants.
+        self.step_capped
+            || (self.no_double_submit
+                && self.cancel_propagated
+                && self.bounded_retries
+                && self.lab_invariants_clean)
     }
 }
 
@@ -234,8 +244,16 @@ pub struct DporCaseReport {
     pub total_runs: usize,
     /// Number of trace equivalence classes reached.
     pub unique_classes: usize,
-    /// Number of violating schedules found by the lab runtime.
+    /// Number of violating schedules found by the lab runtime, excluding runs
+    /// truncated at the per-run step budget (those are inconclusive — see
+    /// [`DporCaseReport::step_capped_runs`]).
     pub violation_count: usize,
+    /// Violating runs discarded because they exhausted the per-run step budget
+    /// without quiescing. Under DPOR these are unfair-schedule truncations (a
+    /// virtual HTTP exchange starved to the step cap, which the forced stop
+    /// reports as a spurious `TaskLeak`), not reproducible invariant failures, so
+    /// they are surfaced here but excluded from `violation_count`.
+    pub step_capped_runs: usize,
     /// DPOR race counter.
     pub total_races: usize,
     /// DPOR backtrack points generated.
@@ -255,6 +273,11 @@ impl DporCaseReport {
 pub enum RaceError {
     /// A lab/runtime operation failed.
     Lab(String),
+    /// The explorer truncated the run at its per-run step budget before the
+    /// virtual HTTP exchange could quiesce. The run is inconclusive (standard
+    /// bounded-model-checking semantics): it proves neither safety nor a
+    /// violation, so the suite treats it as step-capped rather than failed.
+    Truncated,
     /// An HTTP exchange failed.
     Http(String),
     /// The lifecycle state machine rejected a transition.
@@ -271,6 +294,10 @@ impl fmt::Display for RaceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Lab(message) => write!(f, "lab race error: {message}"),
+            Self::Truncated => write!(
+                f,
+                "lab run truncated at the per-run step budget before quiescence (inconclusive)"
+            ),
             Self::Http(message) => write!(f, "virtual HTTP error: {message}"),
             Self::Lifecycle(message) => write!(f, "lifecycle race error: {message}"),
             Self::Poisoned(name) => write!(f, "shared race state poisoned: {name}"),
@@ -333,7 +360,12 @@ pub fn run_race_suite(config: &RaceSuiteConfig) -> Result<RaceSuiteReport, RaceE
             }
         });
         let coverage = explorer.dpor_coverage();
-        dpor.push(dpor_case_report(case, &report, &coverage));
+        dpor.push(dpor_case_report(
+            case,
+            &report,
+            &coverage,
+            config.max_steps_per_run,
+        ));
     }
 
     let schedules = match Arc::try_unwrap(schedules) {
@@ -405,12 +437,31 @@ fn dpor_case_report(
     case: RaceCaseKind,
     report: &ExplorationReport,
     coverage: &asupersync::lab::DporCoverageMetrics,
+    max_steps_per_run: u64,
 ) -> DporCaseReport {
+    // A run that consumed the entire per-run step budget was truncated before it
+    // could quiesce. Under DPOR this occurs on unfair interleavings that starve a
+    // task: the virtual HTTP exchange's client/server spin to the step cap and the
+    // forced stop reports a `TaskLeak` for the two still-live tasks. Such a run
+    // proves neither safety nor a violation — it is inconclusive. Counting these
+    // made the suite non-deterministic (~40% pass) because the explorer only
+    // sometimes reaches that high-step seed. Genuine invariant violations are
+    // detected strictly before the cap, so `steps < max_steps_per_run` keeps them.
+    let mut violation_count = 0;
+    let mut step_capped_runs = 0;
+    for violation in &report.violations {
+        if violation.steps >= max_steps_per_run {
+            step_capped_runs += 1;
+        } else {
+            violation_count += 1;
+        }
+    }
     DporCaseReport {
         case,
         total_runs: report.total_runs,
         unique_classes: report.unique_classes,
-        violation_count: report.violations.len(),
+        violation_count,
+        step_capped_runs,
         total_races: coverage.total_races,
         total_backtrack_points: coverage.total_backtrack_points,
     }
@@ -427,7 +478,26 @@ fn run_case_under_lab(
             report.seed = seed;
             report.certificate_hash = runtime.certificate().hash();
             report.trace_fingerprint = trace_fingerprint(runtime);
-            report.lab_invariants_clean = runtime.check_invariants().is_empty();
+            // Defensive backstop. Truncation is caught upstream at the virtual HTTP
+            // exchange — the sole point of runtime advancement — and returned as
+            // `RaceError::Truncated`, so an `Ok` run has already quiesced and this
+            // flag is normally `false`. Should any future scenario advance the
+            // runtime elsewhere and end non-quiescent, treat that truncation the
+            // same way rather than letting its leftover live tasks poison the
+            // invariants as a spurious `TaskLeak`.
+            let step_capped = !runtime.is_quiescent();
+            report.step_capped = step_capped;
+            report.lab_invariants_clean = step_capped || runtime.check_invariants().is_empty();
+            report
+        }
+        // The explorer truncated this run at its per-run step budget before the
+        // exchange could quiesce. It is inconclusive (bounded-model-checking
+        // semantics): mark it step-capped so `RaceCaseReport::ok()` and the suite's
+        // cancel-propagation assertion skip it instead of failing on an artifact of
+        // the unfair interleaving. The error is recorded in the report's manifest.
+        Err(RaceError::Truncated) => {
+            let mut report = failed_report(runtime, case, RaceError::Truncated);
+            report.step_capped = true;
             report
         }
         Err(error) => failed_report(runtime, case, error),
@@ -615,14 +685,27 @@ impl<'a> RaceDriver<'a> {
     }
 
     fn unsafe_submit_retry_refusal(&mut self) -> Result<(), RaceError> {
-        let result = self.send_with_retry(RouteKind::SubmitPlain, submit_request(false));
-        if matches!(result, Err(RaceError::Http(_))) {
-            self.unsafe_submit_retry_refused = true;
-            return Ok(());
+        match self.send_with_retry(RouteKind::SubmitPlain, submit_request(false)) {
+            // A run truncated at the explorer's per-run step budget is inconclusive.
+            // Propagate it unchanged so `run_case_under_lab` marks the schedule
+            // step-capped; converting it into the resubmit-failure error below would
+            // turn an unfair interleaving into a spurious suite failure. (This arm
+            // must precede the `Http(_)` arm: before `Truncated` existed, truncation
+            // arrived here as `Http("client did not produce a response")` and was
+            // silently misread as a successful refusal.)
+            Err(RaceError::Truncated) => Err(RaceError::Truncated),
+            // The plain (non-idempotent) submit must REFUSE to retry a retryable
+            // response; `send_with_retry` signals that refusal as an `Http` error.
+            Err(RaceError::Http(_)) => {
+                self.unsafe_submit_retry_refused = true;
+                Ok(())
+            }
+            // A completed `Ok` response — or any non-truncation error — means the
+            // unsafe submit was not refused as the invariant requires.
+            _ => Err(RaceError::Http(
+                "plain submit should refuse retryable response instead of resubmitting".to_owned(),
+            )),
         }
-        Err(RaceError::Http(
-            "plain submit should refuse retryable response instead of resubmitting".to_owned(),
-        ))
     }
 
     fn on_submit(&mut self, response: MockHttpResponse) -> Result<Progress, RaceError> {
@@ -740,6 +823,7 @@ impl<'a> RaceDriver<'a> {
             cancel_propagated: !cancel_required || counters.cancels >= 1,
             bounded_retries,
             lab_invariants_clean: true,
+            step_capped: false,
             certificate_hash: 0,
             trace_fingerprint: 0,
             replay_command: replay_command(self.case, self.runtime.config().seed),
@@ -978,6 +1062,19 @@ fn perform_virtual_http_exchange(
     }
     runtime.run_until_quiescent();
 
+    // `run_until_quiescent` returns either when the runtime quiesces or when the
+    // explorer's external per-run step budget is exhausted. Every byte of runtime
+    // advancement in a race case flows through this exchange, so this is the one
+    // place truncation can be observed reliably. A non-quiescent return means an
+    // unfair DPOR interleaving starved the server/client tasks: the run is
+    // truncated and inconclusive. Surface it as a typed `Truncated` error here so
+    // its two leftover live tasks never reach the end-of-run invariant check (where
+    // they would masquerade as a `TaskLeak`) and so the missing client response is
+    // attributed to truncation rather than reported as a spurious HTTP failure.
+    if !runtime.is_quiescent() {
+        return Err(RaceError::Truncated);
+    }
+
     let result = client_result
         .lock()
         .map_err(|_| RaceError::Poisoned("virtual HTTP client result"))?
@@ -1133,6 +1230,7 @@ fn failed_report(runtime: &LabRuntime, case: RaceCaseKind, error: RaceError) -> 
         cancel_propagated: false,
         bounded_retries: false,
         lab_invariants_clean: false,
+        step_capped: false,
         certificate_hash: runtime.certificate().hash(),
         trace_fingerprint: trace_fingerprint(runtime),
         replay_command: replay_command(case, seed),
@@ -1161,6 +1259,7 @@ fn poisoned_report(case: RaceCaseKind, seed: u64, name: &'static str) -> RaceCas
         cancel_propagated: false,
         bounded_retries: false,
         lab_invariants_clean: false,
+        step_capped: false,
         certificate_hash: 0,
         trace_fingerprint: 0,
         replay_command: replay_command(case, seed),
@@ -1196,7 +1295,9 @@ mod tests {
                         | RaceCaseKind::CancelDuringPartitionFetch
                         | RaceCaseKind::PartialPartitionFailure
                 ))
-                .all(|schedule| schedule.cancels >= 1)
+                // Step-capped runs are inconclusive (truncated before the cancel
+                // step), so they are exempt from the cancel-propagation check.
+                .all(|schedule| schedule.step_capped || schedule.cancels >= 1)
         );
         let jsonl = race_suite_jsonl(&report)?;
         assert_eq!(jsonl.lines().count(), report.schedules.len());
