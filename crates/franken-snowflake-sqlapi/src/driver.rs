@@ -21,6 +21,7 @@ use franken_snowflake_core::cancel::CancelReason;
 use franken_snowflake_core::error::{SnowflakeError, SnowflakeErrorCode};
 use franken_snowflake_core::ids::StatementHandle;
 use franken_snowflake_core::outcome::SnowflakeOutcome;
+use franken_snowflake_core::redact::redact;
 use franken_snowflake_http::{
     AuthorizationDescriptor, PartitionHttpRequest, PollHttpRequest, SnowflakeHttpClient,
     StatusClass, SubmitHttpRequest, TransportRoute,
@@ -89,15 +90,15 @@ pub async fn run_statement(
         match progress {
             Progress::Complete(completed) => return SnowflakeOutcome::ok(completed),
             Progress::TimedOut(failure) => {
-                return SnowflakeOutcome::err(SnowflakeError::new(
-                    SnowflakeErrorCode::UpstreamError,
-                    failure.message,
+                return SnowflakeOutcome::err(terminal_failure_error(
+                    SnowflakeErrorCode::StatementTimeout,
+                    failure,
                 ));
             }
             Progress::Failed(failure) => {
-                return SnowflakeOutcome::err(SnowflakeError::new(
-                    SnowflakeErrorCode::UpstreamError,
-                    failure.message,
+                return SnowflakeOutcome::err(terminal_failure_error(
+                    SnowflakeErrorCode::StatementFailed,
+                    failure,
                 ));
             }
             Progress::PollAgain(handle) => {
@@ -198,6 +199,13 @@ fn local_cancel_reason(cx: &Cx) -> CancelReason {
         .unwrap_or_else(CancelReason::parent_cancelled)
 }
 
+fn terminal_failure_error(
+    code: SnowflakeErrorCode,
+    failure: crate::response::QueryFailureStatus,
+) -> SnowflakeError {
+    SnowflakeError::new(code, redact(&failure.message).into_owned())
+}
+
 /// Wait `delay` between poll `GET`s, cancel-aware. Returns the cancellation reason
 /// if the ambient `Cx` is cancelled before or during the wait, so the caller can
 /// fire the remote cancel for the live statement handle.
@@ -258,7 +266,9 @@ const fn response_class(status: StatusClass) -> ResponseClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::response::QueryFailureStatus;
     use asupersync::{Budget, CancelKind, Time};
+    use franken_snowflake_core::outcome::{OutcomeKind, SnowflakeOutcomeExt};
 
     #[test]
     fn response_class_maps_each_transport_status() {
@@ -336,5 +346,47 @@ mod tests {
 
             assert_eq!(reason.kind, CancelKind::Deadline);
         });
+    }
+
+    #[test]
+    fn terminal_statement_failures_keep_precise_error_projection() {
+        let timeout = QueryFailureStatus {
+            code: "000630".to_owned(),
+            sql_state: Some("57014".to_owned()),
+            message: "Statement reached its statement timeout and was canceled.".to_owned(),
+            statement_handle: Some(StatementHandle::new("timeout-handle")),
+        };
+        let timeout_error = terminal_failure_error(SnowflakeErrorCode::StatementTimeout, timeout);
+        let timeout_outcome: StatementOutcome = SnowflakeOutcome::err(timeout_error.clone());
+        assert_eq!(timeout_error.code, SnowflakeErrorCode::StatementTimeout);
+        assert_eq!(timeout_outcome.outcome_kind(), OutcomeKind::Timeout);
+
+        let failure = QueryFailureStatus {
+            code: "001003".to_owned(),
+            sql_state: Some("42000".to_owned()),
+            message: "SQL compilation error.".to_owned(),
+            statement_handle: Some(StatementHandle::new("failed-handle")),
+        };
+        let failure_error = terminal_failure_error(SnowflakeErrorCode::StatementFailed, failure);
+        let failure_outcome: StatementOutcome = SnowflakeOutcome::err(failure_error.clone());
+        assert_eq!(failure_error.code, SnowflakeErrorCode::StatementFailed);
+        assert_eq!(failure_outcome.outcome_kind(), OutcomeKind::Error);
+    }
+
+    #[test]
+    fn terminal_statement_failures_redact_secret_shaped_upstream_messages() {
+        let raw_token = "sfpat_driverFailureEcho001";
+        let failure = QueryFailureStatus {
+            code: "001003".to_owned(),
+            sql_state: Some("42000".to_owned()),
+            message: format!("SQL compilation error near literal '{raw_token}'"),
+            statement_handle: Some(StatementHandle::new("failed-handle")),
+        };
+
+        let error = terminal_failure_error(SnowflakeErrorCode::StatementFailed, failure);
+
+        assert_eq!(error.code, SnowflakeErrorCode::StatementFailed);
+        assert!(error.message.contains("[REDACTED]"));
+        assert!(!error.message.contains(raw_token));
     }
 }
