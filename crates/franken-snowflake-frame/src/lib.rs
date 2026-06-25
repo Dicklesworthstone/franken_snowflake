@@ -150,7 +150,8 @@ mod frankenpandas {
     impl FrameColumnMeta {
         fn from_snowflake(column: &SnowflakeColumn) -> Self {
             let logical_type = SnowflakeLogicalType::from_snowflake_type(&column.snowflake_type);
-            let storage_kind = FrameStorageKind::from_logical(logical_type, column.scale);
+            let storage_kind =
+                FrameStorageKind::from_logical(logical_type, column.scale, column.precision);
             let fp_dtype = storage_kind.fp_dtype(column.nullable);
             Self {
                 name: column.name.clone(),
@@ -219,9 +220,17 @@ mod frankenpandas {
     }
 
     impl FrameStorageKind {
-        fn from_logical(logical_type: SnowflakeLogicalType, scale: Option<i32>) -> Self {
+        fn from_logical(
+            logical_type: SnowflakeLogicalType,
+            scale: Option<i32>,
+            precision: Option<i32>,
+        ) -> Self {
             match logical_type {
-                SnowflakeLogicalType::Fixed if scale.unwrap_or(0) == 0 => Self::Int64,
+                SnowflakeLogicalType::Fixed
+                    if scale.unwrap_or(0) == 0 && scale0_precision_fits_i64(precision) =>
+                {
+                    Self::Int64
+                }
                 SnowflakeLogicalType::Fixed => Self::DecimalString,
                 SnowflakeLogicalType::Real => Self::Float64,
                 SnowflakeLogicalType::Boolean => Self::Bool,
@@ -515,6 +524,10 @@ mod frankenpandas {
         }
     }
 
+    fn scale0_precision_fits_i64(precision: Option<i32>) -> bool {
+        precision.is_none_or(|precision| precision <= 18)
+    }
+
     fn parse_scale0_int(text: &str) -> Option<i64> {
         if let Some((int_part, frac_part)) = text.split_once('.') {
             if frac_part.bytes().all(|byte| byte == b'0') {
@@ -598,9 +611,15 @@ mod frankenpandas {
     }
 
     fn checked_i128_to_i64(value: i128, source: &SnowflakeColumn) -> FrameResult<i64> {
-        i64::try_from(value).map_err(|_| FrameError::TimestampOutOfRange {
+        let value = i64::try_from(value).map_err(|_| FrameError::TimestampOutOfRange {
             column: source.name.clone(),
-        })
+        })?;
+        if value == i64::MIN {
+            return Err(FrameError::TimestampOutOfRange {
+                column: source.name.clone(),
+            });
+        }
+        Ok(value)
     }
 
     fn is_even_hex(text: &str) -> bool {
@@ -641,6 +660,12 @@ mod frankenpandas {
                 ),
                 (
                     col("C", "FIXED").with_scale(2),
+                    SnowflakeLogicalType::Fixed,
+                    FrameStorageKind::DecimalString,
+                    DType::Utf8,
+                ),
+                (
+                    col("C_BIG", "FIXED").with_scale(0).with_precision(38),
                     SnowflakeLogicalType::Fixed,
                     FrameStorageKind::DecimalString,
                     DType::Utf8,
@@ -813,6 +838,62 @@ mod frankenpandas {
                 amount.column.value(0),
                 Some(&Scalar::Utf8("12345678901234567.89".to_owned()))
             );
+            Ok(())
+        }
+
+        #[test]
+        fn number_38_scale0_values_beyond_i64_remain_exact_strings() -> Result<(), String> {
+            let columns = vec![col("BIG_ID", "NUMBER")
+                .with_scale(0)
+                .with_precision(38)
+                .nullable(false)];
+            let partitions = vec![ResultPartition::new(
+                0,
+                vec![vec![Some("99999999999999999999".to_owned())]],
+            )];
+
+            let frame = materialize_partitions(&columns, partitions).map_err(|e| e.to_string())?;
+            let big_id = frame_column(&frame, "BIG_ID")?;
+            assert_eq!(
+                big_id.metadata.storage_kind,
+                FrameStorageKind::DecimalString
+            );
+            assert_eq!(big_id.column.dtype(), DType::Utf8);
+            assert_eq!(
+                big_id.column.value(0),
+                Some(&Scalar::Utf8("99999999999999999999".to_owned()))
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn timestamp_min_nanosecond_boundary_is_not_materialized_as_nat() -> Result<(), String> {
+            let columns = vec![col("T", "TIMESTAMP_NTZ")];
+            let accepted = materialize_partitions(
+                &columns,
+                vec![ResultPartition::new(
+                    0,
+                    vec![vec![Some("-9223372036.854775807".to_owned())]],
+                )],
+            )
+            .map_err(|e| e.to_string())?;
+            let accepted_timestamps = frame_column(&accepted, "T")?;
+            assert_eq!(
+                accepted_timestamps.column.value(0),
+                Some(&Scalar::Datetime64(i64::MIN + 1))
+            );
+
+            let rejected = materialize_partitions(
+                &columns,
+                vec![ResultPartition::new(
+                    0,
+                    vec![vec![Some("-9223372036.854775808".to_owned())]],
+                )],
+            );
+            assert!(matches!(
+                rejected,
+                Err(FrameError::TimestampOutOfRange { .. })
+            ));
             Ok(())
         }
 
