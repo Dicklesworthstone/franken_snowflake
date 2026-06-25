@@ -7,7 +7,14 @@
 //! - [`ids`] — identifier newtypes (`AccountIdentifier`, `ProfileName`,
 //!   `StatementHandle`, `QueryId`, `DatasetId`, `ReceiptHash`, ...).
 //! - [`outcome`] — the [`outcome::OutcomeKind`] / [`outcome::DataSource`] enums
-//!   and the [`outcome::SnowflakeOutcome`] result carrier.
+//!   and the [`outcome::SnowflakeOutcome`] result carrier built on Asupersync's
+//!   four-valued `Outcome`, with [`outcome::SnowflakeOutcomeExt`] projections.
+//! - [`cancel`] — Asupersync `CancelReason`/`CancelKind` re-exports plus the
+//!   [`cancel::CancelPolicy`] routing keyed off `reason.kind`.
+//! - [`budget`] — query [`budget::Budget`] (deadline + poll quota + advisory cost
+//!   quota) with `meet()` propagation to partition fetchers.
+//! - [`capabilities`] — the type-level capability rows for the planner / transport
+//!   / write-intent layers, with compile-time `SubsetOf` layering proofs.
 //! - [`error`] — [`error::SnowflakeErrorCode`], the stable `FSNOW-*` error-code
 //!   registry, and [`error::SnowflakeError`] with auto-populated recovery paths.
 //! - [`exit`] — the process [`exit::ExitCode`] dictionary.
@@ -15,20 +22,23 @@
 //!   redactor (so the redactor and the last-mile output scanner cannot drift).
 //! - [`envelope`] — the deterministic, versioned JSON envelope metadata.
 //!
-//! See `docs/agent_cli_contract.md` (envelope + exit codes) and
-//! `docs/security_model.md` (redaction + fail-closed rights) for the normative
-//! contracts these types implement.
+//! See `docs/agent_cli_contract.md` (envelope + exit codes),
+//! `docs/security_model.md` (redaction + fail-closed rights), and
+//! `docs/asupersync_leverage.md` (the Budget/Outcome/capability control plane)
+//! for the normative contracts these types implement.
 //!
-//! ## Asupersync seam
+//! ## Asupersync control plane
 //!
-//! [`outcome::SnowflakeOutcome`] and [`outcome::CancelReason`] are drafted here
-//! as local enums shaped to map cleanly onto Asupersync's four-valued
-//! `Outcome<T, E>` / `CancelReason`. Re-basing them onto Asupersync proper
-//! (adding the dependency once the `[patch.crates-io]` unification from the
-//! toolchain bead is in place) is the job of bead
-//! `fsnow-native-snowflake-connector-w0i.6`. This file is the code-first draft;
-//! the batch test lane lands with that adoption.
+//! Bead `fsnow-native-snowflake-connector-w0i.6` adopts Asupersync's control
+//! plane here: [`outcome::SnowflakeOutcome`] *is* `asupersync::Outcome<T,
+//! SnowflakeError>` (all four states preserved to the edge), [`cancel`] keys
+//! policy off `CancelReason.kind`, [`budget`] uses `asupersync::Budget`, and
+//! [`capabilities`] pins read-only at the type level. The batch test lane lands
+//! separately (`— code-first, batch-test pending`).
 
+pub mod budget;
+pub mod cancel;
+pub mod capabilities;
 pub mod envelope;
 pub mod error;
 pub mod exit;
@@ -42,6 +52,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Convenient re-exports of the most commonly used core types.
 pub mod prelude {
+    pub use crate::budget::Budget;
+    pub use crate::cancel::{CancelKind, CancelPolicy, CancelReason};
+    pub use crate::capabilities::{PlannerCaps, TransportCaps, WriteCaps};
     pub use crate::envelope::{BudgetConsumed, EnvelopeMeta, SCHEMA_VERSION};
     pub use crate::error::{SnowflakeError, SnowflakeErrorCode};
     pub use crate::exit::ExitCode;
@@ -49,5 +62,5 @@ pub mod prelude {
         AccountIdentifier, DatabaseName, DatasetId, ProfileName, QueryId, ReceiptHash, RequestId,
         RoleName, SchemaName, StatementHandle, WarehouseName,
     };
-    pub use crate::outcome::{CancelReason, DataSource, OutcomeKind, SnowflakeOutcome};
+    pub use crate::outcome::{DataSource, OutcomeKind, SnowflakeOutcome, SnowflakeOutcomeExt};
 }

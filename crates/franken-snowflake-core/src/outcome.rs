@@ -1,17 +1,17 @@
-//! Outcome and provenance vocabulary.
+//! Outcome and provenance vocabulary, built on Asupersync's four-valued `Outcome`.
 //!
-//! [`OutcomeKind`] and [`DataSource`] are the envelope-facing enums; they mirror
-//! the wire contract in `docs/agent_cli_contract.md`. [`SnowflakeOutcome`] is the
-//! in-process result carrier.
-//!
-//! **Asupersync seam:** [`SnowflakeOutcome`] and [`CancelReason`] are shaped to
-//! map onto Asupersync's four-valued `Outcome<T, E>` / `CancelReason`. Bead
-//! `fsnow-native-snowflake-connector-w0i.6` re-bases them onto Asupersync once the
-//! dependency is unified via the toolchain bead's `[patch.crates-io]` block.
+//! [`OutcomeKind`] and [`DataSource`] are the envelope-facing enums (wire contract
+//! in `docs/agent_cli_contract.md`). [`SnowflakeOutcome`] **is** Asupersync's
+//! `Outcome<T, E>` specialized to [`SnowflakeError`], so all four states
+//! (`Ok`/`Err`/`Cancelled`/`Panicked`) survive to the CLI/MCP edge and collapse
+//! only at the policy boundary via [`SnowflakeOutcomeExt`].
 
+use asupersync::Outcome;
 use serde::{Deserialize, Serialize};
 
+use crate::cancel::{cancel_exit_code, cancel_outcome_kind};
 use crate::error::SnowflakeError;
+use crate::exit::ExitCode;
 
 /// The finer-grained outcome class carried in the JSON envelope, independent of
 /// `ok` and of the process exit code. A cancelled query is `Cancelled`, never an
@@ -25,7 +25,7 @@ pub enum OutcomeKind {
     PartialSuccess,
     /// A policy/safety refusal — the connector declined to act.
     Refusal,
-    /// Cooperatively cancelled (see [`CancelReason`]).
+    /// Cooperatively cancelled.
     Cancelled,
     /// A deadline or statement timeout elapsed.
     Timeout,
@@ -63,94 +63,47 @@ impl Default for DataSource {
     }
 }
 
-/// Why a [`SnowflakeOutcome`] was cancelled. Maps onto Asupersync `CancelReason`
-/// in bead `w0i.6`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CancelReason {
-    /// The caller (CLI signal / MCP disconnect) requested cancellation.
-    Client,
-    /// A wall-clock deadline elapsed.
-    Deadline,
-    /// The advisory client-side cost budget was exceeded.
-    CostBudget,
-    /// The poll-count quota was exhausted.
-    PollQuota,
-    /// Cancellation propagated from an upstream/parent region.
-    Upstream,
-}
-
-/// The in-process result carrier for connector operations.
+/// The connector's result carrier: Asupersync's four-valued `Outcome` specialized
+/// to [`SnowflakeError`].
 ///
-/// This is a faithful draft of the Asupersync `Outcome<T, E>` shape, specialized
-/// to [`SnowflakeError`]. The [`SnowflakeOutcome::kind`] method projects it to the
-/// envelope's [`OutcomeKind`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SnowflakeOutcome<T> {
-    /// Fully successful, carrying the value.
-    Success(T),
-    /// Succeeded with non-fatal warnings.
-    PartialSuccess {
-        /// The (degraded but usable) value.
-        value: T,
-        /// Human-readable warnings.
-        warnings: Vec<String>,
-    },
-    /// A policy/safety refusal.
-    Refusal(SnowflakeError),
-    /// Cooperatively cancelled.
-    Cancelled(CancelReason),
-    /// A deadline/statement timeout elapsed after `after_ms`.
-    Timeout {
-        /// Milliseconds elapsed before the timeout fired.
-        after_ms: u64,
-    },
-    /// An error occurred.
-    Error(SnowflakeError),
+/// Preserve all four variants to the edge; project to the envelope vocabulary with
+/// [`SnowflakeOutcomeExt`] only at the policy boundary (exit code / MCP error /
+/// receipt status).
+pub type SnowflakeOutcome<T> = Outcome<T, SnowflakeError>;
+
+/// Projections from the four-valued [`SnowflakeOutcome`] to the envelope/exit
+/// vocabulary. Implemented for the `Outcome` alias so callers keep Asupersync's
+/// native methods (`is_ok`, `map`, ...) and gain these.
+pub trait SnowflakeOutcomeExt {
+    /// The envelope `outcome_kind` this outcome projects to.
+    fn outcome_kind(&self) -> OutcomeKind;
+    /// The process exit code this outcome projects to.
+    fn exit_code(&self) -> ExitCode;
+    /// Whether `ok` should be true in the envelope (a plain `Ok`).
+    fn is_success(&self) -> bool;
 }
 
-impl<T> SnowflakeOutcome<T> {
-    /// Project to the envelope's [`OutcomeKind`].
-    #[must_use]
-    pub const fn kind(&self) -> OutcomeKind {
+impl<T> SnowflakeOutcomeExt for SnowflakeOutcome<T> {
+    fn outcome_kind(&self) -> OutcomeKind {
         match self {
-            Self::Success(_) => OutcomeKind::Success,
-            Self::PartialSuccess { .. } => OutcomeKind::PartialSuccess,
-            Self::Refusal(_) => OutcomeKind::Refusal,
-            Self::Cancelled(_) => OutcomeKind::Cancelled,
-            Self::Timeout { .. } => OutcomeKind::Timeout,
-            Self::Error(_) => OutcomeKind::Error,
+            Outcome::Ok(_) => OutcomeKind::Success,
+            Outcome::Err(_) => OutcomeKind::Error,
+            Outcome::Cancelled(reason) => cancel_outcome_kind(reason.kind),
+            Outcome::Panicked(_) => OutcomeKind::Error,
         }
     }
 
-    /// Whether `ok` should be true in the envelope (success or partial success).
-    #[must_use]
-    pub const fn is_ok(&self) -> bool {
-        matches!(self, Self::Success(_) | Self::PartialSuccess { .. })
-    }
-
-    /// Borrow the success value, if present.
-    #[must_use]
-    pub const fn value(&self) -> Option<&T> {
+    fn exit_code(&self) -> ExitCode {
         match self {
-            Self::Success(value) | Self::PartialSuccess { value, .. } => Some(value),
-            _ => None,
+            Outcome::Ok(_) => ExitCode::Success,
+            Outcome::Err(error) => error.exit_code(),
+            Outcome::Cancelled(reason) => cancel_exit_code(reason.kind),
+            // A panic collapses to an internal/I/O-class failure at the boundary.
+            Outcome::Panicked(_) => ExitCode::Io,
         }
     }
 
-    /// Map the success value, preserving the outcome shape.
-    #[must_use]
-    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> SnowflakeOutcome<U> {
-        match self {
-            Self::Success(value) => SnowflakeOutcome::Success(f(value)),
-            Self::PartialSuccess { value, warnings } => SnowflakeOutcome::PartialSuccess {
-                value: f(value),
-                warnings,
-            },
-            Self::Refusal(e) => SnowflakeOutcome::Refusal(e),
-            Self::Cancelled(r) => SnowflakeOutcome::Cancelled(r),
-            Self::Timeout { after_ms } => SnowflakeOutcome::Timeout { after_ms },
-            Self::Error(e) => SnowflakeOutcome::Error(e),
-        }
+    fn is_success(&self) -> bool {
+        matches!(self, Outcome::Ok(_))
     }
 }
