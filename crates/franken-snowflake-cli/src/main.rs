@@ -927,7 +927,7 @@ fn dispatch(invocation: Invocation) -> Outcome {
         Command::QueryRun { profile, sql } => {
             query_run_outcome(invocation.output, request_id, profile, sql)
         }
-        Command::QueryCancel { statement_handle } => not_implemented_with_data(
+        Command::QueryCancel { statement_handle } => live_transport_required_with_data(
             invocation.output,
             "query.cancel",
             "fsnow.query.cancel.v1",
@@ -937,7 +937,10 @@ fn dispatch(invocation: Invocation) -> Outcome {
                 ("statement_handle", json_string(statement_handle)),
                 (
                     "requires",
-                    json_array(vec![json_string("statement lifecycle cancel handler")]),
+                    json_array(vec![
+                        json_string("live SQL API transport"),
+                        json_string("profile credential handles"),
+                    ]),
                 ),
             ]),
             vec!["franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string()],
@@ -1069,6 +1072,40 @@ fn not_implemented_with_data(
     envelope.repair_commands = vec!["franken-snowflake doctor --json".to_string()];
     Outcome {
         status: SnowflakeErrorCode::Internal.exit_code(),
+        body: Body::Envelope { envelope, format },
+    }
+}
+
+fn live_transport_required_with_data(
+    format: OutputFormat,
+    command_id: &'static str,
+    output_contract_id: &'static str,
+    request_id: String,
+    profile_id: Option<String>,
+    data: Json,
+    safe_next_commands: Vec<String>,
+) -> Outcome {
+    let mut envelope = base_envelope(
+        false,
+        "refusal",
+        command_id,
+        output_contract_id,
+        request_id,
+        data,
+    );
+    envelope.profile_id = profile_id;
+    envelope.error = Some(error_info(
+        SnowflakeErrorCode::RequireLiveRefused,
+        "This command requires live SQL API transport and profile credential handles; the CLI did not substitute fixture or empty data.",
+        vec![json_string("live transport boundary")],
+    ));
+    envelope.safe_next_commands = safe_next_commands;
+    envelope.repair_commands = vec![
+        "franken-snowflake profile validate <profile> --json".to_string(),
+        "franken-snowflake profile doctor <profile> --json".to_string(),
+    ];
+    Outcome {
+        status: SnowflakeErrorCode::RequireLiveRefused.exit_code(),
         body: Body::Envelope { envelope, format },
     }
 }
@@ -1990,7 +2027,8 @@ fn query_plan_outcome(
                 string_array(vec![
                     "parse SQL safety class".to_string(),
                     "attach request_id as SQL API idempotency key".to_string(),
-                    "submit through statement lifecycle handler when available".to_string(),
+                    "submit through live SQL API transport when profile credentials are available"
+                        .to_string(),
                 ]),
             ),
         ]),
@@ -2040,7 +2078,7 @@ fn query_run_outcome(
         );
     }
 
-    not_implemented_with_data(
+    live_transport_required_with_data(
         format,
         "query.run",
         "fsnow.query.run.v1",
@@ -2050,9 +2088,11 @@ fn query_run_outcome(
             ("sql_accepted_by_local_safety_check", Json::Bool(true)),
             (
                 "requires",
-                json_array(vec![json_string(
-                    "statement lifecycle submit/poll/partition handler",
-                )]),
+                json_array(vec![
+                    json_string("live SQL API transport"),
+                    json_string("profile credential handles"),
+                    json_string("statement lifecycle submit/poll/partition handler"),
+                ]),
             ),
         ]),
         vec!["franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string()],
@@ -2822,7 +2862,7 @@ mod tests {
         assert!(rendered.contains("\"command_id\":\"query.cancel\""));
         assert!(rendered.contains("\"output_contract_id\":\"fsnow.query.cancel.v1\""));
         assert!(rendered.contains("\"statement_handle\":\"01bcaafe-0000\""));
-        assert!(rendered.contains("FSNOW-9001"));
+        assert!(rendered.contains("FSNOW-3003"));
     }
 
     #[test]
