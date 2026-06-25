@@ -1,0 +1,27 @@
+{
+  "export_time": "2026-06-24T22:35:08.933764007+00:00",
+  "issues_count": 18,
+  "content_hash": "50746a1d250154f85e224b1e1074b059c95050550e6b9f12f593d2f543f9b214",
+  "exported_ids": [
+    "fsnow-agent-ergonomic-cli-mpk",
+    "fsnow-asupersync-native-https-ofq",
+    "fsnow-auth-foundations-kdw",
+    "fsnow-catalog-dataset-manifests-yot",
+    "fsnow-dataset-query-planner-jjo",
+    "fsnow-deferred-write-intent-9r9",
+    "fsnow-deterministic-testkit-bak",
+    "fsnow-downstream-integration-contract-vyl",
+    "fsnow-frankenpandas-frame-materialization-z1o",
+    "fsnow-live-proof-lanes-onf",
+    "fsnow-local-cache-repository-afb",
+    "fsnow-native-snowflake-connector-w0i",
+    "fsnow-open-source-release-readiness-bzg",
+    "fsnow-repo-governance-scaffold-zra",
+    "fsnow-security-cost-guardrails-bgp",
+    "fsnow-sqlapi-protocol-schemas-kx6",
+    "fsnow-statement-lifecycle-ofl",
+    "fsnow-text-indexing-frankensearch-h9q"
+  ],
+  "policy": "strict",
+  "errors": []
+}
