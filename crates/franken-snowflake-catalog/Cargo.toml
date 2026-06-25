@@ -15,10 +15,10 @@ workspace = true
 
 [dependencies]
 franken-snowflake-cache = { path = "../franken-snowflake-cache" }
+franken-snowflake-core = { path = "../franken-snowflake-core" }
 franken-snowflake-sqlapi = { path = "../franken-snowflake-sqlapi" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-franken-snowflake-core = { path = "../franken-snowflake-core" }
 franken-snowflake-testkit = { path = "../franken-snowflake-testkit" }

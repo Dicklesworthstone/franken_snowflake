@@ -36,8 +36,9 @@ pub mod prelude {
         OperatorCatalogEntry, OutputDtypeRule,
     };
     pub use crate::planner::{
-        plan_dataset_query, DatasetQueryRequest, PlanGuardrails, PlanMode, PlanRefusal,
-        PlanWarning, QueryPlan, TypedBinding,
+        plan_dataset_query, plan_raw_sql_dry_run, plan_refusal_log_line, plan_success_log_line,
+        DatasetQueryRequest, PlanGuardrails, PlanMode, PlanRefusal, PlanWarning, PlannerLogLine,
+        PredicatePushdownPlan, QueryPlan, RawSqlPlanRequest, TypedBinding,
     };
     pub use crate::predicate::{
         validate_predicate, LeafPredicate, PredicateAst, PredicateRefusal, PredicateRefusalCode,

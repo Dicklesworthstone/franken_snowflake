@@ -2,7 +2,12 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use franken_snowflake_core::error::SnowflakeErrorCode;
+use franken_snowflake_core::guardrails::{
+    enforce_query_safety, QueryPlanGuard, QuerySafetyLimits, DEFAULT_MAX_RESULT_BYTES,
+    DEFAULT_MAX_RESULT_ROWS,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::{
@@ -14,8 +19,12 @@ use crate::predicate::{
     PredicateRefusalCode,
 };
 
-/// Dataset-mode planner request.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+const PLANNER_LOG_SCHEMA_VERSION: u16 = 1;
+const DATASET_STATEMENT_TIMEOUT_SECONDS: u32 = 60;
+
+/// Dataset query mode. The caller supplies catalog artifacts; this planner
+/// never discovers metadata or contacts Snowflake.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DatasetQueryRequest {
     /// Dataset ID.
     pub dataset_id: String,
@@ -46,6 +55,36 @@ pub struct DatasetQueryRequest {
     /// Explicit confirmation token for large non-export plans.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmation_token: Option<String>,
+    /// Optional warehouse selected by the resolved profile. The pure catalog
+    /// planner accepts `None`; profile validation can require one earlier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warehouse: Option<String>,
+    /// Secret-free profile fingerprint used in the deterministic plan ID.
+    pub profile_fingerprint: String,
+    /// CLI/MCP command identifier.
+    pub command_id: String,
+    /// Trace identifier; also used as the Snowflake `QUERY_TAG` when present.
+    pub trace_id: String,
+}
+
+/// Raw SQL dry-run request. Raw mode is expert-only and still read-only: the
+/// planner accepts a single safe `SELECT`, applies guardrails, and returns a
+/// plan without executing it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RawSqlPlanRequest {
+    /// Caller-authored SQL. Must be one read-only `SELECT`.
+    pub sql: String,
+    /// Optional explicit row limit to push down if the SQL has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    /// Whether this plan is for an export path.
+    pub export_mode: bool,
+    /// Explicit confirmation token for large non-export raw scans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation_token: Option<String>,
+    /// Optional warehouse selected by the resolved profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warehouse: Option<String>,
     /// Secret-free profile fingerprint used in the deterministic plan ID.
     pub profile_fingerprint: String,
     /// CLI/MCP command identifier.
@@ -55,7 +94,7 @@ pub struct DatasetQueryRequest {
 }
 
 /// Planned query mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanMode {
     /// Dataset manifest mode.
@@ -65,7 +104,7 @@ pub enum PlanMode {
 }
 
 /// A typed positional SQL API binding.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypedBinding {
     /// Snowflake SQL API binding type.
     #[serde(rename = "type")]
@@ -75,18 +114,20 @@ pub struct TypedBinding {
 }
 
 /// Server-enforced guardrails attached to every plan.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanGuardrails {
     /// `STATEMENT_TIMEOUT_IN_SECONDS` value.
     pub statement_timeout_seconds: u32,
     /// Result row cap.
     pub result_row_cap: u64,
+    /// Result byte cap retained locally before export.
+    pub result_byte_cap: u64,
     /// Snowflake `QUERY_TAG`.
     pub query_tag: String,
 }
 
 /// Advisory planner warning.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanWarning {
     /// Stable warning code.
     pub code: String,
@@ -94,8 +135,21 @@ pub struct PlanWarning {
     pub message: String,
 }
 
+/// Predicate and projection pushdown evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredicatePushdownPlan {
+    /// Number of projection columns pushed into the `SELECT` list.
+    pub projected_columns: usize,
+    /// Number of role-based axis filters pushed into `WHERE`.
+    pub axis_filters: usize,
+    /// Number of predicate AST leaves pushed into `WHERE`.
+    pub predicate_filters: usize,
+    /// True only when every validated predicate leaf was compiled into SQL.
+    pub all_predicates_pushed_down: bool,
+}
+
 /// Dataset query plan output.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryPlan {
     /// Deterministic normalized-plan hash.
     pub plan_id: String,
@@ -107,13 +161,15 @@ pub struct QueryPlan {
     pub bindings: BTreeMap<String, TypedBinding>,
     /// Server-enforced guardrails.
     pub guardrails: PlanGuardrails,
+    /// Predicate/projection pushdown evidence.
+    pub pushdown: PredicatePushdownPlan,
     /// Advisory warnings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<PlanWarning>,
 }
 
 /// Planner refusal.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanRefusal {
     /// Stable refusal code.
     pub code: String,
@@ -122,6 +178,78 @@ pub struct PlanRefusal {
     /// Suggestions where safe.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub did_you_mean: Vec<String>,
+}
+
+/// Structured JSON-line log event emitted by planner callers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannerLogLine {
+    /// Schema version for planner log lines.
+    pub schema_version: u16,
+    /// Event name.
+    pub event: String,
+    /// `ok` or `refusal`.
+    pub outcome: String,
+    /// Planning mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<PlanMode>,
+    /// Deterministic plan ID on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    /// Stable refusal or warning code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// Redacted diagnostic.
+    pub message: String,
+    /// CLI/MCP command identifier.
+    pub command_id: String,
+    /// End-to-end trace ID.
+    pub trace_id: String,
+    /// Redaction markers applied before logging.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redactions_applied: Vec<String>,
+}
+
+/// Build the success log line for a plan.
+#[must_use]
+pub fn plan_success_log_line(
+    plan: &QueryPlan,
+    command_id: impl Into<String>,
+    trace_id: impl Into<String>,
+) -> PlannerLogLine {
+    PlannerLogLine {
+        schema_version: PLANNER_LOG_SCHEMA_VERSION,
+        event: "query_plan".to_owned(),
+        outcome: "ok".to_owned(),
+        mode: Some(plan.mode),
+        plan_id: Some(plan.plan_id.clone()),
+        code: None,
+        message: "query plan accepted".to_owned(),
+        command_id: command_id.into(),
+        trace_id: trace_id.into(),
+        redactions_applied: Vec::new(),
+    }
+}
+
+/// Build the refusal log line for a planner refusal.
+#[must_use]
+pub fn plan_refusal_log_line(
+    refusal: &PlanRefusal,
+    mode: PlanMode,
+    command_id: impl Into<String>,
+    trace_id: impl Into<String>,
+) -> PlannerLogLine {
+    PlannerLogLine {
+        schema_version: PLANNER_LOG_SCHEMA_VERSION,
+        event: "query_plan".to_owned(),
+        outcome: "refusal".to_owned(),
+        mode: Some(mode),
+        plan_id: None,
+        code: Some(refusal.code.clone()),
+        message: refusal.message.clone(),
+        command_id: command_id.into(),
+        trace_id: trace_id.into(),
+        redactions_applied: Vec::new(),
+    }
 }
 
 /// Plan a dataset-mode query.
@@ -158,19 +286,13 @@ pub fn plan_dataset_query(
     }
 
     let effective_limit = request.limit.unwrap_or(manifest.default_limit);
-    if !request.export_mode
-        && request.confirmation_token.is_none()
-        && effective_limit > manifest.max_rows_without_export
-    {
-        refusals.push(PlanRefusal {
-            code: "FSNOW_RESULT_TOO_LARGE".to_owned(),
-            message: format!(
-                "limit {effective_limit} exceeds max_rows_without_export {}",
-                manifest.max_rows_without_export
-            ),
-            did_you_mean: Vec::new(),
-        });
-    }
+    enforce_interactive_row_policy(
+        effective_limit,
+        manifest.max_rows_without_export,
+        request.export_mode,
+        request.confirmation_token.as_deref(),
+        &mut refusals,
+    );
 
     if !refusals.is_empty() {
         return Err(refusals);
@@ -206,7 +328,7 @@ pub fn plan_dataset_query(
     }
 
     let mut where_clauses = Vec::new();
-    add_axis_filters(
+    let axis_filters = add_axis_filters(
         manifest,
         &dataset_columns,
         request,
@@ -214,6 +336,8 @@ pub fn plan_dataset_query(
         &mut next_binding,
         &mut where_clauses,
     );
+    let predicate_filters = request.filter.as_ref().map_or(0, count_predicate_leaves);
+    let mut pushed_predicate_filters = 0usize;
     if let Some(predicate) = &request.filter {
         if let Some(compiled) = compile_predicate(
             predicate,
@@ -222,6 +346,7 @@ pub fn plan_dataset_query(
             &mut next_binding,
         ) {
             where_clauses.push(compiled);
+            pushed_predicate_filters = predicate_filters;
         }
     }
 
@@ -238,12 +363,15 @@ pub fn plan_dataset_query(
         effective_limit.to_string(),
     ));
 
-    let guardrails = PlanGuardrails {
-        statement_timeout_seconds: 60,
-        result_row_cap: effective_limit,
-        query_tag: query_tag(request),
-    };
-    let warnings = warnings_for_request(request);
+    let (guardrails, mut warnings) = planner_guardrails(
+        &sql,
+        effective_limit,
+        request.export_mode,
+        request.warehouse.clone(),
+        query_tag(request),
+    )
+    .map_err(|refusal| vec![refusal])?;
+    warnings.extend(warnings_for_request(request));
     let plan_id = plan_id(&sql, &bindings, &guardrails, manifest, request);
 
     Ok(QueryPlan {
@@ -252,8 +380,208 @@ pub fn plan_dataset_query(
         sql,
         bindings,
         guardrails,
+        pushdown: PredicatePushdownPlan {
+            projected_columns: projection.len(),
+            axis_filters,
+            predicate_filters,
+            all_predicates_pushed_down: pushed_predicate_filters == predicate_filters,
+        },
         warnings,
     })
+}
+
+/// Plan a raw SQL dry-run. Raw mode accepts one conservative read-only `SELECT`
+/// and never executes it; callers submit the returned plan through the same
+/// receipt/guardrail path as dataset plans.
+pub fn plan_raw_sql_dry_run(request: &RawSqlPlanRequest) -> Result<QueryPlan, Vec<PlanRefusal>> {
+    let mut warnings = Vec::new();
+    let mut sql = match normalize_raw_select(&request.sql) {
+        Ok(sql) => sql,
+        Err(refusal) => return Err(vec![refusal]),
+    };
+
+    let has_sql_limit = has_result_limit(&sql);
+    let pushed_limit = if has_sql_limit {
+        request.limit
+    } else {
+        request.limit.or_else(|| {
+            if request.export_mode || request.confirmation_token.is_some() {
+                None
+            } else {
+                warnings.push(PlanWarning {
+                    code: "FSNOW_UNCONSTRAINED_QUERY_ADVISORY".to_owned(),
+                    message: "raw SELECT had no LIMIT; planner pushed down the default row cap"
+                        .to_owned(),
+                });
+                Some(DEFAULT_MAX_RESULT_ROWS)
+            }
+        })
+    };
+
+    let mut bindings = BTreeMap::new();
+    let mut next_binding = 1usize;
+    if !has_sql_limit {
+        if let Some(limit) = pushed_limit {
+            sql.push_str(" LIMIT ");
+            sql.push_str(&push_binding(
+                &mut bindings,
+                &mut next_binding,
+                DtypeClass::Number,
+                limit.to_string(),
+            ));
+        }
+    }
+
+    let result_row_cap = pushed_limit.unwrap_or(DEFAULT_MAX_RESULT_ROWS);
+    let (guardrails, mut guardrail_warnings) = planner_guardrails(
+        &sql,
+        result_row_cap,
+        request.export_mode,
+        request.warehouse.clone(),
+        raw_query_tag(request),
+    )
+    .map_err(|refusal| vec![refusal])?;
+    warnings.append(&mut guardrail_warnings);
+    let plan_id = raw_plan_id(&sql, &bindings, &guardrails, request);
+
+    Ok(QueryPlan {
+        plan_id,
+        mode: PlanMode::RawSql,
+        sql,
+        bindings,
+        guardrails,
+        pushdown: PredicatePushdownPlan {
+            projected_columns: 0,
+            axis_filters: 0,
+            predicate_filters: 0,
+            all_predicates_pushed_down: true,
+        },
+        warnings,
+    })
+}
+
+fn enforce_interactive_row_policy(
+    effective_limit: u64,
+    manifest_max_rows_without_export: u64,
+    export_mode: bool,
+    confirmation_token: Option<&str>,
+    refusals: &mut Vec<PlanRefusal>,
+) {
+    let interactive_cap = manifest_max_rows_without_export.min(DEFAULT_MAX_RESULT_ROWS);
+    if !export_mode && confirmation_token.is_none() && effective_limit > interactive_cap {
+        refusals.push(PlanRefusal {
+            code: "FSNOW_RESULT_TOO_LARGE".to_owned(),
+            message: format!(
+                "limit {effective_limit} exceeds interactive row cap {interactive_cap}; use export mode, a narrower limit, or confirmation"
+            ),
+            did_you_mean: Vec::new(),
+        });
+    }
+    if effective_limit > manifest_max_rows_without_export && !export_mode {
+        refusals.push(PlanRefusal {
+            code: "FSNOW_RESULT_TOO_LARGE".to_owned(),
+            message: format!(
+                "limit {effective_limit} exceeds max_rows_without_export {manifest_max_rows_without_export}"
+            ),
+            did_you_mean: Vec::new(),
+        });
+    }
+}
+
+fn planner_guardrails(
+    sql: &str,
+    result_row_cap: u64,
+    export_mode: bool,
+    warehouse: Option<String>,
+    query_tag: String,
+) -> Result<(PlanGuardrails, Vec<PlanWarning>), PlanRefusal> {
+    let limits = QuerySafetyLimits {
+        max_result_rows: result_row_cap,
+        statement_timeout_seconds: DATASET_STATEMENT_TIMEOUT_SECONDS,
+        require_warehouse: false,
+        ..QuerySafetyLimits::default()
+    };
+    let mut guard = QueryPlanGuard::new(sql.to_owned());
+    guard.statement_timeout_seconds = Some(DATASET_STATEMENT_TIMEOUT_SECONDS);
+    guard.result_row_cap = Some(result_row_cap);
+    guard.result_byte_cap = Some(DEFAULT_MAX_RESULT_BYTES);
+    guard.warehouse = warehouse;
+    guard.export_mode = export_mode;
+
+    let bounded = enforce_query_safety(guard, &limits).map_err(plan_refusal_from_core_error)?;
+    let warnings = bounded
+        .warnings
+        .into_iter()
+        .map(|warning| PlanWarning {
+            code: warning.code,
+            message: warning.message,
+        })
+        .collect();
+
+    Ok((
+        PlanGuardrails {
+            statement_timeout_seconds: bounded.statement_timeout_seconds,
+            result_row_cap: bounded.result_row_cap,
+            result_byte_cap: bounded.result_byte_cap,
+            query_tag,
+        },
+        warnings,
+    ))
+}
+
+fn plan_refusal_from_core_error(
+    error: franken_snowflake_core::error::SnowflakeError,
+) -> PlanRefusal {
+    let code = match error.code {
+        SnowflakeErrorCode::MutationRefused | SnowflakeErrorCode::MultiStatementRefused => {
+            "FSNOW_RAW_SQL_UNSAFE"
+        }
+        SnowflakeErrorCode::RowCapExceeded | SnowflakeErrorCode::SafetyLimitExceeded => {
+            "FSNOW_RESULT_TOO_LARGE"
+        }
+        SnowflakeErrorCode::WarehouseRefused => "FSNOW_WAREHOUSE_REFUSED",
+        _ => "FSNOW_QUERY_GUARDRAIL",
+    };
+    PlanRefusal {
+        code: code.to_owned(),
+        message: error.message,
+        did_you_mean: Vec::new(),
+    }
+}
+
+fn normalize_raw_select(sql: &str) -> Result<String, PlanRefusal> {
+    let trimmed = sql.trim();
+    if trimmed.is_empty() {
+        return Err(raw_sql_refusal("raw SQL must be a single SELECT statement"));
+    }
+    let without_trailing_semicolon = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
+    if without_trailing_semicolon.contains(';') {
+        return Err(raw_sql_refusal(
+            "raw SQL dry-run accepts one statement; semicolon chaining is refused",
+        ));
+    }
+    if first_keyword(without_trailing_semicolon).as_deref() != Some("select") {
+        return Err(raw_sql_refusal("raw SQL dry-run accepts SELECT only"));
+    }
+    for keyword in [
+        "alter", "call", "copy", "create", "delete", "drop", "grant", "insert", "merge", "put",
+        "remove", "revoke", "truncate", "update", "use",
+    ] {
+        if contains_word(without_trailing_semicolon, keyword) {
+            return Err(raw_sql_refusal(
+                "raw SQL dry-run refused a mutating or session-changing keyword",
+            ));
+        }
+    }
+    Ok(without_trailing_semicolon.to_owned())
+}
+
+fn raw_sql_refusal(message: impl Into<String>) -> PlanRefusal {
+    PlanRefusal {
+        code: "FSNOW_RAW_SQL_UNSAFE".to_owned(),
+        message: message.into(),
+        did_you_mean: Vec::new(),
+    }
 }
 
 fn sorted_dataset_columns<'a>(
@@ -378,7 +706,8 @@ fn add_axis_filters(
     bindings: &mut BTreeMap<String, TypedBinding>,
     next_binding: &mut usize,
     where_clauses: &mut Vec<String>,
-) {
+) -> usize {
+    let mut pushed = 0usize;
     if let Some(entity) = &request.entity {
         if let Some(column) = axis_column(manifest, columns, FieldRole::EntityKey) {
             where_clauses.push(format!(
@@ -386,6 +715,7 @@ fn add_axis_filters(
                 quote_identifier(&column.column),
                 push_binding(bindings, next_binding, column.dtype_class, entity.clone())
             ));
+            pushed += 1;
         }
     }
     if let Some(from) = &request.from {
@@ -395,6 +725,7 @@ fn add_axis_filters(
                 quote_identifier(&column.column),
                 push_binding(bindings, next_binding, column.dtype_class, from.clone())
             ));
+            pushed += 1;
         }
     }
     if let Some(to) = &request.to {
@@ -404,8 +735,10 @@ fn add_axis_filters(
                 quote_identifier(&column.column),
                 push_binding(bindings, next_binding, column.dtype_class, to.clone())
             ));
+            pushed += 1;
         }
     }
+    pushed
 }
 
 fn axis_column<'a>(
@@ -429,6 +762,25 @@ fn compile_predicate(
             compile_compound(compound, columns, bindings, next_binding)
         }
         PredicateAst::Leaf(leaf) => compile_leaf(leaf, columns, bindings, next_binding),
+    }
+}
+
+fn count_predicate_leaves(predicate: &PredicateAst) -> usize {
+    match predicate {
+        PredicateAst::Leaf(_) => 1,
+        PredicateAst::Compound(compound) => {
+            compound
+                .and
+                .iter()
+                .map(count_predicate_leaves)
+                .sum::<usize>()
+                + compound
+                    .or
+                    .iter()
+                    .map(count_predicate_leaves)
+                    .sum::<usize>()
+                + compound.not.as_deref().map_or(0, count_predicate_leaves)
+        }
     }
 }
 
@@ -596,6 +948,16 @@ fn query_tag(request: &DatasetQueryRequest) -> String {
     }
 }
 
+fn raw_query_tag(request: &RawSqlPlanRequest) -> String {
+    if !request.trace_id.is_empty() {
+        request.trace_id.clone()
+    } else if !request.command_id.is_empty() {
+        request.command_id.clone()
+    } else {
+        "franken-snowflake.raw-query-plan".to_owned()
+    }
+}
+
 fn warnings_for_request(request: &DatasetQueryRequest) -> Vec<PlanWarning> {
     if request.limit.is_some() {
         Vec::new()
@@ -605,6 +967,27 @@ fn warnings_for_request(request: &DatasetQueryRequest) -> Vec<PlanWarning> {
             message: "no explicit limit supplied; manifest default_limit was applied".to_owned(),
         }]
     }
+}
+
+fn has_result_limit(sql: &str) -> bool {
+    contains_word(sql, "limit") || contains_word(sql, "fetch")
+}
+
+fn first_keyword(sql: &str) -> Option<String> {
+    sql.lines()
+        .map(|line| line.split_once("--").map_or(line, |(before, _)| before))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_start()
+        .split(|ch: char| !ch.is_ascii_alphabetic())
+        .find(|part| !part.is_empty())
+        .map(|part| part.to_ascii_lowercase())
+}
+
+fn contains_word(sql: &str, needle: &str) -> bool {
+    sql.to_ascii_lowercase()
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .any(|part| part == needle)
 }
 
 fn plan_id(
@@ -630,6 +1013,37 @@ fn plan_id(
     normalized.push_str(&guardrails.statement_timeout_seconds.to_string());
     normalized.push('|');
     normalized.push_str(&guardrails.result_row_cap.to_string());
+    normalized.push('|');
+    normalized.push_str(&guardrails.result_byte_cap.to_string());
+    normalized.push('|');
+    normalized.push_str(&guardrails.query_tag);
+    for (position, binding) in bindings {
+        normalized.push('|');
+        normalized.push_str(position);
+        normalized.push(':');
+        normalized.push_str(&binding.binding_type);
+        normalized.push('=');
+        normalized.push_str(&binding.value);
+    }
+    format!("plan:{:016x}", fnv1a64(normalized.as_bytes()))
+}
+
+fn raw_plan_id(
+    sql: &str,
+    bindings: &BTreeMap<String, TypedBinding>,
+    guardrails: &PlanGuardrails,
+    request: &RawSqlPlanRequest,
+) -> String {
+    let mut normalized = String::new();
+    normalized.push_str(sql);
+    normalized.push('|');
+    normalized.push_str(&request.profile_fingerprint);
+    normalized.push_str("|raw|");
+    normalized.push_str(&guardrails.statement_timeout_seconds.to_string());
+    normalized.push('|');
+    normalized.push_str(&guardrails.result_row_cap.to_string());
+    normalized.push('|');
+    normalized.push_str(&guardrails.result_byte_cap.to_string());
     normalized.push('|');
     normalized.push_str(&guardrails.query_tag);
     for (position, binding) in bindings {
@@ -664,6 +1078,313 @@ impl From<PredicateRefusal> for PlanRefusal {
             code: code.to_owned(),
             message: value.message,
             did_you_mean: value.did_you_mean,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::model::{
+        DataSourceClass, DatasetField, DatasetKind, Provenance, ProvenanceSource, RightsClass,
+        RoleConfidence,
+    };
+    use crate::operator::built_in_operator_catalog;
+
+    #[test]
+    fn dataset_plan_pushes_safe_predicates_with_typed_bindings() {
+        let request = DatasetQueryRequest {
+            dataset_id: "events_daily".to_owned(),
+            select: vec![
+                "EVENT_DATE".to_owned(),
+                "ENTITY_ID".to_owned(),
+                "VALUE".to_owned(),
+            ],
+            entity: Some("ENTITY'; DROP TABLE X; --".to_owned()),
+            from: Some("2024-01-01".to_owned()),
+            to: Some("2024-12-31".to_owned()),
+            as_of: Some("2024-12-31T23:59:59Z".to_owned()),
+            filter: Some(PredicateAst::Leaf(LeafPredicate::new(
+                "VALUE",
+                "gt",
+                json!("0 OR 1=1"),
+            ))),
+            limit: Some(1_000),
+            export_mode: false,
+            confirmation_token: None,
+            warehouse: None,
+            profile_fingerprint: "profile:fixture".to_owned(),
+            command_id: "query.plan".to_owned(),
+            trace_id: "trace-abc".to_owned(),
+        };
+
+        let plan = plan_dataset_query(
+            &fixture_manifest("events_daily"),
+            &fixture_columns("events_daily"),
+            &built_in_operator_catalog(),
+            &request,
+        );
+
+        assert!(plan.is_ok());
+        if let Ok(plan) = plan {
+            assert_eq!(
+                plan.sql,
+                "SELECT \"EVENT_DATE\", \"ENTITY_ID\", \"VALUE\" FROM \"ANALYTICS\".\"PUBLIC\".\"EVENTS_DAILY\" AT(TIMESTAMP => ?) WHERE \"ENTITY_ID\" = ? AND \"EVENT_DATE\" >= ? AND \"EVENT_DATE\" <= ? AND \"VALUE\" > ? LIMIT ?"
+            );
+            assert!(!plan.sql.contains("DROP TABLE"));
+            assert!(!plan.sql.contains("0 OR 1=1"));
+            assert_eq!(
+                plan.bindings.get("2").map(|binding| binding.value.as_str()),
+                Some("ENTITY'; DROP TABLE X; --")
+            );
+            assert_eq!(
+                plan.bindings.get("5").map(|binding| binding.value.as_str()),
+                Some("0 OR 1=1")
+            );
+            assert_eq!(
+                plan.bindings
+                    .get("5")
+                    .map(|binding| binding.binding_type.as_str()),
+                Some("FIXED")
+            );
+            assert_eq!(plan.guardrails.query_tag, "trace-abc");
+            assert_eq!(plan.guardrails.statement_timeout_seconds, 60);
+            assert_eq!(plan.guardrails.result_row_cap, 1_000);
+            assert_eq!(plan.pushdown.predicate_filters, 1);
+            assert!(plan.pushdown.all_predicates_pushed_down);
+        }
+    }
+
+    #[test]
+    fn identifier_quoting_contains_identifier_injection() {
+        let mut manifest = fixture_manifest("events_daily");
+        manifest.database = "ANA\"LYTICS".to_owned();
+        manifest.object = "EVENTS\"; DROP TABLE X; --".to_owned();
+        let mut columns = fixture_columns("events_daily");
+        for column in &mut columns {
+            column.database.clone_from(&manifest.database);
+            column.object.clone_from(&manifest.object);
+        }
+        let request = base_dataset_request(Some(10));
+
+        let plan = plan_dataset_query(&manifest, &columns, &built_in_operator_catalog(), &request);
+
+        assert!(plan.is_ok());
+        if let Ok(plan) = plan {
+            assert!(plan
+                .sql
+                .contains("FROM \"ANA\"\"LYTICS\".\"PUBLIC\".\"EVENTS\"\"; DROP TABLE X; --\""));
+            assert_eq!(plan.sql.matches(';').count(), 1);
+            assert!(plan.sql.ends_with(" LIMIT ?"));
+        }
+    }
+
+    #[test]
+    fn large_interactive_dataset_plan_requires_export_or_confirmation() {
+        let mut request = base_dataset_request(Some(DEFAULT_MAX_RESULT_ROWS + 1));
+        request.confirmation_token = None;
+        request.export_mode = false;
+
+        let refused = plan_dataset_query(
+            &fixture_manifest("events_daily"),
+            &fixture_columns("events_daily"),
+            &built_in_operator_catalog(),
+            &request,
+        );
+        assert!(matches!(
+            refused,
+            Err(refusals) if refusals.iter().any(|refusal| refusal.code == "FSNOW_RESULT_TOO_LARGE")
+        ));
+
+        request.confirmation_token = Some("confirm-large-result".to_owned());
+        assert!(plan_dataset_query(
+            &fixture_manifest("events_daily"),
+            &fixture_columns("events_daily"),
+            &built_in_operator_catalog(),
+            &request,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn raw_sql_dry_run_refuses_mutation_and_statement_chaining() {
+        let mut request = base_raw_request("delete from events_daily");
+        let mutation = plan_raw_sql_dry_run(&request);
+        assert!(matches!(
+            mutation,
+            Err(refusals) if refusals[0].code == "FSNOW_RAW_SQL_UNSAFE"
+        ));
+
+        request.sql = "select * from events_daily; drop table events_daily".to_owned();
+        let chained = plan_raw_sql_dry_run(&request);
+        assert!(matches!(
+            chained,
+            Err(refusals) if refusals[0].code == "FSNOW_RAW_SQL_UNSAFE"
+        ));
+    }
+
+    #[test]
+    fn raw_sql_dry_run_pushes_default_limit_and_warns() {
+        let request = base_raw_request("select * from events_daily");
+
+        let plan = plan_raw_sql_dry_run(&request);
+
+        assert!(plan.is_ok());
+        if let Ok(plan) = plan {
+            assert_eq!(plan.mode, PlanMode::RawSql);
+            assert_eq!(plan.sql, "select * from events_daily LIMIT ?");
+            assert_eq!(
+                plan.bindings.get("1").map(|binding| binding.value.as_str()),
+                Some("10000")
+            );
+            assert_eq!(plan.guardrails.query_tag, "trace-raw");
+            assert!(plan
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "FSNOW_UNCONSTRAINED_QUERY_ADVISORY"));
+        }
+    }
+
+    #[test]
+    fn plan_ids_and_structured_logs_are_deterministic() -> Result<(), serde_json::Error> {
+        let request = base_dataset_request(Some(100));
+        let left = plan_dataset_query(
+            &fixture_manifest("events_daily"),
+            &fixture_columns("events_daily"),
+            &built_in_operator_catalog(),
+            &request,
+        );
+        let right = plan_dataset_query(
+            &fixture_manifest("events_daily"),
+            &fixture_columns("events_daily"),
+            &built_in_operator_catalog(),
+            &request,
+        );
+
+        assert!(left.is_ok());
+        assert!(right.is_ok());
+        if let (Ok(left), Ok(right)) = (left, right) {
+            assert_eq!(left.plan_id, right.plan_id);
+            let log = plan_success_log_line(&left, &request.command_id, &request.trace_id);
+            let line = serde_json::to_string(&log)?;
+            assert!(line.contains("\"event\":\"query_plan\""));
+            assert!(line.contains("\"outcome\":\"ok\""));
+            assert!(line.contains("\"plan_id\""));
+        }
+        Ok(())
+    }
+
+    fn base_dataset_request(limit: Option<u64>) -> DatasetQueryRequest {
+        DatasetQueryRequest {
+            dataset_id: "events_daily".to_owned(),
+            select: Vec::new(),
+            entity: None,
+            from: None,
+            to: None,
+            as_of: None,
+            filter: None,
+            limit,
+            export_mode: false,
+            confirmation_token: None,
+            warehouse: None,
+            profile_fingerprint: "profile:fixture".to_owned(),
+            command_id: "query.plan".to_owned(),
+            trace_id: "trace-dataset".to_owned(),
+        }
+    }
+
+    fn base_raw_request(sql: &str) -> RawSqlPlanRequest {
+        RawSqlPlanRequest {
+            sql: sql.to_owned(),
+            limit: None,
+            export_mode: false,
+            confirmation_token: None,
+            warehouse: None,
+            profile_fingerprint: "profile:fixture".to_owned(),
+            command_id: "query.plan".to_owned(),
+            trace_id: "trace-raw".to_owned(),
+        }
+    }
+
+    fn fixture_manifest(dataset_id: &str) -> DatasetManifest {
+        DatasetManifest {
+            id: dataset_id.to_owned(),
+            profile: "demo".to_owned(),
+            database: "ANALYTICS".to_owned(),
+            schema: "PUBLIC".to_owned(),
+            object: "EVENTS_DAILY".to_owned(),
+            kind: DatasetKind::Table,
+            rights_class: RightsClass::Private,
+            default_limit: 1_000,
+            max_rows_without_export: 50_000,
+            description: None,
+            provenance: fixture_provenance(),
+            fields: vec![
+                field("ENTITY_ID", FieldRole::EntityKey, DtypeClass::String),
+                field("EVENT_DATE", FieldRole::TimeIndex, DtypeClass::Date),
+                field("VALUE", FieldRole::Feature, DtypeClass::Number),
+            ],
+        }
+    }
+
+    fn field(column: &str, role: FieldRole, dtype: DtypeClass) -> DatasetField {
+        DatasetField {
+            column: column.to_owned(),
+            role,
+            dtype,
+            required: matches!(role, FieldRole::EntityKey | FieldRole::TimeIndex),
+            role_confidence: RoleConfidence::Confirmed,
+        }
+    }
+
+    fn fixture_columns(dataset_id: &str) -> Vec<ColumnCatalogEntry> {
+        vec![
+            column(dataset_id, "ENTITY_ID", 1, "TEXT", DtypeClass::String),
+            column(dataset_id, "EVENT_DATE", 2, "DATE", DtypeClass::Date),
+            column(dataset_id, "VALUE", 3, "NUMBER", DtypeClass::Number),
+        ]
+    }
+
+    fn column(
+        dataset_id: &str,
+        column: &str,
+        ordinal: u32,
+        snowflake_type: &str,
+        dtype_class: DtypeClass,
+    ) -> ColumnCatalogEntry {
+        ColumnCatalogEntry {
+            dataset_id: dataset_id.to_owned(),
+            database: "ANALYTICS".to_owned(),
+            schema: "PUBLIC".to_owned(),
+            object: "EVENTS_DAILY".to_owned(),
+            column: column.to_owned(),
+            ordinal,
+            snowflake_type: snowflake_type.to_owned(),
+            dtype_class,
+            nullable: false,
+            precision: None,
+            scale: None,
+            length: None,
+            aliases: Vec::new(),
+            comment: None,
+            tags: Vec::new(),
+            provenance: Some(fixture_provenance()),
+        }
+    }
+
+    fn fixture_provenance() -> Provenance {
+        Provenance {
+            source: ProvenanceSource::Fixture,
+            data_source: DataSourceClass::Fixture,
+            snapshot_id: "snapshot-fixture".to_owned(),
+            discovered_at: "2026-06-25T00:00:00Z".to_owned(),
+            profile_fingerprint: "profile:fixture".to_owned(),
+            object_fingerprint: "snowflake-object:ANALYTICS.PUBLIC.EVENTS_DAILY".to_owned(),
+            command_id: "catalog.fixture".to_owned(),
+            trace_id: "trace-fixture".to_owned(),
+            redactions_applied: Vec::new(),
         }
     }
 }
