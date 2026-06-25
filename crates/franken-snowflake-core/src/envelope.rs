@@ -167,7 +167,8 @@ impl EnvelopeMeta {
         Self::new(command_id, output_contract_id, true, OutcomeKind::Success)
     }
 
-    /// An error envelope built from a [`SnowflakeError`]: `ok = false`,
+    /// An error envelope built from a [`SnowflakeError`]: `ok = false`, refusal
+    /// errors projected as `outcome_kind = refusal`, other errors as
     /// `outcome_kind = error`, error block attached.
     #[must_use]
     pub fn error(
@@ -175,7 +176,12 @@ impl EnvelopeMeta {
         output_contract_id: impl Into<String>,
         error: SnowflakeError,
     ) -> Self {
-        let mut meta = Self::new(command_id, output_contract_id, false, OutcomeKind::Error);
+        let outcome_kind = if error.policy_boundary() {
+            OutcomeKind::Refusal
+        } else {
+            OutcomeKind::Error
+        };
+        let mut meta = Self::new(command_id, output_contract_id, false, outcome_kind);
         meta.error = Some(error.into());
         meta
     }
@@ -293,6 +299,18 @@ mod tests {
         assert!(json.contains("\"ok\":false"));
         assert!(json.contains("\"code\":\"FSNOW-2001\""));
         assert!(json.contains("\"retryable\":false"));
+        Ok(())
+    }
+
+    #[test]
+    fn policy_boundary_error_envelope_carries_refusal_outcome() -> Result<(), serde_json::Error> {
+        let err = SnowflakeError::new(SnowflakeErrorCode::MutationRefused, "read-only");
+        let meta = EnvelopeMeta::error("query", "query.v1", err);
+        assert!(!meta.ok);
+        assert_eq!(meta.outcome_kind, OutcomeKind::Refusal);
+        let json = meta.to_json_string()?;
+        assert!(json.contains("\"outcome_kind\":\"refusal\""));
+        assert!(json.contains("\"code\":\"FSNOW-3001\""));
         Ok(())
     }
 

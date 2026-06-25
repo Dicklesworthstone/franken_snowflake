@@ -87,6 +87,7 @@ impl<T> SnowflakeOutcomeExt for SnowflakeOutcome<T> {
     fn outcome_kind(&self) -> OutcomeKind {
         match self {
             Outcome::Ok(_) => OutcomeKind::Success,
+            Outcome::Err(error) if error.policy_boundary() => OutcomeKind::Refusal,
             Outcome::Err(_) => OutcomeKind::Error,
             Outcome::Cancelled(reason) => cancel_outcome_kind(reason.kind),
             Outcome::Panicked(_) => OutcomeKind::Error,
@@ -137,6 +138,15 @@ mod tests {
         let outcome: SnowflakeOutcome<u32> = Outcome::err(err);
         assert_eq!(outcome.outcome_kind(), OutcomeKind::Error);
         assert_eq!(outcome.exit_code(), ExitCode::UpstreamError);
+        assert!(!outcome.is_success());
+    }
+
+    #[test]
+    fn policy_boundary_err_maps_to_refusal_and_registry_exit() {
+        let err = SnowflakeError::new(SnowflakeErrorCode::MutationRefused, "read-only");
+        let outcome: SnowflakeOutcome<u32> = Outcome::err(err);
+        assert_eq!(outcome.outcome_kind(), OutcomeKind::Refusal);
+        assert_eq!(outcome.exit_code(), ExitCode::SafetyRefusal);
         assert!(!outcome.is_success());
     }
 
