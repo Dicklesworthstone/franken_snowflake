@@ -390,7 +390,7 @@ fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
         });
     }
 
-    if has_any(&args, &["--help", "-h", "help"]) {
+    if has_any(&args, &["--help", "-h"]) || args.first().is_some_and(|arg| arg == "help") {
         return Ok(Invocation {
             args_for_request_id,
             command: Command::Help,
@@ -3407,6 +3407,26 @@ mod tests {
         };
         assert!(rendered.contains("Missing value for `--profile`."));
         assert!(!rendered.contains("\"command_id\":\"capabilities\""));
+    }
+
+    #[test]
+    fn help_value_is_not_misparsed_as_global_help() {
+        let profile_validate = render_json(&envelope_for(&["profile", "validate", "help"]));
+        assert!(profile_validate.contains("\"command_id\":\"profile.validate\""));
+        assert!(profile_validate.contains("\"profile_id\":\"help\""));
+        assert!(!profile_validate.contains("\"command_id\":\"help\""));
+
+        let query_plan = render_json(&envelope_for(&[
+            "query",
+            "plan",
+            "--profile",
+            "help",
+            "--sql",
+            "select 1",
+        ]));
+        assert!(query_plan.contains("\"command_id\":\"query.plan\""));
+        assert!(query_plan.contains("\"profile_id\":\"help\""));
+        assert!(!query_plan.contains("\"command_id\":\"help\""));
     }
 
     #[cfg(feature = "toon")]
