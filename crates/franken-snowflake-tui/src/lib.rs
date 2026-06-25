@@ -762,13 +762,15 @@ fn format_browser_row(selected: bool, label: &str) -> String {
 #[cfg(feature = "tui")]
 mod ftui_surface {
     use ftui::render::drawing::Draw;
-    use ftui::{Cell, Cmd, Event, Frame, KeyCode, KeyEventKind, Model, PackedRgba};
+    use ftui::{Cell, Cmd, Event, Frame, KeyCode, KeyEvent, KeyEventKind, Model, PackedRgba};
 
-    use super::{SnowflakeTuiApp, TuiEvent};
+    use super::{FocusPane, SnowflakeTuiApp, TuiEvent};
 
     /// FrankenTUI message wrapper for the app model.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum TuiMessage {
+        /// Raw key event interpreted against the current focused pane.
+        Key(KeyEvent),
         /// Terminal-independent app event.
         App(TuiEvent),
         /// Ignore key-release and unsupported terminal events.
@@ -780,19 +782,7 @@ mod ftui_surface {
             match event {
                 Event::Tick => Self::Ignore,
                 Event::Key(key) if key.kind == KeyEventKind::Release => Self::Ignore,
-                Event::Key(key) => match key.code {
-                    KeyCode::Char('q') if !key.ctrl() => Self::App(TuiEvent::Quit),
-                    KeyCode::Char('c') if key.ctrl() => Self::App(TuiEvent::Quit),
-                    KeyCode::Tab => Self::App(TuiEvent::NextPane),
-                    KeyCode::BackTab => Self::App(TuiEvent::PreviousPane),
-                    KeyCode::Down => Self::App(TuiEvent::CatalogDown),
-                    KeyCode::Up => Self::App(TuiEvent::CatalogUp),
-                    KeyCode::Right | KeyCode::Enter => Self::App(TuiEvent::CatalogEnter),
-                    KeyCode::Left | KeyCode::Escape => Self::App(TuiEvent::CatalogBack),
-                    KeyCode::Backspace => Self::App(TuiEvent::QueryBackspace),
-                    KeyCode::Char(ch) => Self::App(TuiEvent::QueryInput(ch)),
-                    _ => Self::Ignore,
-                },
+                Event::Key(key) => Self::Key(key),
                 _ => Self::Ignore,
             }
         }
@@ -804,6 +794,14 @@ mod ftui_surface {
         fn update(&mut self, msg: Self::Message) -> Cmd<Self::Message> {
             match msg {
                 TuiMessage::App(TuiEvent::Quit) => Cmd::quit(),
+                TuiMessage::Key(key) => match event_for_key(self.focus, key) {
+                    Some(TuiEvent::Quit) => Cmd::quit(),
+                    Some(event) => {
+                        let _ = self.apply_event(event);
+                        Cmd::none()
+                    }
+                    None => Cmd::none(),
+                },
                 TuiMessage::App(event) => {
                     let _ = self.apply_event(event);
                     Cmd::none()
@@ -851,6 +849,32 @@ mod ftui_surface {
                 };
                 frame.buffer.print_text_clipped(0, y, line, cell, width);
             }
+        }
+    }
+
+    fn event_for_key(focus: FocusPane, key: KeyEvent) -> Option<TuiEvent> {
+        if key.ctrl() && matches!(key.code, KeyCode::Char('c')) {
+            return Some(TuiEvent::Quit);
+        }
+
+        match key.code {
+            KeyCode::Tab => Some(TuiEvent::NextPane),
+            KeyCode::BackTab => Some(TuiEvent::PreviousPane),
+            KeyCode::Char('q') if focus != FocusPane::Query && !key.ctrl() => Some(TuiEvent::Quit),
+            KeyCode::Down if focus == FocusPane::Catalog => Some(TuiEvent::CatalogDown),
+            KeyCode::Up if focus == FocusPane::Catalog => Some(TuiEvent::CatalogUp),
+            KeyCode::Right | KeyCode::Enter if focus == FocusPane::Catalog => {
+                Some(TuiEvent::CatalogEnter)
+            }
+            KeyCode::Left | KeyCode::Escape if focus == FocusPane::Catalog => {
+                Some(TuiEvent::CatalogBack)
+            }
+            KeyCode::Enter if focus == FocusPane::Query => Some(TuiEvent::QuerySubmit),
+            KeyCode::Backspace if focus == FocusPane::Query => Some(TuiEvent::QueryBackspace),
+            KeyCode::Char(ch) if focus == FocusPane::Query && !key.ctrl() => {
+                Some(TuiEvent::QueryInput(ch))
+            }
+            _ => None,
         }
     }
 
@@ -970,6 +994,47 @@ mod tests {
         assert_eq!(app.focus, FocusPane::Progress);
         assert_eq!(app.apply_event(TuiEvent::PreviousPane), TuiAction::None);
         assert_eq!(app.focus, FocusPane::Query);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn terminal_enter_submits_query_when_query_pane_is_focused() {
+        use ftui::{Event, KeyCode, KeyEvent, Model};
+
+        let mut app = SnowflakeTuiApp {
+            focus: FocusPane::Query,
+            query: QueryDraft {
+                sql: "SELECT ID FROM DB1.PUBLIC.POSITIONS".to_owned(),
+                ..QueryDraft::default()
+            },
+            ..SnowflakeTuiApp::default()
+        };
+
+        let _ = app.update(TuiMessage::from(Event::Key(KeyEvent::new(KeyCode::Enter))));
+
+        assert!(app.last_plan.is_some());
+        assert_eq!(app.progress.phase, StatementPhase::Planned);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn terminal_character_input_is_scoped_to_query_focus() {
+        use ftui::{Event, KeyCode, KeyEvent, Model};
+
+        let mut app = SnowflakeTuiApp::default();
+        let original = app.query.sql.clone();
+        let _ = app.update(TuiMessage::from(Event::Key(KeyEvent::new(KeyCode::Char(
+            'X',
+        )))));
+        assert_eq!(app.query.sql, original);
+
+        app.focus = FocusPane::Query;
+        app.query.sql.clear();
+        let _ = app.update(TuiMessage::from(Event::Key(KeyEvent::new(KeyCode::Char(
+            'q',
+        )))));
+        assert_eq!(app.query.sql, "q");
+        assert!(app.last_plan.is_none());
     }
 
     fn fixture_snapshot() -> CatalogSnapshot {
