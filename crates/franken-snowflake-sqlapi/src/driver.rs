@@ -17,7 +17,7 @@
 use asupersync::Cx;
 use franken_snowflake_core::cancel::CancelReason;
 use franken_snowflake_core::error::{SnowflakeError, SnowflakeErrorCode};
-use franken_snowflake_core::ids::{RequestId, StatementHandle};
+use franken_snowflake_core::ids::StatementHandle;
 use franken_snowflake_core::outcome::SnowflakeOutcome;
 use franken_snowflake_http::{
     AuthorizationDescriptor, PartitionHttpRequest, PollHttpRequest, SnowflakeHttpClient,
@@ -183,14 +183,13 @@ fn local_cancel_reason(cx: &Cx) -> CancelReason {
         .unwrap_or_else(CancelReason::parent_cancelled)
 }
 
-/// Pick the submit route: the idempotent resubmit form
-/// (`requestId=...&retry=true`) when both are present, else a plain submit.
+/// Pick the submit route, preserving every typed submit query parameter.
 fn submit_route(params: &SubmitQueryParams) -> TransportRoute {
-    match (&params.request_id, params.retry) {
-        (Some(request_id), true) => TransportRoute::SubmitRetry {
-            request_id: RequestId::new(request_id.clone()),
-        },
-        _ => TransportRoute::Submit,
+    let query = params.to_query_pairs();
+    if query.is_empty() {
+        TransportRoute::Submit
+    } else {
+        TransportRoute::SubmitWithQuery { query }
     }
 }
 
@@ -247,16 +246,35 @@ mod tests {
             retry: true,
             ..SubmitQueryParams::default()
         };
-        assert!(matches!(
-            submit_route(&resubmit),
-            TransportRoute::SubmitRetry { .. }
-        ));
+        assert!(submit_route(&resubmit).has_retry_contract());
 
         // retry=true without a requestId cannot use the idempotent contract.
         let no_id = SubmitQueryParams {
             retry: true,
             ..SubmitQueryParams::default()
         };
-        assert!(matches!(submit_route(&no_id), TransportRoute::Submit));
+        assert!(!submit_route(&no_id).has_retry_contract());
+    }
+
+    #[test]
+    fn submit_route_golden_preserves_async_and_nullable_query_params() {
+        let params = SubmitQueryParams {
+            request_id: Some("req-async-nullable".to_owned()),
+            retry: true,
+            asynchronous: true,
+            nullable: Some(false),
+        };
+        let expected_pairs = params.to_query_pairs();
+
+        let route = submit_route(&params);
+        assert!(matches!(
+            &route,
+            TransportRoute::SubmitWithQuery { query } if query == &expected_pairs
+        ));
+        assert!(route.has_retry_contract());
+        assert_eq!(
+            route.path_and_query(),
+            "/api/v2/statements?requestId=req-async-nullable&retry=true&async=true&nullable=false"
+        );
     }
 }
