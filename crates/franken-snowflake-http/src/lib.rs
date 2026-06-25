@@ -39,6 +39,10 @@ const HEADER_ACCEPT_ENCODING: &str = "Accept-Encoding";
 const HEADER_CONTENT_ENCODING: &str = "Content-Encoding";
 const JSON_MEDIA_TYPE: &str = "application/json";
 const PARTITION_ACCEPT_ENCODING: &str = "gzip, identity";
+/// Official Snowflake SQL API resubmit contract consulted 2026-06-25.
+pub const SNOWFLAKE_SQL_API_RESUBMIT_DOC_URL: &str = "https://docs.snowflake.com/en/developer-guide/sql-api/submitting-requests#resubmitting-a-request-to-execute-sql-statements";
+/// Date the Snowflake SQL API resubmit contract above was consulted.
+pub const SNOWFLAKE_SQL_API_RESUBMIT_DOC_CONSULTED: &str = "2026-06-25";
 
 /// Transport APIs preserve the connector's in-process outcome carrier.
 pub type TransportOutcome<T> = franken_snowflake_core::outcome::SnowflakeOutcome<T>;
@@ -92,13 +96,12 @@ impl SnowflakeHttpClient {
     /// Build a submit request plan without performing network I/O.
     #[must_use]
     pub fn submit_plan(&self, request: &SubmitHttpRequest) -> Result<WireRequest, TransportError> {
-        let route = TransportRoute::Submit;
         self.wire_request(
             Method::Post,
-            route,
+            request.route.clone(),
             request.body.clone(),
             &request.auth,
-            false,
+            request.retry_resubmit,
         )
     }
 
@@ -223,7 +226,7 @@ impl SnowflakeHttpClient {
         };
         let _partition_fetch_budget = partition_child_budget(cx.budget(), request.child_budget);
 
-        for partition in request.seed_partitions {
+        for partition in request.seed_partitions.iter().cloned() {
             if cx.checkpoint().is_err() {
                 let reason = cancel_reason_or(cx, CancelReason::parent_cancelled);
                 return self
@@ -357,6 +360,19 @@ impl SnowflakeHttpClient {
                     let retry_after_ms = retry_after_ms(response.headers.as_slice());
                     let retryable = is_retryable_status(response.status);
                     if retryable {
+                        if !route_allows_automatic_retry(&wire.route) {
+                            return TransportOutcome::err(
+                                TransportError::new(
+                                    TransportErrorCode::NonIdempotentSubmitRetryRefused,
+                                    format!(
+                                        "{} returned retryable HTTP status {}, but automatic retry requires requestId plus retry=true",
+                                        route_kind.as_str(),
+                                        response.status
+                                    ),
+                                )
+                                .into_snowflake_error(),
+                            );
+                        }
                         if let Some(retry) = self.config.retry.next_retry(
                             planned.request_id.as_ref(),
                             route_kind,
@@ -400,19 +416,21 @@ impl SnowflakeHttpClient {
                     ));
                 }
                 Err(error) => {
-                    if let Some(retry) = self.config.retry.next_retry(
-                        planned.request_id.as_ref(),
-                        route_kind,
-                        attempt,
-                        None,
-                        retry_spent_ms,
-                    ) {
-                        if let Err(reason) = wait_retry_delay(cx, retry.delay).await {
-                            return TransportOutcome::cancelled(reason);
+                    if route_allows_automatic_retry(&wire.route) {
+                        if let Some(retry) = self.config.retry.next_retry(
+                            planned.request_id.as_ref(),
+                            route_kind,
+                            attempt,
+                            None,
+                            retry_spent_ms,
+                        ) {
+                            if let Err(reason) = wait_retry_delay(cx, retry.delay).await {
+                                return TransportOutcome::cancelled(reason);
+                            }
+                            attempt = attempt.saturating_add(1);
+                            retry_spent_ms = retry.spent_after_ms;
+                            continue;
                         }
-                        attempt = attempt.saturating_add(1);
-                        retry_spent_ms = retry.spent_after_ms;
-                        continue;
                     }
                     return TransportOutcome::err(
                         TransportError::new(
@@ -1312,6 +1330,18 @@ fn is_retryable_status(status: u16) -> bool {
     )
 }
 
+fn route_allows_automatic_retry(route: &TransportRoute) -> bool {
+    // Snowflake warns that ambiguous resubmission of a statement can execute
+    // the SQL twice. Automatic submit retry is allowed only when the URL carries
+    // the documented requestId + retry=true contract recorded above.
+    matches!(
+        route,
+        TransportRoute::SubmitRetry { .. }
+            | TransportRoute::Poll { .. }
+            | TransportRoute::Partition { .. }
+    )
+}
+
 fn cancel_reason_or(cx: &Cx, fallback: fn() -> CancelReason) -> CancelReason {
     cx.cancel_reason().unwrap_or_else(fallback)
 }
@@ -1939,6 +1969,32 @@ mod tests {
             retry_resubmit: true,
         };
         assert!(client.submit_plan(&request).is_ok());
+    }
+
+    #[test]
+    fn plain_submit_post_is_not_blindly_retried() {
+        assert_eq!(SNOWFLAKE_SQL_API_RESUBMIT_DOC_CONSULTED, "2026-06-25");
+        assert!(
+            SNOWFLAKE_SQL_API_RESUBMIT_DOC_URL
+                .contains("/developer-guide/sql-api/submitting-requests")
+        );
+        assert!(is_retryable_status(503));
+        assert!(is_retryable_status(429));
+
+        assert!(!route_allows_automatic_retry(&TransportRoute::Submit));
+        assert!(route_allows_automatic_retry(&TransportRoute::SubmitRetry {
+            request_id: RequestId::new("req-123")
+        }));
+        assert!(route_allows_automatic_retry(&TransportRoute::Poll {
+            handle: StatementHandle::new("stmt-1")
+        }));
+        assert!(route_allows_automatic_retry(&TransportRoute::Partition {
+            handle: StatementHandle::new("stmt-1"),
+            partition: 1,
+        }));
+        assert!(!route_allows_automatic_retry(&TransportRoute::Cancel {
+            handle: StatementHandle::new("stmt-1")
+        }));
     }
 
     #[test]
