@@ -822,9 +822,16 @@ mod tests {
             FieldRole::KnownAt
         );
 
-        for column in ["SEAT", "HEARTBEAT", "REPORTS", "FORMAT"] {
+        for (column, dtype) in [
+            ("SEAT", DtypeClass::Date),
+            ("HEARTBEAT", DtypeClass::Time),
+            ("STAT", DtypeClass::Timestamp),
+            ("FORMAT", DtypeClass::Time),
+            ("REPORTS", DtypeClass::Timestamp),
+            ("RESULTS", DtypeClass::Timestamp),
+        ] {
             assert_eq!(
-                infer_field_role(column, DtypeClass::Timestamp),
+                infer_field_role(column, dtype),
                 FieldRole::Feature,
                 "{column} should not be inferred as a time axis"
             );
