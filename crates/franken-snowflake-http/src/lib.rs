@@ -15,8 +15,12 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use asupersync::http::Response;
+use asupersync::http::compress::{Decompressor, GzipDecompressor, IdentityDecompressor};
 use asupersync::http::{Client as AsupersyncHttpClient, Method, StatusCode};
 use asupersync::{CancelKind, Cx};
+use franken_snowflake_core::budget::{Budget, partition_child_budget};
+use franken_snowflake_core::cancel::{CancelPolicy, CancelReason, cancel_policy};
 use franken_snowflake_core::ids::{RequestId, StatementHandle};
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +32,10 @@ const HEADER_AUTHORIZATION: &str = "Authorization";
 const HEADER_TOKEN_TYPE: &str = "X-Snowflake-Authorization-Token-Type";
 const HEADER_CONTENT_TYPE: &str = "Content-Type";
 const HEADER_ACCEPT: &str = "Accept";
+const HEADER_ACCEPT_ENCODING: &str = "Accept-Encoding";
+const HEADER_CONTENT_ENCODING: &str = "Content-Encoding";
 const JSON_MEDIA_TYPE: &str = "application/json";
+const PARTITION_ACCEPT_ENCODING: &str = "gzip, identity";
 
 /// Transport APIs preserve the connector's in-process outcome carrier.
 pub type TransportOutcome<T> = franken_snowflake_core::outcome::SnowflakeOutcome<T>;
@@ -123,8 +130,7 @@ impl SnowflakeHttpClient {
         self.wire_request(Method::Post, route, Vec::new(), &request.auth, false)
     }
 
-    /// Draft live submit API. Network execution lands once SQL API schemas,
-    /// auth, and testkit seams are ready.
+    /// Submit a SQL API statement over the live Asupersync HTTPS transport.
     pub async fn submit_statement(
         &self,
         cx: &Cx,
@@ -133,7 +139,7 @@ impl SnowflakeHttpClient {
         self.execute(cx, request, TransportRouteKind::Submit).await
     }
 
-    /// Draft live poll API.
+    /// Poll a submitted statement handle.
     pub async fn poll_statement(
         &self,
         cx: &Cx,
@@ -142,7 +148,7 @@ impl SnowflakeHttpClient {
         self.execute(cx, request, TransportRouteKind::Poll).await
     }
 
-    /// Draft live partition fetch API.
+    /// Fetch and decode a result partition.
     pub async fn fetch_partition(
         &self,
         cx: &Cx,
@@ -152,7 +158,7 @@ impl SnowflakeHttpClient {
             .await
     }
 
-    /// Draft live cancel API.
+    /// Cancel a statement handle.
     pub async fn cancel_statement(
         &self,
         cx: &Cx,
@@ -161,8 +167,35 @@ impl SnowflakeHttpClient {
         self.execute(cx, request, TransportRouteKind::Cancel).await
     }
 
-    /// Draft partition streaming API. This first slice validates the streaming
-    /// plan and sink contract without starting child fetchers yet.
+    /// Send a remote cancel during a bounded cleanup phase after local
+    /// cancellation. The caller owns the cleanup `Cx`; this function deliberately
+    /// does not manufacture a detached context inside the transport layer.
+    pub async fn cancel_after_local_cancel(
+        &self,
+        cleanup_cx: &Cx,
+        auth: AuthorizationDescriptor,
+        statement_handle: StatementHandle,
+        reason: CancelReason,
+    ) -> TransportOutcome<CancelHttpResponse> {
+        match cancel_policy(reason.kind) {
+            CancelPolicy::RemoteCancelAndReceipt | CancelPolicy::BoundedDrain => {
+                self.cancel_statement(
+                    cleanup_cx,
+                    CancelHttpRequest {
+                        auth,
+                        statement_handle,
+                        reason_kind: reason.kind,
+                    },
+                )
+                .await
+            }
+            CancelPolicy::RetryOrDegrade | CancelPolicy::QuietDrain => {
+                TransportOutcome::cancelled(reason)
+            }
+        }
+    }
+
+    /// Fetch partitions in order and stream them into the caller's sink.
     pub async fn stream_partitions<S>(
         &self,
         cx: &Cx,
@@ -173,21 +206,81 @@ impl SnowflakeHttpClient {
         S: PartitionSink,
     {
         if cx.checkpoint().is_err() {
-            return TransportOutcome::Cancelled(
-                franken_snowflake_core::outcome::CancelReason::Upstream,
-            );
+            return TransportOutcome::cancelled(cancel_reason_or(
+                cx,
+                CancelReason::parent_cancelled,
+            ));
         }
-        match request.plan() {
-            Ok(summary) => {
-                for partition in request.seed_partitions {
-                    if let Err(error) = sink.accept(cx, partition).await {
-                        return TransportOutcome::Error(error.into_snowflake_error());
-                    }
+        let summary = match request.plan() {
+            Ok(summary) => summary,
+            Err(error) => return TransportOutcome::err(error.into_snowflake_error()),
+        };
+        let _partition_fetch_budget = partition_child_budget(cx.budget(), request.child_budget);
+
+        for partition in request.seed_partitions {
+            if cx.checkpoint().is_err() {
+                let reason = cancel_reason_or(cx, CancelReason::parent_cancelled);
+                if request.remote_cancel_on_local_cancel {
+                    return self
+                        .cancel_after_local_cancel(
+                            cx,
+                            request.auth,
+                            request.statement_handle,
+                            reason,
+                        )
+                        .await
+                        .map(|_| summary);
                 }
-                TransportOutcome::Success(summary)
+                return TransportOutcome::cancelled(reason);
             }
-            Err(error) => TransportOutcome::Error(error.into_snowflake_error()),
+            if let Err(error) = sink.accept(cx, partition).await {
+                return TransportOutcome::err(error.into_snowflake_error());
+            }
         }
+
+        for partition in request.first_partition..request.end_partition_exclusive {
+            if cx.checkpoint().is_err() {
+                let reason = cancel_reason_or(cx, CancelReason::parent_cancelled);
+                if request.remote_cancel_on_local_cancel {
+                    return self
+                        .cancel_after_local_cancel(
+                            cx,
+                            request.auth,
+                            request.statement_handle,
+                            reason,
+                        )
+                        .await
+                        .map(|_| summary);
+                }
+                return TransportOutcome::cancelled(reason);
+            }
+            let body = match self
+                .fetch_partition(
+                    cx,
+                    PartitionHttpRequest {
+                        auth: request.auth.clone(),
+                        statement_handle: request.statement_handle.clone(),
+                        partition,
+                    },
+                )
+                .await
+            {
+                TransportOutcome::Ok(body) => body,
+                TransportOutcome::Err(error) => return TransportOutcome::err(error),
+                TransportOutcome::Cancelled(reason) => return TransportOutcome::cancelled(reason),
+                TransportOutcome::Panicked(payload) => return TransportOutcome::panicked(payload),
+            };
+            let decoded = DecodedPartition {
+                partition,
+                body: body.body,
+                compression: body.compression,
+            };
+            if let Err(error) = sink.accept(cx, decoded).await {
+                return TransportOutcome::err(error.into_snowflake_error());
+            }
+        }
+
+        TransportOutcome::ok(summary)
     }
 
     async fn execute<R, T>(
@@ -200,49 +293,114 @@ impl SnowflakeHttpClient {
         R: Into<PlannedTransportRequest>,
         T: FromResponseBody,
     {
-        if cx.checkpoint().is_err() {
-            return TransportOutcome::Cancelled(
-                franken_snowflake_core::outcome::CancelReason::Upstream,
-            );
-        }
+        let mut retry_spent_ms = 0_u64;
         let planned = request.into();
         let wire = match self.wire_request(
             route_kind.method(),
-            planned.route,
-            planned.body,
+            planned.route.clone(),
+            planned.body.clone(),
             &planned.auth,
             planned.retry_resubmit,
         ) {
             Ok(wire) => wire,
-            Err(error) => return TransportOutcome::Error(error.into_snowflake_error()),
+            Err(error) => return TransportOutcome::err(error.into_snowflake_error()),
         };
-        let result = self
-            .client
-            .request_builder(route_kind.method(), wire.url)
-            .headers(
-                wire.headers
-                    .iter()
-                    .map(|h| (h.name.as_str(), h.value.as_str())),
-            )
-            .body(wire.body)
-            .send(cx)
-            .await;
 
-        match result {
-            Ok(response) => match T::from_response(response.status.into(), response.body) {
-                Ok(value) => TransportOutcome::Success(value),
-                Err(error) => TransportOutcome::Error(error.into_snowflake_error()),
-            },
-            Err(error) if error.is_cancelled() => {
-                TransportOutcome::Cancelled(franken_snowflake_core::outcome::CancelReason::Upstream)
+        let mut attempt = 1_u32;
+        loop {
+            if cx.checkpoint().is_err() {
+                return TransportOutcome::cancelled(cancel_reason_or(
+                    cx,
+                    CancelReason::parent_cancelled,
+                ));
             }
-            Err(error) => TransportOutcome::Error(
-                TransportError::new(
-                    TransportErrorCode::NetworkError,
-                    format!("Asupersync HTTP client error: {error}"),
+
+            let _attempt_budget =
+                self.config
+                    .retry
+                    .attempt_budget(cx.budget(), planned.budget, attempt);
+            let result = self
+                .client
+                .request_builder(route_kind.method(), wire.url.clone())
+                .headers(
+                    wire.headers
+                        .iter()
+                        .map(|h| (h.name.as_str(), h.value.as_str())),
                 )
-                .into_snowflake_error(),
-            ),
+                .body(wire.body.clone())
+                .send(cx)
+                .await;
+
+            match result {
+                Ok(response) => {
+                    let retry_after_ms = retry_after_ms(response.headers.as_slice());
+                    let retryable = is_retryable_status(response.status);
+                    if retryable {
+                        if let Some(delay) = self.config.retry.delay_for(
+                            planned.request_id.as_ref(),
+                            route_kind,
+                            attempt,
+                            retry_after_ms,
+                            retry_spent_ms,
+                        ) {
+                            attempt = attempt.saturating_add(1);
+                            retry_spent_ms =
+                                retry_spent_ms.saturating_add(delay.as_millis() as u64);
+                            continue;
+                        }
+                        return TransportOutcome::err(
+                            TransportError::new(
+                                TransportErrorCode::RetryBudgetExhausted,
+                                format!(
+                                    "{} exhausted retry budget after {attempt} attempts",
+                                    route_kind.as_str()
+                                ),
+                            )
+                            .into_snowflake_error(),
+                        );
+                    }
+                    return match T::from_response(response, self.config.limits, planned.partition) {
+                        Ok(value) => TransportOutcome::ok(value),
+                        Err(error) => TransportOutcome::err(error.into_snowflake_error()),
+                    };
+                }
+                Err(error) if error.is_cancelled() => {
+                    let reason = cancel_reason_or(cx, CancelReason::parent_cancelled);
+                    if attempt == 1 {
+                        return TransportOutcome::err(
+                            TransportError::new(
+                                TransportErrorCode::CancelledDuringConnect,
+                                format!(
+                                    "{} cancelled before a response was received",
+                                    route_kind.as_str()
+                                ),
+                            )
+                            .into_snowflake_error(),
+                        );
+                    }
+                    return TransportOutcome::cancelled(reason);
+                }
+                Err(error) => {
+                    if let Some(delay) = self.config.retry.delay_for(
+                        planned.request_id.as_ref(),
+                        route_kind,
+                        attempt,
+                        None,
+                        retry_spent_ms,
+                    ) {
+                        attempt = attempt.saturating_add(1);
+                        retry_spent_ms = retry_spent_ms.saturating_add(delay.as_millis() as u64);
+                        continue;
+                    }
+                    return TransportOutcome::err(
+                        TransportError::new(
+                            TransportErrorCode::NetworkError,
+                            format!("Asupersync HTTP client error: {error}"),
+                        )
+                        .into_snowflake_error(),
+                    );
+                }
+            }
         }
     }
 
@@ -268,6 +426,12 @@ impl SnowflakeHttpClient {
 
         let mut headers = auth.wire_headers()?;
         headers.push(Header::new(HEADER_ACCEPT, JSON_MEDIA_TYPE)?);
+        if matches!(route_kind, TransportRouteKind::Partition) {
+            headers.push(Header::new(
+                HEADER_ACCEPT_ENCODING,
+                PARTITION_ACCEPT_ENCODING,
+            )?);
+        }
         if matches!(method, Method::Post) {
             headers.push(Header::new(HEADER_CONTENT_TYPE, JSON_MEDIA_TYPE)?);
         }
@@ -488,6 +652,28 @@ impl BodyLimits {
         }
         Ok(())
     }
+
+    /// Enforce non-partition response body limits.
+    pub fn enforce_response_size(
+        self,
+        route: TransportRouteKind,
+        body_len: usize,
+    ) -> Result<(), TransportError> {
+        let max = match route {
+            TransportRouteKind::Submit => self.max_submit_response_bytes,
+            TransportRouteKind::Poll => self.max_poll_response_bytes,
+            TransportRouteKind::Cancel => self.max_poll_response_bytes,
+            TransportRouteKind::Partition => self.max_partition_compressed_bytes,
+        };
+        if body_len as u64 > max {
+            Err(TransportError::new(
+                TransportErrorCode::BodyLimitExceeded,
+                format!("response body has {body_len} bytes, limit is {max}"),
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Default for BodyLimits {
@@ -548,6 +734,19 @@ impl RetryPolicy {
         } else {
             Some(Duration::from_millis(delay))
         }
+    }
+
+    /// Budget slice for one transport attempt, meet-composed with the caller's
+    /// ambient budget and any route-specific child budget.
+    #[must_use]
+    pub fn attempt_budget(self, ambient: Budget, route_budget: Budget, attempt: u32) -> Budget {
+        let remaining_attempts = self
+            .max_attempts
+            .saturating_sub(attempt.saturating_sub(1))
+            .max(1);
+        ambient
+            .meet(route_budget)
+            .meet(Budget::new().with_poll_quota(remaining_attempts))
     }
 }
 
@@ -979,6 +1178,94 @@ impl ContentEncoding {
     }
 }
 
+struct DecodedPartitionResponse {
+    status: StatusClass,
+    body: Vec<u8>,
+    compression: CompressionEvidence,
+}
+
+fn decode_partition_response(
+    response: Response,
+    limits: BodyLimits,
+    partition: u32,
+) -> Result<DecodedPartitionResponse, TransportError> {
+    let encoding = ContentEncoding::parse(response_header(
+        response.headers.as_slice(),
+        HEADER_CONTENT_ENCODING,
+    ))?;
+    let compressed_bytes = response.body.len() as u64;
+    let max_uncompressed =
+        usize::try_from(limits.max_partition_uncompressed_bytes).map_err(|_| {
+            TransportError::new(
+                TransportErrorCode::BodyLimitExceeded,
+                "partition uncompressed limit exceeds local addressable memory",
+            )
+        })?;
+    let mut decoded = Vec::new();
+    let decode_result = match encoding {
+        ContentEncoding::Identity => {
+            let mut decompressor = IdentityDecompressor::new(Some(max_uncompressed));
+            decompressor
+                .decompress(response.body.as_slice(), &mut decoded)
+                .and_then(|()| decompressor.finish(&mut decoded))
+        }
+        ContentEncoding::Gzip => {
+            let mut decompressor = GzipDecompressor::new(Some(max_uncompressed));
+            decompressor
+                .decompress(response.body.as_slice(), &mut decoded)
+                .and_then(|()| decompressor.finish(&mut decoded))
+        }
+    };
+    if let Err(error) = decode_result {
+        let code = match encoding {
+            ContentEncoding::Identity => TransportErrorCode::BodyLimitExceeded,
+            ContentEncoding::Gzip => TransportErrorCode::GzipDecodeFailed,
+        };
+        return Err(TransportError::new(
+            code,
+            format!("partition {partition} decode failed: {error}"),
+        ));
+    }
+    let uncompressed_bytes = decoded.len() as u64;
+    limits.enforce_partition_sizes(compressed_bytes, uncompressed_bytes)?;
+    Ok(DecodedPartitionResponse {
+        status: classify_status(StatusCode(response.status)),
+        body: decoded,
+        compression: CompressionEvidence {
+            content_encoding: encoding,
+            compressed_bytes,
+            uncompressed_bytes,
+        },
+    })
+}
+
+fn response_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn retry_after_ms(headers: &[(String, String)]) -> Option<u64> {
+    let raw = response_header(headers, "Retry-After")?.trim();
+    raw.parse::<u64>()
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000))
+}
+
+fn is_retryable_status(status: u16) -> bool {
+    matches!(
+        classify_status(StatusCode(status)),
+        StatusClass::StatementTimeout
+            | StatusClass::RateLimited
+            | StatusClass::ServerErrorRetryable
+    )
+}
+
+fn cancel_reason_or(cx: &Cx, fallback: fn() -> CancelReason) -> CancelReason {
+    cx.cancel_reason().unwrap_or_else(fallback)
+}
+
 /// Async partition sink.
 pub trait PartitionSink {
     /// Accept a decoded partition in order.
@@ -992,6 +1279,8 @@ pub trait PartitionSink {
 /// Partition stream request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartitionStreamRequest {
+    /// Authorization for partition GETs and optional cleanup cancellation.
+    pub auth: AuthorizationDescriptor,
     /// Statement handle.
     pub statement_handle: StatementHandle,
     /// First partition index to fetch.
@@ -1000,6 +1289,10 @@ pub struct PartitionStreamRequest {
     pub end_partition_exclusive: u32,
     /// Maximum concurrent fetches.
     pub max_concurrent_fetches: usize,
+    /// Child budget meet-composed with the ambient query budget for each fetch.
+    pub child_budget: Budget,
+    /// Whether a local cancellation should attempt a remote statement cancel.
+    pub remote_cancel_on_local_cancel: bool,
     /// Seed partitions already decoded, normally inline partition zero.
     pub seed_partitions: Vec<DecodedPartition>,
 }
@@ -1099,6 +1392,8 @@ pub struct PartitionBody {
     pub status: StatusClass,
     /// Raw response body.
     pub body: Vec<u8>,
+    /// Compression evidence from the wire response.
+    pub compression: CompressionEvidence,
 }
 
 /// Cancel request.
@@ -1126,15 +1421,28 @@ struct PlannedTransportRequest {
     auth: AuthorizationDescriptor,
     body: Vec<u8>,
     retry_resubmit: bool,
+    request_id: Option<RequestId>,
+    partition: Option<u32>,
+    budget: Budget,
 }
 
 impl From<SubmitHttpRequest> for PlannedTransportRequest {
     fn from(value: SubmitHttpRequest) -> Self {
+        let request_id = match &value.route {
+            TransportRoute::SubmitRetry { request_id } => Some(request_id.clone()),
+            TransportRoute::Submit
+            | TransportRoute::Poll { .. }
+            | TransportRoute::Partition { .. }
+            | TransportRoute::Cancel { .. } => None,
+        };
         Self {
             route: value.route,
             auth: value.auth,
             body: value.body,
             retry_resubmit: value.retry_resubmit,
+            request_id,
+            partition: None,
+            budget: Budget::unlimited(),
         }
     }
 }
@@ -1148,6 +1456,9 @@ impl From<PollHttpRequest> for PlannedTransportRequest {
             auth: value.auth,
             body: Vec::new(),
             retry_resubmit: false,
+            request_id: None,
+            partition: None,
+            budget: Budget::unlimited(),
         }
     }
 }
@@ -1162,6 +1473,9 @@ impl From<PartitionHttpRequest> for PlannedTransportRequest {
             auth: value.auth,
             body: Vec::new(),
             retry_resubmit: false,
+            request_id: None,
+            partition: Some(value.partition),
+            budget: Budget::unlimited(),
         }
     }
 }
@@ -1175,46 +1489,74 @@ impl From<CancelHttpRequest> for PlannedTransportRequest {
             auth: value.auth,
             body: Vec::new(),
             retry_resubmit: false,
+            request_id: None,
+            partition: None,
+            budget: Budget::unlimited(),
         }
     }
 }
 
 trait FromResponseBody: Sized {
-    fn from_response(status: u16, body: Vec<u8>) -> Result<Self, TransportError>;
+    fn from_response(
+        response: Response,
+        limits: BodyLimits,
+        partition: Option<u32>,
+    ) -> Result<Self, TransportError>;
 }
 
 impl FromResponseBody for SubmitHttpResponse {
-    fn from_response(status: u16, body: Vec<u8>) -> Result<Self, TransportError> {
+    fn from_response(
+        response: Response,
+        limits: BodyLimits,
+        _partition: Option<u32>,
+    ) -> Result<Self, TransportError> {
+        limits.enforce_response_size(TransportRouteKind::Submit, response.body.len())?;
         Ok(Self {
-            status: classify_status(StatusCode(status)),
-            body,
+            status: classify_status(StatusCode(response.status)),
+            body: response.body,
         })
     }
 }
 
 impl FromResponseBody for PollHttpResponse {
-    fn from_response(status: u16, body: Vec<u8>) -> Result<Self, TransportError> {
+    fn from_response(
+        response: Response,
+        limits: BodyLimits,
+        _partition: Option<u32>,
+    ) -> Result<Self, TransportError> {
+        limits.enforce_response_size(TransportRouteKind::Poll, response.body.len())?;
         Ok(Self {
-            status: classify_status(StatusCode(status)),
-            body,
+            status: classify_status(StatusCode(response.status)),
+            body: response.body,
         })
     }
 }
 
 impl FromResponseBody for PartitionBody {
-    fn from_response(status: u16, body: Vec<u8>) -> Result<Self, TransportError> {
+    fn from_response(
+        response: Response,
+        limits: BodyLimits,
+        partition: Option<u32>,
+    ) -> Result<Self, TransportError> {
+        let decoded = decode_partition_response(response, limits, partition.unwrap_or_default())?;
         Ok(Self {
-            status: classify_status(StatusCode(status)),
-            body,
+            status: decoded.status,
+            body: decoded.body,
+            compression: decoded.compression,
         })
     }
 }
 
 impl FromResponseBody for CancelHttpResponse {
-    fn from_response(status: u16, body: Vec<u8>) -> Result<Self, TransportError> {
+    fn from_response(
+        response: Response,
+        limits: BodyLimits,
+        _partition: Option<u32>,
+    ) -> Result<Self, TransportError> {
+        limits.enforce_response_size(TransportRouteKind::Cancel, response.body.len())?;
         Ok(Self {
-            status: classify_status(StatusCode(status)),
-            body,
+            status: classify_status(StatusCode(response.status)),
+            body: response.body,
         })
     }
 }
@@ -1492,12 +1834,58 @@ mod tests {
     }
 
     #[test]
+    fn partition_wire_plan_advertises_gzip() {
+        let client = SnowflakeHttpClient::new(
+            TransportConfig::new(endpoint()),
+            AsupersyncHttpClient::new(),
+        );
+        let request = PartitionHttpRequest {
+            auth: auth(),
+            statement_handle: StatementHandle::new("stmt-1"),
+            partition: 2,
+        };
+        let plan = client.partition_plan(&request).expect("partition plan");
+        assert!(
+            plan.headers
+                .iter()
+                .any(|h| h.name == HEADER_ACCEPT_ENCODING && h.value == PARTITION_ACCEPT_ENCODING)
+        );
+    }
+
+    #[test]
+    fn gzip_partition_response_is_decoded_with_evidence() {
+        use asupersync::http::compress::{Compressor, GzipCompressor};
+
+        let mut compressed = Vec::new();
+        let mut compressor = GzipCompressor::new();
+        compressor
+            .compress(br#"{"data":[["one"]]}"#, &mut compressed)
+            .expect("compress");
+        compressor.finish(&mut compressed).expect("finish");
+
+        let response =
+            Response::new(200, "OK", compressed.clone()).with_header("content-encoding", "gzip");
+        let body =
+            PartitionBody::from_response(response, BodyLimits::default(), Some(1)).expect("decode");
+        assert_eq!(body.body, br#"{"data":[["one"]]}"#);
+        assert_eq!(body.compression.content_encoding, ContentEncoding::Gzip);
+        assert_eq!(body.compression.compressed_bytes, compressed.len() as u64);
+        assert_eq!(
+            body.compression.uncompressed_bytes,
+            br#"{"data":[["one"]]}"#.len() as u64
+        );
+    }
+
+    #[test]
     fn partition_stream_plan_validates_concurrency() {
         let request = PartitionStreamRequest {
+            auth: auth(),
             statement_handle: StatementHandle::new("stmt-1"),
             first_partition: 1,
             end_partition_exclusive: 3,
             max_concurrent_fetches: 2,
+            child_budget: Budget::unlimited(),
+            remote_cancel_on_local_cancel: true,
             seed_partitions: Vec::new(),
         };
         assert_eq!(request.plan().expect("plan").planned_partitions, 2);
