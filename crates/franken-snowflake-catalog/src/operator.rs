@@ -146,7 +146,12 @@ pub fn describe_operator_json_schema(operator: &OperatorCatalogEntry) -> Value {
         }),
         OperatorArity::Exact { count: 1 } => json!({
             "properties": {
-                "value": scalar_value_schema()
+                "value": {
+                    "oneOf": [
+                        scalar_value_schema(),
+                        single_value_array_schema()
+                    ]
+                }
             },
             "required": ["value"]
         }),
@@ -197,11 +202,41 @@ pub fn describe_operator_json_schema(operator: &OperatorCatalogEntry) -> Value {
 
 fn scalar_value_schema() -> Value {
     json!({
-        "oneOf": [
-            { "type": "string" },
-            { "type": "number" },
-            { "type": "integer" },
-            { "type": "boolean" }
-        ]
+        "type": ["string", "number", "boolean"]
     })
+}
+
+fn single_value_array_schema() -> Value {
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 1,
+        "items": scalar_value_schema()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_one_operator_schema_accepts_scalar_or_single_value_array() {
+        let operator = built_in_operator_catalog()
+            .into_iter()
+            .find(|operator| operator.id == "eq")
+            .expect("eq operator exists");
+
+        let schema = describe_operator_json_schema(&operator);
+        let value_schema = &schema["allOf"][0]["properties"]["value"];
+        assert_eq!(value_schema["oneOf"][0], scalar_value_schema());
+        assert_eq!(value_schema["oneOf"][1], single_value_array_schema());
+    }
+
+    #[test]
+    fn scalar_value_schema_has_no_overlapping_integer_number_one_of() {
+        assert_eq!(
+            scalar_value_schema(),
+            json!({ "type": ["string", "number", "boolean"] })
+        );
+    }
 }
