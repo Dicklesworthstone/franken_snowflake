@@ -743,6 +743,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "fp-columnar"
+version = "0.1.0"
+dependencies = [
+ "fp-types",
+ "rustc-hash",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "fp-types"
+version = "0.1.0"
+dependencies = [
+ "rustc-hash",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "franken-decision"
 version = "0.3.5"
 dependencies = [
@@ -800,6 +819,16 @@ name = "franken-snowflake-core"
 version = "0.0.0"
 dependencies = [
  "asupersync",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "franken-snowflake-frame"
+version = "0.0.0"
+dependencies = [
+ "fp-columnar",
+ "fp-types",
  "serde",
  "serde_json",
 ]
@@ -1681,6 +1710,12 @@ dependencies = [
  "subtle",
  "zeroize",
 ]
+
+[[package]]
+name = "rustc-hash"
+version = "2.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
 
 [[package]]
 name = "rustc_version"
@@ -2663,10 +2698,6 @@ name = "fnx-views"
 version = "0.2.0"
 
 [[patch.unused]]
-name = "fp-columnar"
-version = "0.1.0"
-
-[[patch.unused]]
 name = "fp-conformance"
 version = "0.1.0"
 
@@ -2704,10 +2735,6 @@ version = "0.1.0"
 
 [[patch.unused]]
 name = "fp-runtime"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "fp-types"
 version = "0.1.0"
 
 [[patch.unused]]
