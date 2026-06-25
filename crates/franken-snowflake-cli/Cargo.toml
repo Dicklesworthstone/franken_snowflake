@@ -19,11 +19,11 @@ path = "src/main.rs"
 workspace = true
 
 [features]
-default = []
+default = ["toon"]
 mcp = ["dep:franken-snowflake-mcp", "franken-snowflake-mcp/mcp"]
-toon = []
+toon = ["dep:toon"]
 
 [dependencies]
 franken-snowflake-core = { path = "../franken-snowflake-core" }
 franken-snowflake-mcp = { path = "../franken-snowflake-mcp", optional = true }
-toon = { package = "tru", version = "0.2.3", default-features = false }
+toon = { package = "tru", version = "0.2.3", default-features = false, optional = true }

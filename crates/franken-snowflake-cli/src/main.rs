@@ -372,8 +372,13 @@ fn execute(raw_args: Vec<String>) -> Outcome {
 }
 
 fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
+    let request_id = stable_request_id(&raw_args.join("\u{1f}"));
     let (output, explicit_json, args) = extract_output_format(raw_args);
     let args_for_request_id = args.clone();
+
+    if output == OutputFormat::Toon && !toon_output_available() {
+        return Err(toon_feature_disabled(request_id));
+    }
 
     validate_known_flags(output, &args)?;
 
@@ -1232,7 +1237,7 @@ fn feature_disabled(
     envelope.error = Some(error_info(
         code,
         message,
-        vec![json_string("default build omits this feature")],
+        vec![json_string("this build omits this feature")],
     ));
     envelope.safe_next_commands = safe_next_commands;
     envelope.repair_commands = vec!["franken-snowflake capabilities --json".to_string()];
@@ -1240,6 +1245,19 @@ fn feature_disabled(
         status: code.exit_code(),
         body: Body::Envelope { envelope, format },
     }
+}
+
+fn toon_feature_disabled(request_id: String) -> Outcome {
+    feature_disabled(
+        OutputFormat::Json,
+        "help",
+        "fsnow.help.v1",
+        request_id,
+        Some("toon".to_string()),
+        SnowflakeErrorCode::UsageError,
+        "TOON output is feature-gated and not linked in this CLI build; retry with --json or rebuild with the `toon` feature.",
+        vec!["franken-snowflake capabilities --json".to_string()],
+    )
 }
 
 fn error_outcome(
@@ -1544,10 +1562,7 @@ fn write_outcome(outcome: Outcome) -> ExitCode {
                 };
                 let _ignored = write_stderr(&diagnostic);
             }
-            let rendered = match format {
-                OutputFormat::Json => render_json(&envelope_json(&envelope)),
-                OutputFormat::Toon => render_toon(&envelope_json(&envelope)),
-            };
+            let rendered = render_envelope(&envelope, format);
             match write_stdout(&rendered) {
                 Ok(()) => process_exit_code(status),
                 Err(()) => process_exit_code(CoreExitCode::Io),
@@ -1585,7 +1600,7 @@ fn capabilities_data() -> Json {
         ("contract_version", json_string(CLI_CONTRACT_VERSION)),
         ("schema_version", json_string(ENVELOPE_SCHEMA_VERSION)),
         ("default_output", json_string("json")),
-        ("alternate_outputs", string_array(vec!["toon".to_string()])),
+        ("alternate_outputs", string_array(alternate_outputs())),
         (
             "feature_flags",
             json_object(vec![
@@ -1593,7 +1608,7 @@ fn capabilities_data() -> Json {
                 ("testkit", Json::Bool(false)),
                 ("mcp", Json::Bool(false)),
                 ("tui", Json::Bool(false)),
-                ("toon", Json::Bool(true)),
+                ("toon", Json::Bool(toon_output_available())),
             ]),
         ),
         ("commands", Json::Array(command_registry())),
@@ -1610,6 +1625,14 @@ fn capabilities_data() -> Json {
             ]),
         ),
     ])
+}
+
+fn alternate_outputs() -> Vec<String> {
+    if toon_output_available() {
+        vec!["toon".to_string()]
+    } else {
+        vec![]
+    }
 }
 
 fn command_registry() -> Vec<Json> {
@@ -1716,7 +1739,7 @@ fn help_data() -> Json {
     json_object(vec![
         (
             "usage",
-            json_string("franken-snowflake <command> [--json|--toon]"),
+            json_string(output_mode_usage()),
         ),
         ("contract_version", json_string(CLI_CONTRACT_VERSION)),
         ("first_commands", string_array(first_commands())),
@@ -2995,6 +3018,24 @@ fn render_json(value: &Json) -> String {
     out
 }
 
+fn render_envelope(envelope: &Envelope, format: OutputFormat) -> String {
+    let value = envelope_json(envelope);
+    match format {
+        OutputFormat::Json => render_json(&value),
+        OutputFormat::Toon => render_toon_payload(&value),
+    }
+}
+
+#[cfg(feature = "toon")]
+fn render_toon_payload(value: &Json) -> String {
+    render_toon(value)
+}
+
+#[cfg(not(feature = "toon"))]
+fn render_toon_payload(value: &Json) -> String {
+    render_json(value)
+}
+
 fn render_json_into(value: &Json, out: &mut String) {
     match value {
         Json::Null => out.push_str("null"),
@@ -3047,6 +3088,7 @@ fn escape_json_string(value: &str) -> String {
     out
 }
 
+#[cfg(feature = "toon")]
 fn render_toon(value: &Json) -> String {
     toon::encode(
         toon_json_value(value),
@@ -3092,10 +3134,7 @@ pub fn execute_cli_contract(args: Vec<String>) -> CliContractOutput {
                     ),
                 })
             };
-            let stdout = match format {
-                OutputFormat::Json => render_json(&envelope_json(&envelope)),
-                OutputFormat::Toon => render_toon(&envelope_json(&envelope)),
-            };
+            let stdout = render_envelope(&envelope, format);
             CliContractOutput {
                 exit_code,
                 stdout,
@@ -3116,6 +3155,19 @@ mod mcp_surface;
 #[cfg(feature = "mcp")]
 pub use mcp_surface::run_mcp_serve_process;
 
+fn toon_output_available() -> bool {
+    cfg!(feature = "toon")
+}
+
+fn output_mode_usage() -> &'static str {
+    if toon_output_available() {
+        "franken-snowflake <command> [--json|--toon]"
+    } else {
+        "franken-snowflake <command> [--json]"
+    }
+}
+
+#[cfg(feature = "toon")]
 fn toon_json_value(value: &Json) -> toon::JsonValue {
     match value {
         Json::Null => toon::JsonValue::Primitive(toon::StringOrNumberOrBoolOrNull::Null),
@@ -3169,7 +3221,13 @@ mod tests {
         assert!(rendered.contains("\"command_id\":\"query.cancel\""));
         assert!(rendered.contains("\"command_id\":\"mcp.serve\""));
         assert!(rendered.contains("franken-snowflake query [run] --profile"));
-        assert!(rendered.contains("\"alternate_outputs\":[\"toon\"]"));
+        if toon_output_available() {
+            assert!(rendered.contains("\"alternate_outputs\":[\"toon\"]"));
+            assert!(rendered.contains("\"toon\":true"));
+        } else {
+            assert!(rendered.contains("\"alternate_outputs\":[]"));
+            assert!(rendered.contains("\"toon\":false"));
+        }
         assert!(rendered.contains("\"error_registry\""));
         assert!(rendered.contains("FSNOW-1002"));
     }
@@ -3248,6 +3306,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "toon")]
     #[test]
     fn toon_renderer_uses_same_envelope_keys() {
         let envelope = envelope_for(&["agent-handbook", "--toon"]);
@@ -3260,6 +3319,7 @@ mod tests {
         assert!(!rendered.contains("\"ok\""));
     }
 
+    #[cfg(feature = "toon")]
     #[test]
     fn toon_output_round_trips_to_same_logical_envelope() {
         let envelope = envelope_for(&["capabilities", "--json"]);
@@ -3276,6 +3336,7 @@ mod tests {
         assert_eq!(decoded, toon_json_value(&envelope));
     }
 
+    #[cfg(feature = "toon")]
     #[test]
     fn toon_output_is_smaller_for_large_agent_payload() {
         let envelope = envelope_for(&["capabilities", "--json"]);
@@ -3348,6 +3409,7 @@ mod tests {
         assert!(!rendered.contains("\"command_id\":\"capabilities\""));
     }
 
+    #[cfg(feature = "toon")]
     #[test]
     fn parse_errors_keep_requested_toon_format() {
         let outcome = execute(vec![
@@ -3360,6 +3422,26 @@ mod tests {
             Body::Raw { .. } => false,
         };
         assert!(is_toon);
+    }
+
+    #[cfg(not(feature = "toon"))]
+    #[test]
+    fn toon_requests_return_json_feature_refusal_when_encoder_is_absent() {
+        let output = execute_cli_contract(vec![
+            "capabilities".to_string(),
+            "--toon".to_string(),
+        ]);
+
+        assert_eq!(output.exit_code, CoreExitCode::Usage.code());
+        assert!(output.stdout.starts_with("{\"ok\":false"));
+        assert!(output.stdout.contains("\"command_id\":\"help\""));
+        assert!(output.stdout.contains("\"feature_enabled\":false"));
+        assert!(output.stdout.contains("\"context\":\"toon\""));
+        assert!(output.stdout.contains("TOON output is feature-gated"));
+        assert_eq!(
+            output.stderr.as_deref(),
+            Some("FSNOW-1002: TOON output is feature-gated and not linked in this CLI build; retry with --json or rebuild with the `toon` feature.")
+        );
     }
 
     #[test]
