@@ -18,6 +18,7 @@ members = [
     "crates/franken-snowflake-auth",
     "crates/franken-snowflake-http",
     "crates/franken-snowflake-sqlapi",
+    "crates/franken-snowflake-catalog",
     "crates/franken-snowflake-testkit",
     "crates/franken-snowflake-cli",
 ]
