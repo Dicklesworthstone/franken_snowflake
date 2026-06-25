@@ -75,6 +75,14 @@ pub const PAT_MAX_VALIDITY_SECONDS: u64 = 365 * 24 * 60 * 60;
 /// Snowflake OAuth access tokens are typically short lived.
 pub const OAUTH_EXPECTED_VALIDITY_SECONDS: u64 = 10 * 60;
 
+/// Official Snowflake SQL API JWT claim contract consulted for account
+/// normalization.
+pub const SNOWFLAKE_SQL_API_AUTH_DOC_URL: &str =
+    "https://docs.snowflake.com/en/developer-guide/sql-api/authenticating";
+
+/// Date the Snowflake SQL API JWT claim contract above was consulted.
+pub const SNOWFLAKE_SQL_API_AUTH_DOC_CONSULTED: &str = "2026-06-25";
+
 /// Structured auth log schema version.
 pub const AUTH_LOG_SCHEMA_VERSION: u16 = 1;
 
@@ -1396,8 +1404,14 @@ impl fmt::Debug for KeyPairJwtAuth {
 }
 
 /// Normalize a Snowflake account identifier for JWT `iss` / `sub` values.
+///
+/// Snowflake's SQL API docs require account locators to exclude region/cloud
+/// suffixes in JWT claims, while organization/account forms that contain dots
+/// are uppercased with dots replaced by hyphens.
 pub fn normalize_account_for_jwt(account: &str) -> Result<String, AuthError> {
-    let normalized = account.trim().to_ascii_uppercase().replace('.', "-");
+    let account = account_identifier_input(account);
+    let account = strip_locator_region_suffix(account);
+    let normalized = account.to_ascii_uppercase().replace('.', "-");
     if normalized.is_empty() {
         return Err(AuthError::EmptyAccount);
     }
@@ -1509,6 +1523,37 @@ fn validate_secret_source_handle(source_kind: &'static str, handle: &str) -> Res
         return Err(AuthError::SecretSourceLooksSensitive { source_kind });
     }
     Ok(())
+}
+
+fn account_identifier_input(account: &str) -> &str {
+    let account = account.trim().trim_end_matches('/');
+    if let Some(rest) = account.strip_prefix("https://") {
+        let host = rest.split('/').next().unwrap_or(rest);
+        return host.trim_end_matches(".snowflakecomputing.com");
+    }
+    account
+}
+
+fn strip_locator_region_suffix(account: &str) -> &str {
+    if account.to_ascii_lowercase().contains(".global") {
+        return account;
+    }
+    let Some((locator, suffix)) = account.split_once('.') else {
+        return account;
+    };
+    if looks_like_locator_region_suffix(suffix) {
+        locator
+    } else {
+        account
+    }
+}
+
+fn looks_like_locator_region_suffix(suffix: &str) -> bool {
+    suffix.split('.').any(|label| {
+        label
+            .bytes()
+            .any(|byte| byte.is_ascii_digit() || byte == b'-')
+    })
 }
 
 fn export_env_next_command(name: &str) -> String {
@@ -1666,10 +1711,18 @@ dQIDAQAB
     #[test]
     fn normalizes_account_and_user_for_snowflake_claims() -> Result<(), Box<dyn std::error::Error>>
     {
+        assert_eq!(SNOWFLAKE_SQL_API_AUTH_DOC_CONSULTED, "2026-06-25");
+        assert!(SNOWFLAKE_SQL_API_AUTH_DOC_URL.contains("/developer-guide/sql-api/authenticating"));
+        assert_eq!(normalize_account_for_jwt("xy12345.us-east-1")?, "XY12345");
         assert_eq!(
-            normalize_account_for_jwt("xy12345.us-east-1")?,
-            "XY12345-US-EAST-1"
+            normalize_account_for_jwt("xy12345.us-east-1.aws")?,
+            "XY12345"
         );
+        assert_eq!(
+            normalize_account_for_jwt("https://xy12345.us-east-1.snowflakecomputing.com")?,
+            "XY12345"
+        );
+        assert_eq!(normalize_account_for_jwt("org.account")?, "ORG-ACCOUNT");
         assert_eq!(normalize_user_for_jwt("svc_user")?, "SVC_USER");
         Ok(())
     }

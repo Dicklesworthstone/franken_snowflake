@@ -216,6 +216,7 @@ impl StatementMachine {
         class: ResponseClass,
         body: &[u8],
     ) -> Result<Progress, LifecycleError> {
+        self.ensure_not_terminal()?;
         match class {
             ResponseClass::Completed => self.enter_terminal_result(parse_result_set(body)?),
             ResponseClass::Running => {
@@ -241,6 +242,7 @@ impl StatementMachine {
         class: ResponseClass,
         body: &[u8],
     ) -> Result<Progress, LifecycleError> {
+        self.ensure_not_terminal()?;
         self.polls_done = self.polls_done.saturating_add(1);
         match class {
             ResponseClass::Completed => self.enter_terminal_result(parse_result_set(body)?),
@@ -341,6 +343,22 @@ impl StatementMachine {
                 partition: upcoming,
             })
         }
+    }
+
+    /// Refuse a submit/poll response once the machine has reached a terminal
+    /// state. `on_partition` enforces this structurally (it only proceeds from
+    /// `Assembling`), but `on_submit`/`on_poll` reset the phase via
+    /// `enter_terminal_result`, so without this guard a late or duplicate `200`
+    /// would re-open a closed statement — silently turning a `408` timeout or
+    /// `422` failure into a success. A `Done` machine is terminal: terminal.
+    fn ensure_not_terminal(&self) -> Result<(), LifecycleError> {
+        if matches!(self.phase, Phase::Done) {
+            return Err(LifecycleError::new(
+                LifecycleErrorCode::UnexpectedStatus,
+                "statement machine already reached a terminal state",
+            ));
+        }
+        Ok(())
     }
 
     fn enter_terminal_timeout(
@@ -593,6 +611,56 @@ mod tests {
                 "expected terminal machine refusal, got {progress:?}"
             )),
         }
+    }
+
+    #[test]
+    fn terminal_machine_refuses_every_reentry_path() -> Result<(), String> {
+        let failure = br#"{"code":"001003","message":"bad sql","statementHandle":"h"}"#;
+        let completed = br#"{"resultSetMetaData":{"numRows":0,"format":"jsonv2","rowType":[]},
+            "data":[],"code":"090001","statementHandle":"h"}"#;
+
+        // A 422 failure closes the machine; a follow-up 200 poll must not re-open
+        // it into a success (the original re-open hole).
+        let mut after_failure = StatementMachine::new(PollPlan::default());
+        assert!(matches!(
+            after_failure.on_submit(ResponseClass::StatementFailed, failure),
+            Ok(Progress::Failed(_))
+        ));
+        assert_eq!(
+            after_failure
+                .on_poll(ResponseClass::Completed, completed)
+                .map(|_| ())
+                .unwrap_err()
+                .code,
+            LifecycleErrorCode::UnexpectedStatus
+        );
+
+        // A completed statement is terminal too: a duplicate submit/poll is refused
+        // rather than silently restarting the lifecycle.
+        let mut after_success = StatementMachine::new(PollPlan::default());
+        assert!(matches!(
+            after_success.on_submit(ResponseClass::Completed, completed),
+            Ok(Progress::Complete(_))
+        ));
+        assert_eq!(
+            after_success
+                .on_submit(ResponseClass::Completed, completed)
+                .map(|_| ())
+                .unwrap_err()
+                .code,
+            LifecycleErrorCode::UnexpectedStatus
+        );
+        assert_eq!(
+            after_success
+                .on_poll(ResponseClass::Completed, completed)
+                .map(|_| ())
+                .unwrap_err()
+                .code,
+            LifecycleErrorCode::UnexpectedStatus
+        );
+        // A refused poll must not be billed against the poll quota.
+        assert_eq!(after_success.polls_done(), 0);
+        Ok(())
     }
 
     #[test]
