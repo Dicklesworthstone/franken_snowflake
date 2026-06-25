@@ -28,6 +28,8 @@
 //! `fsnow-native-snowflake-connector-w0i.4`.
 
 pub mod harness;
+pub mod mock;
+pub mod replay;
 
 /// Crate version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -46,4 +48,11 @@ pub mod prelude {
         GoldenConfig, GoldenMismatch, assert_no_cr, compare, to_canonical_json,
     };
     pub use crate::harness::logger::{RunLogger, RunSummary, StepEvent, StepOutcome};
+    pub use crate::mock::http::{Method, MockHttpRequest, MockHttpResponse, ResponseClass};
+    pub use crate::mock::server::{MockSqlApi, RecordedRequest};
+    pub use crate::mock::{ScriptedResponder, scenarios};
+    pub use crate::replay::{
+        ProtocolPacket, ReplayError, ReplayHarness, ReplayStep, ReplaySummary,
+        default_protocol_replay,
+    };
 }
