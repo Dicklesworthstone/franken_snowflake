@@ -91,10 +91,13 @@ disabled), and exit non-zero on any envelope/exit-code deviation.
   package across each lane — default production graph, `--no-default-features`,
   each production feature, all production features combined, and **each dev/test
   feature in its own lane** (`--edges all`, so dev-deps are scanned too, not just
-  the production `normal,build` edges). Any lane that resolves Tokio, reqwest,
-  hyper, hyper-util, axum, tower, tower-http, sqlx, diesel, sea-orm,
-  sea-orm-migration, `fp-io`, `orc-rust`, or a third-party Snowflake driver fails
-  the gate. Each lane emits a structured JSON verdict; a built-in parser
+  the production `normal,build` edges). It also runs workspace-level
+  `--no-default-features`, workspace `--features <production-feature>`, and
+  workspace all-production-features-combined lanes so product-level features such
+  as `graph` and `toon` cannot be missed by per-crate scanning. Any lane that
+  resolves Tokio, reqwest, hyper, hyper-util, axum, tower, tower-http, sqlx,
+  diesel, sea-orm, sea-orm-migration, `fp-io`, `orc-rust`, or a third-party
+  Snowflake driver fails the gate. Each lane emits a structured JSON verdict; a built-in parser
   self-test injects the known-bad `fp-io → orc-rust → tokio` path plus a
   third-party Snowflake package and asserts the gate catches it (`--self-test-only`
   runs it without invoking cargo). FrankenSuite candidate groups

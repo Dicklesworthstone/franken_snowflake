@@ -21,6 +21,7 @@ workspace = true
 [features]
 default = []
 mcp = ["dep:franken-snowflake-mcp", "franken-snowflake-mcp/mcp"]
+toon = []
 
 [dependencies]
 franken-snowflake-core = { path = "../franken-snowflake-core" }

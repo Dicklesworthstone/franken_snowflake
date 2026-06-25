@@ -10,6 +10,10 @@ It runs `cargo metadata --locked`, discovers workspace packages, then runs
 - `--no-default-features` production graph
 - each production feature
 - all production features combined
+- workspace-level `--no-default-features`
+- workspace-level `--features <production-feature>` for every policy-listed
+  production feature
+- workspace-level all-production-features combined
 - each dev/test feature as a separate lane
 
 Every lane emits a structured JSON verdict. The gate fails if any lane, including
@@ -17,6 +21,11 @@ a dev/test feature lane, resolves Tokio, reqwest, hyper, axum, tower, sqlx,
 diesel, sea-orm, `fp-io`, `orc-rust`, or a third-party Snowflake driver. The
 `fp-io` / `orc-rust` negative assertion is global, so future frame and export
 crates are covered as soon as they enter the workspace.
+
+The policy-listed production features must also have at least one workspace
+crate owner. Missing owners fail the gate before any `cargo tree` scan, which
+keeps product-level lanes such as `graph` and `toon` from silently dropping out
+of CI coverage.
 
 To extend the harness for a new dependency:
 

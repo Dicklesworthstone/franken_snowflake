@@ -10,6 +10,10 @@ homepage.workspace = true
 description = "Catalog lineage graph model, algorithms, and Mermaid/SVG rendering for franken_snowflake."
 publish.workspace = true
 
+[features]
+default = []
+graph = []
+
 [lints]
 workspace = true
 

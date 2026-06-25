@@ -22,6 +22,7 @@ from typing import Iterable
 
 GATE = "dependency-admissibility"
 FSNOW_SKIP_FSQLITE_WINDOWS_PREREQ = "FSNOW_SKIP_FSQLITE_WINDOWS_PREREQ"
+WORKSPACE_LANE_PACKAGE = "<workspace>"
 
 FORBIDDEN_PACKAGES = {
     "tokio",
@@ -291,11 +292,43 @@ def classify_features(features: dict[str, list[str]]) -> tuple[list[str], list[s
     return production, dev
 
 
-def lanes_for_package(package: dict[str, object]) -> list[Lane]:
-    name = str(package["name"])
+def package_features(package: dict[str, object]) -> dict[str, list[str]]:
     features = package.get("features", {})
     if not isinstance(features, dict):
-        features = {}
+        return {}
+    return features
+
+
+def production_feature_owners(packages: list[dict[str, object]]) -> dict[str, list[str]]:
+    owners: dict[str, list[str]] = {feature: [] for feature in sorted(PRODUCTION_FEATURES)}
+    for package in packages:
+        name = str(package["name"])
+        for feature in package_features(package):
+            if feature in PRODUCTION_FEATURES:
+                owners[feature].append(name)
+    return {feature: sorted(names) for feature, names in owners.items() if names}
+
+
+def enforce_production_feature_coverage(packages: list[dict[str, object]]) -> int:
+    owners = production_feature_owners(packages)
+    missing = sorted(PRODUCTION_FEATURES.difference(owners))
+    emit("production_feature_coverage", feature_owners=owners, missing_features=missing)
+    if missing:
+        emit_error(
+            "production_feature_coverage_failure",
+            missing_features=missing,
+            remediation=(
+                "Add an explicit feature alias to the owning workspace crate or "
+                "remove the feature from PRODUCTION_FEATURES if it is no longer a "
+                "supported production policy lane."
+            ),
+        )
+    return len(missing)
+
+
+def lanes_for_package(package: dict[str, object]) -> list[Lane]:
+    name = str(package["name"])
+    features = package_features(package)
 
     lanes = [
         Lane(
@@ -364,6 +397,54 @@ def lanes_for_package(package: dict[str, object]) -> list[Lane]:
     return lanes
 
 
+def workspace_feature_lanes(packages: list[dict[str, object]]) -> list[Lane]:
+    owners = production_feature_owners(packages)
+    lanes = [
+        Lane(
+            package=WORKSPACE_LANE_PACKAGE,
+            name="workspace-production-no-default-features",
+            scope="workspace-production",
+            args=("--workspace", "--no-default-features", "--edges", "normal,build"),
+        )
+    ]
+
+    for feature in sorted(owners):
+        lanes.append(
+            Lane(
+                package=WORKSPACE_LANE_PACKAGE,
+                name=f"workspace-production-feature:{feature}",
+                scope="workspace-production-feature",
+                args=(
+                    "--workspace",
+                    "--no-default-features",
+                    "--features",
+                    feature,
+                    "--edges",
+                    "normal,build",
+                ),
+            )
+        )
+
+    if owners:
+        lanes.append(
+            Lane(
+                package=WORKSPACE_LANE_PACKAGE,
+                name="workspace-production-features:combined",
+                scope="workspace-production-feature",
+                args=(
+                    "--workspace",
+                    "--no-default-features",
+                    "--features",
+                    ",".join(sorted(owners)),
+                    "--edges",
+                    "normal,build",
+                ),
+            )
+        )
+
+    return lanes
+
+
 def dedupe_lanes(lanes: Iterable[Lane]) -> list[Lane]:
     seen: set[tuple[str, tuple[str, ...]]] = set()
     deduped: list[Lane] = []
@@ -377,18 +458,12 @@ def dedupe_lanes(lanes: Iterable[Lane]) -> list[Lane]:
 
 
 def scan_lane(lane: Lane) -> list[str]:
-    command = [
-        "cargo",
-        "tree",
-        "--locked",
-        "-p",
-        lane.package,
-        "--prefix",
-        "none",
-        "--format",
-        "{p}",
-        *lane.args,
-    ]
+    command = ["cargo", "tree", "--locked"]
+    if lane.package == WORKSPACE_LANE_PACKAGE:
+        command.extend(lane.args)
+    else:
+        command.extend(["-p", lane.package, *lane.args])
+    command.extend(["--prefix", "none", "--format", "{p}"])
     result = run_command(command)
     packages = package_names_from_tree(result.stdout)
     lane_violations = violations(packages)
@@ -479,8 +554,10 @@ def main() -> int:
     all_lanes: list[Lane] = []
     for package in packages:
         all_lanes.extend(lanes_for_package(package))
+    all_lanes.extend(workspace_feature_lanes(packages))
     lanes = dedupe_lanes(all_lanes)
 
+    coverage_failures = enforce_production_feature_coverage(packages)
     emit(
         "scan_plan",
         workspace_packages=[package["name"] for package in packages],
@@ -495,7 +572,7 @@ def main() -> int:
         ],
     )
 
-    failure_count = 0
+    failure_count = coverage_failures
     skipped_count = 0
     for lane in lanes:
         if is_fsqlite_windows_prereq_lane(lane):

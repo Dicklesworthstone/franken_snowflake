@@ -610,9 +610,15 @@ impl CacheBackend for InMemoryCache {
 
     fn insert_catalog_snapshot(&self, record: CatalogSnapshotRecord) -> CacheResult<()> {
         record.payload.verify("catalog_snapshot")?;
+        // First-write-wins, mirroring the SQLite backend's `INSERT OR IGNORE`.
+        // `BTreeMap::insert` is last-write-wins, which silently overwrote a
+        // snapshot that production would have preserved — a contract drift that
+        // made the in-memory test backend model different behavior than the
+        // FrankenSQLite backend on any duplicate primary key.
         self.catalog_snapshots
             .borrow_mut()
-            .insert(record.snapshot_id.clone(), record);
+            .entry(record.snapshot_id.clone())
+            .or_insert(record);
         Ok(())
     }
 
@@ -645,9 +651,14 @@ impl CacheBackend for InMemoryCache {
 
     fn append_query_receipt(&self, record: QueryReceiptRecord) -> CacheResult<()> {
         record.receipt.verify("query_receipt")?;
+        // Append-only ledger: a duplicate receipt_id keeps the first write, like
+        // the SQLite `INSERT OR IGNORE`. Overwriting here let a later state row
+        // (e.g. an `error` re-append under a reused id) clobber the committed
+        // receipt in tests while production silently ignored it.
         self.query_receipts
             .borrow_mut()
-            .insert(record.receipt_id.clone(), record);
+            .entry(record.receipt_id.clone())
+            .or_insert(record);
         Ok(())
     }
 
@@ -667,14 +678,20 @@ impl CacheBackend for InMemoryCache {
         profile_id: &str,
         snowflake_query_id: &str,
     ) -> CacheResult<Option<QueryReceiptRecord>> {
+        // Match the SQLite backend's `ORDER BY created_at_ms DESC LIMIT 1`: a
+        // snowflake_query_id is not unique across receipt rows, so selecting the
+        // newest matching receipt is the contract. `Iterator::find` returned the
+        // lexicographically-first receipt_id instead, so the two backends could
+        // hand back different receipts for the same lookup.
         let receipt = self
             .query_receipts
             .borrow()
             .values()
-            .find(|receipt| {
+            .filter(|receipt| {
                 receipt.profile_id == profile_id
                     && receipt.snowflake_query_id.as_deref() == Some(snowflake_query_id)
             })
+            .max_by_key(|receipt| receipt.created_at_ms)
             .cloned();
         Ok(receipt)
     }
@@ -705,56 +722,94 @@ impl CacheBackend for InMemoryCache {
         // that string is the destination, not the addressed content — and rejected
         // every real export while the SQLite backend accepted it.
         record.content_address.verify_well_formed("export_record")?;
+        // First-write-wins, mirroring the SQLite `INSERT OR IGNORE`.
         self.exports
             .borrow_mut()
-            .insert(record.export_id.clone(), record);
+            .entry(record.export_id.clone())
+            .or_insert(record);
         Ok(())
     }
 
     fn exports_for_receipt(&self, receipt_id: &str) -> CacheResult<Vec<ExportRecord>> {
-        Ok(self
+        // Mirror the SQLite `ORDER BY created_at_ms DESC`: callers expect the most
+        // recent export first. Iterating the BTreeMap returned export_id order, so
+        // the in-memory backend handed back a different sequence than production.
+        let mut exports: Vec<ExportRecord> = self
             .exports
             .borrow()
             .values()
             .filter(|export| export.receipt_id == receipt_id)
             .cloned()
-            .collect())
+            .collect();
+        exports.sort_by(|a, b| {
+            b.created_at_ms
+                .cmp(&a.created_at_ms)
+                .then_with(|| a.export_id.cmp(&b.export_id))
+        });
+        Ok(exports)
     }
 
     fn append_cost_history(&self, record: CostHistoryRecord) -> CacheResult<()> {
+        // First-write-wins, mirroring the SQLite `INSERT OR IGNORE`.
         self.cost_history
             .borrow_mut()
-            .insert(record.history_id.clone(), record);
+            .entry(record.history_id.clone())
+            .or_insert(record);
         Ok(())
     }
 
     fn cost_history_for_profile(&self, profile_id: &str) -> CacheResult<Vec<CostHistoryRecord>> {
-        Ok(self
+        // Mirror the SQLite `ORDER BY created_at_ms DESC` (newest cost row first).
+        let mut history: Vec<CostHistoryRecord> = self
             .cost_history
             .borrow()
             .values()
             .filter(|record| record.profile_id == profile_id)
             .cloned()
-            .collect())
+            .collect();
+        history.sort_by(|a, b| {
+            b.created_at_ms
+                .cmp(&a.created_at_ms)
+                .then_with(|| a.history_id.cmp(&b.history_id))
+        });
+        Ok(history)
     }
 
     fn append_replay_bundle(&self, record: OfflineReplayBundleRecord) -> CacheResult<()> {
         record.manifest.verify("offline_replay_bundle")?;
+        // First-write-wins, mirroring the SQLite `INSERT OR IGNORE`.
         self.replay_bundles
             .borrow_mut()
-            .insert(record.bundle_id.clone(), record);
+            .entry(record.bundle_id.clone())
+            .or_insert(record);
         Ok(())
     }
 
     fn append_audit_event(&self, record: AuditEventRecord) -> CacheResult<()> {
+        // The audit log is append-only and immutable (the SQLite path enforces it
+        // with `INSERT OR IGNORE` plus `lint_append_only_audit_sql`). Overwriting
+        // an event with a reused event_id would silently mutate a record the rest
+        // of the system treats as tamper-evident, so keep the first write.
         self.audit_events
             .borrow_mut()
-            .insert(record.event_id.clone(), record);
+            .entry(record.event_id.clone())
+            .or_insert(record);
         Ok(())
     }
 
     fn audit_events(&self) -> CacheResult<Vec<AuditEventRecord>> {
-        Ok(self.audit_events.borrow().values().cloned().collect())
+        // Mirror the SQLite `ORDER BY created_at_ms, event_id`: the audit log is a
+        // chronological ledger and consumers read it in time order. The BTreeMap
+        // iterated by event_id alone, so an event written later but with a smaller
+        // event_id would have surfaced out of chronological order in tests only.
+        let mut events: Vec<AuditEventRecord> =
+            self.audit_events.borrow().values().cloned().collect();
+        events.sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.event_id.cmp(&b.event_id))
+        });
+        Ok(events)
     }
 }
 
@@ -2083,6 +2138,138 @@ mod tests {
         let count = cache.with_cache(|backend| Ok(backend.profiles()?.len()))?;
 
         assert_eq!(count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn append_methods_are_first_write_wins_like_sqlite_insert_or_ignore() -> CacheResult<()> {
+        // The SQLite backend uses `INSERT OR IGNORE` for every append-only table
+        // (catalog snapshots, receipts, exports, cost history, replay bundles,
+        // audit events), so a second write under an existing primary key keeps the
+        // first row. The in-memory backend must model the same contract. Before
+        // this fix it used `BTreeMap::insert` (last-write-wins), so identical code
+        // diverged between the test backend and production on any duplicate id.
+        let cache = InMemoryCache::new();
+
+        // A reused receipt_id must keep the first committed receipt, not the later
+        // re-append (here at created_at_ms 99) that production would have ignored.
+        cache.append_query_receipt(sample_receipt("r1", "plan-a", 10, "ok"))?;
+        cache.append_query_receipt(sample_receipt("r1", "plan-a", 99, "ok"))?;
+        assert_eq!(
+            cache
+                .latest_successful_receipt("plan-a")?
+                .map(|receipt| receipt.created_at_ms),
+            Some(10),
+            "duplicate receipt_id must not overwrite the first append"
+        );
+
+        // The audit log is explicitly append-only: a duplicate event_id is ignored.
+        let audit_event = |json: &str| AuditEventRecord {
+            event_id: "e1".to_owned(),
+            receipt_id: None,
+            command_id: "cmd".to_owned(),
+            trace_id: "trace".to_owned(),
+            event_kind: "kind".to_owned(),
+            event_json: json.to_owned(),
+            created_at_ms: 1,
+        };
+        cache.append_audit_event(audit_event("{\"v\":1}"))?;
+        cache.append_audit_event(audit_event("{\"v\":2}"))?;
+        let events = cache.audit_events()?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_json, "{\"v\":1}");
+
+        // upsert_* keeps last-write-wins (it maps to SQLite `INSERT OR REPLACE`),
+        // so the distinction between append and upsert is preserved.
+        let mut profile = sample_profile("demo");
+        cache.upsert_profile(profile.clone())?;
+        profile.display_name = "Renamed".to_owned();
+        cache.upsert_profile(profile)?;
+        assert_eq!(
+            cache.profile("demo")?.map(|record| record.display_name),
+            Some("Renamed".to_owned())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn list_queries_match_sqlite_ordering() -> CacheResult<()> {
+        // The in-memory list queries must return rows in the same order as the
+        // SQLite backend's `ORDER BY` clauses, not BTreeMap primary-key order.
+        let cache = InMemoryCache::new();
+
+        // audit_events: SQLite orders by (created_at_ms, event_id). Insert a later
+        // event with a smaller event_id to expose the previous event_id-only order.
+        let audit_event = |id: &str, at: u64| AuditEventRecord {
+            event_id: id.to_owned(),
+            receipt_id: None,
+            command_id: "cmd".to_owned(),
+            trace_id: "trace".to_owned(),
+            event_kind: "kind".to_owned(),
+            event_json: "{}".to_owned(),
+            created_at_ms: at,
+        };
+        cache.append_audit_event(audit_event("zzz", 1))?;
+        cache.append_audit_event(audit_event("aaa", 2))?;
+        assert_eq!(
+            cache
+                .audit_events()?
+                .into_iter()
+                .map(|event| event.event_id)
+                .collect::<Vec<_>>(),
+            vec!["zzz".to_owned(), "aaa".to_owned()],
+            "audit events must be chronological, not event_id order"
+        );
+
+        // exports_for_receipt: SQLite orders by created_at_ms DESC (newest first).
+        let export = |id: &str, at: u64| ExportRecord {
+            export_id: id.to_owned(),
+            receipt_id: "r1".to_owned(),
+            export_kind: ExportKind::LocalCsv,
+            target_uri_redacted: "file:///[REDACTED]".to_owned(),
+            content_address: ContentAddress::blake3(id.as_bytes()),
+            row_count: Some(1),
+            created_at_ms: at,
+        };
+        cache.append_export(export("aaa-old", 10))?;
+        cache.append_export(export("zzz-new", 20))?;
+        assert_eq!(
+            cache
+                .exports_for_receipt("r1")?
+                .into_iter()
+                .map(|record| record.export_id)
+                .collect::<Vec<_>>(),
+            vec!["zzz-new".to_owned(), "aaa-old".to_owned()],
+            "exports must be newest-first, not export_id order"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn receipt_by_snowflake_query_id_returns_latest_like_sqlite() -> CacheResult<()> {
+        // The SQLite backend selects the newest matching receipt
+        // (`ORDER BY created_at_ms DESC LIMIT 1`). A snowflake_query_id is not
+        // unique across receipt rows, so the in-memory backend must also return
+        // the newest, not the lexicographically-first receipt_id that `find` gave.
+        let cache = InMemoryCache::new();
+        let mut older = sample_receipt("aaa-older", "plan-a", 10, "ok");
+        older.snowflake_query_id = Some("shared-qid".to_owned());
+        let mut newer = sample_receipt("zzz-newer", "plan-a", 50, "ok");
+        newer.snowflake_query_id = Some("shared-qid".to_owned());
+        // Re-address the mutated receipts so the byte-length/digest checks pass.
+        for receipt in [&mut older, &mut newer] {
+            receipt.receipt.address = ContentAddress::blake3(receipt.receipt.canonical.as_bytes());
+        }
+        cache.append_query_receipt(older)?;
+        cache.append_query_receipt(newer)?;
+
+        assert_eq!(
+            cache
+                .receipt_by_snowflake_query_id("demo", "shared-qid")?
+                .map(|receipt| receipt.receipt_id),
+            Some("zzz-newer".to_owned())
+        );
         Ok(())
     }
 
