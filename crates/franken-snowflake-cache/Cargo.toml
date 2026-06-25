@@ -19,6 +19,7 @@ workspace = true
 
 [dependencies]
 blake3 = "1"
+franken-snowflake-core = { path = "../franken-snowflake-core" }
 serde = { version = "1", features = ["derive"] }
 sqlmodel-core = { version = "0.2.2", optional = true }
 sqlmodel-frankensqlite = { version = "0.2.2", optional = true }

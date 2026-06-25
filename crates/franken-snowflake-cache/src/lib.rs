@@ -17,6 +17,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Mutex;
 
+pub use franken_snowflake_core::redact::SECRET_PREFIXES;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "frankensqlite")]
 use sqlmodel_core::{Row, Value};
@@ -1574,25 +1575,6 @@ fn row_audit_event(row: &Row) -> CacheResult<AuditEventRecord> {
     })
 }
 
-// Known secret-shape prefixes the profile store refuses. This MUST stay a
-// superset of `franken_snowflake_core::redact::SECRET_PREFIXES`; a stale copy is
-// a secret-acceptance gap (this list previously omitted `ASIA`, `gho_`,
-// `github_pat_`, and `xoxp-`). Single-source unification is tracked by bead
-// `fsnow-agent-ergonomic-cli-yy3`.
-const SECRET_PREFIXES: &[&str] = &[
-    "eyJ",
-    "AKIA",
-    "ASIA",
-    "ghp_",
-    "gho_",
-    "github_pat_",
-    "sk-",
-    "xoxb-",
-    "xoxp-",
-    "glpat-",
-    "AIza",
-];
-
 #[cfg(feature = "frankensqlite")]
 const MIGRATION_1_UP: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -1783,6 +1765,14 @@ DROP TABLE IF EXISTS schema_migrations;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_prefixes_are_reexported_from_core() {
+        assert_eq!(
+            SECRET_PREFIXES,
+            franken_snowflake_core::redact::SECRET_PREFIXES
+        );
+    }
 
     #[test]
     fn profile_storage_rejects_secret_shaped_reference() {
