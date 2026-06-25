@@ -14,3 +14,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# Shared harness deps. `franken-snowflake-core` is used only for the single
+# shared secret-needle list (`core::redact`) so the canary leak guard and the
+# production redactor cannot drift (see `docs/security_model.md`, "one needle
+# list"). serde/serde_json back the deterministic golden + JSON-line lanes.
+franken-snowflake-core = { path = "../franken-snowflake-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

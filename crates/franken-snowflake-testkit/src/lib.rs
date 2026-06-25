@@ -20,9 +20,30 @@
 //! forbidden-dependency scan. `fastapi_rust` is a testkit dependency, never a
 //! production core dependency. See `docs/proof_lanes.md`.
 //!
-//! Status: Phase 0 skeleton. Built out by `fsnow-deterministic-testkit-bak`,
-//! the shared harness `fsnow-native-snowflake-connector-w0i.15`, and the
-//! VirtualTcp/DPOR suite `fsnow-native-snowflake-connector-w0i.4`.
+//! Status: the **shared, generic harness** ([`harness`]) is implemented by
+//! `fsnow-native-snowflake-connector-w0i.15` and is the foundation every other
+//! crate consumes as a dev-dependency. The Snowflake-specific fixtures and the
+//! `fastapi_rust` mock server build on top of it in
+//! `fsnow-deterministic-testkit-bak`; the VirtualTcp/DPOR race suite lands in
+//! `fsnow-native-snowflake-connector-w0i.4`.
+
+pub mod harness;
 
 /// Crate version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The most commonly used harness types, re-exported for terse dev-dependency
+/// imports: `use franken_snowflake_testkit::prelude::*;`.
+pub mod prelude {
+    pub use crate::harness::canary::{
+        CanaryGuard, CanaryHit, CanaryReport, Channel, DEFAULT_CANARY,
+    };
+    pub use crate::harness::clock::{
+        BackoffPolicy, Clock, Deadline, DeterministicRng, ManualClock, SystemClock,
+        backoff_schedule,
+    };
+    pub use crate::harness::golden::{
+        GoldenConfig, GoldenMismatch, assert_no_cr, compare, to_canonical_json,
+    };
+    pub use crate::harness::logger::{RunLogger, RunSummary, StepEvent, StepOutcome};
+}
