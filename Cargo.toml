@@ -23,6 +23,7 @@ members = [
     "crates/franken-snowflake-graph",
     "crates/franken-snowflake-cache",
     "crates/franken-snowflake-export",
+    "crates/franken-snowflake-text-indexing",
     "crates/franken-snowflake-testkit",
     "crates/franken-snowflake-cli",
 ]

@@ -1,0 +1,28 @@
+[package]
+name = "franken-snowflake-text-indexing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Optional hash and lexical Frankensearch text indexing contracts for franken_snowflake."
+publish.workspace = true
+
+[features]
+default = []
+frankensearch = ["dep:frankensearch"]
+rerank = []
+
+[lints]
+workspace = true
+
+[dependencies]
+franken-snowflake-core = { path = "../franken-snowflake-core" }
+frankensearch = { version = "0.3.2", default-features = false, features = ["hash", "lexical"], optional = true }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+asupersync = { workspace = true }
+tempfile = "3"
