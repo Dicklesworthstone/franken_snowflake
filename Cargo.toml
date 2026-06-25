@@ -7,10 +7,9 @@
 # COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md ("Repository Shape").
 #
 # The toolchain pin (rust-toolchain.toml), the [patch.crates-io] Asupersync
-# unification block, deny.toml, and the single-asupersync-version CI gate are
-# owned by a dedicated toolchain bead (fsnow-native-snowflake-connector-w0i.3),
-# so they are intentionally absent here. Phase 0 skeletons carry no external
-# dependencies.
+# unification block, and the single-asupersync-version CI gate are owned by
+# bead fsnow-native-snowflake-connector-w0i.3. The broader forbidden-dependency
+# admissibility harness remains in fsnow-native-snowflake-connector-w0i.7.
 
 [workspace]
 resolver = "3"
@@ -56,3 +55,133 @@ expect_used = "deny"
 panic = "deny"
 todo = "deny"
 dbg_macro = "deny"
+
+[workspace.dependencies]
+asupersync = { version = "=0.3.5", path = "/dp/asupersync", default-features = false, features = ["proc-macros", "tls", "tls-native-roots", "compression"] }
+
+# Local FrankenSuite candidate graph. These patches do not admit a crate into
+# the production feature graph; they only force one local checkout per crate
+# once a later bead proves the dependency is clean and enables it.
+[patch.crates-io]
+asupersync = { path = "/dp/asupersync" }
+asupersync-macros = { path = "/dp/asupersync/asupersync-macros" }
+
+fastmcp-rust = { path = "/dp/fastmcp_rust/crates/fastmcp" }
+fastmcp-core = { path = "/dp/fastmcp_rust/crates/fastmcp-core" }
+fastmcp-transport = { path = "/dp/fastmcp_rust/crates/fastmcp-transport" }
+fastmcp-protocol = { path = "/dp/fastmcp_rust/crates/fastmcp-protocol" }
+fastmcp-server = { path = "/dp/fastmcp_rust/crates/fastmcp-server" }
+fastmcp-client = { path = "/dp/fastmcp_rust/crates/fastmcp-client" }
+fastmcp-derive = { path = "/dp/fastmcp_rust/crates/fastmcp-macros" }
+fastmcp-console = { path = "/dp/fastmcp_rust/crates/fastmcp-console" }
+fastmcp-cli = { path = "/dp/fastmcp_rust/crates/fastmcp-cli" }
+
+fsqlite = { path = "/dp/frankensqlite/crates/fsqlite" }
+fsqlite-ast = { path = "/dp/frankensqlite/crates/fsqlite-ast" }
+fsqlite-btree = { path = "/dp/frankensqlite/crates/fsqlite-btree" }
+fsqlite-c-api = { path = "/dp/frankensqlite/crates/fsqlite-c-api" }
+fsqlite-cli = { path = "/dp/frankensqlite/crates/fsqlite-cli" }
+fsqlite-core = { path = "/dp/frankensqlite/crates/fsqlite-core" }
+fsqlite-e2e = { path = "/dp/frankensqlite/crates/fsqlite-e2e" }
+fsqlite-error = { path = "/dp/frankensqlite/crates/fsqlite-error" }
+fsqlite-ext-fts3 = { path = "/dp/frankensqlite/crates/fsqlite-ext-fts3" }
+fsqlite-ext-fts5 = { path = "/dp/frankensqlite/crates/fsqlite-ext-fts5" }
+fsqlite-ext-icu = { path = "/dp/frankensqlite/crates/fsqlite-ext-icu" }
+fsqlite-ext-json = { path = "/dp/frankensqlite/crates/fsqlite-ext-json" }
+fsqlite-ext-misc = { path = "/dp/frankensqlite/crates/fsqlite-ext-misc" }
+fsqlite-ext-rtree = { path = "/dp/frankensqlite/crates/fsqlite-ext-rtree" }
+fsqlite-ext-session = { path = "/dp/frankensqlite/crates/fsqlite-ext-session" }
+fsqlite-func = { path = "/dp/frankensqlite/crates/fsqlite-func" }
+fsqlite-harness = { path = "/dp/frankensqlite/crates/fsqlite-harness" }
+fsqlite-mvcc = { path = "/dp/frankensqlite/crates/fsqlite-mvcc" }
+fsqlite-observability = { path = "/dp/frankensqlite/crates/fsqlite-observability" }
+fsqlite-pager = { path = "/dp/frankensqlite/crates/fsqlite-pager" }
+fsqlite-parser = { path = "/dp/frankensqlite/crates/fsqlite-parser" }
+fsqlite-planner = { path = "/dp/frankensqlite/crates/fsqlite-planner" }
+fsqlite-types = { path = "/dp/frankensqlite/crates/fsqlite-types" }
+fsqlite-vdbe = { path = "/dp/frankensqlite/crates/fsqlite-vdbe" }
+fsqlite-vfs = { path = "/dp/frankensqlite/crates/fsqlite-vfs" }
+fsqlite-wal = { path = "/dp/frankensqlite/crates/fsqlite-wal" }
+fsqlite-wasm = { path = "/dp/frankensqlite/crates/fsqlite-wasm" }
+
+sqlmodel = { path = "/dp/sqlmodel_rust/crates/sqlmodel" }
+sqlmodel-console = { path = "/dp/sqlmodel_rust/crates/sqlmodel-console" }
+sqlmodel-core = { path = "/dp/sqlmodel_rust/crates/sqlmodel-core" }
+sqlmodel-frankensqlite = { path = "/dp/sqlmodel_rust/crates/sqlmodel-frankensqlite" }
+sqlmodel-macros = { path = "/dp/sqlmodel_rust/crates/sqlmodel-macros" }
+sqlmodel-mysql = { path = "/dp/sqlmodel_rust/crates/sqlmodel-mysql" }
+sqlmodel-pool = { path = "/dp/sqlmodel_rust/crates/sqlmodel-pool" }
+sqlmodel-postgres = { path = "/dp/sqlmodel_rust/crates/sqlmodel-postgres" }
+sqlmodel-query = { path = "/dp/sqlmodel_rust/crates/sqlmodel-query" }
+sqlmodel-schema = { path = "/dp/sqlmodel_rust/crates/sqlmodel-schema" }
+sqlmodel-session = { path = "/dp/sqlmodel_rust/crates/sqlmodel-session" }
+sqlmodel-sqlite = { path = "/dp/sqlmodel_rust/crates/sqlmodel-sqlite" }
+
+fp-columnar = { path = "/dp/frankenpandas/crates/fp-columnar" }
+fp-conformance = { path = "/dp/frankenpandas/crates/fp-conformance" }
+fp-expr = { path = "/dp/frankenpandas/crates/fp-expr" }
+fp-frame = { path = "/dp/frankenpandas/crates/fp-frame" }
+fp-frankentui = { path = "/dp/frankenpandas/crates/fp-frankentui" }
+fp-groupby = { path = "/dp/frankenpandas/crates/fp-groupby" }
+fp-index = { path = "/dp/frankenpandas/crates/fp-index" }
+fp-io = { path = "/dp/frankenpandas/crates/fp-io" }
+fp-join = { path = "/dp/frankenpandas/crates/fp-join" }
+fp-python = { path = "/dp/frankenpandas/crates/fp-python" }
+fp-runtime = { path = "/dp/frankenpandas/crates/fp-runtime" }
+fp-types = { path = "/dp/frankenpandas/crates/fp-types" }
+
+frankensearch = { path = "/dp/frankensearch/frankensearch" }
+frankensearch-core = { path = "/dp/frankensearch/crates/frankensearch-core" }
+frankensearch-durability = { path = "/dp/frankensearch/crates/frankensearch-durability" }
+frankensearch-embed = { path = "/dp/frankensearch/crates/frankensearch-embed" }
+frankensearch-fsfs = { path = "/dp/frankensearch/crates/frankensearch-fsfs" }
+frankensearch-fusion = { path = "/dp/frankensearch/crates/frankensearch-fusion" }
+frankensearch-index = { path = "/dp/frankensearch/crates/frankensearch-index" }
+frankensearch-lexical = { path = "/dp/frankensearch/crates/frankensearch-lexical" }
+frankensearch-ops = { path = "/dp/frankensearch/crates/frankensearch-ops" }
+frankensearch-rerank = { path = "/dp/frankensearch/crates/frankensearch-rerank" }
+frankensearch-storage = { path = "/dp/frankensearch/crates/frankensearch-storage" }
+frankensearch-tui = { path = "/dp/frankensearch/crates/frankensearch-tui" }
+
+ftui = { path = "/dp/frankentui/crates/ftui" }
+ftui-a11y = { path = "/dp/frankentui/crates/ftui-a11y" }
+ftui-backend = { path = "/dp/frankentui/crates/ftui-backend" }
+ftui-core = { path = "/dp/frankentui/crates/ftui-core" }
+ftui-extras = { path = "/dp/frankentui/crates/ftui-extras" }
+ftui-harness = { path = "/dp/frankentui/crates/ftui-harness" }
+ftui-i18n = { path = "/dp/frankentui/crates/ftui-i18n" }
+ftui-layout = { path = "/dp/frankentui/crates/ftui-layout" }
+ftui-pty = { path = "/dp/frankentui/crates/ftui-pty" }
+ftui-render = { path = "/dp/frankentui/crates/ftui-render" }
+ftui-runtime = { path = "/dp/frankentui/crates/ftui-runtime" }
+ftui-simd = { path = "/dp/frankentui/crates/ftui-simd" }
+ftui-style = { path = "/dp/frankentui/crates/ftui-style" }
+ftui-text = { path = "/dp/frankentui/crates/ftui-text" }
+ftui-tty = { path = "/dp/frankentui/crates/ftui-tty" }
+ftui-web = { path = "/dp/frankentui/crates/ftui-web" }
+ftui-widgets = { path = "/dp/frankentui/crates/ftui-widgets" }
+
+frankenmermaid-cli = { path = "/dp/frankenmermaid/crates/fm-cli" }
+fm-core = { path = "/dp/frankenmermaid/crates/fm-core" }
+fm-layout = { path = "/dp/frankenmermaid/crates/fm-layout" }
+fm-parser = { path = "/dp/frankenmermaid/crates/fm-parser" }
+fm-regression-harness = { path = "/dp/frankenmermaid/crates/fm-regression-harness" }
+fm-render-canvas = { path = "/dp/frankenmermaid/crates/fm-render-canvas" }
+fm-render-svg = { path = "/dp/frankenmermaid/crates/fm-render-svg" }
+fm-render-term = { path = "/dp/frankenmermaid/crates/fm-render-term" }
+fm-wasm = { path = "/dp/frankenmermaid/crates/fm-wasm" }
+
+fnx-algorithms = { path = "/dp/franken_networkx/crates/fnx-algorithms" }
+fnx-cgse = { path = "/dp/franken_networkx/crates/fnx-cgse" }
+fnx-classes = { path = "/dp/franken_networkx/crates/fnx-classes" }
+fnx-conformance = { path = "/dp/franken_networkx/crates/fnx-conformance" }
+fnx-convert = { path = "/dp/franken_networkx/crates/fnx-convert" }
+fnx-dispatch = { path = "/dp/franken_networkx/crates/fnx-dispatch" }
+fnx-durability = { path = "/dp/franken_networkx/crates/fnx-durability" }
+fnx-generators = { path = "/dp/franken_networkx/crates/fnx-generators" }
+fnx-python = { path = "/dp/franken_networkx/crates/fnx-python" }
+fnx-readwrite = { path = "/dp/franken_networkx/crates/fnx-readwrite" }
+fnx-runtime = { path = "/dp/franken_networkx/crates/fnx-runtime" }
+fnx-views = { path = "/dp/franken_networkx/crates/fnx-views" }
+
+tru = { path = "/data/projects/toon_rust" }

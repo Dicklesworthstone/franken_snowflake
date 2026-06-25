@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: /tmp/franken-snowflake-target
+
+jobs:
+  toolchain-and-dependency-gates:
+    name: toolchain and dependency gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show pinned toolchain
+        run: |
+          rustup show
+          rustc --version --verbose
+          cargo --version --verbose
+
+      - name: Cargo check
+        run: cargo check --locked
+
+      - name: Assert single Asupersync version
+        run: scripts/check-asupersync-single-version.sh
