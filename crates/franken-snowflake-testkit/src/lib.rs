@@ -29,6 +29,7 @@
 
 pub mod harness;
 pub mod mock;
+pub mod race;
 pub mod replay;
 
 /// Crate version string.
@@ -51,6 +52,11 @@ pub mod prelude {
     pub use crate::mock::http::{Method, MockHttpRequest, MockHttpResponse, ResponseClass};
     pub use crate::mock::server::{MockSqlApi, RecordedRequest};
     pub use crate::mock::{ScriptedResponder, scenarios};
+    pub use crate::race::{
+        RaceCaseKind, RaceCaseReport, RaceError, RaceSuiteConfig, RaceSuiteReport,
+        default_race_suite_config, race_suite_jsonl, run_default_race_suite, run_race_suite,
+        write_race_suite_artifacts,
+    };
     pub use crate::replay::{
         ProtocolPacket, ReplayError, ReplayHarness, ReplayStep, ReplaySummary,
         default_protocol_replay,
