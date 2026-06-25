@@ -23,6 +23,8 @@
 //! - [`guardrails`] — fail-closed rights, read-only mutation refusal, provenance,
 //!   redaction, canary scanning, and enforceable/advisory query cost limits.
 //! - [`envelope`] — the deterministic, versioned JSON envelope metadata.
+//! - [`adapter`] — public downstream extension points and optional
+//!   `adapter-fixtures` contract tests.
 //!
 //! See `docs/agent_cli_contract.md` (envelope + exit codes),
 //! `docs/security_model.md` (redaction + fail-closed rights), and
@@ -38,6 +40,7 @@
 //! [`capabilities`] pins read-only at the type level. The batch test lane lands
 //! separately (`— code-first, batch-test pending`).
 
+pub mod adapter;
 pub mod budget;
 pub mod cancel;
 pub mod capabilities;
@@ -55,6 +58,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Convenient re-exports of the most commonly used core types.
 pub mod prelude {
+    pub use crate::adapter::{
+        AdapterOutputContract, AdapterResult, AdapterSafetyFacet, ContentAddressRef,
+        SnowflakeDataLakeAdapter,
+    };
     pub use crate::budget::Budget;
     pub use crate::cancel::{CancelKind, CancelPolicy, CancelReason};
     pub use crate::capabilities::{PlannerCaps, TransportCaps, WriteCaps};
