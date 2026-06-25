@@ -2022,9 +2022,10 @@ impl TransportError {
     /// Create a transport error.
     #[must_use]
     pub fn new(code: TransportErrorCode, message: impl Into<String>) -> Self {
+        let message = message.into();
         Self {
             code,
-            message: message.into(),
+            message: redact(&message).into_owned(),
         }
     }
 
@@ -2183,6 +2184,28 @@ mod tests {
             assert!(
                 !rendered.contains(token),
                 "diagnostic surface leaked bearer token: {rendered}"
+            );
+            assert!(rendered.contains(REDACTION_PLACEHOLDER));
+        }
+    }
+
+    #[test]
+    fn transport_error_constructor_redacts_secret_shaped_messages() {
+        let token = "ghp_httpTransportSecret0123";
+        let error = TransportError::new(
+            TransportErrorCode::NetworkError,
+            format!("connect failed with token={token}"),
+        );
+
+        for rendered in [
+            error.message.clone(),
+            error.to_string(),
+            serde_json::to_string(&error).expect("error json"),
+            format!("{error:?}"),
+        ] {
+            assert!(
+                !rendered.contains(token),
+                "transport error leaked secret-shaped token: {rendered}"
             );
             assert!(rendered.contains(REDACTION_PLACEHOLDER));
         }
