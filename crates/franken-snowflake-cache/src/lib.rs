@@ -1574,7 +1574,24 @@ fn row_audit_event(row: &Row) -> CacheResult<AuditEventRecord> {
     })
 }
 
-const SECRET_PREFIXES: &[&str] = &["eyJ", "AKIA", "ghp_", "sk-", "xoxb-", "glpat-", "AIza"];
+// Known secret-shape prefixes the profile store refuses. This MUST stay a
+// superset of `franken_snowflake_core::redact::SECRET_PREFIXES`; a stale copy is
+// a secret-acceptance gap (this list previously omitted `ASIA`, `gho_`,
+// `github_pat_`, and `xoxp-`). Single-source unification is tracked by bead
+// `fsnow-agent-ergonomic-cli-yy3`.
+const SECRET_PREFIXES: &[&str] = &[
+    "eyJ",
+    "AKIA",
+    "ASIA",
+    "ghp_",
+    "gho_",
+    "github_pat_",
+    "sk-",
+    "xoxb-",
+    "xoxp-",
+    "glpat-",
+    "AIza",
+];
 
 #[cfg(feature = "frankensqlite")]
 const MIGRATION_1_UP: &str = r#"
@@ -1782,6 +1799,30 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn profile_storage_rejects_recently_added_secret_prefixes() {
+        // Regression: the needle list previously omitted these shapes, so a
+        // profile reference carrying one would have been stored as a "reference".
+        // Each must now be refused.
+        for needle in [
+            "ASIAEXAMPLE0000",
+            "gho_EXAMPLE0000",
+            "github_pat_EXAMPLE0000",
+            "xoxp-EXAMPLE-0000",
+        ] {
+            let cache = InMemoryCache::new();
+            let mut profile = sample_profile("demo");
+            profile.credential_ref = CredentialRef::env(needle);
+            assert!(
+                matches!(
+                    cache.upsert_profile(profile),
+                    Err(CacheError::SecretRefused { .. })
+                ),
+                "secret-shaped reference {needle} was not rejected"
+            );
+        }
     }
 
     #[test]
