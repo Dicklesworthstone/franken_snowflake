@@ -555,7 +555,7 @@ fn normalize_raw_select(sql: &str) -> Result<String, PlanRefusal> {
         return Err(raw_sql_refusal("raw SQL must be a single SELECT statement"));
     }
     let without_trailing_semicolon = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
-    if without_trailing_semicolon.contains(';') {
+    if has_statement_separator(without_trailing_semicolon) {
         return Err(raw_sql_refusal(
             "raw SQL dry-run accepts one statement; semicolon chaining is refused",
         ));
@@ -974,20 +974,110 @@ fn has_result_limit(sql: &str) -> bool {
 }
 
 fn first_keyword(sql: &str) -> Option<String> {
-    sql.lines()
-        .map(|line| line.split_once("--").map_or(line, |(before, _)| before))
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim_start()
-        .split(|ch: char| !ch.is_ascii_alphabetic())
-        .find(|part| !part.is_empty())
-        .map(|part| part.to_ascii_lowercase())
+    executable_sql_tokens(sql).words.into_iter().next()
 }
 
 fn contains_word(sql: &str, needle: &str) -> bool {
-    sql.to_ascii_lowercase()
-        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+    executable_sql_tokens(sql)
+        .words
+        .into_iter()
         .any(|part| part == needle)
+}
+
+fn has_statement_separator(sql: &str) -> bool {
+    executable_sql_tokens(sql).has_semicolon
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ExecutableSqlTokens {
+    words: Vec<String>,
+    has_semicolon: bool,
+}
+
+fn executable_sql_tokens(sql: &str) -> ExecutableSqlTokens {
+    let mut tokens = ExecutableSqlTokens::default();
+    let mut word = String::new();
+    let mut chars = sql.chars().peekable();
+    let mut state = SqlScanState::Normal;
+
+    while let Some(ch) = chars.next() {
+        match state {
+            SqlScanState::Normal => match ch {
+                '-' if chars.peek() == Some(&'-') => {
+                    chars.next();
+                    flush_word(&mut word, &mut tokens.words);
+                    state = SqlScanState::LineComment;
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    flush_word(&mut word, &mut tokens.words);
+                    state = SqlScanState::BlockComment;
+                }
+                '\'' => {
+                    flush_word(&mut word, &mut tokens.words);
+                    state = SqlScanState::SingleQuoted;
+                }
+                '"' => {
+                    flush_word(&mut word, &mut tokens.words);
+                    state = SqlScanState::DoubleQuoted;
+                }
+                ';' => {
+                    flush_word(&mut word, &mut tokens.words);
+                    tokens.has_semicolon = true;
+                }
+                _ if ch.is_ascii_alphanumeric() || ch == '_' => {
+                    word.push(ch.to_ascii_lowercase());
+                }
+                _ => flush_word(&mut word, &mut tokens.words),
+            },
+            SqlScanState::SingleQuoted => match ch {
+                '\\' => {
+                    chars.next();
+                }
+                '\'' if chars.peek() == Some(&'\'') => {
+                    chars.next();
+                }
+                '\'' => state = SqlScanState::Normal,
+                _ => {}
+            },
+            SqlScanState::DoubleQuoted => match ch {
+                '"' if chars.peek() == Some(&'"') => {
+                    chars.next();
+                }
+                '"' => state = SqlScanState::Normal,
+                _ => {}
+            },
+            SqlScanState::LineComment => {
+                if matches!(ch, '\n' | '\r') {
+                    state = SqlScanState::Normal;
+                }
+            }
+            SqlScanState::BlockComment => {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    state = SqlScanState::Normal;
+                }
+            }
+        }
+    }
+
+    flush_word(&mut word, &mut tokens.words);
+    tokens
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SqlScanState {
+    Normal,
+    SingleQuoted,
+    DoubleQuoted,
+    LineComment,
+    BlockComment,
+}
+
+fn flush_word(word: &mut String, words: &mut Vec<String>) {
+    if !word.is_empty() {
+        words.push(std::mem::take(word));
+    }
 }
 
 fn plan_id(
@@ -1223,6 +1313,39 @@ mod tests {
             chained,
             Err(refusals) if refusals[0].code == "FSNOW_RAW_SQL_UNSAFE"
         ));
+    }
+
+    #[test]
+    fn raw_sql_dry_run_ignores_denylisted_words_inside_literals() {
+        let request =
+            base_raw_request("select * from events_daily where action = 'delete; drop table x'");
+
+        let plan = plan_raw_sql_dry_run(&request);
+
+        assert!(plan.is_ok());
+        if let Ok(plan) = plan {
+            assert_eq!(
+                plan.sql,
+                "select * from events_daily where action = 'delete; drop table x' LIMIT ?"
+            );
+            assert_eq!(
+                plan.bindings.get("1").map(|binding| binding.value.as_str()),
+                Some("10000")
+            );
+        }
+    }
+
+    #[test]
+    fn raw_sql_dry_run_ignores_denylisted_words_inside_quoted_identifiers() {
+        let request = base_raw_request("select \"delete\" from events_daily limit 1");
+
+        let plan = plan_raw_sql_dry_run(&request);
+
+        assert!(plan.is_ok());
+        if let Ok(plan) = plan {
+            assert_eq!(plan.sql, "select \"delete\" from events_daily limit 1");
+            assert!(plan.bindings.is_empty());
+        }
     }
 
     #[test]
