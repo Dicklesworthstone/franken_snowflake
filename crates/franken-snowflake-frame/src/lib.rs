@@ -209,6 +209,7 @@ mod frankenpandas {
     #[serde(rename_all = "snake_case")]
     pub enum FrameStorageKind {
         Int64,
+        DecimalString,
         Float64,
         Bool,
         Utf8,
@@ -221,7 +222,8 @@ mod frankenpandas {
         fn from_logical(logical_type: SnowflakeLogicalType, scale: Option<i32>) -> Self {
             match logical_type {
                 SnowflakeLogicalType::Fixed if scale.unwrap_or(0) == 0 => Self::Int64,
-                SnowflakeLogicalType::Fixed | SnowflakeLogicalType::Real => Self::Float64,
+                SnowflakeLogicalType::Fixed => Self::DecimalString,
+                SnowflakeLogicalType::Real => Self::Float64,
                 SnowflakeLogicalType::Boolean => Self::Bool,
                 SnowflakeLogicalType::Date
                 | SnowflakeLogicalType::Time
@@ -241,6 +243,7 @@ mod frankenpandas {
                 Self::Bool if nullable => DType::BoolNullable,
                 Self::Bool => DType::Bool,
                 Self::Float64 => DType::Float64,
+                Self::DecimalString => DType::Utf8,
                 Self::Datetime64 => DType::Datetime64,
                 Self::Utf8 | Self::StructuredJson | Self::BinaryHex => DType::Utf8,
             }
@@ -421,7 +424,16 @@ mod frankenpandas {
                     decode_error(source, "FIXED/NUMBER scale 0 must be an integer decimal")
                 })?)
             }
-            SnowflakeLogicalType::Fixed | SnowflakeLogicalType::Real => {
+            SnowflakeLogicalType::Fixed => {
+                if !is_fixed_decimal(text, meta.scale) {
+                    return Err(decode_error(
+                        source,
+                        "FIXED/NUMBER must be a decimal string",
+                    ));
+                }
+                Scalar::Utf8(text.to_owned())
+            }
+            SnowflakeLogicalType::Real => {
                 let value = text
                     .parse::<f64>()
                     .map_err(|_| decode_error(source, "expected a numeric decimal string"))?;
@@ -513,6 +525,38 @@ mod frankenpandas {
         text.parse::<i64>().ok()
     }
 
+    fn is_fixed_decimal(text: &str, scale: Option<i32>) -> bool {
+        if scale.unwrap_or(0) == 0 {
+            return is_integer_decimal_with_optional_zero_fraction(text);
+        }
+        is_decimal_string(text)
+    }
+
+    fn is_integer_decimal_with_optional_zero_fraction(text: &str) -> bool {
+        match text.split_once('.') {
+            Some((int_part, frac_part)) => {
+                is_signed_digits(int_part) && frac_part.bytes().all(|byte| byte == b'0')
+            }
+            None => is_signed_digits(text),
+        }
+    }
+
+    fn is_decimal_string(text: &str) -> bool {
+        let Some((int_part, frac_part)) = text.split_once('.') else {
+            return is_signed_digits(text);
+        };
+        let int_ok = int_part == "-" || int_part == "+" || is_signed_digits(int_part);
+        int_ok && !frac_part.is_empty() && frac_part.bytes().all(|byte| byte.is_ascii_digit())
+    }
+
+    fn is_signed_digits(text: &str) -> bool {
+        let digits = text
+            .strip_prefix('-')
+            .or_else(|| text.strip_prefix('+'))
+            .unwrap_or(text);
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    }
+
     fn parse_fractional_seconds(text: &str) -> Option<(i64, u32)> {
         let negative = text.starts_with('-');
         let (int_str, frac_nanos) = match text.split_once('.') {
@@ -598,8 +642,8 @@ mod frankenpandas {
                 (
                     col("C", "FIXED").with_scale(2),
                     SnowflakeLogicalType::Fixed,
-                    FrameStorageKind::Float64,
-                    DType::Float64,
+                    FrameStorageKind::DecimalString,
+                    DType::Utf8,
                 ),
                 (
                     col("D", "REAL"),
@@ -707,8 +751,11 @@ mod frankenpandas {
             assert_eq!(id.column.value(1), Some(&Scalar::Int64(2)));
 
             let amount = frame_column(&frame, "AMOUNT")?;
-            assert_eq!(amount.column.dtype(), DType::Float64);
-            assert_eq!(amount.column.value(0), Some(&Scalar::Float64(12.34)));
+            assert_eq!(amount.column.dtype(), DType::Utf8);
+            assert_eq!(
+                amount.column.value(0),
+                Some(&Scalar::Utf8("12.34".to_owned()))
+            );
             assert_eq!(amount.missing_kinds[1], Some(FrameMissingKind::SqlNull));
 
             let date = frame_column(&frame, "DATE_COL")?;
@@ -741,6 +788,31 @@ mod frankenpandas {
                 Some(&Scalar::Utf8("0A0b".to_owned()))
             );
 
+            Ok(())
+        }
+
+        #[test]
+        fn fixed_decimal_values_remain_exact_strings() -> Result<(), String> {
+            let columns = vec![col("AMOUNT", "NUMBER")
+                .with_scale(2)
+                .with_precision(38)
+                .nullable(false)];
+            let partitions = vec![ResultPartition::new(
+                0,
+                vec![vec![Some("12345678901234567.89".to_owned())]],
+            )];
+
+            let frame = materialize_partitions(&columns, partitions).map_err(|e| e.to_string())?;
+            let amount = frame_column(&frame, "AMOUNT")?;
+            assert_eq!(
+                amount.metadata.storage_kind,
+                FrameStorageKind::DecimalString
+            );
+            assert_eq!(amount.column.dtype(), DType::Utf8);
+            assert_eq!(
+                amount.column.value(0),
+                Some(&Scalar::Utf8("12345678901234567.89".to_owned()))
+            );
             Ok(())
         }
 
