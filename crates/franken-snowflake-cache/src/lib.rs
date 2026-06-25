@@ -1789,18 +1789,21 @@ mod tests {
     #[test]
     fn content_address_verify_rejects_unsupported_algorithm() {
         let payload: &[u8] = b"franken-snowflake-cache-content";
-        let blake3 = ContentAddress::blake3(payload);
+        let address = ContentAddress::blake3(payload);
 
         // The canonical blake3 address still verifies.
-        assert!(blake3.verify("unit", payload).is_ok());
+        assert!(address.verify("unit", payload).is_ok());
 
         // A non-blake3 algorithm must fail closed instead of skipping the digest
         // check. Regression: verification previously returned Ok for any label
         // other than "blake3", silently bypassing content-address integrity.
+        // The foreign address carries a correct digest on purpose, so the test
+        // pins that the algorithm is rejected before (and regardless of) the
+        // digest comparison.
         let foreign = ContentAddress {
             algorithm: "sha256".to_owned(),
-            digest_hex: blake3.digest_hex.clone(),
-            byte_len: blake3.byte_len,
+            digest_hex: address.digest_hex.clone(),
+            byte_len: address.byte_len,
         };
         assert!(matches!(
             foreign.verify("unit", payload),
@@ -1811,7 +1814,7 @@ mod tests {
         let tampered = ContentAddress {
             algorithm: "blake3".to_owned(),
             digest_hex: "00".to_owned(),
-            byte_len: blake3.byte_len,
+            byte_len: address.byte_len,
         };
         assert!(matches!(
             tampered.verify("unit", payload),
