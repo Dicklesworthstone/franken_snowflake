@@ -36,6 +36,12 @@ use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod redaction_policy;
+pub use redaction_policy::{
+    CREDENTIAL_FIELD_MARKERS, NON_SECRET_CREDENTIAL_FIELD_MARKERS, REDACTED,
+    SECRET_VALUE_NEEDLE_PREFIXES,
+};
+
 /// Crate version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -71,8 +77,6 @@ pub const OAUTH_EXPECTED_VALIDITY_SECONDS: u64 = 10 * 60;
 
 /// Structured auth log schema version.
 pub const AUTH_LOG_SCHEMA_VERSION: u16 = 1;
-
-const REDACTED: &str = "[REDACTED]";
 
 /// Errors emitted by secret-safe auth construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -510,12 +514,23 @@ pub type KeyPairJwtHeaders = AuthHeaders;
 /// `iss` intentionally includes the public-key fingerprint while `sub` does
 /// not. Snowflake requires both ACCOUNT and USER to be uppercase, and accounts
 /// containing dots are normalized with dots replaced by dashes.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SnowflakeJwtClaims {
     pub iss: String,
     pub sub: String,
     pub iat: i64,
     pub exp: i64,
+}
+
+impl fmt::Debug for SnowflakeJwtClaims {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnowflakeJwtClaims")
+            .field("iss", &REDACTED)
+            .field("sub", &REDACTED)
+            .field("iat", &self.iat)
+            .field("exp", &self.exp)
+            .finish()
+    }
 }
 
 /// Signed Snowflake key-pair JWT plus non-secret metadata.
@@ -1386,6 +1401,47 @@ pub fn public_key_fingerprint_from_der(public_key_der: &[u8]) -> String {
     format!("SHA256:{}", BASE64_STANDARD.encode(digest))
 }
 
+/// Redact explicit secret values plus token-like values matching the shared
+/// secret prefix policy.
+#[must_use]
+pub fn redact_with_policy(input: &str, explicit_secret_needles: &[&str]) -> String {
+    let mut redacted = input.to_string();
+    let mut explicit = explicit_secret_needles
+        .iter()
+        .copied()
+        .filter(|needle| !needle.is_empty())
+        .collect::<Vec<_>>();
+    explicit.sort_by_key(|needle| std::cmp::Reverse(needle.len()));
+    for needle in explicit {
+        redacted = redacted.replace(needle, REDACTED);
+    }
+
+    let mut prefixes = SECRET_VALUE_NEEDLE_PREFIXES.to_vec();
+    prefixes.sort_by_key(|needle| std::cmp::Reverse(needle.len()));
+    for prefix in prefixes {
+        redacted = redact_prefixed_tokens(&redacted, prefix);
+    }
+    redacted
+}
+
+/// Return the longest known secret prefix that starts `candidate`.
+#[must_use]
+pub fn longest_secret_prefix(candidate: &str) -> Option<&'static str> {
+    SECRET_VALUE_NEEDLE_PREFIXES
+        .iter()
+        .copied()
+        .filter(|prefix| candidate.starts_with(prefix))
+        .max_by_key(|prefix| prefix.len())
+}
+
+/// Detect whether text contains any known secret-looking prefix.
+#[must_use]
+pub fn contains_secret_needle(input: &str) -> bool {
+    SECRET_VALUE_NEEDLE_PREFIXES
+        .iter()
+        .any(|prefix| input.contains(prefix))
+}
+
 fn pat_lifetime(
     issued_at_unix_seconds: Option<i64>,
     expires_at_unix_seconds: Option<i64>,
@@ -1435,6 +1491,32 @@ fn ceil_div_i64(value: i64, divisor: i64) -> i64 {
     } else {
         (value + divisor - 1) / divisor
     }
+}
+
+fn redact_prefixed_tokens(input: &str, prefix: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
+    while let Some(start) = remaining.find(prefix) {
+        output.push_str(&remaining[..start]);
+        let secret_tail = &remaining[start..];
+        if prefix.chars().any(char::is_whitespace) {
+            output.push_str(REDACTED);
+            remaining = &secret_tail[prefix.len()..];
+            continue;
+        }
+        let end = secret_tail
+            .char_indices()
+            .find_map(|(idx, ch)| is_secret_delimiter(ch).then_some(idx))
+            .unwrap_or(secret_tail.len());
+        output.push_str(REDACTED);
+        remaining = &secret_tail[end..];
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn is_secret_delimiter(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';' | ')' | ']' | '}')
 }
 
 #[cfg(test)]
@@ -1650,6 +1732,18 @@ dQIDAQAB
         assert_eq!(headers.token_type_value(), PROGRAMMATIC_ACCESS_TOKEN_TYPE);
         assert_eq!(resolver.read_checks.get(), 1);
         Ok(())
+    }
+
+    #[test]
+    fn shared_redactor_uses_secret_needle_prefixes() {
+        let input = "Authorization: Bearer sk-live-secret and ghp_exampletoken";
+        let redacted = redact_with_policy(input, &["live-secret"]);
+
+        assert!(contains_secret_needle(input));
+        assert_eq!(longest_secret_prefix("ghp_exampletoken"), Some("ghp_"));
+        assert!(!redacted.contains("sk-live-secret"));
+        assert!(!redacted.contains("ghp_exampletoken"));
+        assert!(redacted.contains(REDACTED));
     }
 
     #[test]
