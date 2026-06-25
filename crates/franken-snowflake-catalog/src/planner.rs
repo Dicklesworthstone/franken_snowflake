@@ -5,11 +5,13 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::model::{ColumnCatalogEntry, DatasetManifest, DtypeClass, FieldRole};
+use crate::model::{
+    normalize_identifier, ColumnCatalogEntry, DatasetManifest, DtypeClass, FieldRole,
+};
 use crate::operator::OperatorCatalogEntry;
 use crate::predicate::{
-    find_column, validate_predicate, CompoundPredicate, LeafPredicate, PredicateAst,
-    PredicateRefusal, PredicateRefusalCode,
+    validate_predicate, CompoundPredicate, LeafPredicate, PredicateAst, PredicateRefusal,
+    PredicateRefusalCode,
 };
 
 /// Dataset-mode planner request.
@@ -542,16 +544,11 @@ fn find_column_in_refs<'a>(
     column: &str,
     columns: &[&'a ColumnCatalogEntry],
 ) -> Option<&'a ColumnCatalogEntry> {
-    let owned = columns
+    let normalized = normalize_identifier(column);
+    columns
         .iter()
-        .map(|column| (*column).clone())
-        .collect::<Vec<_>>();
-    find_column(column, &owned).and_then(|found| {
-        columns
-            .iter()
-            .copied()
-            .find(|candidate| candidate.column == found.column)
-    })
+        .copied()
+        .find(|candidate| normalize_identifier(&candidate.column) == normalized)
 }
 
 fn push_binding(
