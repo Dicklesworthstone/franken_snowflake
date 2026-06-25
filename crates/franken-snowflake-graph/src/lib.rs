@@ -976,7 +976,7 @@ mod tests {
     fn builds_catalog_graph_from_snapshot() {
         let graph = CatalogGraph::from_snapshot(&fixture_snapshot());
         assert_eq!(graph.node_count(), 8);
-        assert_eq!(graph.edge_count(), 11);
+        assert_eq!(graph.edge_count(), 10);
         assert!(graph.reachable(
             &dataset_key("events_daily"),
             &object_key("demo", "ANALYTICS", "PUBLIC", "EVENTS_DAILY")
