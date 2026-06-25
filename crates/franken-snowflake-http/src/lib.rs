@@ -25,7 +25,8 @@ use asupersync::{CancelKind, Cx};
 use franken_snowflake_core::budget::{Budget, partition_child_budget};
 use franken_snowflake_core::cancel::{CancelPolicy, CancelReason, cancel_policy};
 use franken_snowflake_core::ids::{RequestId, StatementHandle};
-use serde::{Deserialize, Serialize};
+use franken_snowflake_core::redact::{REDACTION_PLACEHOLDER, redact};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
 /// Crate version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -944,12 +945,33 @@ impl fmt::Debug for AuthorizationDescriptor {
 }
 
 /// HTTP header pair.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Deserialize)]
 pub struct Header {
     /// Header name.
     pub name: String,
     /// Header value.
     pub value: String,
+}
+
+impl fmt::Debug for Header {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Header")
+            .field("name", &self.name)
+            .field("value", &redacted_header_value(&self.name, &self.value))
+            .finish()
+    }
+}
+
+impl Serialize for Header {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("Header", 2)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("value", &redacted_header_value(&self.name, &self.value))?;
+        state.end()
+    }
 }
 
 impl Header {
@@ -964,6 +986,21 @@ impl Header {
             ));
         }
         Ok(Self { name, value })
+    }
+}
+
+fn redacted_header_value(name: &str, value: &str) -> String {
+    let value = redact(value).into_owned();
+    if !name.eq_ignore_ascii_case(HEADER_AUTHORIZATION) {
+        return value;
+    }
+    if value.contains(REDACTION_PLACEHOLDER) {
+        return value;
+    }
+    let mut words = value.split_whitespace();
+    match (words.next(), words.next()) {
+        (Some(scheme), Some(_)) => format!("{scheme} {REDACTION_PLACEHOLDER}"),
+        _ => REDACTION_PLACEHOLDER.to_owned(),
     }
 }
 
@@ -983,6 +1020,11 @@ fn is_header_value(value: &str) -> bool {
 pub enum TransportRoute {
     /// `POST /api/v2/statements`.
     Submit,
+    /// `POST /api/v2/statements?<query pairs>`.
+    SubmitWithQuery {
+        /// Stable, caller-rendered submit query parameters in wire order.
+        query: Vec<(&'static str, String)>,
+    },
     /// `POST /api/v2/statements?requestId=...&retry=true`.
     SubmitRetry {
         /// Stable idempotency request id.
@@ -1012,7 +1054,9 @@ impl TransportRoute {
     #[must_use]
     pub const fn kind(&self) -> TransportRouteKind {
         match self {
-            Self::Submit | Self::SubmitRetry { .. } => TransportRouteKind::Submit,
+            Self::Submit | Self::SubmitWithQuery { .. } | Self::SubmitRetry { .. } => {
+                TransportRouteKind::Submit
+            }
             Self::Poll { .. } => TransportRouteKind::Poll,
             Self::Partition { .. } => TransportRouteKind::Partition,
             Self::Cancel { .. } => TransportRouteKind::Cancel,
@@ -1021,8 +1065,14 @@ impl TransportRoute {
 
     /// Whether this submit has the Snowflake idempotent resubmit contract.
     #[must_use]
-    pub const fn has_retry_contract(&self) -> bool {
-        matches!(self, Self::SubmitRetry { .. })
+    pub fn has_retry_contract(&self) -> bool {
+        match self {
+            Self::SubmitRetry { .. } => true,
+            Self::SubmitWithQuery { query } => submit_query_has_retry_contract(query),
+            Self::Submit | Self::Poll { .. } | Self::Partition { .. } | Self::Cancel { .. } => {
+                false
+            }
+        }
     }
 
     /// Path and query for the SQL API route.
@@ -1030,6 +1080,7 @@ impl TransportRoute {
     pub fn path_and_query(&self) -> String {
         match self {
             Self::Submit => SQL_API_STATEMENTS_PATH.to_owned(),
+            Self::SubmitWithQuery { query } => render_submit_query(query),
             Self::SubmitRetry { request_id } => {
                 format!(
                     "{SQL_API_STATEMENTS_PATH}?requestId={}&retry=true",
@@ -1050,6 +1101,30 @@ impl TransportRoute {
             }
         }
     }
+}
+
+fn render_submit_query(query: &[(&'static str, String)]) -> String {
+    if query.is_empty() {
+        return SQL_API_STATEMENTS_PATH.to_owned();
+    }
+
+    let mut rendered = String::from(SQL_API_STATEMENTS_PATH);
+    for (index, (key, value)) in query.iter().enumerate() {
+        rendered.push(if index == 0 { '?' } else { '&' });
+        rendered.push_str(key);
+        rendered.push('=');
+        rendered.push_str(value);
+    }
+    rendered
+}
+
+fn submit_query_has_retry_contract(query: &[(&'static str, String)]) -> bool {
+    query
+        .iter()
+        .any(|(key, value)| *key == "requestId" && !value.is_empty())
+        && query
+            .iter()
+            .any(|(key, value)| *key == "retry" && value == "true")
 }
 
 /// Coarse transport route kind.
@@ -1089,7 +1164,7 @@ impl TransportRouteKind {
 }
 
 /// Fully planned wire request.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WireRequest {
     /// HTTP method.
     pub method: Method,
@@ -1101,6 +1176,18 @@ pub struct WireRequest {
     pub headers: Vec<Header>,
     /// Request body bytes.
     pub body: Vec<u8>,
+}
+
+impl fmt::Debug for WireRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WireRequest")
+            .field("method", &self.method)
+            .field("url", &self.url)
+            .field("route", &self.route)
+            .field("headers", &self.headers)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 /// Status classification for Snowflake SQL API responses.
@@ -1334,12 +1421,11 @@ fn route_allows_automatic_retry(route: &TransportRoute) -> bool {
     // Snowflake warns that ambiguous resubmission of a statement can execute
     // the SQL twice. Automatic submit retry is allowed only when the URL carries
     // the documented requestId + retry=true contract recorded above.
-    matches!(
-        route,
-        TransportRoute::SubmitRetry { .. }
-            | TransportRoute::Poll { .. }
-            | TransportRoute::Partition { .. }
-    )
+    route.has_retry_contract()
+        || matches!(
+            route,
+            TransportRoute::Poll { .. } | TransportRoute::Partition { .. }
+        )
 }
 
 fn cancel_reason_or(cx: &Cx, fallback: fn() -> CancelReason) -> CancelReason {
@@ -1531,6 +1617,9 @@ impl From<SubmitHttpRequest> for PlannedTransportRequest {
     fn from(value: SubmitHttpRequest) -> Self {
         let request_id = match &value.route {
             TransportRoute::SubmitRetry { request_id } => Some(request_id.clone()),
+            TransportRoute::SubmitWithQuery { query } => query
+                .iter()
+                .find_map(|(key, value)| (*key == "requestId").then(|| RequestId::new(value))),
             TransportRoute::Submit
             | TransportRoute::Poll { .. }
             | TransportRoute::Partition { .. }
@@ -1758,9 +1847,13 @@ mod tests {
     }
 
     fn auth() -> AuthorizationDescriptor {
+        auth_with_token("secret-token")
+    }
+
+    fn auth_with_token(token: &str) -> AuthorizationDescriptor {
         AuthorizationDescriptor::bearer(
             SnowflakeAuthTokenType::ProgrammaticAccessToken,
-            "secret-token",
+            token,
             "sha256:abc123",
         )
     }
@@ -1812,6 +1905,42 @@ mod tests {
                 .iter()
                 .any(|h| { h.name == HEADER_TOKEN_TYPE && h.value == "PROGRAMMATIC_ACCESS_TOKEN" })
         );
+    }
+
+    #[test]
+    fn wire_request_and_header_debug_redact_authorization_bearer() {
+        let token = "sfpat_http_debug_secret_123";
+        let client = SnowflakeHttpClient::new(
+            TransportConfig::new(endpoint()),
+            AsupersyncHttpClient::new(),
+        );
+        let request = SubmitHttpRequest {
+            route: TransportRoute::Submit,
+            auth: auth_with_token(token),
+            body: b"{}".to_vec(),
+            retry_resubmit: false,
+        };
+        let plan = client.submit_plan(&request).expect("submit plan");
+        let authorization = plan
+            .headers
+            .iter()
+            .find(|header| header.name == HEADER_AUTHORIZATION)
+            .expect("authorization header");
+
+        assert_eq!(authorization.value, format!("Bearer {token}"));
+
+        for rendered in [
+            format!("{authorization:?}"),
+            format!("{:?}", plan.headers),
+            format!("{plan:?}"),
+            serde_json::to_string(authorization).expect("header json"),
+        ] {
+            assert!(
+                !rendered.contains(token),
+                "diagnostic surface leaked bearer token: {rendered}"
+            );
+            assert!(rendered.contains(REDACTION_PLACEHOLDER));
+        }
     }
 
     #[test]
