@@ -12,12 +12,17 @@ use std::borrow::Cow;
 
 /// Known secret-shape prefixes (longest-prefix detection). Extend here only.
 pub const SECRET_PREFIXES: &[&str] = &[
-    "eyJ",    // JWT / base64url JSON header
-    "AKIA",   // AWS access key id
-    "ASIA",   // AWS temporary access key id
-    "ghp_",   // GitHub personal access token
-    "gho_",   // GitHub OAuth token
+    "-----BEGIN PRIVATE KEY-----",
+    "-----BEGIN RSA PRIVATE KEY-----",
+    "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+    "eyJ",  // JWT / base64url JSON header
+    "AKIA", // AWS access key id
+    "ASIA", // AWS temporary access key id
+    "ghp_", // GitHub personal access token
+    "gho_", // GitHub OAuth token
     "github_pat_",
+    "pat_",
+    "sfpat_",
     "sk-",    // OpenAI-style secret key
     "xoxb-",  // Slack bot token
     "xoxp-",  // Slack user token
@@ -65,7 +70,16 @@ fn secret_spans(input: &str) -> Vec<(usize, usize)> {
         let at_boundary = idx == 0 || !continues_token_left(chars[idx - 1].1);
         if at_boundary {
             let rest = &input[byte_start..];
-            if SECRET_PREFIXES.iter().any(|p| rest.starts_with(*p)) {
+            if let Some(prefix) = longest_secret_prefix(rest) {
+                if is_pem_private_key_prefix(prefix) {
+                    let byte_end = pem_private_key_end(input, byte_start);
+                    spans.push((byte_start, byte_end));
+                    idx = chars
+                        .iter()
+                        .position(|(byte_index, _)| *byte_index >= byte_end)
+                        .unwrap_or(chars.len());
+                    continue;
+                }
                 let mut end = idx;
                 while end < chars.len() && is_token_char(chars[end].1) {
                     end += 1;
@@ -83,6 +97,16 @@ fn secret_spans(input: &str) -> Vec<(usize, usize)> {
         idx += 1;
     }
     spans
+}
+
+/// The longest known secret prefix at the start of `input`.
+#[must_use]
+pub fn longest_secret_prefix(input: &str) -> Option<&'static str> {
+    SECRET_PREFIXES
+        .iter()
+        .copied()
+        .filter(|prefix| input.starts_with(prefix))
+        .max_by_key(|prefix| prefix.len())
 }
 
 /// Whether `input` contains a secret-shaped token.
@@ -112,6 +136,43 @@ pub fn redact(input: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// Redact exact account identifiers when a caller requested account redaction.
+///
+/// Secrets are still handled by [`redact`]; this helper is intentionally exact
+/// match for account identifiers supplied by the caller, because account strings
+/// are not always sensitive and should only be removed on request.
+#[must_use]
+pub fn redact_with_account(input: &str, account_identifiers: &[&str]) -> String {
+    let mut output = input.to_owned();
+    let mut accounts = account_identifiers
+        .iter()
+        .copied()
+        .filter(|account| !account.trim().is_empty())
+        .collect::<Vec<_>>();
+    accounts.sort_by_key(|account| std::cmp::Reverse(account.len()));
+    for account in accounts {
+        output = output.replace(account, REDACTION_PLACEHOLDER);
+    }
+    output
+}
+
+fn is_pem_private_key_prefix(prefix: &str) -> bool {
+    prefix.starts_with("-----BEGIN ") && prefix.contains("PRIVATE KEY")
+}
+
+fn pem_private_key_end(input: &str, byte_start: usize) -> usize {
+    let rest = &input[byte_start..];
+    if let Some(end_marker) = rest.find("-----END ") {
+        let after_end = &rest[end_marker..];
+        if let Some(line_end) = after_end.find('\n') {
+            return byte_start + end_marker + line_end;
+        }
+        return input.len();
+    }
+    rest.find('\n')
+        .map_or(input.len(), |line_end| byte_start + line_end)
+}
+
 /// Whether `field_name` is credential-shaped per [`CREDENTIAL_FIELD_SUFFIXES`].
 #[must_use]
 pub fn is_credential_field(field_name: &str) -> bool {
@@ -127,7 +188,16 @@ mod tests {
 
     #[test]
     fn needle_list_has_expected_prefixes() {
-        for needle in ["eyJ", "AKIA", "ghp_", "sk-", "xoxb-", "glpat-", "AIza"] {
+        for needle in [
+            "-----BEGIN PRIVATE KEY-----",
+            "eyJ",
+            "AKIA",
+            "ghp_",
+            "sk-",
+            "xoxb-",
+            "glpat-",
+            "AIza",
+        ] {
             assert!(SECRET_PREFIXES.contains(&needle), "missing needle {needle}");
         }
         assert!(!SECRET_PREFIXES.is_empty());
@@ -166,6 +236,39 @@ mod tests {
         assert!(!out.contains("AKIAEXAMPLE0001"));
         assert!(!out.contains("ghp_abcdEFGH0001"));
         assert_eq!(out.matches(REDACTION_PLACEHOLDER).count(), 2);
+    }
+
+    #[test]
+    fn every_secret_prefix_redacts_in_header_and_query_param_forms() {
+        for prefix in SECRET_PREFIXES {
+            let suffix = if prefix.chars().any(char::is_whitespace) {
+                "\nabc123\n-----END PRIVATE KEY-----"
+            } else {
+                "ABCdef0123"
+            };
+            let header = format!("Authorization: Bearer {prefix}{suffix}");
+            let query = format!("?token={prefix}{suffix}");
+            for sample in [header, query] {
+                let out = redact(&sample);
+                assert!(
+                    out.contains(REDACTION_PLACEHOLDER),
+                    "prefix {prefix} not redacted in {sample:?}"
+                );
+                assert!(
+                    !contains_secret(out.as_ref()),
+                    "redacted output still contains secret prefix {prefix}: {out}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn account_redaction_is_opt_in_and_exact() {
+        let input = "xy12345.us-east-1 and xy12345";
+        assert_eq!(
+            redact_with_account(input, &["xy12345.us-east-1"]),
+            "[REDACTED] and xy12345"
+        );
     }
 
     #[test]

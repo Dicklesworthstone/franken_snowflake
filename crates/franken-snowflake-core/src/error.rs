@@ -38,6 +38,10 @@ pub enum SnowflakeErrorCode {
     RequireLiveRefused,
     /// A result exceeded the row cap without `--export`/`--max-rows`.
     RowCapExceeded,
+    /// A statement/result safety bound was exceeded.
+    SafetyLimitExceeded,
+    /// Warehouse policy refused the requested warehouse.
+    WarehouseRefused,
     /// An upstream Snowflake SQL API error.
     UpstreamError,
     /// A statement failed upstream (422 / SQL error).
@@ -94,6 +98,8 @@ impl SnowflakeErrorCode {
         Self::MultiStatementRefused,
         Self::RequireLiveRefused,
         Self::RowCapExceeded,
+        Self::SafetyLimitExceeded,
+        Self::WarehouseRefused,
         Self::UpstreamError,
         Self::StatementFailed,
         Self::StatementTimeout,
@@ -209,6 +215,26 @@ impl SnowflakeErrorCode {
                 summary: "Result exceeded the row cap; use export or raise the cap.",
                 safe_next_commands: &["franken-snowflake query run --profile <profile> --sql <sql> --max-rows <n> --json"],
                 repair_commands: &["franken-snowflake export --profile <profile> --sql <sql>"],
+            },
+            Self::SafetyLimitExceeded => ErrorEntry {
+                code: self,
+                stable_code: "FSNOW-3005",
+                exit_code: ExitCode::SafetyRefusal,
+                retryable: false,
+                policy_boundary: true,
+                summary: "Statement or result safety bound exceeded.",
+                safe_next_commands: &["franken-snowflake query plan --profile <profile> --sql <sql> --json"],
+                repair_commands: &["franken-snowflake query plan --profile <profile> --sql <bounded-sql> --json"],
+            },
+            Self::WarehouseRefused => ErrorEntry {
+                code: self,
+                stable_code: "FSNOW-3006",
+                exit_code: ExitCode::SafetyRefusal,
+                retryable: false,
+                policy_boundary: true,
+                summary: "Warehouse guardrail refused the requested warehouse.",
+                safe_next_commands: &["franken-snowflake profile validate <profile> --json"],
+                repair_commands: &["franken-snowflake profile doctor <profile> --json"],
             },
             Self::UpstreamError => ErrorEntry {
                 code: self,
@@ -340,10 +366,7 @@ impl SnowflakeErrorCode {
     /// Resolve a code from its stable wire string.
     #[must_use]
     pub fn from_stable_code(code: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|c| c.stable_code() == code)
+        Self::ALL.iter().copied().find(|c| c.stable_code() == code)
     }
 }
 
@@ -391,7 +414,11 @@ impl SnowflakeError {
                 .iter()
                 .map(|s| (*s).to_owned())
                 .collect(),
-            repair_commands: entry.repair_commands.iter().map(|s| (*s).to_owned()).collect(),
+            repair_commands: entry
+                .repair_commands
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
         }
     }
 

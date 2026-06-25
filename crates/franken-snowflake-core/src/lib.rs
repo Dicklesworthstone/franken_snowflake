@@ -20,6 +20,8 @@
 //! - [`exit`] — the process [`exit::ExitCode`] dictionary.
 //! - [`redact`] — the single shared secret-needle list and the composable
 //!   redactor (so the redactor and the last-mile output scanner cannot drift).
+//! - [`guardrails`] — fail-closed rights, read-only mutation refusal, provenance,
+//!   redaction, canary scanning, and enforceable/advisory query cost limits.
 //! - [`envelope`] — the deterministic, versioned JSON envelope metadata.
 //!
 //! See `docs/agent_cli_contract.md` (envelope + exit codes),
@@ -42,6 +44,7 @@ pub mod capabilities;
 pub mod envelope;
 pub mod error;
 pub mod exit;
+pub mod guardrails;
 pub mod ids;
 pub mod outcome;
 pub mod redact;
@@ -58,6 +61,10 @@ pub mod prelude {
     pub use crate::envelope::{BudgetConsumed, EnvelopeMeta, SCHEMA_VERSION};
     pub use crate::error::{SnowflakeError, SnowflakeErrorCode};
     pub use crate::exit::ExitCode;
+    pub use crate::guardrails::{
+        BoundedQueryPlan, CostVector, MutationPolicy, QueryPlanGuard, QuerySafetyLimits,
+        RightsClass, RightsEntitlement,
+    };
     pub use crate::ids::{
         AccountIdentifier, DatabaseName, DatasetId, ProfileName, QueryId, ReceiptHash, RequestId,
         RoleName, SchemaName, StatementHandle, WarehouseName,
