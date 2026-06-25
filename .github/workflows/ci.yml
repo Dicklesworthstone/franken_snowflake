@@ -25,7 +25,10 @@ jobs:
           cargo --version --verbose
 
       - name: Cargo check
-        run: cargo check --locked
+        run: cargo check --workspace --locked
+
+      - name: Workspace lint policy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Assert single Asupersync version
         run: scripts/check-asupersync-single-version.sh
