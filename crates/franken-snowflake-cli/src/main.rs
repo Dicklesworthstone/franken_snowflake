@@ -647,11 +647,42 @@ fn parse_profile(args: &[String], output: OutputFormat) -> Result<Command, Outco
 fn parse_catalog(args: &[String], output: OutputFormat) -> Result<Command, Outcome> {
     match args.get(1).map(String::as_str) {
         Some("scan") => match args.get(2) {
-            Some(profile) => Ok(Command::CatalogScan {
-                profile: profile.clone(),
-                database: value_after(args, "--database"),
-                schema: value_after(args, "--schema"),
-            }),
+            Some(profile) => {
+                let database = value_after(args, "--database");
+                let schema = value_after(args, "--schema");
+                if database.is_none() {
+                    return Err(usage_error(
+                        output,
+                        "catalog.scan",
+                        "fsnow.catalog.scan.v1",
+                        "Missing --database for `catalog scan`.",
+                        vec![
+                            "franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json"
+                                .to_string(),
+                        ],
+                        vec![],
+                    ));
+                }
+                if schema.is_none() {
+                    return Err(usage_error(
+                        output,
+                        "catalog.scan",
+                        "fsnow.catalog.scan.v1",
+                        "Missing --schema for `catalog scan`.",
+                        vec![
+                            "franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json"
+                                .to_string(),
+                        ],
+                        vec![],
+                    ));
+                }
+
+                Ok(Command::CatalogScan {
+                    profile: profile.clone(),
+                    database,
+                    schema,
+                })
+            }
             None => Err(usage_error(
                 output,
                 "catalog.scan",
@@ -1818,6 +1849,17 @@ fn query_plan_outcome(
     profile: Option<String>,
     sql: Option<String>,
 ) -> Outcome {
+    if profile.is_none() {
+        return usage_error(
+            format,
+            "query.plan",
+            "fsnow.query.plan.v1",
+            "Missing --profile for `query plan`.",
+            vec!["franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string()],
+            vec![],
+        );
+    }
+
     let Some(sql_text) = sql else {
         return usage_error(
             format,
@@ -1896,6 +1938,17 @@ fn query_run_outcome(
     profile: Option<String>,
     sql: Option<String>,
 ) -> Outcome {
+    if profile.is_none() {
+        return usage_error(
+            format,
+            "query.run",
+            "fsnow.query.run.v1",
+            "Missing --profile for `query run`.",
+            vec!["franken-snowflake query run --profile <profile> --sql <sql> --json".to_string()],
+            vec![],
+        );
+    }
+
     let Some(sql_text) = sql else {
         return usage_error(
             format,
@@ -2580,6 +2633,44 @@ mod tests {
         };
         assert!(rendered.contains("\"command_id\":\"query.run\""));
         assert!(rendered.contains("sql_accepted_by_local_safety_check"));
+    }
+
+    #[test]
+    fn query_plan_requires_profile() {
+        let outcome = execute(vec![
+            "query".to_string(),
+            "plan".to_string(),
+            "--sql".to_string(),
+            "select 1".to_string(),
+        ]);
+        assert_eq!(outcome.status.code(), 64);
+        let rendered = match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("Missing --profile for `query plan`."));
+        assert!(rendered.contains("franken-snowflake query plan --profile"));
+    }
+
+    #[test]
+    fn catalog_scan_requires_database_and_schema() {
+        let outcome = execute(vec![
+            "catalog".to_string(),
+            "scan".to_string(),
+            "demo".to_string(),
+            "--database".to_string(),
+            "ANALYTICS".to_string(),
+        ]);
+        assert_eq!(outcome.status.code(), 64);
+        let rendered = match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("Missing --schema for `catalog scan`."));
+        assert!(
+            rendered.contains("catalog scan &lt;profile&gt;")
+                || rendered.contains("catalog scan <profile>")
+        );
     }
 
     #[test]
