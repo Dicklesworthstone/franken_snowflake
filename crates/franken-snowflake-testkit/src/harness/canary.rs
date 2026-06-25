@@ -408,4 +408,15 @@ mod tests {
         assert!(rendered.contains("stdout"));
         Ok(())
     }
+
+    #[test]
+    fn fully_clean_channels_pass_assert_clean() -> Result<(), Box<dyn std::error::Error>> {
+        // Negative case: even with a canary armed and shape scanning on, output
+        // that contains no planted sentinel and no secret shape is clean.
+        let guard = CanaryGuard::with_default_canary();
+        let report = guard.scan("clean stdout output", "clean stderr output", &[])?;
+        assert!(!report.leaked());
+        report.assert_clean()?;
+        Ok(())
+    }
 }

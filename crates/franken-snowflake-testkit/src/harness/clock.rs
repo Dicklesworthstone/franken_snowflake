@@ -326,4 +326,23 @@ mod tests {
             assert!(delay <= high, "attempt {attempt}: {delay:?} > {high:?}");
         }
     }
+
+    #[test]
+    fn manual_clock_is_deterministic_and_monotonic_under_identical_advances() {
+        let run = || {
+            let clock = ManualClock::new();
+            let mut samples = Vec::new();
+            for step in [10_u64, 5, 0, 100] {
+                clock.advance(Duration::from_millis(step));
+                samples.push(clock.now());
+            }
+            samples
+        };
+        // Determinism: identical advance sequences yield identical timelines.
+        assert_eq!(run(), run());
+        // Monotonicity: time never goes backwards (a zero advance holds steady).
+        for pair in run().windows(2) {
+            assert!(pair[1] >= pair[0]);
+        }
+    }
 }

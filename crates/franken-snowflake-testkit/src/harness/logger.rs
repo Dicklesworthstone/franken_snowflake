@@ -424,4 +424,76 @@ mod tests {
         fs::remove_dir_all(&root)?;
         Ok(())
     }
+
+    #[test]
+    fn step_outcome_serializes_to_stable_snake_case() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(serde_json::to_string(&StepOutcome::Pass)?, "\"pass\"");
+        assert_eq!(serde_json::to_string(&StepOutcome::Fail)?, "\"fail\"");
+        assert_eq!(serde_json::to_string(&StepOutcome::Skip)?, "\"skip\"");
+        assert_eq!(serde_json::to_string(&StepOutcome::Info)?, "\"info\"");
+        Ok(())
+    }
+
+    #[test]
+    fn pass_event_schema_is_stable() -> Result<(), Box<dyn std::error::Error>> {
+        // Pin the JSON-line wire shape: a passing step carries exactly the
+        // mandatory key set and omits the failure-only fields.
+        let event = StepEvent {
+            schema_version: LOG_SCHEMA_VERSION,
+            trace_id: "t".to_owned(),
+            command_id: "c".to_owned(),
+            seq: 1,
+            step: "s".to_owned(),
+            outcome: StepOutcome::Pass,
+            elapsed_ms: 0,
+            detail: None,
+            expected: None,
+            actual: None,
+        };
+        let value = serde_json::to_value(&event)?;
+        let object = value.as_object().ok_or("event must serialize to an object")?;
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "command_id",
+                "elapsed_ms",
+                "outcome",
+                "schema_version",
+                "seq",
+                "step",
+                "trace_id",
+            ]
+        );
+        assert_eq!(
+            object.get("schema_version").and_then(serde_json::Value::as_u64),
+            Some(u64::from(LOG_SCHEMA_VERSION))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failure_event_schema_adds_expected_and_actual() -> Result<(), Box<dyn std::error::Error>> {
+        let event = StepEvent {
+            schema_version: LOG_SCHEMA_VERSION,
+            trace_id: "t".to_owned(),
+            command_id: "c".to_owned(),
+            seq: 2,
+            step: "s".to_owned(),
+            outcome: StepOutcome::Fail,
+            elapsed_ms: 0,
+            detail: None,
+            expected: Some("200".to_owned()),
+            actual: Some("202".to_owned()),
+        };
+        let value = serde_json::to_value(&event)?;
+        let object = value.as_object().ok_or("event must serialize to an object")?;
+        assert_eq!(object.get("outcome").and_then(serde_json::Value::as_str), Some("fail"));
+        assert_eq!(object.get("expected").and_then(serde_json::Value::as_str), Some("200"));
+        assert_eq!(object.get("actual").and_then(serde_json::Value::as_str), Some("202"));
+        // detail stays absent when not set.
+        assert!(!object.contains_key("detail"));
+        Ok(())
+    }
 }

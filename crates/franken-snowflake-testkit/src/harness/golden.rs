@@ -756,4 +756,18 @@ mod tests {
         check_golden_file(path, &fresh, &cfg)?;
         Ok(())
     }
+
+    #[test]
+    fn canonical_json_is_deterministic_and_idempotent() {
+        let cfg = GoldenConfig::default();
+        // Same logical value, different key-insertion orders, plus a volatile id.
+        let a = json!({ "z": 1, "a": 2, "m": { "q": 1, "b": 2 }, "trace_id": "x" });
+        let b = json!({ "a": 2, "trace_id": "y", "m": { "b": 2, "q": 1 }, "z": 1 });
+        // Determinism: order-independent, byte-identical output.
+        assert_eq!(to_canonical_json(&a, &cfg), to_canonical_json(&b, &cfg));
+        // Idempotence: canonicalizing an already-canonical value is a no-op.
+        let once = canonicalize(&a, &cfg);
+        let twice = canonicalize(&once, &cfg);
+        assert_eq!(once, twice);
+    }
 }
