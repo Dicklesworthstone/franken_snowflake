@@ -22,12 +22,15 @@
 //!   redactor (so the redactor and the last-mile output scanner cannot drift).
 //! - [`guardrails`] — fail-closed rights, read-only mutation refusal, provenance,
 //!   redaction, canary scanning, and enforceable/advisory query cost limits.
+//! - [`write_intent`] — non-executing deferred write ladder types, dry-run
+//!   planning receipts, exact confirmation tokens, and append-only audit gates.
 //! - [`envelope`] — the deterministic, versioned JSON envelope metadata.
 //! - [`adapter`] — public downstream extension points and optional
 //!   `adapter-fixtures` contract tests.
 //!
 //! See `docs/agent_cli_contract.md` (envelope + exit codes),
-//! `docs/security_model.md` (redaction + fail-closed rights), and
+//! `docs/security_model.md` (redaction + fail-closed rights),
+//! `docs/write_intent_ladder.md` (future mutation ladder), and
 //! `docs/asupersync_leverage.md` (the Budget/Outcome/capability control plane)
 //! for the normative contracts these types implement.
 //!
@@ -51,6 +54,7 @@ pub mod guardrails;
 pub mod ids;
 pub mod outcome;
 pub mod redact;
+pub mod write_intent;
 
 /// Crate version string, surfaced in the `capabilities` / `agent-handbook`
 /// envelopes once those commands exist.
@@ -77,4 +81,10 @@ pub mod prelude {
         RoleName, SchemaName, StatementHandle, WarehouseName,
     };
     pub use crate::outcome::{DataSource, OutcomeKind, SnowflakeOutcome, SnowflakeOutcomeExt};
+    pub use crate::write_intent::{
+        AppendOnlyAuditIntent, ConfirmationToken, StatementAllowlistEntry, WriteIntentDecision,
+        WriteIntentMode, WriteIntentPlan, WriteIntentPolicy, WriteIntentReceipt,
+        WriteIntentRefusal, WriteIntentRefusalCode, WriteIntentRequest, WriteIntentStage,
+        WriteSafetyClass, WriteStatementKind,
+    };
 }
