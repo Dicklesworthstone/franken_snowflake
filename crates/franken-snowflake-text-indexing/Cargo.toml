@@ -24,5 +24,5 @@ frankensearch = { version = "0.3.2", default-features = false, features = ["hash
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-asupersync = { workspace = true }
+asupersync = { workspace = true, features = ["test-internals"] }
 tempfile = "3"

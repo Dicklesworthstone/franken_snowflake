@@ -404,6 +404,8 @@ pub struct TextIndexEvent {
     pub schema_version: u16,
     /// Event kind.
     pub kind: TextIndexEventKind,
+    /// Whether this event belongs to live, fixture, or offline data.
+    pub data_source: TextIndexDataSource,
     /// Active feature surface.
     pub features: TextIndexingFeatureReport,
     /// Source kind if the event belongs to one source.
@@ -421,12 +423,25 @@ impl TextIndexEvent {
         Self {
             schema_version: TEXT_INDEX_SCHEMA_VERSION,
             kind,
+            data_source: TextIndexDataSource::Offline,
             features: TextIndexingFeatureReport::current(),
             source_kind: None,
             item_count: 0,
             rights_class: None,
         }
     }
+}
+
+/// Data provenance class for structured text-indexing events.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextIndexDataSource {
+    /// Live Snowflake-derived data.
+    Live,
+    /// Deterministic fixture data.
+    Fixture,
+    /// Local/offline data with no live Snowflake contact.
+    Offline,
 }
 
 /// Structured text indexing event vocabulary.
@@ -466,7 +481,8 @@ pub mod frankensearch_adapter {
 
     use frankensearch::{
         Cx, Embedder, EmbedderStack, HashEmbedder, IndexBuildStats, IndexBuilder, ScoredResult,
-        SearchResult, TantivyIndex, TwoTierConfig, TwoTierIndex, TwoTierMetrics, TwoTierSearcher,
+        SearchError, SearchResult, TantivyIndex, TwoTierConfig, TwoTierIndex, TwoTierMetrics,
+        TwoTierSearcher,
     };
 
     use super::TextChunk;
@@ -482,6 +498,11 @@ pub mod frankensearch_adapter {
         let stack = EmbedderStack::from_parts(fast, Some(quality));
         let mut builder = IndexBuilder::new(index_dir.as_ref()).with_embedder_stack(stack);
         for chunk in chunks {
+            chunk.validate().map_err(|err| SearchError::InvalidConfig {
+                field: "chunks.text".to_owned(),
+                value: chunk.handle.to_string(),
+                reason: err.to_string(),
+            })?;
             builder = match &chunk.title {
                 Some(title) => builder.add_document_with_title(
                     chunk.handle.as_str(),
@@ -585,6 +606,12 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn structured_events_include_data_source() {
+        let event = TextIndexEvent::new(TextIndexEventKind::IndexBuildStarted);
+        assert_eq!(event.data_source, TextIndexDataSource::Offline);
+    }
+
     #[cfg(feature = "frankensearch")]
     #[test]
     fn frankensearch_fixture_docs_build_and_query() {
@@ -622,6 +649,33 @@ mod tests {
                     .as_ref()
                     .is_ok_and(|(results, _)| !results.is_empty())
             );
+        });
+    }
+
+    #[cfg(feature = "frankensearch")]
+    #[test]
+    fn frankensearch_builder_refuses_empty_chunks() {
+        use crate::frankensearch_adapter::build_hash_lexical_index;
+
+        let Ok(dir) = tempfile::tempdir() else {
+            assert!(false, "temp dir should be available");
+            return;
+        };
+        let index_path = dir.path().to_path_buf();
+        let chunks = vec![TextChunk::new(
+            query_source(),
+            "notes",
+            0,
+            " ",
+            RightsClass::Internal,
+        )];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let build = build_hash_lexical_index(&cx, &index_path, &chunks).await;
+            assert!(matches!(
+                build,
+                Err(frankensearch::SearchError::InvalidConfig { .. })
+            ));
         });
     }
 }
