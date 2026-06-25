@@ -22,6 +22,7 @@
 //! `fsnow-native-snowflake-connector-w0i.2` (JWT signer) and
 //! `fsnow-auth-foundations-kdw` (PAT/OAuth + signer integration).
 
+use std::env;
 use std::error::Error;
 use std::fmt;
 
@@ -44,6 +45,12 @@ pub const SNOWFLAKE_AUTHORIZATION_TOKEN_TYPE_HEADER: &str = "X-Snowflake-Authori
 /// Token-type value Snowflake expects for key-pair JWT auth.
 pub const KEYPAIR_JWT_TOKEN_TYPE: &str = "KEYPAIR_JWT";
 
+/// Token-type value Snowflake expects for programmatic access tokens.
+pub const PROGRAMMATIC_ACCESS_TOKEN_TYPE: &str = "PROGRAMMATIC_ACCESS_TOKEN";
+
+/// Token-type value Snowflake expects for OAuth bearer tokens.
+pub const OAUTH_TOKEN_TYPE: &str = "OAUTH";
+
 /// Standard bearer authorization header.
 pub const AUTHORIZATION_HEADER: &str = "Authorization";
 
@@ -53,6 +60,18 @@ pub const MAX_JWT_VALIDITY_SECONDS: u64 = 3_600;
 /// Refresh a cached JWT this many seconds before expiry by default.
 pub const DEFAULT_REFRESH_BEFORE_EXPIRY_SECONDS: u64 = 60;
 
+/// Snowflake PATs default to 15-day expiry unless policy says otherwise.
+pub const PAT_DEFAULT_VALIDITY_SECONDS: u64 = 15 * 24 * 60 * 60;
+
+/// Snowflake caps PAT expiry policy at 365 days.
+pub const PAT_MAX_VALIDITY_SECONDS: u64 = 365 * 24 * 60 * 60;
+
+/// Snowflake OAuth access tokens are typically short lived.
+pub const OAUTH_EXPECTED_VALIDITY_SECONDS: u64 = 10 * 60;
+
+/// Structured auth log schema version.
+pub const AUTH_LOG_SCHEMA_VERSION: u16 = 1;
+
 const REDACTED: &str = "[REDACTED]";
 
 /// Errors emitted by secret-safe auth construction.
@@ -60,6 +79,11 @@ const REDACTED: &str = "[REDACTED]";
 pub enum AuthError {
     EmptyAccount,
     EmptyUser,
+    EmptySecretSource { source_kind: &'static str },
+    EmptySecretValue,
+    MissingEnvVar { name: String, next_command: String },
+    UnsupportedSecretProvider { handle: String },
+    UnsupportedAuthLane { lane: AuthLane },
     InvalidPrivateKey { reason: String },
     InvalidPublicKey { reason: String },
     RsaKeyTooSmall { bits: usize },
@@ -72,6 +96,25 @@ impl fmt::Display for AuthError {
         match self {
             Self::EmptyAccount => f.write_str("Snowflake account identifier is empty"),
             Self::EmptyUser => f.write_str("Snowflake user is empty"),
+            Self::EmptySecretSource { source_kind } => {
+                write!(f, "{source_kind} secret source is empty")
+            }
+            Self::EmptySecretValue => f.write_str("resolved credential value is empty"),
+            Self::MissingEnvVar { name, next_command } => {
+                write!(
+                    f,
+                    "required credential environment variable {name} is not set; next command: {next_command}"
+                )
+            }
+            Self::UnsupportedSecretProvider { handle } => {
+                write!(
+                    f,
+                    "secret provider handle {handle} is not supported by this resolver"
+                )
+            }
+            Self::UnsupportedAuthLane { lane } => {
+                write!(f, "auth lane {lane} is not implemented yet")
+            }
             Self::InvalidPrivateKey { reason } => {
                 write!(f, "invalid RSA private key material: {reason}")
             }
@@ -94,27 +137,329 @@ impl fmt::Display for AuthError {
 
 impl Error for AuthError {}
 
-/// Snowflake JWT claim set for key-pair auth.
-///
-/// `iss` intentionally includes the public-key fingerprint while `sub` does
-/// not. Snowflake requires both ACCOUNT and USER to be uppercase, and accounts
-/// containing dots are normalized with dots replaced by dashes.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct SnowflakeJwtClaims {
-    pub iss: String,
-    pub sub: String,
-    pub iat: i64,
-    pub exp: i64,
+/// Supported Snowflake auth lanes.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthLane {
+    ProgrammaticAccessToken,
+    KeyPairJwt,
+    OAuthBearer,
+    WorkloadIdentityFederation,
 }
 
-/// Redacted auth headers for a signed key-pair JWT.
+impl fmt::Display for AuthLane {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProgrammaticAccessToken => f.write_str("programmatic_access_token"),
+            Self::KeyPairJwt => f.write_str("key_pair_jwt"),
+            Self::OAuthBearer => f.write_str("oauth_bearer"),
+            Self::WorkloadIdentityFederation => f.write_str("workload_identity_federation"),
+        }
+    }
+}
+
+/// Kind of non-secret pointer used to retrieve credential material.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretSourceKind {
+    EnvVar,
+    SecretProvider,
+}
+
+/// Profile-safe pointer to credential material.
+///
+/// This never stores the secret value. Environment variable names are accepted
+/// while deserializing profiles, but skipped in serialized diagnostics so JSON
+/// output only carries opaque credential handles.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SecretSource {
+    EnvVar {
+        #[serde(skip_serializing)]
+        name: String,
+    },
+    SecretProvider {
+        handle: String,
+    },
+}
+
+impl SecretSource {
+    pub fn env_var(name: impl Into<String>) -> Result<Self, AuthError> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(AuthError::EmptySecretSource {
+                source_kind: "environment variable",
+            });
+        }
+        Ok(Self::EnvVar { name })
+    }
+
+    pub fn secret_provider(handle: impl Into<String>) -> Result<Self, AuthError> {
+        let handle = handle.into();
+        if handle.trim().is_empty() {
+            return Err(AuthError::EmptySecretSource {
+                source_kind: "secret provider",
+            });
+        }
+        Ok(Self::SecretProvider { handle })
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> SecretSourceKind {
+        match self {
+            Self::EnvVar { .. } => SecretSourceKind::EnvVar,
+            Self::SecretProvider { .. } => SecretSourceKind::SecretProvider,
+        }
+    }
+
+    #[must_use]
+    pub fn credential_handle(&self) -> String {
+        match self {
+            Self::EnvVar { name } => opaque_credential_handle("env", name),
+            Self::SecretProvider { handle } => opaque_credential_handle("provider", handle),
+        }
+    }
+
+    pub fn probe_offline<R: SecretResolver>(&self, resolver: &R) -> SecretSourceStatus {
+        match self {
+            Self::EnvVar { name } => {
+                let presence = if resolver.env_var_present(name) {
+                    SecretPresence::Present
+                } else {
+                    SecretPresence::Missing
+                };
+                SecretSourceStatus {
+                    source_kind: SecretSourceKind::EnvVar,
+                    credential_handle: self.credential_handle(),
+                    presence,
+                }
+            }
+            Self::SecretProvider { .. } => SecretSourceStatus {
+                source_kind: SecretSourceKind::SecretProvider,
+                credential_handle: self.credential_handle(),
+                presence: SecretPresence::UnknownExternal,
+            },
+        }
+    }
+
+    pub fn resolve<R: SecretResolver>(&self, resolver: &R) -> Result<SecretValue, AuthError> {
+        match self {
+            Self::EnvVar { name } => resolver.read_env_secret(name),
+            Self::SecretProvider { handle } => resolver.read_provider_secret(handle),
+        }
+    }
+}
+
+impl fmt::Debug for SecretSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretSource")
+            .field("kind", &self.kind())
+            .field("credential_handle", &self.credential_handle())
+            .finish()
+    }
+}
+
+impl fmt::Display for SecretSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.credential_handle())
+    }
+}
+
+/// Presence-only secret source status for offline profile validation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretPresence {
+    Present,
+    Missing,
+    UnknownExternal,
+}
+
+/// Redacted, serializable source status for profile validation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SecretSourceStatus {
+    pub source_kind: SecretSourceKind,
+    pub credential_handle: String,
+    pub presence: SecretPresence,
+}
+
+/// Runtime secret value. Formatting and JSON serialization always redact.
 #[derive(Clone, Eq, PartialEq)]
-pub struct KeyPairJwtHeaders {
+pub struct SecretValue {
+    value: String,
+}
+
+impl SecretValue {
+    pub fn new(value: impl Into<String>) -> Result<Self, AuthError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(AuthError::EmptySecretValue);
+        }
+        Ok(Self { value })
+    }
+
+    fn expose_secret(&self) -> &str {
+        &self.value
+    }
+}
+
+impl fmt::Debug for SecretValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(REDACTED)
+    }
+}
+
+impl fmt::Display for SecretValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(REDACTED)
+    }
+}
+
+impl Serialize for SecretValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(REDACTED)
+    }
+}
+
+/// Secret lookup abstraction used by profile validation and live resolution.
+pub trait SecretResolver {
+    fn env_var_present(&self, name: &str) -> bool;
+    fn read_env_secret(&self, name: &str) -> Result<SecretValue, AuthError>;
+    fn read_provider_secret(&self, handle: &str) -> Result<SecretValue, AuthError>;
+}
+
+/// Process environment resolver for live auth material resolution.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProcessSecretResolver;
+
+impl SecretResolver for ProcessSecretResolver {
+    fn env_var_present(&self, name: &str) -> bool {
+        env::var_os(name).is_some()
+    }
+
+    fn read_env_secret(&self, name: &str) -> Result<SecretValue, AuthError> {
+        let value = env::var(name).map_err(|_| AuthError::MissingEnvVar {
+            name: name.to_string(),
+            next_command: export_env_next_command(name),
+        })?;
+        SecretValue::new(value)
+    }
+
+    fn read_provider_secret(&self, handle: &str) -> Result<SecretValue, AuthError> {
+        Err(AuthError::UnsupportedSecretProvider {
+            handle: handle.to_string(),
+        })
+    }
+}
+
+/// Credential lifetime metadata surfaced to doctor-style diagnostics.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CredentialLifetime {
+    pub lane: AuthLane,
+    pub issued_at_unix_seconds: Option<i64>,
+    pub expires_at_unix_seconds: Option<i64>,
+    pub expected_validity_seconds: Option<u64>,
+    pub max_validity_seconds: Option<u64>,
+    pub refresh_before_expiry_seconds: Option<u64>,
+}
+
+impl CredentialLifetime {
+    #[must_use]
+    pub fn seconds_until_expiry(&self, now_unix_seconds: i64) -> Option<i64> {
+        self.expires_at_unix_seconds
+            .map(|expires_at| expires_at.saturating_sub(now_unix_seconds))
+    }
+
+    #[must_use]
+    pub fn doctor_warning_at(&self, now_unix_seconds: i64) -> Option<CredentialLifetimeWarning> {
+        if self.lane == AuthLane::KeyPairJwt {
+            let requested = self.expected_validity_seconds?;
+            let max = self.max_validity_seconds?;
+            return (requested > max).then(|| CredentialLifetimeWarning {
+                lane: self.lane,
+                message: format!("key-pair JWT requested validity exceeds Snowflake's {max}s cap"),
+            });
+        }
+
+        let remaining = self.seconds_until_expiry(now_unix_seconds)?;
+        match self.lane {
+            AuthLane::ProgrammaticAccessToken if remaining <= 2 * 24 * 60 * 60 => {
+                Some(CredentialLifetimeWarning {
+                    lane: self.lane,
+                    message: format!(
+                        "programmatic access token expires in {} day(s)",
+                        ceil_div_i64(remaining.max(0), 24 * 60 * 60)
+                    ),
+                })
+            }
+            AuthLane::OAuthBearer if remaining <= 2 * 60 => Some(CredentialLifetimeWarning {
+                lane: self.lane,
+                message: format!(
+                    "OAuth access token expires in {} minute(s); refresh before long polling",
+                    ceil_div_i64(remaining.max(0), 60)
+                ),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Non-secret doctor warning derived from lifetime metadata.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CredentialLifetimeWarning {
+    pub lane: AuthLane,
+    pub message: String,
+}
+
+/// Structured auth event suitable for JSON-line logs.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AuthLogLine {
+    pub schema_version: u16,
+    pub event: String,
+    pub lane: AuthLane,
+    pub credential_handle: Option<String>,
+    pub message: String,
+    pub lifetime: Option<CredentialLifetime>,
+}
+
+impl AuthLogLine {
+    #[must_use]
+    pub fn new(
+        event: impl Into<String>,
+        lane: AuthLane,
+        credential_handle: Option<String>,
+        message: impl Into<String>,
+        lifetime: Option<CredentialLifetime>,
+    ) -> Self {
+        Self {
+            schema_version: AUTH_LOG_SCHEMA_VERSION,
+            event: event.into(),
+            lane,
+            credential_handle,
+            message: message.into(),
+            lifetime,
+        }
+    }
+}
+
+/// Common auth headers for all bearer lanes.
+#[derive(Clone, Eq, PartialEq)]
+pub struct AuthHeaders {
     authorization: String,
     token_type: &'static str,
 }
 
-impl KeyPairJwtHeaders {
+impl AuthHeaders {
+    #[must_use]
+    pub fn bearer(token: &str, token_type: &'static str) -> Self {
+        Self {
+            authorization: format!("Bearer {token}"),
+            token_type,
+        }
+    }
+
     #[must_use]
     pub fn authorization_header_name(&self) -> &'static str {
         AUTHORIZATION_HEADER
@@ -136,25 +481,41 @@ impl KeyPairJwtHeaders {
     }
 }
 
-impl fmt::Debug for KeyPairJwtHeaders {
+impl fmt::Debug for AuthHeaders {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("KeyPairJwtHeaders")
+        f.debug_struct("AuthHeaders")
             .field("authorization", &REDACTED)
             .field("token_type", &self.token_type)
             .finish()
     }
 }
 
-impl Serialize for KeyPairJwtHeaders {
+impl Serialize for AuthHeaders {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("KeyPairJwtHeaders", 2)?;
+        let mut state = serializer.serialize_struct("AuthHeaders", 2)?;
         state.serialize_field(AUTHORIZATION_HEADER, REDACTED)?;
         state.serialize_field(SNOWFLAKE_AUTHORIZATION_TOKEN_TYPE_HEADER, self.token_type)?;
         state.end()
     }
+}
+
+/// Backwards-compatible name from the JWT signer bead.
+pub type KeyPairJwtHeaders = AuthHeaders;
+
+/// Snowflake JWT claim set for key-pair auth.
+///
+/// `iss` intentionally includes the public-key fingerprint while `sub` does
+/// not. Snowflake requires both ACCOUNT and USER to be uppercase, and accounts
+/// containing dots are normalized with dots replaced by dashes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SnowflakeJwtClaims {
+    pub iss: String,
+    pub sub: String,
+    pub iat: i64,
+    pub exp: i64,
 }
 
 /// Signed Snowflake key-pair JWT plus non-secret metadata.
@@ -180,10 +541,7 @@ impl SignedKeyPairJwt {
 
     #[must_use]
     pub fn headers(&self) -> KeyPairJwtHeaders {
-        KeyPairJwtHeaders {
-            authorization: self.bearer_authorization_value(),
-            token_type: KEYPAIR_JWT_TOKEN_TYPE,
-        }
+        AuthHeaders::bearer(self.token(), KEYPAIR_JWT_TOKEN_TYPE)
     }
 }
 
@@ -476,6 +834,532 @@ impl fmt::Debug for KeyPairJwtRefreshSession {
     }
 }
 
+/// Profile auth descriptor. This is safe to deserialize from configuration.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AuthProfile {
+    Pat {
+        source: SecretSource,
+        issued_at_unix_seconds: Option<i64>,
+        expires_at_unix_seconds: Option<i64>,
+    },
+    KeyPairJwt {
+        private_key_source: SecretSource,
+        private_key_passphrase_source: Option<SecretSource>,
+        requested_validity_seconds: u64,
+    },
+    OAuthBearer {
+        source: SecretSource,
+        issued_at_unix_seconds: Option<i64>,
+        expires_at_unix_seconds: Option<i64>,
+    },
+    WorkloadIdentityFederation {
+        provider: String,
+    },
+}
+
+impl AuthProfile {
+    #[must_use]
+    pub fn pat(source: SecretSource) -> Self {
+        Self::Pat {
+            source,
+            issued_at_unix_seconds: None,
+            expires_at_unix_seconds: None,
+        }
+    }
+
+    #[must_use]
+    pub fn key_pair_jwt(
+        private_key_source: SecretSource,
+        private_key_passphrase_source: Option<SecretSource>,
+        requested_validity_seconds: u64,
+    ) -> Self {
+        Self::KeyPairJwt {
+            private_key_source,
+            private_key_passphrase_source,
+            requested_validity_seconds,
+        }
+    }
+
+    #[must_use]
+    pub fn oauth_bearer(source: SecretSource) -> Self {
+        Self::OAuthBearer {
+            source,
+            issued_at_unix_seconds: None,
+            expires_at_unix_seconds: None,
+        }
+    }
+
+    #[must_use]
+    pub fn lane(&self) -> AuthLane {
+        match self {
+            Self::Pat { .. } => AuthLane::ProgrammaticAccessToken,
+            Self::KeyPairJwt { .. } => AuthLane::KeyPairJwt,
+            Self::OAuthBearer { .. } => AuthLane::OAuthBearer,
+            Self::WorkloadIdentityFederation { .. } => AuthLane::WorkloadIdentityFederation,
+        }
+    }
+
+    #[must_use]
+    pub fn validate_offline<R: SecretResolver>(&self, resolver: &R) -> Vec<SecretSourceStatus> {
+        match self {
+            Self::Pat { source, .. } | Self::OAuthBearer { source, .. } => {
+                vec![source.probe_offline(resolver)]
+            }
+            Self::KeyPairJwt {
+                private_key_source,
+                private_key_passphrase_source,
+                ..
+            } => {
+                let mut statuses = vec![private_key_source.probe_offline(resolver)];
+                if let Some(source) = private_key_passphrase_source {
+                    statuses.push(source.probe_offline(resolver));
+                }
+                statuses
+            }
+            Self::WorkloadIdentityFederation { .. } => Vec::new(),
+        }
+    }
+
+    pub fn resolve<R: SecretResolver>(
+        &self,
+        resolver: &R,
+        account: &str,
+        user: &str,
+    ) -> Result<AuthMechanism, AuthError> {
+        match self {
+            Self::Pat {
+                source,
+                issued_at_unix_seconds,
+                expires_at_unix_seconds,
+            } => ProgrammaticAccessTokenAuth::from_source(
+                source,
+                resolver,
+                *issued_at_unix_seconds,
+                *expires_at_unix_seconds,
+            )
+            .map(AuthMechanism::ProgrammaticAccessToken),
+            Self::KeyPairJwt {
+                private_key_source,
+                private_key_passphrase_source,
+                requested_validity_seconds,
+            } => KeyPairJwtAuth::from_sources(
+                account,
+                user,
+                private_key_source,
+                private_key_passphrase_source.as_ref(),
+                *requested_validity_seconds,
+                resolver,
+            )
+            .map(AuthMechanism::KeyPairJwt),
+            Self::OAuthBearer {
+                source,
+                issued_at_unix_seconds,
+                expires_at_unix_seconds,
+            } => OAuthBearerAuth::from_source(
+                source,
+                resolver,
+                *issued_at_unix_seconds,
+                *expires_at_unix_seconds,
+            )
+            .map(AuthMechanism::OAuthBearer),
+            Self::WorkloadIdentityFederation { .. } => Err(AuthError::UnsupportedAuthLane {
+                lane: AuthLane::WorkloadIdentityFederation,
+            }),
+        }
+    }
+}
+
+impl fmt::Debug for AuthProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pat {
+                source,
+                issued_at_unix_seconds,
+                expires_at_unix_seconds,
+            } => f
+                .debug_struct("AuthProfile::Pat")
+                .field("source", source)
+                .field("issued_at_unix_seconds", issued_at_unix_seconds)
+                .field("expires_at_unix_seconds", expires_at_unix_seconds)
+                .finish(),
+            Self::KeyPairJwt {
+                private_key_source,
+                private_key_passphrase_source,
+                requested_validity_seconds,
+            } => f
+                .debug_struct("AuthProfile::KeyPairJwt")
+                .field("private_key_source", private_key_source)
+                .field(
+                    "private_key_passphrase_source",
+                    private_key_passphrase_source,
+                )
+                .field("requested_validity_seconds", requested_validity_seconds)
+                .finish(),
+            Self::OAuthBearer {
+                source,
+                issued_at_unix_seconds,
+                expires_at_unix_seconds,
+            } => f
+                .debug_struct("AuthProfile::OAuthBearer")
+                .field("source", source)
+                .field("issued_at_unix_seconds", issued_at_unix_seconds)
+                .field("expires_at_unix_seconds", expires_at_unix_seconds)
+                .finish(),
+            Self::WorkloadIdentityFederation { provider } => f
+                .debug_struct("AuthProfile::WorkloadIdentityFederation")
+                .field("provider", provider)
+                .finish(),
+        }
+    }
+}
+
+/// Re-auth policy decision after a mid-poll 401.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum ReauthDecision {
+    NotRequired,
+    ReauthRequired {
+        lane: AuthLane,
+        credential_handle: Option<String>,
+        reason: String,
+    },
+    ResignJwt {
+        reason: String,
+    },
+}
+
+/// Common interface consumed by SQL API transport and statement polling code.
+pub trait SnowflakeAuth {
+    fn lane(&self) -> AuthLane;
+    fn credential_handle(&self) -> Option<&str>;
+    fn headers_at(&mut self, now_unix_seconds: i64) -> Result<AuthHeaders, AuthError>;
+    fn lifetime(&self) -> CredentialLifetime;
+
+    fn on_unauthorized_mid_poll(&mut self, _now_unix_seconds: i64) -> ReauthDecision {
+        ReauthDecision::NotRequired
+    }
+
+    fn log_line(&self, event: &str, message: &str) -> AuthLogLine {
+        AuthLogLine::new(
+            event,
+            self.lane(),
+            self.credential_handle().map(str::to_string),
+            message,
+            Some(self.lifetime()),
+        )
+    }
+}
+
+/// Resolved auth mechanism. Runtime credentials are redacted in all formatting.
+pub enum AuthMechanism {
+    ProgrammaticAccessToken(ProgrammaticAccessTokenAuth),
+    KeyPairJwt(KeyPairJwtAuth),
+    OAuthBearer(OAuthBearerAuth),
+}
+
+impl SnowflakeAuth for AuthMechanism {
+    fn lane(&self) -> AuthLane {
+        match self {
+            Self::ProgrammaticAccessToken(auth) => auth.lane(),
+            Self::KeyPairJwt(auth) => auth.lane(),
+            Self::OAuthBearer(auth) => auth.lane(),
+        }
+    }
+
+    fn credential_handle(&self) -> Option<&str> {
+        match self {
+            Self::ProgrammaticAccessToken(auth) => auth.credential_handle(),
+            Self::KeyPairJwt(auth) => auth.credential_handle(),
+            Self::OAuthBearer(auth) => auth.credential_handle(),
+        }
+    }
+
+    fn headers_at(&mut self, now_unix_seconds: i64) -> Result<AuthHeaders, AuthError> {
+        match self {
+            Self::ProgrammaticAccessToken(auth) => auth.headers_at(now_unix_seconds),
+            Self::KeyPairJwt(auth) => auth.headers_at(now_unix_seconds),
+            Self::OAuthBearer(auth) => auth.headers_at(now_unix_seconds),
+        }
+    }
+
+    fn lifetime(&self) -> CredentialLifetime {
+        match self {
+            Self::ProgrammaticAccessToken(auth) => auth.lifetime(),
+            Self::KeyPairJwt(auth) => auth.lifetime(),
+            Self::OAuthBearer(auth) => auth.lifetime(),
+        }
+    }
+
+    fn on_unauthorized_mid_poll(&mut self, now_unix_seconds: i64) -> ReauthDecision {
+        match self {
+            Self::ProgrammaticAccessToken(auth) => auth.on_unauthorized_mid_poll(now_unix_seconds),
+            Self::KeyPairJwt(auth) => auth.on_unauthorized_mid_poll(now_unix_seconds),
+            Self::OAuthBearer(auth) => auth.on_unauthorized_mid_poll(now_unix_seconds),
+        }
+    }
+}
+
+impl fmt::Debug for AuthMechanism {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProgrammaticAccessToken(auth) => f
+                .debug_tuple("AuthMechanism::ProgrammaticAccessToken")
+                .field(auth)
+                .finish(),
+            Self::KeyPairJwt(auth) => f
+                .debug_tuple("AuthMechanism::KeyPairJwt")
+                .field(auth)
+                .finish(),
+            Self::OAuthBearer(auth) => f
+                .debug_tuple("AuthMechanism::OAuthBearer")
+                .field(auth)
+                .finish(),
+        }
+    }
+}
+
+/// Runtime PAT authenticator.
+#[derive(Clone)]
+pub struct ProgrammaticAccessTokenAuth {
+    credential: SecretValue,
+    credential_handle: Option<String>,
+    lifetime: CredentialLifetime,
+}
+
+impl ProgrammaticAccessTokenAuth {
+    pub fn from_bearer_token(
+        token: impl Into<String>,
+        issued_at_unix_seconds: Option<i64>,
+        expires_at_unix_seconds: Option<i64>,
+    ) -> Result<Self, AuthError> {
+        Ok(Self {
+            credential: SecretValue::new(token)?,
+            credential_handle: None,
+            lifetime: pat_lifetime(issued_at_unix_seconds, expires_at_unix_seconds),
+        })
+    }
+
+    pub fn from_source<R: SecretResolver>(
+        source: &SecretSource,
+        resolver: &R,
+        issued_at_unix_seconds: Option<i64>,
+        expires_at_unix_seconds: Option<i64>,
+    ) -> Result<Self, AuthError> {
+        Ok(Self {
+            credential: source.resolve(resolver)?,
+            credential_handle: Some(source.credential_handle()),
+            lifetime: pat_lifetime(issued_at_unix_seconds, expires_at_unix_seconds),
+        })
+    }
+}
+
+impl SnowflakeAuth for ProgrammaticAccessTokenAuth {
+    fn lane(&self) -> AuthLane {
+        AuthLane::ProgrammaticAccessToken
+    }
+
+    fn credential_handle(&self) -> Option<&str> {
+        self.credential_handle.as_deref()
+    }
+
+    fn headers_at(&mut self, _now_unix_seconds: i64) -> Result<AuthHeaders, AuthError> {
+        Ok(AuthHeaders::bearer(
+            self.credential.expose_secret(),
+            PROGRAMMATIC_ACCESS_TOKEN_TYPE,
+        ))
+    }
+
+    fn lifetime(&self) -> CredentialLifetime {
+        self.lifetime.clone()
+    }
+}
+
+impl fmt::Debug for ProgrammaticAccessTokenAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProgrammaticAccessTokenAuth")
+            .field("credential", &REDACTED)
+            .field("credential_handle", &self.credential_handle)
+            .field("lifetime", &self.lifetime)
+            .finish()
+    }
+}
+
+impl fmt::Display for ProgrammaticAccessTokenAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProgrammaticAccessTokenAuth([REDACTED])")
+    }
+}
+
+/// Runtime OAuth bearer authenticator.
+#[derive(Clone)]
+pub struct OAuthBearerAuth {
+    credential: SecretValue,
+    credential_handle: Option<String>,
+    lifetime: CredentialLifetime,
+}
+
+impl OAuthBearerAuth {
+    pub fn from_bearer_token(
+        token: impl Into<String>,
+        issued_at_unix_seconds: Option<i64>,
+        expires_at_unix_seconds: Option<i64>,
+    ) -> Result<Self, AuthError> {
+        Ok(Self {
+            credential: SecretValue::new(token)?,
+            credential_handle: None,
+            lifetime: oauth_lifetime(issued_at_unix_seconds, expires_at_unix_seconds),
+        })
+    }
+
+    pub fn from_source<R: SecretResolver>(
+        source: &SecretSource,
+        resolver: &R,
+        issued_at_unix_seconds: Option<i64>,
+        expires_at_unix_seconds: Option<i64>,
+    ) -> Result<Self, AuthError> {
+        Ok(Self {
+            credential: source.resolve(resolver)?,
+            credential_handle: Some(source.credential_handle()),
+            lifetime: oauth_lifetime(issued_at_unix_seconds, expires_at_unix_seconds),
+        })
+    }
+}
+
+impl SnowflakeAuth for OAuthBearerAuth {
+    fn lane(&self) -> AuthLane {
+        AuthLane::OAuthBearer
+    }
+
+    fn credential_handle(&self) -> Option<&str> {
+        self.credential_handle.as_deref()
+    }
+
+    fn headers_at(&mut self, _now_unix_seconds: i64) -> Result<AuthHeaders, AuthError> {
+        Ok(AuthHeaders::bearer(
+            self.credential.expose_secret(),
+            OAUTH_TOKEN_TYPE,
+        ))
+    }
+
+    fn lifetime(&self) -> CredentialLifetime {
+        self.lifetime.clone()
+    }
+
+    fn on_unauthorized_mid_poll(&mut self, _now_unix_seconds: i64) -> ReauthDecision {
+        ReauthDecision::ReauthRequired {
+            lane: AuthLane::OAuthBearer,
+            credential_handle: self.credential_handle.clone(),
+            reason: "OAuth bearer returned 401 while polling; refresh the access token and retry the poll".to_string(),
+        }
+    }
+}
+
+impl fmt::Debug for OAuthBearerAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthBearerAuth")
+            .field("credential", &REDACTED)
+            .field("credential_handle", &self.credential_handle)
+            .field("lifetime", &self.lifetime)
+            .finish()
+    }
+}
+
+impl fmt::Display for OAuthBearerAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OAuthBearerAuth([REDACTED])")
+    }
+}
+
+/// Runtime key-pair JWT authenticator backed by the RS256 signer.
+#[derive(Clone)]
+pub struct KeyPairJwtAuth {
+    session: KeyPairJwtRefreshSession,
+    requested_validity_seconds: u64,
+    credential_handle: Option<String>,
+}
+
+impl KeyPairJwtAuth {
+    #[must_use]
+    pub fn from_signer(signer: KeyPairJwtSigner, requested_validity_seconds: u64) -> Self {
+        Self {
+            session: signer.refresh_session(requested_validity_seconds),
+            requested_validity_seconds,
+            credential_handle: None,
+        }
+    }
+
+    pub fn from_sources<R: SecretResolver>(
+        account: &str,
+        user: &str,
+        private_key_source: &SecretSource,
+        private_key_passphrase_source: Option<&SecretSource>,
+        requested_validity_seconds: u64,
+        resolver: &R,
+    ) -> Result<Self, AuthError> {
+        let private_key = private_key_source.resolve(resolver)?;
+        let passphrase = private_key_passphrase_source
+            .map(|source| source.resolve(resolver))
+            .transpose()?;
+        let signer = KeyPairJwtSigner::from_pkcs8_pem(
+            account,
+            user,
+            private_key.expose_secret(),
+            passphrase.as_ref().map(SecretValue::expose_secret),
+        )?;
+        Ok(Self {
+            session: signer.refresh_session(requested_validity_seconds),
+            requested_validity_seconds,
+            credential_handle: Some(private_key_source.credential_handle()),
+        })
+    }
+}
+
+impl SnowflakeAuth for KeyPairJwtAuth {
+    fn lane(&self) -> AuthLane {
+        AuthLane::KeyPairJwt
+    }
+
+    fn credential_handle(&self) -> Option<&str> {
+        self.credential_handle.as_deref()
+    }
+
+    fn headers_at(&mut self, now_unix_seconds: i64) -> Result<AuthHeaders, AuthError> {
+        Ok(self.session.token_for_poll_at(now_unix_seconds)?.headers())
+    }
+
+    fn lifetime(&self) -> CredentialLifetime {
+        CredentialLifetime {
+            lane: AuthLane::KeyPairJwt,
+            issued_at_unix_seconds: None,
+            expires_at_unix_seconds: None,
+            expected_validity_seconds: Some(self.requested_validity_seconds),
+            max_validity_seconds: Some(MAX_JWT_VALIDITY_SECONDS),
+            refresh_before_expiry_seconds: Some(DEFAULT_REFRESH_BEFORE_EXPIRY_SECONDS),
+        }
+    }
+
+    fn on_unauthorized_mid_poll(&mut self, _now_unix_seconds: i64) -> ReauthDecision {
+        ReauthDecision::ResignJwt {
+            reason: "key-pair JWT returned 401 while polling; re-sign before retrying the poll"
+                .to_string(),
+        }
+    }
+}
+
+impl fmt::Debug for KeyPairJwtAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeyPairJwtAuth")
+            .field("session", &self.session)
+            .field(
+                "requested_validity_seconds",
+                &self.requested_validity_seconds,
+            )
+            .field("credential_handle", &self.credential_handle)
+            .finish()
+    }
+}
+
 /// Normalize a Snowflake account identifier for JWT `iss` / `sub` values.
 pub fn normalize_account_for_jwt(account: &str) -> Result<String, AuthError> {
     let normalized = account.trim().to_ascii_uppercase().replace('.', "-");
@@ -502,8 +1386,61 @@ pub fn public_key_fingerprint_from_der(public_key_der: &[u8]) -> String {
     format!("SHA256:{}", BASE64_STANDARD.encode(digest))
 }
 
+fn pat_lifetime(
+    issued_at_unix_seconds: Option<i64>,
+    expires_at_unix_seconds: Option<i64>,
+) -> CredentialLifetime {
+    CredentialLifetime {
+        lane: AuthLane::ProgrammaticAccessToken,
+        issued_at_unix_seconds,
+        expires_at_unix_seconds,
+        expected_validity_seconds: Some(PAT_DEFAULT_VALIDITY_SECONDS),
+        max_validity_seconds: Some(PAT_MAX_VALIDITY_SECONDS),
+        refresh_before_expiry_seconds: None,
+    }
+}
+
+fn oauth_lifetime(
+    issued_at_unix_seconds: Option<i64>,
+    expires_at_unix_seconds: Option<i64>,
+) -> CredentialLifetime {
+    CredentialLifetime {
+        lane: AuthLane::OAuthBearer,
+        issued_at_unix_seconds,
+        expires_at_unix_seconds,
+        expected_validity_seconds: Some(OAUTH_EXPECTED_VALIDITY_SECONDS),
+        max_validity_seconds: None,
+        refresh_before_expiry_seconds: Some(60),
+    }
+}
+
+fn opaque_credential_handle(prefix: &str, value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    let suffix: String = BASE64_STANDARD
+        .encode(digest)
+        .chars()
+        .filter(|candidate| candidate.is_ascii_alphanumeric())
+        .take(12)
+        .collect();
+    format!("cred_{prefix}_{suffix}")
+}
+
+fn export_env_next_command(name: &str) -> String {
+    format!("export {name}=<redacted>")
+}
+
+fn ceil_div_i64(value: i64, divisor: i64) -> i64 {
+    if value <= 0 {
+        0
+    } else {
+        (value + divisor - 1) / divisor
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
     use rand::rngs::OsRng;
     use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
@@ -559,6 +1496,61 @@ dQIDAQAB
         )?)
     }
 
+    struct FakeResolver {
+        env_name: String,
+        env_value: Option<String>,
+        presence_checks: Cell<usize>,
+        read_checks: Cell<usize>,
+    }
+
+    impl FakeResolver {
+        fn with_env(name: &str, value: &str) -> Self {
+            Self {
+                env_name: name.to_string(),
+                env_value: Some(value.to_string()),
+                presence_checks: Cell::new(0),
+                read_checks: Cell::new(0),
+            }
+        }
+
+        fn missing(name: &str) -> Self {
+            Self {
+                env_name: name.to_string(),
+                env_value: None,
+                presence_checks: Cell::new(0),
+                read_checks: Cell::new(0),
+            }
+        }
+    }
+
+    impl SecretResolver for FakeResolver {
+        fn env_var_present(&self, name: &str) -> bool {
+            self.presence_checks
+                .set(self.presence_checks.get().saturating_add(1));
+            name == self.env_name && self.env_value.is_some()
+        }
+
+        fn read_env_secret(&self, name: &str) -> Result<SecretValue, AuthError> {
+            self.read_checks
+                .set(self.read_checks.get().saturating_add(1));
+            if name == self.env_name {
+                if let Some(value) = &self.env_value {
+                    return SecretValue::new(value.clone());
+                }
+            }
+            Err(AuthError::MissingEnvVar {
+                name: name.to_string(),
+                next_command: export_env_next_command(name),
+            })
+        }
+
+        fn read_provider_secret(&self, handle: &str) -> Result<SecretValue, AuthError> {
+            Err(AuthError::UnsupportedSecretProvider {
+                handle: handle.to_string(),
+            })
+        }
+    }
+
     #[test]
     fn normalizes_account_and_user_for_snowflake_claims() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -567,6 +1559,96 @@ dQIDAQAB
             "XY12345-US-EAST-1"
         );
         assert_eq!(normalize_user_for_jwt("svc_user")?, "SVC_USER");
+        Ok(())
+    }
+
+    #[test]
+    fn pat_auth_constructs_bearer_headers_with_pat_token_type(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut auth = ProgrammaticAccessTokenAuth::from_bearer_token(
+            "pat-secret-value",
+            Some(1_800_000_000),
+            Some(1_800_000_000 + PAT_DEFAULT_VALIDITY_SECONDS as i64),
+        )?;
+        let headers = auth.headers_at(1_800_000_000)?;
+
+        assert_eq!(headers.authorization_header_name(), AUTHORIZATION_HEADER);
+        assert_eq!(headers.authorization_value(), "Bearer pat-secret-value");
+        assert_eq!(
+            headers.token_type_header_name(),
+            SNOWFLAKE_AUTHORIZATION_TOKEN_TYPE_HEADER
+        );
+        assert_eq!(headers.token_type_value(), PROGRAMMATIC_ACCESS_TOKEN_TYPE);
+        assert!(!format!("{headers:?}").contains("pat-secret-value"));
+        assert!(!serde_json::to_string(&headers)?.contains("pat-secret-value"));
+        Ok(())
+    }
+
+    #[test]
+    fn oauth_auth_constructs_bearer_headers_with_oauth_token_type(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut auth = OAuthBearerAuth::from_bearer_token(
+            "oauth-secret-value",
+            Some(1_800_000_000),
+            Some(1_800_000_000 + OAUTH_EXPECTED_VALIDITY_SECONDS as i64),
+        )?;
+        let headers = auth.headers_at(1_800_000_000)?;
+
+        assert_eq!(headers.authorization_value(), "Bearer oauth-secret-value");
+        assert_eq!(headers.token_type_value(), OAUTH_TOKEN_TYPE);
+        assert!(!format!("{headers:?}").contains("oauth-secret-value"));
+        assert!(!serde_json::to_string(&headers)?.contains("oauth-secret-value"));
+        Ok(())
+    }
+
+    #[test]
+    fn profile_env_source_probes_presence_without_reading_secret(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let resolver = FakeResolver::with_env("SNOWFLAKE_PAT", "pat-secret-value");
+        let source = SecretSource::env_var("SNOWFLAKE_PAT")?;
+        let profile = AuthProfile::pat(source);
+        let statuses = profile.validate_offline(&resolver);
+        let json = serde_json::to_string(&profile)?;
+
+        assert_eq!(resolver.presence_checks.get(), 1);
+        assert_eq!(resolver.read_checks.get(), 0);
+        assert_eq!(statuses[0].presence, SecretPresence::Present);
+        assert!(!json.contains("SNOWFLAKE_PAT"));
+        assert!(!json.contains("pat-secret-value"));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_env_var_teaches_exact_next_command_without_secret(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let resolver = FakeResolver::missing("SNOWFLAKE_PAT");
+        let source = SecretSource::env_var("SNOWFLAKE_PAT")?;
+        let error = match source.resolve(&resolver) {
+            Ok(_) => return Err("missing env var unexpectedly resolved".into()),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+
+        assert!(message.contains("export SNOWFLAKE_PAT=<redacted>"));
+        assert!(!message.contains("pat-secret-value"));
+        Ok(())
+    }
+
+    #[test]
+    fn auth_profile_resolves_pat_from_source() -> Result<(), Box<dyn std::error::Error>> {
+        let resolver = FakeResolver::with_env("SNOWFLAKE_PAT", "pat-secret-value");
+        let profile = AuthProfile::Pat {
+            source: SecretSource::env_var("SNOWFLAKE_PAT")?,
+            issued_at_unix_seconds: Some(1_800_000_000),
+            expires_at_unix_seconds: Some(1_800_000_000 + PAT_DEFAULT_VALIDITY_SECONDS as i64),
+        };
+        let mut auth = profile.resolve(&resolver, "org.account", "svc_user")?;
+        let headers = auth.headers_at(1_800_000_000)?;
+
+        assert_eq!(auth.lane(), AuthLane::ProgrammaticAccessToken);
+        assert_eq!(headers.authorization_value(), "Bearer pat-secret-value");
+        assert_eq!(headers.token_type_value(), PROGRAMMATIC_ACCESS_TOKEN_TYPE);
+        assert_eq!(resolver.read_checks.get(), 1);
         Ok(())
     }
 
@@ -630,6 +1712,72 @@ dQIDAQAB
     }
 
     #[test]
+    fn jwt_signer_is_available_behind_auth_trait() -> Result<(), Box<dyn std::error::Error>> {
+        let mut auth = AuthMechanism::KeyPairJwt(KeyPairJwtAuth::from_signer(
+            signer()?,
+            MAX_JWT_VALIDITY_SECONDS,
+        ));
+        let headers = auth.headers_at(1_800_000_000)?;
+
+        assert_eq!(auth.lane(), AuthLane::KeyPairJwt);
+        assert!(headers.authorization_value().starts_with("Bearer "));
+        assert_eq!(headers.token_type_value(), KEYPAIR_JWT_TOKEN_TYPE);
+        Ok(())
+    }
+
+    #[test]
+    fn lifetime_metadata_surfaces_doctor_warnings() -> Result<(), Box<dyn std::error::Error>> {
+        let pat = ProgrammaticAccessTokenAuth::from_bearer_token(
+            "pat-secret-value",
+            Some(1_800_000_000),
+            Some(1_800_000_000 + 60 * 60),
+        )?;
+        let oauth = OAuthBearerAuth::from_bearer_token(
+            "oauth-secret-value",
+            Some(1_800_000_000),
+            Some(1_800_000_000 + 90),
+        )?;
+        let jwt = KeyPairJwtAuth::from_signer(signer()?, MAX_JWT_VALIDITY_SECONDS + 1);
+
+        assert!(pat
+            .lifetime()
+            .doctor_warning_at(1_800_000_000)
+            .map(|warning| warning.message.contains("expires in"))
+            .unwrap_or(false));
+        assert!(oauth
+            .lifetime()
+            .doctor_warning_at(1_800_000_000)
+            .map(|warning| warning.message.contains("refresh"))
+            .unwrap_or(false));
+        assert!(jwt
+            .lifetime()
+            .doctor_warning_at(1_800_000_000)
+            .map(|warning| warning.message.contains("3600s cap"))
+            .unwrap_or(false));
+        Ok(())
+    }
+
+    #[test]
+    fn oauth_unauthorized_mid_poll_triggers_reauth() -> Result<(), Box<dyn std::error::Error>> {
+        let mut auth = OAuthBearerAuth::from_bearer_token(
+            "oauth-secret-value",
+            Some(1_800_000_000),
+            Some(1_800_000_600),
+        )?;
+        let decision = auth.on_unauthorized_mid_poll(1_800_000_100);
+
+        assert!(matches!(
+            decision,
+            ReauthDecision::ReauthRequired {
+                lane: AuthLane::OAuthBearer,
+                ..
+            }
+        ));
+        assert!(!format!("{decision:?}").contains("oauth-secret-value"));
+        Ok(())
+    }
+
+    #[test]
     fn supports_encrypted_pkcs8_pem_loading() -> Result<(), Box<dyn std::error::Error>> {
         let private_key = RsaPrivateKey::from_pkcs8_pem(TEST_PRIVATE_KEY_PEM)?;
         let encrypted = private_key.to_pkcs8_encrypted_pem(
@@ -667,17 +1815,42 @@ dQIDAQAB
     fn debug_and_json_are_redacted() -> Result<(), Box<dyn std::error::Error>> {
         let signer = signer()?;
         let signed = signer.sign_at(1_800_000_000, 300)?;
+        let mut pat = ProgrammaticAccessTokenAuth::from_bearer_token(
+            "pat-secret-value",
+            Some(1_800_000_000),
+            Some(1_800_000_000 + PAT_DEFAULT_VALIDITY_SECONDS as i64),
+        )?;
+        let oauth = OAuthBearerAuth::from_bearer_token(
+            "oauth-secret-value",
+            Some(1_800_000_000),
+            Some(1_800_000_600),
+        )?;
+        let source = SecretSource::env_var("SNOWFLAKE_PAT")?;
+        let profile = AuthProfile::pat(source);
+        let headers = pat.headers_at(1_800_000_000)?;
+        let log = pat.log_line("auth.headers", "constructed auth headers");
         let signer_debug = format!("{signer:?}");
         let signed_debug = format!("{signed:?}");
+        let pat_debug = format!("{pat:?}");
+        let oauth_display = format!("{oauth}");
         let signed_json = serde_json::to_string(&signed)?;
         let signer_json = serde_json::to_string(&signer)?;
+        let profile_json = serde_json::to_string(&profile)?;
+        let headers_json = serde_json::to_string(&headers)?;
+        let log_json = serde_json::to_string(&log)?;
 
         assert!(!signer_debug.contains("MIIEvg"));
         assert!(!signed_debug.contains(signed.token()));
         assert!(!signed_json.contains(signed.token()));
         assert!(!signer_json.contains("MIIEvg"));
+        assert!(!pat_debug.contains("pat-secret-value"));
+        assert!(!oauth_display.contains("oauth-secret-value"));
+        assert!(!profile_json.contains("SNOWFLAKE_PAT"));
+        assert!(!headers_json.contains("pat-secret-value"));
+        assert!(!log_json.contains("pat-secret-value"));
         assert!(signed_json.contains(REDACTED));
         assert!(signer_json.contains(REDACTED));
+        assert!(headers_json.contains(REDACTED));
         Ok(())
     }
 }
