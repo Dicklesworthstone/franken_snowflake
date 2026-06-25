@@ -427,3 +427,69 @@ impl core::fmt::Display for SnowflakeError {
 }
 
 impl std::error::Error for SnowflakeError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_complete_recovery_paths() {
+        for code in SnowflakeErrorCode::ALL {
+            let entry = code.entry();
+            assert!(!entry.stable_code.is_empty(), "{code:?} stable_code");
+            assert!(!entry.summary.is_empty(), "{code:?} summary");
+            assert!(
+                !entry.safe_next_commands.is_empty(),
+                "{code:?} has no safe_next_commands"
+            );
+            assert!(
+                !entry.repair_commands.is_empty(),
+                "{code:?} has no repair_commands"
+            );
+        }
+    }
+
+    #[test]
+    fn stable_codes_unique_and_roundtrip() {
+        let mut seen = std::collections::BTreeSet::new();
+        for code in SnowflakeErrorCode::ALL {
+            let stable = code.stable_code();
+            assert!(seen.insert(stable), "duplicate stable_code {stable}");
+            assert!(stable.starts_with("FSNOW-"), "{code:?} not FSNOW-prefixed");
+            assert_eq!(SnowflakeErrorCode::from_stable_code(stable), Some(*code));
+        }
+        assert_eq!(seen.len(), SnowflakeErrorCode::ALL.len());
+    }
+
+    #[test]
+    fn error_code_serializes_as_stable_string() -> Result<(), serde_json::Error> {
+        let json = serde_json::to_string(&SnowflakeErrorCode::ProfileNotFound)?;
+        assert_eq!(json, "\"FSNOW-2001\"");
+        let back: SnowflakeErrorCode = serde_json::from_str("\"FSNOW-2001\"")?;
+        assert_eq!(back, SnowflakeErrorCode::ProfileNotFound);
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_stable_code_is_none() {
+        assert_eq!(SnowflakeErrorCode::from_stable_code("FSNOW-0000"), None);
+    }
+
+    #[test]
+    fn new_error_autopopulates_recovery() {
+        let err = SnowflakeError::new(SnowflakeErrorCode::ProfileNotFound, "no such profile");
+        assert!(!err.safe_next_commands.is_empty());
+        assert!(!err.repair_commands.is_empty());
+        assert_eq!(err.exit_code(), ExitCode::CredentialError);
+        assert_eq!(err.stable_code(), "FSNOW-2001");
+        assert!(!err.retryable());
+    }
+
+    #[test]
+    fn policy_boundary_and_retryable_flags() {
+        assert!(SnowflakeErrorCode::MutationRefused.policy_boundary());
+        assert!(!SnowflakeErrorCode::NetworkError.policy_boundary());
+        assert!(SnowflakeErrorCode::NetworkError.retryable());
+        assert!(!SnowflakeErrorCode::ProfileNotFound.retryable());
+    }
+}

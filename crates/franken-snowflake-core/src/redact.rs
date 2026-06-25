@@ -111,3 +111,60 @@ pub fn is_credential_field(field_name: &str) -> bool {
         .iter()
         .any(|suffix| lowered.ends_with(suffix))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn needle_list_has_expected_prefixes() {
+        for needle in ["eyJ", "AKIA", "ghp_", "sk-", "xoxb-", "glpat-", "AIza"] {
+            assert!(SECRET_PREFIXES.contains(&needle), "missing needle {needle}");
+        }
+        assert!(!SECRET_PREFIXES.is_empty());
+    }
+
+    #[test]
+    fn redacts_jwt_shaped_token() {
+        let input = "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig done";
+        let out = redact(input);
+        assert!(out.contains(REDACTION_PLACEHOLDER));
+        assert!(!out.contains("eyJhbGciOiJIUzI1NiJ9"));
+        assert!(out.contains("done"));
+    }
+
+    #[test]
+    fn plain_text_is_borrowed_unchanged() {
+        let input = "this is a basket of plain words";
+        let out = redact(input);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), input);
+        assert!(!contains_secret(input));
+    }
+
+    #[test]
+    fn prefix_only_matches_at_token_boundary() {
+        // "sk-" mid-token in "ask-me" is not a secret boundary.
+        assert!(!contains_secret("please ask-me later"));
+        // At a boundary it is detected.
+        assert!(contains_secret("key=sk-ABCDEF0123456789"));
+    }
+
+    #[test]
+    fn redacts_multiple_secrets() {
+        let input = "a=AKIAEXAMPLE0001 b=ghp_abcdEFGH0001";
+        let out = redact(input);
+        assert!(!out.contains("AKIAEXAMPLE0001"));
+        assert!(!out.contains("ghp_abcdEFGH0001"));
+        assert_eq!(out.matches(REDACTION_PLACEHOLDER).count(), 2);
+    }
+
+    #[test]
+    fn credential_field_detection() {
+        assert!(is_credential_field("snowflake_private_key"));
+        assert!(is_credential_field("SNOWFLAKE_PAT_TOKEN"));
+        assert!(is_credential_field("db_password"));
+        assert!(!is_credential_field("username"));
+        assert!(!is_credential_field("account"));
+    }
+}

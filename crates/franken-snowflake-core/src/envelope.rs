@@ -245,3 +245,70 @@ impl<T: Serialize> Envelope<T> {
         serde_json::to_string(self)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::{SnowflakeError, SnowflakeErrorCode};
+    use crate::outcome::{DataSource, OutcomeKind};
+
+    #[test]
+    fn schema_version_is_pinned() {
+        let meta = EnvelopeMeta::success("capabilities", "capabilities.v1");
+        assert_eq!(meta.schema_version, SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 1);
+    }
+
+    #[test]
+    fn serialization_is_deterministic_and_ordered() -> Result<(), serde_json::Error> {
+        let meta =
+            EnvelopeMeta::success("doctor", "doctor.v1").with_data_source(DataSource::Live);
+        let first = meta.to_json_string()?;
+        let second = meta.to_json_string()?;
+        assert_eq!(first, second, "serialization must be deterministic");
+        // Field order is fixed by struct declaration, so the prefix is stable.
+        assert!(
+            first.starts_with("{\"ok\":true,\"outcome_kind\":\"success\",\"command_id\":\"doctor\""),
+            "unexpected key order: {first}"
+        );
+        assert!(first.contains("\"schema_version\":1"));
+        assert!(first.contains("\"data_source\":\"live\""));
+        Ok(())
+    }
+
+    #[test]
+    fn unspecified_data_source_and_absent_ids_are_omitted() -> Result<(), serde_json::Error> {
+        let json = EnvelopeMeta::success("doctor", "doctor.v1").to_json_string()?;
+        assert!(!json.contains("data_source"));
+        assert!(!json.contains("profile_id"));
+        assert!(!json.contains("request_id"));
+        assert!(!json.contains("statement_handle"));
+        Ok(())
+    }
+
+    #[test]
+    fn error_envelope_carries_error_block() -> Result<(), serde_json::Error> {
+        let err = SnowflakeError::new(SnowflakeErrorCode::ProfileNotFound, "missing");
+        let meta = EnvelopeMeta::error("profile-validate", "profile.v1", err);
+        assert!(!meta.ok);
+        assert_eq!(meta.outcome_kind, OutcomeKind::Error);
+        let json = meta.to_json_string()?;
+        assert!(json.contains("\"ok\":false"));
+        assert!(json.contains("\"code\":\"FSNOW-2001\""));
+        assert!(json.contains("\"retryable\":false"));
+        Ok(())
+    }
+
+    #[test]
+    fn full_envelope_flattens_meta_and_data() -> Result<(), serde_json::Error> {
+        let envelope = Envelope::new(
+            EnvelopeMeta::success("query-run", "rows.v1"),
+            serde_json::json!({ "rows": [] }),
+        );
+        let json = envelope.to_json_string()?;
+        assert!(json.contains("\"schema_version\":1"));
+        assert!(json.contains("\"data\":{"));
+        assert!(json.contains("\"rows\":[]"));
+        Ok(())
+    }
+}

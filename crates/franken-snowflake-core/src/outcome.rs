@@ -107,3 +107,104 @@ impl<T> SnowflakeOutcomeExt for SnowflakeOutcome<T> {
         matches!(self, Outcome::Ok(_))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cancel::{CancelPolicy, cancel_policy};
+    use crate::error::{SnowflakeError, SnowflakeErrorCode};
+    use asupersync::{CancelKind, CancelReason, Outcome, PanicPayload};
+
+    #[test]
+    fn ok_maps_to_success_exit_zero() {
+        let outcome: SnowflakeOutcome<u32> = Outcome::ok(7);
+        assert_eq!(outcome.outcome_kind(), OutcomeKind::Success);
+        assert_eq!(outcome.exit_code(), ExitCode::Success);
+        assert!(outcome.is_success());
+    }
+
+    #[test]
+    fn empty_ok_is_still_success_exit_zero() {
+        // empty result = exit 0, never an error
+        let outcome: SnowflakeOutcome<Vec<u8>> = Outcome::ok(Vec::new());
+        assert_eq!(outcome.outcome_kind(), OutcomeKind::Success);
+        assert_eq!(outcome.exit_code(), ExitCode::Success);
+    }
+
+    #[test]
+    fn err_maps_to_error_and_registry_exit() {
+        let err = SnowflakeError::new(SnowflakeErrorCode::UpstreamError, "boom");
+        let outcome: SnowflakeOutcome<u32> = Outcome::err(err);
+        assert_eq!(outcome.outcome_kind(), OutcomeKind::Error);
+        assert_eq!(outcome.exit_code(), ExitCode::UpstreamError);
+        assert!(!outcome.is_success());
+    }
+
+    #[test]
+    fn deadline_cancel_reads_as_timeout() {
+        let outcome: SnowflakeOutcome<u32> = Outcome::cancelled(CancelReason::deadline());
+        assert_eq!(outcome.outcome_kind(), OutcomeKind::Timeout);
+        assert_eq!(outcome.exit_code(), ExitCode::NetworkBudgetExhausted);
+    }
+
+    #[test]
+    fn cost_budget_cancel_is_distinct_from_timeout() {
+        let outcome: SnowflakeOutcome<u32> = Outcome::cancelled(CancelReason::cost_budget());
+        // distinct outcome_kind ...
+        assert_eq!(outcome.outcome_kind(), OutcomeKind::Cancelled);
+        // ... and distinct exit code vs Deadline/Timeout's NetworkBudgetExhausted.
+        assert_eq!(outcome.exit_code(), ExitCode::SafetyRefusal);
+    }
+
+    #[test]
+    fn user_cancel_is_success_exit() {
+        let outcome: SnowflakeOutcome<u32> = Outcome::cancelled(CancelReason::user("stop"));
+        assert_eq!(outcome.outcome_kind(), OutcomeKind::Cancelled);
+        assert_eq!(outcome.exit_code(), ExitCode::Success);
+    }
+
+    #[test]
+    fn panicked_collapses_to_error() {
+        let outcome: SnowflakeOutcome<u32> = Outcome::panicked(PanicPayload::new("oops"));
+        assert_eq!(outcome.outcome_kind(), OutcomeKind::Error);
+        assert_eq!(outcome.exit_code(), ExitCode::Io);
+    }
+
+    #[test]
+    fn all_four_outcome_states_survive_projection() {
+        let states: [SnowflakeOutcome<u32>; 4] = [
+            Outcome::ok(1),
+            Outcome::err(SnowflakeError::new(SnowflakeErrorCode::Internal, "x")),
+            Outcome::cancelled(CancelReason::shutdown()),
+            Outcome::panicked(PanicPayload::new("x")),
+        ];
+        let kinds: Vec<OutcomeKind> = states.iter().map(|o| o.outcome_kind()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                OutcomeKind::Success,
+                OutcomeKind::Error,
+                OutcomeKind::Cancelled,
+                OutcomeKind::Error,
+            ]
+        );
+    }
+
+    #[test]
+    fn cancel_policy_routes_by_kind() {
+        assert_eq!(cancel_policy(CancelKind::Deadline), CancelPolicy::RetryOrDegrade);
+        assert_eq!(cancel_policy(CancelKind::CostBudget), CancelPolicy::RetryOrDegrade);
+        assert_eq!(cancel_policy(CancelKind::Timeout), CancelPolicy::RetryOrDegrade);
+        assert_eq!(cancel_policy(CancelKind::PollQuota), CancelPolicy::RetryOrDegrade);
+        assert_eq!(
+            cancel_policy(CancelKind::User),
+            CancelPolicy::RemoteCancelAndReceipt
+        );
+        assert_eq!(cancel_policy(CancelKind::Shutdown), CancelPolicy::BoundedDrain);
+        assert_eq!(cancel_policy(CancelKind::RaceLost), CancelPolicy::QuietDrain);
+        assert_eq!(
+            cancel_policy(CancelKind::ParentCancelled),
+            CancelPolicy::QuietDrain
+        );
+    }
+}
