@@ -14,3 +14,14 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# kx6 is pure protocol data + serde + the jsonv2 wire codec: no asupersync, no
+# network. The statement lifecycle / transport beads (ofl, https-ofq) add the
+# runtime later. Reuses core's identifier newtypes and OutcomeKind.
+franken-snowflake-core = { path = "../franken-snowflake-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# The shared golden framework (key-sorted canonical JSON, LF discipline) drives
+# the fixture round-trip proofs without a live account.
+franken-snowflake-testkit = { path = "../franken-snowflake-testkit" }
