@@ -2,11 +2,13 @@
 
 Date: 2026-06-25
 
-Status: prep for bead `fsnow-local-cache-repository-afb`. This document pins the
-first `franken-snowflake-cache` design before the crate exists. The implementation
-must use FrankenSQLite through the `sqlmodel-frankensqlite` driver where typed
-models improve clarity; it must not use the C-FFI `sqlmodel-sqlite` driver, and it
-must not store Snowflake secrets.
+Status: prep for bead `fsnow-local-cache-repository-afb`; owner lane is pane 9
+(`franken-snowflake-cache`, `franken-snowflake-frame`, and
+`franken-snowflake-export`). This document pins the first
+`franken-snowflake-cache` design before the crate exists. The implementation must
+use FrankenSQLite through the `sqlmodel-frankensqlite` driver where typed models
+improve clarity; it must not use the C-FFI `sqlmodel-sqlite` driver, and it must
+not store Snowflake secrets.
 
 The cache is local, durable metadata for agent workflows. It is not a shared
 coordination service, not a credential store, and not a replacement for
