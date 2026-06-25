@@ -121,12 +121,42 @@ impl TextSourceRef {
     pub fn stable_source_id(&self) -> String {
         match self {
             Self::QueryResult { receipt_hash, .. } => {
-                format!("receipt:{}", escape_component(receipt_hash.as_str()))
+                escape_component(&format!("receipt:{}", receipt_hash.as_str()))
             }
             Self::StagedDocument {
                 object_fingerprint, ..
-            } => format!("object:{}", escape_component(object_fingerprint)),
+            } => escape_component(&format!("object:{object_fingerprint}")),
         }
+    }
+
+    /// Refuse source refs that cannot produce unique, redacted handles.
+    pub fn validate(&self) -> TextIndexResult<()> {
+        match self {
+            Self::QueryResult { receipt_hash, .. } => {
+                if receipt_hash.as_str().trim().is_empty() {
+                    return Err(TextIndexError::MissingField {
+                        field: "receipt_hash",
+                    });
+                }
+            }
+            Self::StagedDocument {
+                stage_uri_redacted,
+                object_fingerprint,
+                ..
+            } => {
+                if stage_uri_redacted.trim().is_empty() {
+                    return Err(TextIndexError::MissingField {
+                        field: "stage_uri_redacted",
+                    });
+                }
+                if object_fingerprint.trim().is_empty() {
+                    return Err(TextIndexError::MissingField {
+                        field: "object_fingerprint",
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -234,6 +264,12 @@ impl TextChunk {
 
     /// Refuse empty chunks before they reach an index builder.
     pub fn validate(&self) -> TextIndexResult<()> {
+        self.source.validate()?;
+        if self.column_or_path.trim().is_empty() {
+            return Err(TextIndexError::MissingField {
+                field: "column_or_path",
+            });
+        }
         if self.text.trim().is_empty() {
             return Err(TextIndexError::EmptyText {
                 handle: self.handle.to_string(),
@@ -561,8 +597,9 @@ mod tests {
             TextDocumentHandle::from_source(&query_source(), "body/text#0", 7).into_inner();
         assert_eq!(
             handle,
-            "fsnow-text:v1:query:receipt:receiptabc:body%2ftext%230:7"
+            "fsnow-text:v1:query:receipt%3areceiptabc:body%2ftext%230:7"
         );
+        assert_eq!(handle.split(':').count(), 6);
     }
 
     #[test]
@@ -577,9 +614,10 @@ mod tests {
             TextDocumentHandle::from_source(&source, "r\u{00e9}sum\u{00e9}\nbody", 3).into_inner();
         assert_eq!(
             handle,
-            "fsnow-text:v1:stage:object:sha256%3a%ce%b1%0anext:r%c3%a9sum%c3%a9%0abody:3"
+            "fsnow-text:v1:stage:object%3asha256%3a%ce%b1%0anext:r%c3%a9sum%c3%a9%0abody:3"
         );
         assert!(!handle.contains('\n'));
+        assert_eq!(handle.split(':').count(), 6);
     }
 
     #[test]
@@ -622,6 +660,75 @@ mod tests {
         assert!(matches!(
             chunk.validate(),
             Err(TextIndexError::EmptyText { .. })
+        ));
+    }
+
+    #[test]
+    fn missing_source_and_path_fields_are_refused() {
+        let empty_path = TextChunk::new(query_source(), " ", 0, "body", RightsClass::Restricted);
+        assert!(matches!(
+            empty_path.validate(),
+            Err(TextIndexError::MissingField {
+                field: "column_or_path"
+            })
+        ));
+
+        let empty_receipt = TextChunk::new(
+            TextSourceRef::QueryResult {
+                receipt_hash: ReceiptHash::new(" "),
+                statement_handle: None,
+                query_id: None,
+                dataset_id: None,
+                object_ref_redacted: None,
+            },
+            "body",
+            0,
+            "body",
+            RightsClass::Restricted,
+        );
+        assert!(matches!(
+            empty_receipt.validate(),
+            Err(TextIndexError::MissingField {
+                field: "receipt_hash"
+            })
+        ));
+
+        let empty_stage_uri = TextChunk::new(
+            TextSourceRef::StagedDocument {
+                receipt_hash: None,
+                dataset_id: None,
+                stage_uri_redacted: " ".to_owned(),
+                object_fingerprint: "sha256:abc".to_owned(),
+            },
+            "body",
+            0,
+            "body",
+            RightsClass::Restricted,
+        );
+        assert!(matches!(
+            empty_stage_uri.validate(),
+            Err(TextIndexError::MissingField {
+                field: "stage_uri_redacted"
+            })
+        ));
+
+        let empty_object = TextChunk::new(
+            TextSourceRef::StagedDocument {
+                receipt_hash: None,
+                dataset_id: None,
+                stage_uri_redacted: "@redacted/path".to_owned(),
+                object_fingerprint: " ".to_owned(),
+            },
+            "body",
+            0,
+            "body",
+            RightsClass::Restricted,
+        );
+        assert!(matches!(
+            empty_object.validate(),
+            Err(TextIndexError::MissingField {
+                field: "object_fingerprint"
+            })
         ));
     }
 

@@ -87,10 +87,17 @@ fsnow-text:v1:<source-kind>:<source-id>:<column-or-path>:<chunk-ordinal>
 ```
 
 Components are percent-escaped, deterministic, and built from redacted or
-content-addressed provenance. For query results, the source id is receipt-first;
-for staged documents, it is the object fingerprint. A search hit can therefore
-link back to the query receipt, dataset manifest, staged-object fingerprint, and
-chunk ordinal without embedding raw text or secrets in the handle.
+content-addressed provenance. The source-id marker itself is part of that escaped
+component, for example `receipt%3a...` or `object%3a...`, so `:` remains only the
+outer handle delimiter. For query results, the source id is receipt-first; for
+staged documents, it is the object fingerprint. A search hit can therefore link
+back to the query receipt, dataset manifest, staged-object fingerprint, and chunk
+ordinal without embedding raw text or secrets in the handle.
+
+Index builders must refuse chunks with empty text, empty column/path metadata, an
+empty query receipt hash, or empty staged-document redacted URI/fingerprint
+metadata. Missing source fields otherwise collapse multiple documents into the
+same stable handle.
 
 ## Search Flow
 
