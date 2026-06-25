@@ -1737,10 +1737,7 @@ fn robot_docs_data() -> Json {
 
 fn help_data() -> Json {
     json_object(vec![
-        (
-            "usage",
-            json_string(output_mode_usage()),
-        ),
+        ("usage", json_string(output_mode_usage())),
         ("contract_version", json_string(CLI_CONTRACT_VERSION)),
         ("first_commands", string_array(first_commands())),
         (
@@ -3285,7 +3282,14 @@ mod tests {
         );
         // The refusal path already set it; success must agree, not diverge.
         assert_eq!(
-            top_level_profile_id(&["query", "plan", "--profile", "demo", "--sql", "delete from t"]),
+            top_level_profile_id(&[
+                "query",
+                "plan",
+                "--profile",
+                "demo",
+                "--sql",
+                "delete from t"
+            ]),
             Some("demo".to_string()),
             "query plan refusal still sets top-level profile_id"
         );
@@ -3456,10 +3460,7 @@ mod tests {
     #[cfg(not(feature = "toon"))]
     #[test]
     fn toon_requests_return_json_feature_refusal_when_encoder_is_absent() {
-        let output = execute_cli_contract(vec![
-            "capabilities".to_string(),
-            "--toon".to_string(),
-        ]);
+        let output = execute_cli_contract(vec!["capabilities".to_string(), "--toon".to_string()]);
 
         assert_eq!(output.exit_code, CoreExitCode::Usage.code());
         assert!(output.stdout.starts_with("{\"ok\":false"));
@@ -3469,7 +3470,9 @@ mod tests {
         assert!(output.stdout.contains("TOON output is feature-gated"));
         assert_eq!(
             output.stderr.as_deref(),
-            Some("FSNOW-1002: TOON output is feature-gated and not linked in this CLI build; retry with --json or rebuild with the `toon` feature.")
+            Some(
+                "FSNOW-1002: TOON output is feature-gated and not linked in this CLI build; retry with --json or rebuild with the `toon` feature."
+            )
         );
     }
 
