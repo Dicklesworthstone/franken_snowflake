@@ -28,7 +28,8 @@ const SUBMIT_PATH: &str = "/api/v2/statements";
 pub struct RecordedRequest {
     /// The method.
     pub method: Method,
-    /// The request path (query string included).
+    /// The request path (query string included), redacted through the shared
+    /// needle list.
     pub path: String,
     /// The `Authorization` header, redacted through the shared needle list.
     pub redacted_authorization: Option<String>,
@@ -157,7 +158,7 @@ impl MockSqlApi {
     pub fn respond(&mut self, request: &MockHttpRequest) -> MockHttpResponse {
         self.log.push(RecordedRequest {
             method: request.method.clone(),
-            path: request.path.clone(),
+            path: redact(&request.path).into_owned(),
             redacted_authorization: request
                 .authorization()
                 .map(|value| redact(value).into_owned()),
@@ -328,5 +329,16 @@ mod tests {
         assert!(observed[0].contains("[REDACTED]"));
         assert!(!observed[0].contains("eyJhbGciOiJSUzI1NiJ9"));
         Ok(())
+    }
+
+    #[test]
+    fn request_path_is_recorded_redacted() {
+        let mut mock = scenarios::default_async_lifecycle();
+        mock.respond(&MockHttpRequest::get(
+            "/api/v2/statements/abc-123?token=sfpat_SECRET123",
+        ));
+        let recorded = mock.requests().first().expect("request should be recorded");
+        assert!(recorded.path.contains("[REDACTED]"));
+        assert!(!recorded.path.contains("sfpat_SECRET123"));
     }
 }
