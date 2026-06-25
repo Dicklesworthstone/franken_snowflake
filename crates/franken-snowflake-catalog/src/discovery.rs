@@ -430,6 +430,27 @@ fn in_scope(input: &CatalogDiscoveryInput, database: &str, schema: &str, object:
 }
 
 fn dataset_id(database: &str, schema: &str, object: &str) -> String {
+    let readable_slug = readable_dataset_slug(database, schema, object);
+    let identity_digest = dataset_identity_digest(database, schema, object);
+    format!("{readable_slug}_b3_{identity_digest}")
+}
+
+fn dataset_identity_digest(database: &str, schema: &str, object: &str) -> String {
+    let mut identity = Vec::new();
+    push_identity_part(&mut identity, database);
+    push_identity_part(&mut identity, schema);
+    push_identity_part(&mut identity, object);
+    ContentAddress::blake3(&identity).digest_hex
+}
+
+fn push_identity_part(identity: &mut Vec<u8>, value: &str) {
+    identity.extend_from_slice(value.len().to_string().as_bytes());
+    identity.push(b':');
+    identity.extend_from_slice(value.as_bytes());
+    identity.push(b';');
+}
+
+fn readable_dataset_slug(database: &str, schema: &str, object: &str) -> String {
     format!(
         "{}_{}_{}",
         slug_part(database),
@@ -552,10 +573,7 @@ fn infer_field_role(column: &str, dtype: DtypeClass) -> FieldRole {
     } else if matches!(
         dtype,
         DtypeClass::Date | DtypeClass::Time | DtypeClass::Timestamp
-    ) && (normalized.contains("date")
-        || normalized.contains("time")
-        || normalized.ends_with("at")
-        || normalized.ends_with("ts"))
+    ) && is_time_index_column_name(column)
     {
         FieldRole::TimeIndex
     } else if normalized.contains("label") || normalized.contains("target") {
@@ -565,6 +583,34 @@ fn infer_field_role(column: &str, dtype: DtypeClass) -> FieldRole {
     } else {
         FieldRole::Feature
     }
+}
+
+fn is_time_index_column_name(column: &str) -> bool {
+    let normalized = normalize_identifier(column);
+    if matches!(
+        normalized.as_str(),
+        "date" | "dt" | "time" | "datetime" | "timestamp"
+    ) {
+        return true;
+    }
+
+    let tokens = identifier_tokens(column);
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "date" | "dt" | "time" | "datetime" | "timestamp"
+        )
+    }) || tokens
+        .last()
+        .is_some_and(|token| matches!(token.as_str(), "at" | "ts"))
+}
+
+fn identifier_tokens(identifier: &str) -> Vec<String> {
+    identifier
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
 }
 
 fn aliases_for_column(column: &str) -> Vec<String> {
@@ -729,13 +775,15 @@ mod tests {
         let snapshot = build_snapshot_from_information_schema(&input, &discovery_tables);
 
         assert_eq!(snapshot.datasets.len(), 2);
-        assert_eq!(snapshot.datasets[0].id, "db_public_events");
+        let events_id = dataset_id("DB", "PUBLIC", "EVENTS");
+        let v_events_id = dataset_id("DB", "PUBLIC", "V_EVENTS");
+        assert_eq!(snapshot.datasets[0].id, events_id);
         assert_eq!(snapshot.datasets[0].kind, DatasetKind::Table);
-        assert_eq!(snapshot.datasets[1].id, "db_public_v_events");
+        assert_eq!(snapshot.datasets[1].id, v_events_id);
         assert_eq!(snapshot.datasets[1].kind, DatasetKind::View);
         assert_eq!(snapshot.columns.len(), 3);
 
-        let events = snapshot.dataset("db_public_events");
+        let events = snapshot.dataset(&events_id);
         assert!(events.is_some());
         if let Some(events) = events {
             assert_eq!(events.profile, "profile-fixture");
@@ -756,6 +804,34 @@ mod tests {
     }
 
     #[test]
+    fn time_index_role_requires_temporal_identifier_boundaries() {
+        assert_eq!(
+            infer_field_role("EVENT_DATE", DtypeClass::Date),
+            FieldRole::TimeIndex
+        );
+        assert_eq!(
+            infer_field_role("EVENT_TS", DtypeClass::Timestamp),
+            FieldRole::TimeIndex
+        );
+        assert_eq!(
+            infer_field_role("UPDATED_AT", DtypeClass::Timestamp),
+            FieldRole::TimeIndex
+        );
+        assert_eq!(
+            infer_field_role("KNOWN_AT", DtypeClass::Timestamp),
+            FieldRole::KnownAt
+        );
+
+        for column in ["SEAT", "HEARTBEAT", "REPORTS", "FORMAT"] {
+            assert_eq!(
+                infer_field_role(column, DtypeClass::Timestamp),
+                FieldRole::Feature,
+                "{column} should not be inferred as a time axis"
+            );
+        }
+    }
+
+    #[test]
     fn snapshot_persistence_writes_verified_cache_records() {
         let input = fixture_input();
         let snapshot = build_snapshot_from_information_schema(&input, &fixture_tables());
@@ -766,7 +842,8 @@ mod tests {
         let snapshot_record = cache.catalog_snapshot("snap-001");
         assert!(matches!(snapshot_record, Ok(Some(_))));
 
-        let manifest_record = cache.dataset_manifest("db_public_events");
+        let events_id = dataset_id("DB", "PUBLIC", "EVENTS");
+        let manifest_record = cache.dataset_manifest(&events_id);
         assert!(matches!(manifest_record, Ok(Some(_))));
         if let Ok(Some(record)) = manifest_record {
             assert_eq!(record.profile_id, "profile-fixture");
@@ -775,6 +852,54 @@ mod tests {
             assert!(record.manifest.verify("dataset_manifest").is_ok());
             assert!(record.manifest.canonical.contains("\"object\":\"EVENTS\""));
         }
+    }
+
+    #[test]
+    fn dataset_ids_keep_colliding_slugs_separate() {
+        let mut input = fixture_input();
+        input.schema = None;
+        let snapshot = build_snapshot_from_information_schema(&input, &slug_collision_tables());
+
+        let left_id = dataset_id("DB", "A_B", "C");
+        let right_id = dataset_id("DB", "A", "B_C");
+        assert_ne!(left_id, right_id);
+        assert!(left_id.starts_with("db_a_b_c_b3_"));
+        assert!(right_id.starts_with("db_a_b_c_b3_"));
+        assert_eq!(readable_dataset_slug("DB", "A_B", "C"), "db_a_b_c");
+        assert_eq!(readable_dataset_slug("DB", "A", "B_C"), "db_a_b_c");
+
+        assert_eq!(snapshot.datasets.len(), 2);
+        assert_eq!(
+            snapshot
+                .dataset(&left_id)
+                .map(|dataset| dataset.schema.as_str()),
+            Some("A_B")
+        );
+        assert_eq!(
+            snapshot
+                .dataset(&right_id)
+                .map(|dataset| dataset.schema.as_str()),
+            Some("A")
+        );
+
+        let left_columns = snapshot
+            .columns_for_dataset(&left_id)
+            .into_iter()
+            .map(|column| column.column.as_str())
+            .collect::<Vec<_>>();
+        let right_columns = snapshot
+            .columns_for_dataset(&right_id)
+            .into_iter()
+            .map(|column| column.column.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(left_columns, vec!["LEFT_ONLY"]);
+        assert_eq!(right_columns, vec!["RIGHT_ONLY"]);
+
+        let quoted_mixed_case = dataset_id("DB", "Public", "Events");
+        let unquoted_upper_case = dataset_id("DB", "PUBLIC", "EVENTS");
+        assert_ne!(quoted_mixed_case, unquoted_upper_case);
+        assert!(quoted_mixed_case.starts_with("db_public_events_b3_"));
+        assert!(unquoted_upper_case.starts_with("db_public_events_b3_"));
     }
 
     fn fixture_input() -> CatalogDiscoveryInput {
@@ -790,6 +915,94 @@ mod tests {
             command_id: "catalog.scan.fixture".to_owned(),
             trace_id: "trace-001".to_owned(),
             redactions_applied: vec!["account_locator".to_owned()],
+        }
+    }
+
+    fn slug_collision_tables() -> CatalogDiscoveryTables {
+        CatalogDiscoveryTables {
+            databases: completed_statement(
+                "h-db-collision",
+                &["DATABASE_NAME", "COMMENT"],
+                vec![vec![Some("DB"), Some("fixture database")]],
+            ),
+            schemas: completed_statement(
+                "h-schema-collision",
+                &["CATALOG_NAME", "SCHEMA_NAME", "COMMENT"],
+                vec![
+                    vec![Some("DB"), Some("A_B"), Some("left schema")],
+                    vec![Some("DB"), Some("A"), Some("right schema")],
+                ],
+            ),
+            tables: completed_statement(
+                "h-table-collision",
+                &[
+                    "TABLE_CATALOG",
+                    "TABLE_SCHEMA",
+                    "TABLE_NAME",
+                    "TABLE_TYPE",
+                    "COMMENT",
+                ],
+                vec![
+                    vec![
+                        Some("DB"),
+                        Some("A_B"),
+                        Some("C"),
+                        Some("BASE TABLE"),
+                        Some("left table"),
+                    ],
+                    vec![
+                        Some("DB"),
+                        Some("A"),
+                        Some("B_C"),
+                        Some("BASE TABLE"),
+                        Some("right table"),
+                    ],
+                ],
+            ),
+            columns: completed_statement(
+                "h-column-collision",
+                &[
+                    "TABLE_CATALOG",
+                    "TABLE_SCHEMA",
+                    "TABLE_NAME",
+                    "COLUMN_NAME",
+                    "ORDINAL_POSITION",
+                    "DATA_TYPE",
+                    "NUMERIC_PRECISION",
+                    "NUMERIC_SCALE",
+                    "CHARACTER_MAXIMUM_LENGTH",
+                    "IS_NULLABLE",
+                    "COMMENT",
+                ],
+                vec![
+                    vec![
+                        Some("DB"),
+                        Some("A_B"),
+                        Some("C"),
+                        Some("LEFT_ONLY"),
+                        Some("1"),
+                        Some("NUMBER"),
+                        Some("38"),
+                        Some("0"),
+                        None,
+                        Some("NO"),
+                        Some("left only"),
+                    ],
+                    vec![
+                        Some("DB"),
+                        Some("A"),
+                        Some("B_C"),
+                        Some("RIGHT_ONLY"),
+                        Some("1"),
+                        Some("TEXT"),
+                        None,
+                        None,
+                        Some("128"),
+                        Some("YES"),
+                        Some("right only"),
+                    ],
+                ],
+            ),
         }
     }
 
