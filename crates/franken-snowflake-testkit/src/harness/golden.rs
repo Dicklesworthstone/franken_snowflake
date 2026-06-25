@@ -56,11 +56,7 @@ const DEFAULT_VOLATILE_EXACT: &[&str] = &[
     "tid",
     "thread_id",
     // wall-clock
-    "time",
     "now",
-    "date",
-    "today",
-    "timestamp",
     "uptime",
     // per-run correlation identifiers (ephemeral noise, never under test)
     "trace_id",
@@ -838,6 +834,39 @@ mod tests {
         assert_eq!(mismatch.path, "$.receipt_hash");
         assert_eq!(mismatch.kind, MismatchKind::Value);
         Ok(())
+    }
+
+    #[test]
+    fn domain_temporal_keys_are_not_zeroed_by_default() -> Result<(), String> {
+        let cfg = GoldenConfig::default();
+        for key in ["date", "time", "timestamp", "today"] {
+            assert!(
+                !cfg.is_volatile(key),
+                "{key} can be Snowflake row data and must not be hidden by default"
+            );
+        }
+
+        let mismatch = compare(
+            &json!({ "date": "2026-06-24" }),
+            &json!({ "date": "2026-06-25" }),
+            &cfg,
+        )
+        .err()
+        .ok_or_else(|| "domain date drift must mismatch".to_owned())?;
+        assert_eq!(mismatch.path, "$.date");
+        assert_eq!(mismatch.kind, MismatchKind::Value);
+        Ok(())
+    }
+
+    #[test]
+    fn generic_temporal_key_can_be_zeroed_when_fixture_opts_in() {
+        let cfg = GoldenConfig::default().with_volatile_key("timestamp");
+        assert!(compare(
+            &json!({ "timestamp": "2026-06-24T00:00:00Z" }),
+            &json!({ "timestamp": "2026-06-25T00:00:00Z" }),
+            &cfg,
+        )
+        .is_ok());
     }
 
     #[test]
