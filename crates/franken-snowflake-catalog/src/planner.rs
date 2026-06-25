@@ -339,9 +339,11 @@ pub fn plan_dataset_query(
             &dataset_columns,
             &mut bindings,
             &mut next_binding,
-        ) {
-            where_clauses.push(compiled);
-            pushed_predicate_filters = predicate_filters;
+        )
+        .map_err(|refusal| vec![refusal])?
+        {
+            where_clauses.push(compiled.sql);
+            pushed_predicate_filters = compiled.leaf_count;
         }
     }
 
@@ -751,13 +753,18 @@ fn compile_predicate(
     columns: &[&ColumnCatalogEntry],
     bindings: &mut BTreeMap<String, TypedBinding>,
     next_binding: &mut usize,
-) -> Option<String> {
+) -> Result<Option<CompiledPredicate>, PlanRefusal> {
     match predicate {
         PredicateAst::Compound(compound) => {
             compile_compound(compound, columns, bindings, next_binding)
         }
-        PredicateAst::Leaf(leaf) => compile_leaf(leaf, columns, bindings, next_binding),
+        PredicateAst::Leaf(leaf) => compile_leaf(leaf, columns, bindings, next_binding).map(Some),
     }
+}
+
+struct CompiledPredicate {
+    sql: String,
+    leaf_count: usize,
 }
 
 fn count_predicate_leaves(predicate: &PredicateAst) -> usize {
@@ -784,25 +791,32 @@ fn compile_compound(
     columns: &[&ColumnCatalogEntry],
     bindings: &mut BTreeMap<String, TypedBinding>,
     next_binding: &mut usize,
-) -> Option<String> {
+) -> Result<Option<CompiledPredicate>, PlanRefusal> {
     let mut parts = Vec::new();
-    let and = compile_many(" AND ", &compound.and, columns, bindings, next_binding);
+    let mut leaf_count = 0usize;
+    let and = compile_many(" AND ", &compound.and, columns, bindings, next_binding)?;
     if let Some(compiled) = and {
-        parts.push(compiled);
+        leaf_count += compiled.leaf_count;
+        parts.push(compiled.sql);
     }
-    let or = compile_many(" OR ", &compound.or, columns, bindings, next_binding);
+    let or = compile_many(" OR ", &compound.or, columns, bindings, next_binding)?;
     if let Some(compiled) = or {
-        parts.push(compiled);
+        leaf_count += compiled.leaf_count;
+        parts.push(compiled.sql);
     }
     if let Some(not) = &compound.not {
-        if let Some(compiled) = compile_predicate(not, columns, bindings, next_binding) {
-            parts.push(format!("NOT ({compiled})"));
+        if let Some(compiled) = compile_predicate(not, columns, bindings, next_binding)? {
+            leaf_count += compiled.leaf_count;
+            parts.push(format!("NOT ({})", compiled.sql));
         }
     }
     if parts.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(parts.join(" AND "))
+        Ok(Some(CompiledPredicate {
+            sql: parts.join(" AND "),
+            leaf_count,
+        }))
     }
 }
 
@@ -812,15 +826,22 @@ fn compile_many(
     columns: &[&ColumnCatalogEntry],
     bindings: &mut BTreeMap<String, TypedBinding>,
     next_binding: &mut usize,
-) -> Option<String> {
-    let compiled = predicates
-        .iter()
-        .filter_map(|predicate| compile_predicate(predicate, columns, bindings, next_binding))
-        .collect::<Vec<_>>();
-    if compiled.is_empty() {
-        None
+) -> Result<Option<CompiledPredicate>, PlanRefusal> {
+    let mut compiled_sql = Vec::new();
+    let mut leaf_count = 0usize;
+    for predicate in predicates {
+        if let Some(compiled) = compile_predicate(predicate, columns, bindings, next_binding)? {
+            leaf_count += compiled.leaf_count;
+            compiled_sql.push(compiled.sql);
+        }
+    }
+    if compiled_sql.is_empty() {
+        Ok(None)
     } else {
-        Some(format!("({})", compiled.join(joiner)))
+        Ok(Some(CompiledPredicate {
+            sql: format!("({})", compiled_sql.join(joiner)),
+            leaf_count,
+        }))
     }
 }
 
@@ -829,13 +850,25 @@ fn compile_leaf(
     columns: &[&ColumnCatalogEntry],
     bindings: &mut BTreeMap<String, TypedBinding>,
     next_binding: &mut usize,
-) -> Option<String> {
-    let column = find_column_in_refs(&leaf.column, columns)?;
+) -> Result<CompiledPredicate, PlanRefusal> {
+    let Some(column) = find_column_in_refs(&leaf.column, columns) else {
+        return Err(PlanRefusal {
+            code: "FSNOW_COLUMN_UNKNOWN".to_owned(),
+            message: format!("unknown predicate column {:?}", leaf.column),
+            did_you_mean: crate::predicate::did_you_mean_columns(
+                &leaf.column,
+                &columns
+                    .iter()
+                    .map(|column| (*column).clone())
+                    .collect::<Vec<_>>(),
+            ),
+        });
+    };
     let identifier = quote_identifier(&column.column);
     let values = value_strings(&leaf.value);
     let mut bind = |value: String| push_binding(bindings, next_binding, column.dtype_class, value);
 
-    match leaf.op.as_str() {
+    let sql = match leaf.op.as_str() {
         "eq" => Some(format!("{identifier} = {}", bind(first_value(&values)))),
         "neq" => Some(format!("{identifier} != {}", bind(first_value(&values)))),
         "lt" => Some(format!("{identifier} < {}", bind(first_value(&values)))),
@@ -858,7 +891,16 @@ fn compile_leaf(
             bind(first_value(&values))
         )),
         _ => None,
-    }
+    };
+    sql.map(|sql| CompiledPredicate { sql, leaf_count: 1 })
+        .ok_or_else(|| PlanRefusal {
+            code: "FSNOW_FILTER_OPERATOR_UNSUPPORTED".to_owned(),
+            message: format!(
+                "operator {:?} is present in the catalog but unsupported by the SQL compiler",
+                leaf.op
+            ),
+            did_you_mean: Vec::new(),
+        })
 }
 
 fn first_value(values: &[String]) -> String {
@@ -1192,7 +1234,7 @@ mod tests {
         DataSourceClass, DatasetField, DatasetKind, Provenance, ProvenanceSource, RightsClass,
         RoleConfidence,
     };
-    use crate::operator::built_in_operator_catalog;
+    use crate::operator::{built_in_operator_catalog, OperatorArity, OutputDtypeRule};
 
     #[test]
     fn dataset_plan_pushes_safe_predicates_with_typed_bindings() {
@@ -1322,6 +1364,45 @@ mod tests {
             &request,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn unsupported_catalog_operator_is_refused_not_silently_dropped() {
+        let mut operators = built_in_operator_catalog();
+        operators.push(OperatorCatalogEntry {
+            id: "adapter_only_numeric".to_owned(),
+            arity: OperatorArity::Exact { count: 1 },
+            accepted_dtype_classes: vec![DtypeClass::Number],
+            output_dtype_rule: OutputDtypeRule::Boolean,
+            refusal_code: "FSNOW_FILTER_OPERATOR_DTYPE".to_owned(),
+            json_schema_contract_id: "franken_snowflake.operator.adapter_only_numeric.v1"
+                .to_owned(),
+        });
+        let mut request = base_dataset_request(Some(100));
+        request.filter = Some(PredicateAst::Compound(CompoundPredicate {
+            and: vec![
+                PredicateAst::Leaf(LeafPredicate::new("VALUE", "gt", json!(0))),
+                PredicateAst::Leaf(LeafPredicate::new(
+                    "VALUE",
+                    "adapter_only_numeric",
+                    json!(42),
+                )),
+            ],
+            ..CompoundPredicate::default()
+        }));
+
+        let refused = plan_dataset_query(
+            &fixture_manifest("events_daily"),
+            &fixture_columns("events_daily"),
+            &operators,
+            &request,
+        );
+
+        assert!(matches!(
+            refused,
+            Err(refusals)
+                if refusals.iter().any(|refusal| refusal.code == "FSNOW_FILTER_OPERATOR_UNSUPPORTED")
+        ));
     }
 
     #[test]
