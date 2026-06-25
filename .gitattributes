@@ -1,0 +1,25 @@
+# Golden-file newline discipline (see docs/proof_lanes.md, Lane 7).
+#
+# Deterministic JSON/golden fixtures must be byte-identical across Linux, macOS,
+# and Windows checkouts, so force LF and disable CRLF translation regardless of
+# a contributor's core.autocrlf. The full cross-platform CI matrix and the
+# "no golden contains \r" check are owned by bead
+# fsnow-native-snowflake-connector-w0i.14.
+
+# Normalize line endings for text by default.
+* text=auto eol=lf
+
+# Fixtures compared as raw bytes — pin LF explicitly.
+*.json   text eol=lf
+*.jsonl  text eol=lf
+*.golden text eol=lf
+*.toml   text eol=lf
+*.md     text eol=lf
+*.rs     text eol=lf
+*.sh     text eol=lf
+
+# Binary fixtures (e.g. gzip partition bodies) must never be munged.
+*.gz   binary
+*.gzip binary
+*.der  binary
+*.png  binary

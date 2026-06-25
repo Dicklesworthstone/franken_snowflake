@@ -1,13 +1,65 @@
+# ── Rust build artifacts ──────────────────────────────────────────────
 /target/
-/.env
-/.env.*
-!/env.example
+**/*.rs.bk
+*.pdb
+# NOTE: Cargo.lock is intentionally committed — this workspace ships a CLI binary.
+
+# ── Coverage & profiling (the plan enforces a coverage floor + profiling) ──
+*.profraw
+*.profdata
+/coverage/
+lcov.info
+cobertura.xml
+tarpaulin-report.html
+flamegraph.svg
+perf.data
+perf.data.old
+
+# ── Test / run output (ephemeral) ─────────────────────────────────────
+# Goldens and fixtures are committed under tests/ and docs/; only per-run
+# artifact/log output is ignored. Add /artifacts/.gitkeep if you want the dir tracked.
+/artifacts/
+
+# ── Secrets & credentials — NEVER commit ──────────────────────────────
+# This connector handles RSA private keys (PKCS#8 PEM) and PATs; ignore key
+# material defensively. Add a targeted `!` negation if a fake test-fixture key
+# must be committed.
+.env
+.env.*
+!.env.example
+!env.example
 *.pem
 *.key
 *.p8
-*.log
+*.pkcs8
+*.der
 
-# bv (beads viewer) local config and caches
+# ── Logs & temp ───────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# ── Beads / bv local tooling (the .beads/ store has its own .gitignore) ──
 .bv/
-# br doctor per-run artifacts
 .doctor/
+# NTM (tmux agent-swarm) local state: logs, pids, rate limits, crash inbox.
+.ntm/
+# Snapshots from the fixing-beads-problems skill (kept locally, never committed):
+.beads/recovery*/
+
+# ── Editor / IDE ──────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── OS junk (cross-platform: macOS / Windows / Linux) ─────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini

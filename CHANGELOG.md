@@ -7,10 +7,11 @@ release.
 
 ## Scope and method
 
-This project is at the planning and task-graph stage. There is no source code,
-no crate, no git tag, and no GitHub Release yet, so this changelog has no version
-history to reconstruct. The record below is drawn from the two durable sources in
-the repository:
+This project is at the early scaffold stage. The Cargo workspace and its
+minimal-five crate skeletons now exist (no runtime/connector logic yet), and
+there is no crate publish, git tag, or GitHub Release, so this changelog has no
+version history to reconstruct. The record below is drawn from the two durable
+sources in the repository:
 
 - the design documents (`COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md` and
   `docs/asupersync_leverage.md`)
@@ -27,6 +28,25 @@ can pick up and execute.
 
 ### Added
 
+- **Workspace scaffold (Phase 0).** A Cargo workspace (`resolver = "3"`, edition
+  2024) with the minimal-five crate skeletons —
+  `franken-snowflake-{core,auth,sqlapi,testkit,cli}` — building clean and
+  producing the `franken-snowflake` binary. The remaining crates (`http`,
+  `catalog`, `frame`, `export`, `graph`, `cache`, `tui`, `mcp`) are deferred to
+  their boundary-owning beads rather than created in one blind sweep.
+- **Workspace lint policy.** `forbid(unsafe_code)` plus `deny` on
+  `clippy::unwrap_used` / `expect_used` / `panic` / `todo` / `dbg_macro`, inherited
+  by every crate via `[lints] workspace = true` and verified to actually fail a
+  build/clippy run. The toolchain pin, `[patch.crates-io]` Asupersync unification,
+  `deny.toml`, and the single-Asupersync-version CI gate remain owned by a
+  dedicated toolchain bead.
+- **Governance contract docs.** `docs/agent_cli_contract.md` (envelope keys, exit
+  codes, command families, MCP parity), `docs/security_model.md` (secret handling,
+  the two anti-leak mechanisms, auth lanes, cost safety, write-intent ladder),
+  `docs/dataset_manifest_contract.md` (the three-part model and the shared
+  planner), and `docs/proof_lanes.md` (the eight proof lanes plus cross-cutting
+  testing standards), with a `docs/protocol/` placeholder and a `.gitattributes`
+  pinning golden newline discipline.
 - **Architecture plan.** The clean-room design for a Rust-first Snowflake SQL API
   connector that talks HTTPS directly, with no ODBC, JDBC, or third-party
   Snowflake crate, and no Tokio/reqwest/hyper/axum/tower in production crates.
@@ -68,7 +88,8 @@ can pick up and execute.
   graph health.
 - The full rationale is in
   [`COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md`](COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md).
-- Nothing is implemented. Treat the CLI and MCP surfaces in the README as the
-  target contract, not as working commands.
+- No connector logic is implemented yet. The workspace skeleton builds and the
+  `franken-snowflake` binary runs, but it does nothing — treat the CLI and MCP
+  surfaces in the README as the target contract, not as working commands.
 
 [Unreleased]: https://github.com/Dicklesworthstone/franken_snowflake

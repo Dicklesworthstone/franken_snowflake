@@ -1,0 +1,16 @@
+[package]
+name = "franken-snowflake-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Secret-safe Snowflake auth construction (PAT, key-pair JWT, OAuth) for franken_snowflake."
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

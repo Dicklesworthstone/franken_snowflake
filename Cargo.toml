@@ -1,0 +1,58 @@
+# franken_snowflake — workspace root.
+#
+# Phase 0 scaffold (bead fsnow-repo-governance-scaffold-zra): the minimal-five
+# crate skeletons plus the workspace-wide lint policy. The remaining crates
+# (http, catalog, frame, export, graph, cache, tui, mcp) are added by their
+# boundary-owning beads, not in one blind sweep — see
+# COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md ("Repository Shape").
+#
+# The toolchain pin (rust-toolchain.toml), the [patch.crates-io] Asupersync
+# unification block, deny.toml, and the single-asupersync-version CI gate are
+# owned by a dedicated toolchain bead (fsnow-native-snowflake-connector-w0i.3),
+# so they are intentionally absent here. Phase 0 skeletons carry no external
+# dependencies.
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/franken-snowflake-core",
+    "crates/franken-snowflake-auth",
+    "crates/franken-snowflake-sqlapi",
+    "crates/franken-snowflake-testkit",
+    "crates/franken-snowflake-cli",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["Jeffrey Emanuel"]
+repository = "https://github.com/Dicklesworthstone/franken_snowflake"
+homepage = "https://github.com/Dicklesworthstone/franken_snowflake"
+description = "Clean-room, Asupersync-native Snowflake SQL API connector built for coding agents."
+keywords = ["snowflake", "sql-api", "asupersync", "agent", "connector"]
+categories = ["database", "api-bindings", "command-line-utilities"]
+publish = false
+
+# Workspace lint policy. Crates opt in with `[lints] workspace = true`.
+#
+#   forbid(unsafe_code)        — no `unsafe` anywhere in the workspace.
+#   deny clippy::unwrap_used   — no silent panics on `Option`/`Result`.
+#   deny clippy::expect_used   — likewise; surface typed errors instead.
+#   deny clippy::panic         — no `panic!` in library/CLI paths.
+#   deny clippy::todo          — no `todo!()` placeholders survive a build.
+#   deny clippy::dbg_macro      — no stray `dbg!()`.
+#
+# The `unwrap_used`/`expect_used`/`panic`/`todo`/`dbg_macro` checks are clippy
+# restriction lints (verified by `cargo clippy`); `unsafe_code` is enforced by
+# `cargo build`.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+dbg_macro = "deny"
