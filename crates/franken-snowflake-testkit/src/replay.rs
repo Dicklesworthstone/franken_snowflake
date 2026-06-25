@@ -8,6 +8,7 @@
 
 use std::fmt;
 
+use franken_snowflake_core::redact::redact;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -66,12 +67,13 @@ impl ProtocolPacket {
         request: &MockHttpRequest,
         response: &MockHttpResponse,
     ) -> Self {
+        let response = recordable_response(response);
         Self {
             name: name.into(),
             request_method: request.method.as_str().to_owned(),
-            request_path: request.path.clone(),
+            request_path: redact(&request.path).into_owned(),
             status: response.status,
-            response_class: response_class_label(response).to_owned(),
+            response_class: response_class_label(&response).to_owned(),
             headers: response.headers.clone(),
             body_hex: hex(&response.body),
             wire_hex: hex(&response.to_wire()),
@@ -85,6 +87,33 @@ impl ProtocolPacket {
     pub fn body_json(&self) -> Result<Value, ReplayError> {
         let bytes = unhex(&self.body_hex);
         Ok(serde_json::from_slice(&bytes)?)
+    }
+}
+
+fn recordable_response(response: &MockHttpResponse) -> MockHttpResponse {
+    let mut response = response.clone();
+    for (_, value) in &mut response.headers {
+        *value = redact(value).into_owned();
+    }
+    response.body = recordable_body(&response.body);
+    update_content_length(&mut response);
+    response
+}
+
+fn recordable_body(body: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return body.to_vec();
+    };
+    redact(text).as_bytes().to_vec()
+}
+
+fn update_content_length(response: &mut MockHttpResponse) {
+    let len = response.body.len().to_string();
+    for (name, value) in &mut response.headers {
+        if name.eq_ignore_ascii_case("Content-Length") {
+            *value = len;
+            return;
+        }
     }
 }
 
@@ -257,7 +286,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 mod tests {
     use super::*;
     use crate::harness::golden::{
-        GoldenConfig, assert_no_cr, check_golden_file, to_canonical_json,
+        assert_no_cr, check_golden_file, to_canonical_json, GoldenConfig,
     };
 
     #[test]
@@ -269,13 +298,11 @@ mod tests {
         assert_eq!(replay.steps[0].packet.status, 202);
         assert_eq!(replay.steps[3].packet.status, 200);
         assert_eq!(replay.steps[4].packet.response_class, "completed");
-        assert!(
-            replay.steps[4]
-                .packet
-                .headers
-                .iter()
-                .any(|(name, value)| name == "Content-Encoding" && value == "gzip")
-        );
+        assert!(replay.steps[4]
+            .packet
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Content-Encoding" && value == "gzip"));
     }
 
     #[test]
@@ -291,5 +318,31 @@ mod tests {
         ));
         check_golden_file(path, &value, &cfg)?;
         Ok(())
+    }
+
+    #[test]
+    fn replay_packets_redact_recorded_paths_headers_and_text_bodies() {
+        let request =
+            MockHttpRequest::get("/api/v2/statements?requestId=sfpat_replay_path_secret_123");
+        let response =
+            MockHttpResponse::json(200, br#"{"token":"sfpat_replay_body_secret_123"}"#.to_vec())
+                .with_header("X-Debug-Token", "ghp_replay_header_secret_123")
+                .with_header("Content-Length", "40");
+
+        let packet = ProtocolPacket::from_exchange("secret-probe", &request, &response);
+        let body = String::from_utf8(unhex(&packet.body_hex)).expect("body utf8");
+        let wire = String::from_utf8(unhex(&packet.wire_hex)).expect("wire utf8");
+
+        assert!(!packet.request_path.contains("sfpat_replay_path_secret_123"));
+        assert!(packet.request_path.contains("[REDACTED]"));
+        assert!(!body.contains("sfpat_replay_body_secret_123"));
+        assert!(body.contains("[REDACTED]"));
+        assert!(!wire.contains("sfpat_replay_body_secret_123"));
+        assert!(!wire.contains("ghp_replay_header_secret_123"));
+        assert!(wire.contains("[REDACTED]"));
+        assert!(packet
+            .headers
+            .iter()
+            .all(|(_, value)| !value.contains("ghp_replay_header_secret_123")));
     }
 }
