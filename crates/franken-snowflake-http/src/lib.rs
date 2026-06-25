@@ -364,7 +364,8 @@ impl SnowflakeHttpClient {
 
             match result {
                 Ok(response) => {
-                    let retry_after_ms = retry_after_ms(response.headers.as_slice());
+                    let retry_after_ms =
+                        retry_after_ms(response.headers.as_slice(), asupersync::time::wall_now());
                     let retryable = is_retryable_status(response.status);
                     if retryable {
                         if !route_allows_automatic_retry(&wire.route) {
@@ -1423,11 +1424,159 @@ fn response_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'
         .map(|(_, value)| value.as_str())
 }
 
-fn retry_after_ms(headers: &[(String, String)]) -> Option<u64> {
+fn retry_after_ms(headers: &[(String, String)], now: Time) -> Option<u64> {
     let raw = response_header(headers, "Retry-After")?.trim();
     raw.parse::<u64>()
         .ok()
         .and_then(|seconds| seconds.checked_mul(1_000))
+        .or_else(|| retry_after_http_date_ms(raw, now))
+}
+
+fn retry_after_http_date_ms(raw: &str, now: Time) -> Option<u64> {
+    let target_seconds = parse_http_date_unix_seconds(raw)?;
+    if target_seconds <= 0 {
+        return Some(0);
+    }
+    let target = Time::from_secs(u64::try_from(target_seconds).ok()?);
+    Some(duration_millis_saturating(Duration::from_nanos(
+        target.duration_since(now),
+    )))
+}
+
+fn parse_http_date_unix_seconds(raw: &str) -> Option<i64> {
+    parse_imf_fixdate(raw)
+        .or_else(|| parse_rfc850_date(raw))
+        .or_else(|| parse_asctime_date(raw))
+}
+
+fn parse_imf_fixdate(raw: &str) -> Option<i64> {
+    let (_, rest) = raw.split_once(", ")?;
+    let mut parts = rest.split_ascii_whitespace();
+    let day = parts.next()?.parse::<u32>().ok()?;
+    let month = parse_http_month(parts.next()?)?;
+    let year = parts.next()?.parse::<i32>().ok()?;
+    let (hour, minute, second) = parse_http_time(parts.next()?)?;
+    if parts.next()? != "GMT" || parts.next().is_some() {
+        return None;
+    }
+    unix_seconds_utc(year, month, day, hour, minute, second)
+}
+
+fn parse_rfc850_date(raw: &str) -> Option<i64> {
+    let (_, rest) = raw.split_once(", ")?;
+    let mut parts = rest.split_ascii_whitespace();
+    let date = parts.next()?;
+    let mut date_parts = date.split('-');
+    let day = date_parts.next()?.parse::<u32>().ok()?;
+    let month = parse_http_month(date_parts.next()?)?;
+    let year_two_digits = date_parts.next()?.parse::<u32>().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+    let year = if year_two_digits >= 70 {
+        1900 + i32::try_from(year_two_digits).ok()?
+    } else {
+        2000 + i32::try_from(year_two_digits).ok()?
+    };
+    let (hour, minute, second) = parse_http_time(parts.next()?)?;
+    if parts.next()? != "GMT" || parts.next().is_some() {
+        return None;
+    }
+    unix_seconds_utc(year, month, day, hour, minute, second)
+}
+
+fn parse_asctime_date(raw: &str) -> Option<i64> {
+    let mut parts = raw.split_ascii_whitespace();
+    let _weekday = parts.next()?;
+    let month = parse_http_month(parts.next()?)?;
+    let day = parts.next()?.parse::<u32>().ok()?;
+    let (hour, minute, second) = parse_http_time(parts.next()?)?;
+    let year = parts.next()?.parse::<i32>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    unix_seconds_utc(year, month, day, hour, minute, second)
+}
+
+fn parse_http_month(month: &str) -> Option<u32> {
+    match month {
+        "Jan" => Some(1),
+        "Feb" => Some(2),
+        "Mar" => Some(3),
+        "Apr" => Some(4),
+        "May" => Some(5),
+        "Jun" => Some(6),
+        "Jul" => Some(7),
+        "Aug" => Some(8),
+        "Sep" => Some(9),
+        "Oct" => Some(10),
+        "Nov" => Some(11),
+        "Dec" => Some(12),
+        _ => None,
+    }
+}
+
+fn parse_http_time(time: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = time.split(':');
+    let hour = parts.next()?.parse::<u32>().ok()?;
+    let minute = parts.next()?.parse::<u32>().ok()?;
+    let second = parts.next()?.parse::<u32>().ok()?;
+    if parts.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    Some((hour, minute, second))
+}
+
+fn unix_seconds_utc(
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<i64> {
+    if !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let second = second.min(59);
+    Some(
+        days_from_civil(year, month, day)
+            .checked_mul(86_400)?
+            .checked_add(i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))?,
+    )
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let mut year = i64::from(year);
+    let month = i64::from(month);
+    let day = i64::from(day);
+    year -= i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 fn is_retryable_status(status: u16) -> bool {
@@ -1908,6 +2057,10 @@ mod tests {
         )
     }
 
+    fn header(name: &str, value: &str) -> Vec<(String, String)> {
+        vec![(name.to_string(), value.to_string())]
+    }
+
     #[test]
     fn endpoint_requires_https_and_rejects_credentials() {
         assert!(SnowflakeEndpoint::parse("http://xy123.snowflakecomputing.com").is_err());
@@ -2028,6 +2181,37 @@ mod tests {
             .expect("delay");
         assert!(exponential >= Duration::from_millis(200));
         assert!(exponential <= Duration::from_millis(230));
+    }
+
+    #[test]
+    fn retry_after_parses_delta_seconds_and_http_dates() {
+        let now = Time::from_secs(1_445_412_475);
+        assert_eq!(
+            retry_after_ms(&header("Retry-After", "5"), now),
+            Some(5_000)
+        );
+        assert_eq!(
+            retry_after_ms(&header("Retry-After", "Wed, 21 Oct 2015 07:28:00 GMT"), now),
+            Some(5_000)
+        );
+        assert_eq!(
+            retry_after_ms(
+                &header("Retry-After", "Wednesday, 21-Oct-15 07:28:00 GMT"),
+                now
+            ),
+            Some(5_000)
+        );
+        assert_eq!(
+            retry_after_ms(&header("Retry-After", "Wed Oct 21 07:28:00 2015"), now),
+            Some(5_000)
+        );
+        assert_eq!(
+            retry_after_ms(
+                &header("Retry-After", "Wed, 21 Oct 2015 07:28:00 GMT"),
+                Time::from_secs(1_445_412_480)
+            ),
+            Some(0)
+        );
     }
 
     #[test]
