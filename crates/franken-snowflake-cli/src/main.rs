@@ -1606,7 +1606,7 @@ fn capabilities_data() -> Json {
             json_object(vec![
                 ("live", Json::Bool(false)),
                 ("testkit", Json::Bool(false)),
-                ("mcp", Json::Bool(false)),
+                ("mcp", Json::Bool(mcp_surface_available())),
                 ("tui", Json::Bool(false)),
                 ("toon", Json::Bool(toon_output_available())),
             ]),
@@ -3159,6 +3159,10 @@ fn toon_output_available() -> bool {
     cfg!(feature = "toon")
 }
 
+fn mcp_surface_available() -> bool {
+    cfg!(feature = "mcp")
+}
+
 fn output_mode_usage() -> &'static str {
     if toon_output_available() {
         "franken-snowflake <command> [--json|--toon]"
@@ -3221,6 +3225,11 @@ mod tests {
         assert!(rendered.contains("\"command_id\":\"query.cancel\""));
         assert!(rendered.contains("\"command_id\":\"mcp.serve\""));
         assert!(rendered.contains("franken-snowflake query [run] --profile"));
+        if mcp_surface_available() {
+            assert!(rendered.contains("\"mcp\":true"));
+        } else {
+            assert!(rendered.contains("\"mcp\":false"));
+        }
         if toon_output_available() {
             assert!(rendered.contains("\"alternate_outputs\":[\"toon\"]"));
             assert!(rendered.contains("\"toon\":true"));
