@@ -292,23 +292,38 @@ impl SnowflakeHttpClient {
         &self,
         cx: &Cx,
         request: &PartitionStreamRequest,
-        summary: &PartitionStreamSummary,
+        _summary: &PartitionStreamSummary,
         reason: CancelReason,
     ) -> TransportOutcome<PartitionStreamSummary> {
         if request.remote_cancel_on_local_cancel {
-            self.cancel_after_local_cancel(
-                cx,
-                request.auth.clone(),
-                request.statement_handle.clone(),
-                reason,
-            )
-            .await
-            .map(|_| summary.clone())
+            let cleanup = self
+                .cancel_after_local_cancel(
+                    cx,
+                    request.auth.clone(),
+                    request.statement_handle.clone(),
+                    reason.clone(),
+                )
+                .await;
+            stream_cancel_cleanup_outcome(cleanup, reason)
         } else {
             TransportOutcome::cancelled(reason)
         }
     }
+}
 
+fn stream_cancel_cleanup_outcome<T>(
+    cleanup: TransportOutcome<T>,
+    reason: CancelReason,
+) -> TransportOutcome<PartitionStreamSummary> {
+    match cleanup {
+        TransportOutcome::Panicked(payload) => TransportOutcome::panicked(payload),
+        TransportOutcome::Ok(_) | TransportOutcome::Err(_) | TransportOutcome::Cancelled(_) => {
+            TransportOutcome::cancelled(reason)
+        }
+    }
+}
+
+impl SnowflakeHttpClient {
     async fn execute<R, T>(
         &self,
         cx: &Cx,
@@ -2772,6 +2787,24 @@ mod tests {
 
         assert!(checkpoint_ok);
         assert!(cx.checkpoint().is_err());
+    }
+
+    #[test]
+    fn stream_cancel_cleanup_success_still_reports_cancelled() {
+        let reason = CancelReason::user("partition stream cancelled");
+        let cleanup = TransportOutcome::ok(CancelHttpResponse {
+            status: StatusClass::Completed,
+            body: br#"{"code":"090001"}"#.to_vec(),
+        });
+
+        let outcome = stream_cancel_cleanup_outcome(cleanup, reason.clone());
+
+        match outcome {
+            TransportOutcome::Cancelled(actual) => assert_eq!(actual.kind, reason.kind),
+            TransportOutcome::Ok(_) | TransportOutcome::Err(_) | TransportOutcome::Panicked(_) => {
+                panic!("cancelled stream cleanup must not report success")
+            }
+        }
     }
 
     struct CancellingSink {

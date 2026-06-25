@@ -273,7 +273,9 @@ impl StatementMachine {
     ///
     /// # Errors
     /// [`LifecycleError`] on decode failure, a non-`200` status, an out-of-order
-    /// partition, or a final row count that disagrees with `numRows`.
+    /// partition, a per-partition row count that disagrees with
+    /// `partitionInfo[*].rowCount`, or a final row count that disagrees with
+    /// `numRows`.
     pub fn on_partition(
         &mut self,
         class: ResponseClass,
@@ -314,16 +316,12 @@ impl StatementMachine {
             ));
         }
 
-        rows.append(&mut parse_partition_rows(body)?);
+        let mut partition_rows = parse_partition_rows(body)?;
+        validate_partition_row_count(&result_set, partition, partition_rows.len())?;
+        rows.append(&mut partition_rows);
         let upcoming = next.saturating_add(1);
         if upcoming >= total {
-            let expected = result_set.result_set_meta_data.num_rows;
-            if expected >= 0 && rows.len() as i64 != expected {
-                return Err(LifecycleError::new(
-                    LifecycleErrorCode::PartitionRowMismatch,
-                    format!("assembled {} rows but numRows is {expected}", rows.len()),
-                ));
-            }
+            validate_total_row_count(rows.len(), result_set.result_set_meta_data.num_rows)?;
             Ok(Progress::Complete(CompletedStatement {
                 statement_handle: handle,
                 result_set,
@@ -366,17 +364,12 @@ impl StatementMachine {
         let handle = result_set.statement_handle.clone();
         let total = partition_total(&result_set);
         let rows = result_set.data.clone();
+        validate_partition_row_count(&result_set, 0, rows.len())?;
         if total <= 1 {
             self.phase = Phase::Done;
-            // Apply the same row-count integrity check as the multi-partition path:
-            // for a single (inline) partition, `data` must hold exactly `numRows`.
-            let expected = result_set.result_set_meta_data.num_rows;
-            if expected >= 0 && rows.len() as i64 != expected {
-                return Err(LifecycleError::new(
-                    LifecycleErrorCode::PartitionRowMismatch,
-                    format!("assembled {} rows but numRows is {expected}", rows.len()),
-                ));
-            }
+            // Apply the same aggregate integrity check as the multi-partition path:
+            // for a single inline partition, `data` must hold exactly `numRows`.
+            validate_total_row_count(rows.len(), result_set.result_set_meta_data.num_rows)?;
             Ok(Progress::Complete(CompletedStatement {
                 statement_handle: handle,
                 result_set,
@@ -428,6 +421,49 @@ fn parse_failure(body: &[u8]) -> Result<QueryFailureStatus, LifecycleError> {
 pub fn parse_partition_rows(body: &[u8]) -> Result<Vec<Vec<Option<String>>>, LifecycleError> {
     serde_json::from_slice(body)
         .map_err(|error| LifecycleError::new(LifecycleErrorCode::DecodeFailed, error.to_string()))
+}
+
+fn validate_partition_row_count(
+    result_set: &ResultSet,
+    partition: u32,
+    actual_rows: usize,
+) -> Result<(), LifecycleError> {
+    let Some(expected) = usize::try_from(partition)
+        .ok()
+        .and_then(|index| result_set.result_set_meta_data.partition_info.get(index))
+        .map(|info| info.row_count)
+    else {
+        return Ok(());
+    };
+    if expected < 0 {
+        return Err(LifecycleError::new(
+            LifecycleErrorCode::PartitionRowMismatch,
+            format!("partition {partition} rowCount is negative"),
+        ));
+    }
+    if actual_rows as i64 != expected {
+        return Err(LifecycleError::new(
+            LifecycleErrorCode::PartitionRowMismatch,
+            format!("partition {partition} returned {actual_rows} rows but rowCount is {expected}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_total_row_count(actual_rows: usize, expected: i64) -> Result<(), LifecycleError> {
+    if expected < 0 {
+        return Err(LifecycleError::new(
+            LifecycleErrorCode::PartitionRowMismatch,
+            "numRows is negative",
+        ));
+    }
+    if actual_rows as i64 != expected {
+        return Err(LifecycleError::new(
+            LifecycleErrorCode::PartitionRowMismatch,
+            format!("assembled {actual_rows} rows but numRows is {expected}"),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -608,6 +644,76 @@ mod tests {
         let result = machine.on_partition(ResponseClass::Completed, 1, br#"[["y"]]"#);
         assert!(matches!(
             result,
+            Err(LifecycleError {
+                code: LifecycleErrorCode::PartitionRowMismatch,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn fetched_partition_row_count_mismatch_is_rejected_before_total_can_compensate() {
+        let terminal = br#"{"resultSetMetaData":{"numRows":3,"format":"jsonv2",
+            "rowType":[{"name":"A","type":"TEXT","nullable":false}],
+            "partitionInfo":[{"rowCount":1,"compressedSize":1,"uncompressedSize":1},
+                             {"rowCount":1,"compressedSize":1,"uncompressedSize":1},
+                             {"rowCount":1,"compressedSize":1,"uncompressedSize":1}]},
+            "data":[["inline"]],"code":"090001","statementHandle":"hp"}"#;
+        let mut machine = StatementMachine::new(PollPlan::default());
+        assert!(matches!(
+            machine.on_submit(ResponseClass::Completed, terminal),
+            Ok(Progress::FetchPartition { partition: 1, .. })
+        ));
+
+        let result = machine.on_partition(
+            ResponseClass::Completed,
+            1,
+            br#"[["too-many"],["would-hide-empty-next"]]"#,
+        );
+
+        assert!(matches!(
+            result,
+            Err(LifecycleError {
+                code: LifecycleErrorCode::PartitionRowMismatch,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn empty_fetched_partition_with_positive_row_count_is_rejected() {
+        let terminal = br#"{"resultSetMetaData":{"numRows":2,"format":"jsonv2",
+            "rowType":[{"name":"A","type":"TEXT","nullable":false}],
+            "partitionInfo":[{"rowCount":1,"compressedSize":1,"uncompressedSize":1},
+                             {"rowCount":1,"compressedSize":1,"uncompressedSize":1}]},
+            "data":[["inline"]],"code":"090001","statementHandle":"hp"}"#;
+        let mut machine = StatementMachine::new(PollPlan::default());
+        assert!(matches!(
+            machine.on_submit(ResponseClass::Completed, terminal),
+            Ok(Progress::FetchPartition { partition: 1, .. })
+        ));
+
+        let result = machine.on_partition(ResponseClass::Completed, 1, br#"[]"#);
+
+        assert!(matches!(
+            result,
+            Err(LifecycleError {
+                code: LifecycleErrorCode::PartitionRowMismatch,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn inline_partition_info_row_count_mismatch_is_rejected() {
+        let terminal = br#"{"resultSetMetaData":{"numRows":1,"format":"jsonv2",
+            "rowType":[{"name":"A","type":"TEXT","nullable":false}],
+            "partitionInfo":[{"rowCount":2,"compressedSize":1,"uncompressedSize":1}]},
+            "data":[["x"]],"code":"090001","statementHandle":"h"}"#;
+        let mut machine = StatementMachine::new(PollPlan::default());
+
+        assert!(matches!(
+            machine.on_submit(ResponseClass::Completed, terminal),
             Err(LifecycleError {
                 code: LifecycleErrorCode::PartitionRowMismatch,
                 ..

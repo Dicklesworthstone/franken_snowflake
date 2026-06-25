@@ -111,8 +111,8 @@ pub fn decode_cell(raw: Option<&str>, column: &ColumnType) -> Result<CellValue, 
     };
 
     match column.column_type.to_ascii_uppercase().as_str() {
-        "FIXED" | "NUMBER" | "DECIMAL" | "NUMERIC" | "INT" | "INTEGER" | "BIGINT" | "SMALLINT"
-        | "TINYINT" | "BYTEINT" => Ok(CellValue::Number(text.to_owned())),
+        "FIXED" | "NUMBER" | "DECIMAL" | "NUMERIC" | "DECFLOAT" | "INT" | "INTEGER" | "BIGINT"
+        | "SMALLINT" | "TINYINT" | "BYTEINT" => Ok(CellValue::Number(text.to_owned())),
 
         "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" => text
             .parse::<f64>()
@@ -145,10 +145,9 @@ pub fn decode_cell(raw: Option<&str>, column: &ColumnType) -> Result<CellValue, 
             let encoded_offset = offset_part
                 .parse::<i32>()
                 .map_err(|_| make_err("TIMESTAMP_TZ offset must be an integer"))?;
-            // The wire encodes the offset as offset_minutes + 1440 (UTC == 1440),
-            // so the encoded value is in [0, 2880]. Validate the range before
-            // subtracting so a malformed cell cannot underflow i32.
-            if !(0..=2880).contains(&encoded_offset) {
+            // The wire encodes the offset as offset_minutes + 1440 (UTC == 1440).
+            // Snowflake documents the encoded value as 720..=2160 (-12h..=+12h).
+            if !(720..=2160).contains(&encoded_offset) {
                 return Err(make_err("TIMESTAMP_TZ offset is out of range"));
             }
             Ok(CellValue::TimestampTz {
@@ -270,6 +269,14 @@ mod tests {
         column.scale = Some(2);
         let value = decode_cell(Some("1.50"), &column).map_err(|e| e.to_string())?;
         assert_eq!(value, CellValue::Number("1.50".to_owned()));
+        assert_eq!(
+            decode_cell(
+                Some("1.2345678901234567890123456789012345678E+39"),
+                &col("DECFLOAT")
+            )
+            .map_err(|e| e.to_string())?,
+            CellValue::Number("1.2345678901234567890123456789012345678E+39".to_owned())
+        );
         Ok(())
     }
 
@@ -324,6 +331,9 @@ mod tests {
 
     #[test]
     fn timestamp_tz_decodes_offset_minus_1440() -> Result<(), String> {
+        // Snowflake SQL API handling-responses docs, consulted 2026-06-25:
+        // https://docs.snowflake.com/en/developer-guide/sql-api/handling-responses
+        // The encoded offset is 720..=2160, representing UTC-12:00..=UTC+12:00.
         // offset encoded as offset_minutes + 1440; 960 → -480 minutes (UTC-08:00).
         let value = decode_cell(Some("1700000000.000000000 960"), &col("TIMESTAMP_TZ"))
             .map_err(|e| e.to_string())?;
@@ -336,6 +346,26 @@ mod tests {
             }
         );
         assert!(decode_cell(Some("1700000000.0"), &col("TIMESTAMP_TZ")).is_err());
+        assert_eq!(
+            decode_cell(Some("1700000000.0 720"), &col("TIMESTAMP_TZ"))
+                .map_err(|e| e.to_string())?,
+            CellValue::TimestampTz {
+                seconds: 1_700_000_000,
+                nanos: 0,
+                offset_minutes: -720
+            }
+        );
+        assert_eq!(
+            decode_cell(Some("1700000000.0 2160"), &col("TIMESTAMP_TZ"))
+                .map_err(|e| e.to_string())?,
+            CellValue::TimestampTz {
+                seconds: 1_700_000_000,
+                nanos: 0,
+                offset_minutes: 720
+            }
+        );
+        assert!(decode_cell(Some("1700000000.0 719"), &col("TIMESTAMP_TZ")).is_err());
+        assert!(decode_cell(Some("1700000000.0 2161"), &col("TIMESTAMP_TZ")).is_err());
         Ok(())
     }
 
