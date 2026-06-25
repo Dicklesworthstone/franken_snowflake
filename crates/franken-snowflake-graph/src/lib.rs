@@ -318,8 +318,15 @@ impl CatalogGraph {
     #[must_use]
     pub fn cycles(&self) -> Vec<Vec<NodeKey>> {
         let mut fnx_cycles = fnx_algorithms::simple_cycles(&self.to_fnx_digraph());
+        // Canonicalize each cycle by ROTATING it to start at its minimum node.
+        // That is deterministic without destroying the traversal direction —
+        // sorting the nodes within a cycle would make A->B->C->A indistinguishable
+        // from any other 3-node set, so the returned path would no longer describe
+        // a traversable cycle.
         for cycle in &mut fnx_cycles {
-            cycle.sort();
+            if let Some(min_index) = (0..cycle.len()).min_by(|&a, &b| cycle[a].cmp(&cycle[b])) {
+                cycle.rotate_left(min_index);
+            }
         }
         fnx_cycles.sort();
         fnx_cycles
@@ -828,12 +835,37 @@ fn stable_hex(value: &str) -> String {
     format!("{hash:016x}")
 }
 
+/// Escape a label for Mermaid `["..."]` node text and `-->|...|` edge labels.
+///
+/// Mermaid does **not** honor C-style backslash escapes inside quoted labels;
+/// the supported way to carry reserved characters is the HTML entity form,
+/// because Mermaid renders the label as HTML. A raw `"` closes the `["..."]`
+/// quoting early, and a raw `[`/`]`/`{`/`}`/`(`/`)`/`|` can break the node or
+/// inject additional flowchart syntax — and catalog-derived names (legally
+/// quoted Snowflake identifiers) can contain any of these. Encode them all as
+/// HTML entities, neutralize `&`/`<`/`>` against HTML injection in the rendered
+/// SVG, and collapse every line separator (`\n`, `\r`, U+2028, U+2029) to a
+/// space so a label always stays on one line.
 fn escape_mermaid_label(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('|', " ")
-        .replace('\n', " ")
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '"' => escaped.push_str("&quot;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '[' => escaped.push_str("&#91;"),
+            ']' => escaped.push_str("&#93;"),
+            '{' => escaped.push_str("&#123;"),
+            '}' => escaped.push_str("&#125;"),
+            '(' => escaped.push_str("&#40;"),
+            ')' => escaped.push_str("&#41;"),
+            '|' => escaped.push_str("&#124;"),
+            '\n' | '\r' | '\u{2028}' | '\u{2029}' => escaped.push(' '),
+            other => escaped.push(other),
+        }
+    }
+    escaped
 }
 
 fn escape_xml(value: &str) -> String {
@@ -1061,6 +1093,87 @@ mod tests {
         assert!(svg.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\""));
         assert!(svg.contains("Catalog lineage graph"));
         assert!(svg.contains("dataset:events_daily"));
+    }
+
+    #[test]
+    fn mermaid_label_escaping_neutralizes_structural_chars() {
+        // A quoted Snowflake identifier can legally contain Mermaid-structural
+        // characters; backslash escaping does not neutralize them in Mermaid
+        // (it ignores C-style escapes inside ["..."]). They must be HTML-entity
+        // encoded so they cannot close the node text or inject extra syntax.
+        let escaped = escape_mermaid_label("EV\"]click[\"x");
+        for raw in ['"', '[', ']', '{', '}', '(', ')', '|'] {
+            assert!(
+                !escaped.contains(raw),
+                "raw {raw:?} must not survive escaping: {escaped}"
+            );
+        }
+        assert!(escaped.contains("&quot;"));
+        assert!(escaped.contains("&#91;")); // [
+        assert!(escaped.contains("&#93;")); // ]
+        // No backslash escaping is emitted (Mermaid does not honor it).
+        assert!(!escaped.contains('\\'));
+        // Every line separator collapses to a single space.
+        assert_eq!(
+            escape_mermaid_label("a\nb\rc\u{2028}d\u{2029}e"),
+            "a b c d e"
+        );
+    }
+
+    #[test]
+    fn mermaid_injection_in_object_name_cannot_add_nodes() {
+        // A catalog object name crafted to break the bracket and inject a node
+        // must render as exactly one node, with no stray ["..."] openings.
+        let mut snapshot = fixture_snapshot();
+        if let Some(dataset) = snapshot.datasets.first_mut() {
+            dataset.object = "EV\"]evil[\"x".to_owned();
+        }
+        for column in &mut snapshot.columns {
+            column.object = "EV\"]evil[\"x".to_owned();
+        }
+        let graph = CatalogGraph::from_snapshot(&snapshot);
+        let mermaid = graph.to_mermaid();
+        // One ["..."] opening per node; injection would create extra ones.
+        assert_eq!(mermaid.matches("[\"").count(), graph.node_count());
+        assert!(!mermaid.contains("evil[\""));
+    }
+
+    #[test]
+    fn cycles_preserve_loop_order_not_alphabetical_order() {
+        // Regression for the per-cycle sort that discarded traversal order: a
+        // 3-cycle a->c->b->a must come back rotated to its min node in LOOP
+        // order ([a, c, b]), not alphabetized ([a, b, c]).
+        let mut graph = CatalogGraph::from_snapshot(&fixture_snapshot());
+        let nodes = ["cyc_a", "cyc_c", "cyc_b"];
+        for key in nodes {
+            graph.add_node(node(
+                key.to_owned(),
+                CatalogNodeKind::Dataset,
+                key.to_owned(),
+                None,
+                &provenance(),
+            ));
+        }
+        // Loop edges: cyc_a -> cyc_c -> cyc_b -> cyc_a.
+        for (from, to) in [("cyc_a", "cyc_c"), ("cyc_c", "cyc_b"), ("cyc_b", "cyc_a")] {
+            graph.add_edge(edge(
+                from,
+                CatalogEdgeKind::LineageReads,
+                to,
+                None,
+                &provenance(),
+            ));
+        }
+        let injected = graph
+            .cycles()
+            .into_iter()
+            .find(|cycle| cycle.iter().any(|node| node == "cyc_a"))
+            .unwrap_or_default();
+        assert_eq!(
+            injected,
+            vec!["cyc_a".to_owned(), "cyc_c".to_owned(), "cyc_b".to_owned()],
+            "cycle must keep loop order rotated to its min node, not be alphabetized"
+        );
     }
 
     #[test]
