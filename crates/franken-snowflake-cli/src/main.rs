@@ -683,16 +683,16 @@ fn parse_query(args: &[String], output: OutputFormat) -> Result<Command, Outcome
         Some(value) if value.starts_with("--") && value_after(args, "--sql").is_some() => {
             Ok(Command::QueryRun {
                 profile: value_after(args, "--profile"),
-                sql: value_after(args, "--sql"),
+                sql: raw_value_after(args, "--sql"),
             })
         }
         Some("plan") => Ok(Command::QueryPlan {
             profile: value_after(args, "--profile"),
-            sql: value_after(args, "--sql"),
+            sql: raw_value_after(args, "--sql"),
         }),
         Some("run") => Ok(Command::QueryRun {
             profile: value_after(args, "--profile"),
-            sql: value_after(args, "--sql"),
+            sql: raw_value_after(args, "--sql"),
         }),
         Some("cancel") => match args.get(2) {
             Some(statement_handle) => Ok(Command::QueryCancel {
@@ -2506,16 +2506,28 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 }
 
 fn value_after(args: &[String], flag: &str) -> Option<String> {
+    value_after_inner(args, flag, false)
+}
+
+fn raw_value_after(args: &[String], flag: &str) -> Option<String> {
+    value_after_inner(args, flag, true)
+}
+
+fn value_after_inner(args: &[String], flag: &str, allow_flag_like_value: bool) -> Option<String> {
     for (index, arg) in args.iter().enumerate() {
         if arg == flag {
-            return args.get(index + 1).cloned();
+            let value = args.get(index + 1)?;
+            if !allow_flag_like_value && value.starts_with('-') {
+                return None;
+            }
+            return Some(value.clone());
         }
 
         if let Some(value) = arg
             .strip_prefix(flag)
             .and_then(|suffix| suffix.strip_prefix('='))
         {
-            return Some(value.to_string());
+            return (!value.is_empty()).then(|| value.to_string());
         }
     }
 
@@ -3238,6 +3250,24 @@ mod tests {
         assert!(rendered.contains("\"requested_schema\":\"PUBLIC\""));
         assert!(!rendered.contains("Missing --database"));
         assert!(!rendered.contains("Missing --schema"));
+    }
+
+    #[test]
+    fn missing_flag_value_is_not_swallowed_from_next_flag() {
+        let outcome = execute(vec![
+            "query".to_string(),
+            "plan".to_string(),
+            "--profile".to_string(),
+            "--sql".to_string(),
+            "select 1".to_string(),
+        ]);
+        assert_eq!(outcome.status.code(), 64);
+        let rendered = match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("Missing --profile for `query plan`."));
+        assert!(!rendered.contains("\"profile_id\":\"--sql\""));
     }
 
     #[test]
