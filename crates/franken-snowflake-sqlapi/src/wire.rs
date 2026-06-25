@@ -169,13 +169,28 @@ pub fn decode_cell(raw: Option<&str>, column: &ColumnType) -> Result<CellValue, 
 /// Parse `"<seconds>"` or `"<seconds>.<frac>"` into `(whole_seconds, nanos)`.
 /// Fractions are taken to nanosecond precision (extra digits truncated). Returns
 /// `None` on a non-integer seconds part or non-digit fraction.
+///
+/// The result obeys `value = seconds + nanos / 1e9` with `nanos` in
+/// `[0, 1e9)`. For **negative (pre-1970) epoch values with a nonzero fraction**
+/// this needs a borrow — `"-1.5"` is `-1.5s = (-2, 500_000_000)`, and `"-0.5"`
+/// is `-0.5s = (-1, 500_000_000)`. Note the integer part of `"-0.5"` parses to
+/// `0`, so the sign is read from the string, not from the parsed integer.
 fn parse_fractional_seconds(text: &str) -> Option<(i64, u32)> {
-    match text.split_once('.') {
-        Some((seconds, frac)) => {
-            let seconds = seconds.parse::<i64>().ok()?;
-            Some((seconds, frac_to_nanos(frac)?))
-        }
-        None => Some((text.parse::<i64>().ok()?, 0)),
+    let negative = text.starts_with('-');
+    let (int_str, frac_nanos) = match text.split_once('.') {
+        Some((int_str, frac)) => (int_str, frac_to_nanos(frac)?),
+        None => (text, 0),
+    };
+    let int_part = int_str.parse::<i64>().ok()?;
+    if !negative || frac_nanos == 0 {
+        // Positive, or an exact second (no fractional remainder to borrow).
+        Some((int_part, frac_nanos))
+    } else {
+        // Negative with a fractional remainder: borrow one whole second so the
+        // fraction stays non-negative. `frac_nanos` is in `(0, 1e9)` here, so
+        // `1e9 - frac_nanos` is also in `(0, 1e9)`.
+        let seconds = int_part.checked_sub(1)?;
+        Some((seconds, 1_000_000_000 - frac_nanos))
     }
 }
 
@@ -317,6 +332,56 @@ mod tests {
             }
         );
         assert!(decode_cell(Some("1700000000.0"), &col("TIMESTAMP_TZ")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn negative_pre_1970_timestamps_decode_with_borrow() -> Result<(), String> {
+        // Regression (bead fsnow-agent-ergonomic-cli-aq2): pre-epoch fractional
+        // timestamps must satisfy value = seconds + nanos/1e9 with nanos in
+        // [0, 1e9). Before the fix, "-1.5" decoded to (-1, 5e8) = -0.5s.
+        let cases: &[(&str, i64, u32)] = &[
+            ("-1.5", -2, 500_000_000),                  // -1.5s
+            ("-0.5", -1, 500_000_000),                  // -0.5s; integer part "-0" parses to 0
+            ("-1.0", -1, 0),                            // exact: no borrow
+            ("-1", -1, 0),                              // no fraction at all
+            ("-86400.250000000", -86401, 750_000_000),  // one day before epoch, .25s
+        ];
+        for (raw, seconds, nanos) in cases {
+            let value = decode_cell(Some(raw), &col("TIMESTAMP_NTZ")).map_err(|e| e.to_string())?;
+            assert_eq!(
+                value,
+                CellValue::Timestamp {
+                    seconds: *seconds,
+                    nanos: *nanos,
+                },
+                "decode of {raw:?}"
+            );
+        }
+        // The positive path is unchanged.
+        assert_eq!(
+            decode_cell(Some("1.5"), &col("TIMESTAMP_NTZ")).map_err(|e| e.to_string())?,
+            CellValue::Timestamp {
+                seconds: 1,
+                nanos: 500_000_000
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn negative_timestamp_tz_decodes_with_borrow() -> Result<(), String> {
+        // 1969-12-31T23:59:59.5 at UTC-08:00 → "-0.5 960" (offset 960 = -480 + 1440).
+        let value =
+            decode_cell(Some("-0.5 960"), &col("TIMESTAMP_TZ")).map_err(|e| e.to_string())?;
+        assert_eq!(
+            value,
+            CellValue::TimestampTz {
+                seconds: -1,
+                nanos: 500_000_000,
+                offset_minutes: -480,
+            }
+        );
         Ok(())
     }
 
