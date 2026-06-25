@@ -1,0 +1,14 @@
+{
+  "command_id": "query.run",
+  "data_source": "fixture",
+  "ok": true,
+  "outcome_kind": "success",
+  "rows": [
+    { "id": 1, "name": "alpha", "ratio": 0.25 },
+    { "id": 2, "name": "beta", "ratio": 0.5 }
+  ],
+  "result_hash": "0000000000000000",
+  "row_count": 2,
+  "started_at": "2026-06-24T00:00:00Z",
+  "trace_id": "fixture-trace-0000"
+}

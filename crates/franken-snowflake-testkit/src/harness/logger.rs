@@ -369,4 +369,59 @@ mod tests {
         fs::remove_dir_all(&root)?;
         Ok(())
     }
+
+    #[test]
+    fn all_pass_run_is_ok_and_counts_every_outcome() -> Result<(), Box<dyn std::error::Error>> {
+        let root = temp_root("counts");
+        let mut logger = RunLogger::new(&root, "trace-counts")?;
+        logger.pass("cmd", "a")?;
+        logger.pass("cmd", "b")?;
+        logger.info("cmd", "note", "fyi")?;
+        logger.skip("cmd", "live", "no creds")?;
+        let summary = logger.finish()?;
+
+        assert!(summary.ok());
+        assert_eq!(summary.total, 4);
+        assert_eq!(summary.passed, 2);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.info, 1);
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn summary_json_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let root = temp_root("summary");
+        let mut logger = RunLogger::new(&root, "trace-summary")?;
+        logger.pass("cmd", "only")?;
+        let summary = logger.finish()?;
+
+        let json = fs::read_to_string(root.join("trace-summary").join("summary.json"))?;
+        let parsed: RunSummary = serde_json::from_str(&json)?;
+        assert_eq!(parsed, summary);
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn event_lines_are_lf_only_and_individually_valid_json() -> Result<(), Box<dyn std::error::Error>> {
+        let root = temp_root("lf");
+        let mut logger = RunLogger::new(&root, "trace-lf")?;
+        logger.pass("cmd", "first")?;
+        logger.fail("cmd", "second", "x", "y")?;
+        logger.finish()?;
+
+        let events = fs::read_to_string(root.join("trace-lf").join("events.jsonl"))?;
+        // No carriage returns; the goldens-discipline rule applies to logs too.
+        assert!(!events.contains('\r'));
+        for line in events.lines() {
+            let _event: StepEvent = serde_json::from_str(line)?;
+        }
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
 }

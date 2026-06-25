@@ -329,8 +329,9 @@ mod tests {
     #[test]
     fn secret_shape_hits_are_stored_redacted() {
         let guard = CanaryGuard::new();
-        // A GitHub-PAT-shaped token (matches the shared needle list).
-        let hits = guard.scan_text(Channel::Stdout, "token=ghp_0123456789abcdefABCDEF in log");
+        // A GitHub-PAT-shaped token (matches the shared needle list). It must be
+        // a whitespace-delimited token so it lands on a secret-prefix boundary.
+        let hits = guard.scan_text(Channel::Stdout, "leaked token: ghp_0123456789abcdefABCDEF here");
         let shape: Vec<&CanaryHit> = hits
             .iter()
             .filter(|hit| hit.kind == HitKind::SecretShape)
@@ -339,5 +340,72 @@ mod tests {
         // The raw secret is never retained; only the redacted form is.
         assert!(!shape[0].needle.contains("ghp_0123456789"));
         assert!(shape[0].needle.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn disabling_shape_scan_only_keeps_planted_hits() {
+        let guard = CanaryGuard::with_default_canary().scan_shapes(false);
+        let hits = guard.scan_text(
+            Channel::Stderr,
+            &format!("ghp_0123456789abcdefABCDEF and {DEFAULT_CANARY}"),
+        );
+        // The real-shaped token is ignored; only the planted canary trips.
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, HitKind::PlantedCanary);
+    }
+
+    #[test]
+    fn multiple_shape_hits_carry_distinct_offsets() {
+        let guard = CanaryGuard::new();
+        let text = "AKIAIOSFODNN7EXAMPLE then xoxb-abcdEFGH";
+        let hits = guard.scan_text(Channel::Stdout, text);
+        let shapes: Vec<&CanaryHit> = hits
+            .iter()
+            .filter(|hit| hit.kind == HitKind::SecretShape)
+            .collect();
+        assert_eq!(shapes.len(), 2);
+        assert_ne!(shapes[0].byte_offset, shapes[1].byte_offset);
+        // Offsets point at the token starts.
+        assert_eq!(shapes[0].byte_offset, 0);
+        assert_eq!(shapes[1].byte_offset, text.find("xoxb-").unwrap_or(usize::MAX));
+    }
+
+    #[test]
+    fn multiple_planted_canaries_are_all_scanned() {
+        let mut guard = CanaryGuard::new();
+        guard.plant("CANARY_ONE").plant("CANARY_TWO");
+        let hits = guard.scan_text(Channel::Stdout, "x CANARY_ONE y CANARY_TWO z");
+        assert_eq!(hits.iter().filter(|h| h.kind == HitKind::PlantedCanary).count(), 2);
+    }
+
+    #[test]
+    fn scan_file_rejects_non_utf8() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join("fsnow-harness-canary-utf8");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("blob.bin");
+        std::fs::write(&path, [0xff_u8, 0xfe, 0x00])?;
+        let guard = CanaryGuard::with_default_canary();
+        match guard.scan_file(&path) {
+            Err(CanaryError::Utf8) => {}
+            other => return Err(format!("expected Utf8 error, got {other:?}").into()),
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn leak_display_lists_each_hit() -> Result<(), String> {
+        let guard = CanaryGuard::with_default_canary();
+        let report = CanaryReport {
+            hits: guard.scan_text(Channel::Stdout, DEFAULT_CANARY),
+        };
+        let leak = report
+            .assert_clean()
+            .err()
+            .ok_or_else(|| "planted canary must trip".to_owned())?;
+        let rendered = leak.to_string();
+        assert!(rendered.contains("planted canary"));
+        assert!(rendered.contains("stdout"));
+        Ok(())
     }
 }

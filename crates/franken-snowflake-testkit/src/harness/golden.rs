@@ -41,14 +41,20 @@ pub struct GoldenConfig {
 }
 
 /// Exact (lower-cased) key names treated as volatile by [`GoldenConfig::default`].
+///
+/// Deliberately excludes *stable* identifiers like `command_id` and `request_id`
+/// (the envelope contract makes those deterministic and they are often the value
+/// under test) and server/domain ids like `query_id` / `statement_handle` — add
+/// those per-fixture via [`GoldenConfig::with_volatile_key`] when a particular
+/// golden needs them zeroed.
 const DEFAULT_VOLATILE_EXACT: &[&str] = &[
     // host / process identity
     "host", "hostname", "pid", "ppid", "tid", "thread_id",
     // wall-clock
     "time", "now", "date", "today", "timestamp", "uptime",
-    // per-run identifiers
-    "trace_id", "command_id", "run_id", "session_id", "request_id", "span_id",
-    "parent_id", "correlation_id", "nonce", "uuid", "etag", "seed",
+    // per-run correlation identifiers (ephemeral noise, never under test)
+    "trace_id", "run_id", "session_id", "span_id", "parent_id", "correlation_id",
+    "nonce", "uuid", "etag", "seed",
 ];
 
 /// Key suffixes (lower-cased) treated as volatile by [`GoldenConfig::default`].
@@ -609,6 +615,145 @@ mod tests {
             .ok_or_else(|| "CR must be rejected".to_owned())?;
         assert_eq!(violation.byte_offset, 5);
         assert_eq!(violation.line, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn type_mismatch_is_reported_with_type_names() -> Result<(), String> {
+        let cfg = GoldenConfig::strict();
+        let mismatch = compare(&json!({ "v": 1 }), &json!({ "v": "1" }), &cfg)
+            .err()
+            .ok_or_else(|| "number vs string must mismatch".to_owned())?;
+        assert_eq!(mismatch.kind, MismatchKind::Type);
+        assert_eq!(mismatch.path, "$.v");
+        assert_eq!(mismatch.expected, "number");
+        assert_eq!(mismatch.actual, "string");
+        Ok(())
+    }
+
+    #[test]
+    fn array_length_mismatch_is_reported() -> Result<(), String> {
+        let cfg = GoldenConfig::strict();
+        let mismatch = compare(&json!({ "xs": [1, 2, 3] }), &json!({ "xs": [1, 2] }), &cfg)
+            .err()
+            .ok_or_else(|| "length difference must mismatch".to_owned())?;
+        assert_eq!(mismatch.kind, MismatchKind::Length);
+        assert_eq!(mismatch.path, "$.xs");
+        assert_eq!(mismatch.expected, "3");
+        assert_eq!(mismatch.actual, "2");
+        Ok(())
+    }
+
+    #[test]
+    fn missing_and_extra_keys_are_distinguished() -> Result<(), String> {
+        let cfg = GoldenConfig::strict();
+        let missing = compare(&json!({ "a": 1, "b": 2 }), &json!({ "a": 1 }), &cfg)
+            .err()
+            .ok_or_else(|| "missing key must mismatch".to_owned())?;
+        assert_eq!(missing.kind, MismatchKind::MissingKey);
+        assert_eq!(missing.path, "$.b");
+
+        let extra = compare(&json!({ "a": 1 }), &json!({ "a": 1, "c": 3 }), &cfg)
+            .err()
+            .ok_or_else(|| "extra key must mismatch".to_owned())?;
+        assert_eq!(extra.kind, MismatchKind::ExtraKey);
+        assert_eq!(extra.path, "$.c");
+        Ok(())
+    }
+
+    #[test]
+    fn strict_config_does_not_zero_identifiers() -> Result<(), String> {
+        // Under the default config trace_id is volatile, so differing ids match;
+        // under strict() they are compared exactly and must mismatch.
+        let left = json!({ "trace_id": "aaa" });
+        let right = json!({ "trace_id": "bbb" });
+        assert!(compare(&left, &right, &GoldenConfig::default()).is_ok());
+        let mismatch = compare(&left, &right, &GoldenConfig::strict())
+            .err()
+            .ok_or_else(|| "strict compare must see differing ids".to_owned())?;
+        assert_eq!(mismatch.path, "$.trace_id");
+        Ok(())
+    }
+
+    #[test]
+    fn stable_command_id_is_not_zeroed_by_default() -> Result<(), String> {
+        // command_id is a deterministic envelope field; it must survive
+        // canonicalization so two different commands do not collide.
+        let cfg = GoldenConfig::default();
+        let run = compare(
+            &json!({ "command_id": "query.run" }),
+            &json!({ "command_id": "catalog.scan" }),
+            &cfg,
+        );
+        let mismatch = run.err().ok_or_else(|| "command_id must stay stable".to_owned())?;
+        assert_eq!(mismatch.path, "$.command_id");
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_json_is_sorted_compact_and_lf_only() -> Result<(), String> {
+        let cfg = GoldenConfig::strict();
+        let value = json!({ "b": 1, "a": { "y": 2, "x": 1 }, "c": [3, 2, 1] });
+        let canonical = to_canonical_json(&value, &cfg);
+        assert_eq!(canonical, r#"{"a":{"x":1,"y":2},"b":1,"c":[3,2,1]}"#);
+        assert!(assert_no_cr(&canonical).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn write_then_check_golden_file_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = GoldenConfig::default();
+        let dir = std::env::temp_dir().join("fsnow-harness-golden");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("envelope.golden.json");
+
+        let golden = json!({ "command_id": "x", "trace_id": "run-A", "n": 7 });
+        write_golden(&path, &golden, &cfg)?;
+
+        // Written golden is LF-only, sorted, and newline-terminated.
+        let bytes = std::fs::read(&path)?;
+        assert_lf_only(&bytes)?;
+        assert_eq!(bytes.last().copied(), Some(b'\n'));
+
+        // A re-run with a *different* volatile trace_id still matches.
+        let rerun = json!({ "command_id": "x", "trace_id": "run-B", "n": 7 });
+        check_golden_file(&path, &rerun, &cfg)?;
+
+        // A real difference (n: 7 -> 8) is caught.
+        let drifted = json!({ "command_id": "x", "trace_id": "run-C", "n": 8 });
+        assert!(check_golden_file(&path, &drifted, &cfg).is_err());
+
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn on_disk_fixture_matches_a_fresh_run() -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = GoldenConfig::default();
+        let path = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fixtures/golden/sample_run.golden.json"
+        ));
+        // The committed fixture is LF-only.
+        assert_lf_only(&std::fs::read(path)?)?;
+
+        // A fresh run with different volatile time/host/hash/trace values but the
+        // same logical payload matches the committed golden.
+        let fresh = json!({
+            "command_id": "query.run",
+            "data_source": "fixture",
+            "ok": true,
+            "outcome_kind": "success",
+            "rows": [
+                { "id": 1, "name": "alpha", "ratio": 0.25 },
+                { "id": 2, "name": "beta", "ratio": 0.5 }
+            ],
+            "result_hash": "ffffffffffffffff",
+            "row_count": 2,
+            "started_at": "2030-01-01T12:34:56Z",
+            "trace_id": "fixture-trace-9999"
+        });
+        check_golden_file(path, &fresh, &cfg)?;
         Ok(())
     }
 }

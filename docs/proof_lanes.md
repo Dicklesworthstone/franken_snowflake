@@ -121,3 +121,35 @@ resolving the doc ambiguity Lane 1's codec tests are written against.
 - A deterministic injected clock and fixed seeds make timings and ordering
   reproducible; canonicalization zeroes time/host/hash fields before golden
   comparison and reports IEEE-754 bits on float mismatch.
+
+## Shared Harness (implemented)
+
+These cross-cutting standards are implemented **once** in the generic
+`franken_snowflake_testkit::harness` module (bead
+`fsnow-native-snowflake-connector-w0i.15`, closed). Every crate consumes it as a
+dev-dependency rather than re-rolling logging or golden comparison; the
+Snowflake-specific fixtures and the `fastapi_rust` mock build on top of it
+(`fsnow-deterministic-testkit-bak`). It carries no Snowflake protocol knowledge
+and performs no live IO.
+
+- `harness::golden` — `GoldenConfig` (volatile time/host/hash/run-id zeroing;
+  stable `command_id`/`request_id`/domain ids excluded by default, opt-in via
+  `with_volatile_key`), `to_canonical_json` (sorted-key, compact, LF-only),
+  `compare` (structural, IEEE-754 bits on float mismatch), `check_golden_file` /
+  `write_golden` (with the `FSNOW_UPDATE_GOLDENS=1` bless flow), and
+  `assert_no_cr` / `assert_lf_only` for the Lane 7 `eol=lf` rule.
+- `harness::logger` — `RunLogger` writes one JSON-line `StepEvent`
+  (`trace_id`/`command_id`/`seq`/`elapsed_ms`/`outcome`, plus expected-vs-actual
+  on failure) to `‹artifacts_root›/‹trace_id›/events.jsonl`, then `finish()`
+  emits `summary.json` + `summary.txt` and returns a `RunSummary`.
+- `harness::clock` — the injected `Clock` (`SystemClock` / `ManualClock`), a
+  seeded SplitMix64 `DeterministicRng`, a `Deadline` TTL, and a reproducible
+  `backoff_schedule(policy, seed)`.
+- `harness::canary` — `CanaryGuard` scans stdout/stderr/files for planted
+  canaries and for production secret shapes via the single shared needle list in
+  `franken_snowflake_core::redact` (so the guard and the redactor cannot drift,
+  per `docs/security_model.md`).
+
+A committed golden fixture lives at
+`crates/franken-snowflake-testkit/fixtures/golden/sample_run.golden.json`; each
+module ships beside-the-code self-tests with positive and negative cases.

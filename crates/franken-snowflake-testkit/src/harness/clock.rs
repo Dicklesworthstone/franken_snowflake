@@ -270,4 +270,60 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn deterministic_rng_is_seed_reproducible() {
+        let draw = |seed: u64| {
+            let mut rng = DeterministicRng::new(seed);
+            [rng.next_u64(), rng.next_u64(), rng.next_u64()]
+        };
+        assert_eq!(draw(42), draw(42));
+        assert_ne!(draw(42), draw(43));
+    }
+
+    #[test]
+    fn rng_unit_values_stay_in_half_open_unit_interval() {
+        let mut rng = DeterministicRng::new(7);
+        for _ in 0..1_000 {
+            let value = rng.next_unit_f64();
+            assert!((0.0..1.0).contains(&value));
+        }
+    }
+
+    #[test]
+    fn system_clock_is_monotonic() {
+        let clock = SystemClock::new();
+        let first = clock.now();
+        let second = clock.now();
+        assert!(second >= first);
+    }
+
+    #[test]
+    fn manual_clock_at_and_set_position_absolute_time() {
+        let clock = ManualClock::at(Duration::from_secs(100));
+        assert_eq!(clock.now(), Duration::from_secs(100));
+        clock.set(Duration::from_secs(5));
+        assert_eq!(clock.now(), Duration::from_secs(5));
+        let deadline = Deadline::at(Duration::from_secs(10));
+        assert!(!deadline.is_expired(&clock));
+        assert_eq!(deadline.remaining(&clock), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn jittered_backoff_stays_within_symmetric_bounds() {
+        let policy = BackoffPolicy::exponential(
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+            6,
+        )
+        .with_jitter(0.25);
+        for (attempt, delay) in backoff_schedule(&policy, 99).into_iter().enumerate() {
+            let exponent = i32::try_from(attempt).unwrap_or(i32::MAX);
+            let capped = (100.0 * 2.0_f64.powi(exponent)).min(60_000.0);
+            let low = Duration::from_secs_f64((capped * 0.75) / 1000.0);
+            let high = Duration::from_secs_f64((capped * 1.25) / 1000.0);
+            assert!(delay >= low, "attempt {attempt}: {delay:?} < {low:?}");
+            assert!(delay <= high, "attempt {attempt}: {delay:?} > {high:?}");
+        }
+    }
 }
