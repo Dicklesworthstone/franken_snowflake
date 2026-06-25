@@ -1,0 +1,24 @@
+[package]
+name = "franken-snowflake-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Default-off FrankenTUI interface for franken_snowflake catalog browsing and query progress."
+publish.workspace = true
+
+[features]
+default = []
+tui = ["dep:ftui"]
+
+[lints]
+workspace = true
+
+[dependencies]
+franken-snowflake-catalog = { path = "../franken-snowflake-catalog" }
+franken-snowflake-core = { path = "../franken-snowflake-core" }
+ftui = { version = "0.4.0", optional = true, default-features = false, features = ["crossterm"] }
+serde = { version = "1", features = ["derive"] }

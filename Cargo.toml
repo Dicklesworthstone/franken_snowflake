@@ -27,6 +27,7 @@ members = [
     "crates/franken-snowflake-testkit",
     "crates/franken-snowflake-cli",
     "crates/franken-snowflake-mcp",
+    "crates/franken-snowflake-tui",
 ]
 
 [workspace.package]
