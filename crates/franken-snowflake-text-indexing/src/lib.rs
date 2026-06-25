@@ -456,17 +456,19 @@ pub enum TextIndexEventKind {
 }
 
 fn escape_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
     let mut escaped = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
-            b'%' => escaped.push_str("%25"),
-            b':' => escaped.push_str("%3a"),
-            b'/' => escaped.push_str("%2f"),
-            b'#' => escaped.push_str("%23"),
-            b'?' => escaped.push_str("%3f"),
-            b'&' => escaped.push_str("%26"),
-            b'=' => escaped.push_str("%3d"),
-            _ => escaped.push(char::from(byte)),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                escaped.push(char::from(byte));
+            }
+            _ => {
+                escaped.push('%');
+                escaped.push(char::from(HEX[usize::from(byte >> 4)]));
+                escaped.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            }
         }
     }
     escaped
@@ -561,6 +563,23 @@ mod tests {
             handle,
             "fsnow-text:v1:query:receipt:receiptabc:body%2ftext%230:7"
         );
+    }
+
+    #[test]
+    fn stable_handles_percent_encode_control_and_utf8_bytes() {
+        let source = TextSourceRef::StagedDocument {
+            receipt_hash: None,
+            dataset_id: Some(DatasetId::new("dataset-news")),
+            stage_uri_redacted: "@stage/path".to_owned(),
+            object_fingerprint: "sha256:\u{03b1}\nnext".to_owned(),
+        };
+        let handle =
+            TextDocumentHandle::from_source(&source, "r\u{00e9}sum\u{00e9}\nbody", 3).into_inner();
+        assert_eq!(
+            handle,
+            "fsnow-text:v1:stage:object:sha256%3a%ce%b1%0anext:r%c3%a9sum%c3%a9%0abody:3"
+        );
+        assert!(!handle.contains('\n'));
     }
 
     #[test]
