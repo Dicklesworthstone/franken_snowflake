@@ -40,6 +40,7 @@ const HEADER_ACCEPT_ENCODING: &str = "Accept-Encoding";
 const HEADER_CONTENT_ENCODING: &str = "Content-Encoding";
 const JSON_MEDIA_TYPE: &str = "application/json";
 const PARTITION_ACCEPT_ENCODING: &str = "gzip, identity";
+const SNOWFLAKE_HOST_SUFFIX: &str = ".snowflakecomputing.com";
 /// Official Snowflake SQL API resubmit contract consulted 2026-06-25.
 pub const SNOWFLAKE_SQL_API_RESUBMIT_DOC_URL: &str = "https://docs.snowflake.com/en/developer-guide/sql-api/submitting-requests#resubmitting-a-request-to-execute-sql-statements";
 /// Date the Snowflake SQL API resubmit contract above was consulted.
@@ -555,6 +556,12 @@ impl SnowflakeEndpoint {
             ));
         }
         let trimmed = rest.trim_end_matches('/');
+        if trimmed.contains('/') {
+            return Err(TransportError::new(
+                TransportErrorCode::InvalidSnowflakeHost,
+                "Snowflake endpoint must not contain path segments",
+            ));
+        }
         let host = trimmed
             .split('/')
             .next()
@@ -599,7 +606,9 @@ fn validate_host(host: &str) -> Result<(), TransportError> {
         && host.contains('.')
         && !host.starts_with('.')
         && !host.ends_with('.')
-        && !host.contains("..");
+        && !host.contains("..")
+        && host.ends_with(SNOWFLAKE_HOST_SUFFIX)
+        && host.len() > SNOWFLAKE_HOST_SUFFIX.len();
     if valid {
         Ok(())
     } else {
@@ -1110,20 +1119,26 @@ impl TransportRoute {
             Self::SubmitRetry { request_id } => {
                 format!(
                     "{SQL_API_STATEMENTS_PATH}?requestId={}&retry=true",
-                    request_id.as_str()
+                    percent_encode_query_component(request_id.as_str())
                 )
             }
             Self::Poll { handle } => {
-                format!("{SQL_API_STATEMENTS_PATH}/{}", handle.as_str())
+                format!(
+                    "{SQL_API_STATEMENTS_PATH}/{}",
+                    percent_encode_path_segment(handle.as_str())
+                )
             }
             Self::Partition { handle, partition } => {
                 format!(
                     "{SQL_API_STATEMENTS_PATH}/{}?partition={partition}",
-                    handle.as_str()
+                    percent_encode_path_segment(handle.as_str())
                 )
             }
             Self::Cancel { handle } => {
-                format!("{SQL_API_STATEMENTS_PATH}/{}/cancel", handle.as_str())
+                format!(
+                    "{SQL_API_STATEMENTS_PATH}/{}/cancel",
+                    percent_encode_path_segment(handle.as_str())
+                )
             }
         }
     }
@@ -1156,6 +1171,10 @@ fn percent_encode_query_component(value: &str) -> String {
         }
     }
     encoded
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    percent_encode_query_component(value)
 }
 
 const fn is_query_unreserved(byte: u8) -> bool {
@@ -1407,6 +1426,7 @@ fn decode_partition_response(
         HEADER_CONTENT_ENCODING,
     ))?;
     let compressed_bytes = response.body.len() as u64;
+    limits.enforce_partition_sizes(compressed_bytes, 0)?;
     let max_uncompressed =
         usize::try_from(limits.max_partition_uncompressed_bytes).map_err(|_| {
             TransportError::new(
@@ -2150,6 +2170,8 @@ mod tests {
         assert!(SnowflakeEndpoint::parse("http://xy123.snowflakecomputing.com").is_err());
         assert!(SnowflakeEndpoint::parse("https://user@xy123.snowflakecomputing.com").is_err());
         assert!(SnowflakeEndpoint::parse("https://xy123.snowflakecomputing.com?role=x").is_err());
+        assert!(SnowflakeEndpoint::parse("https://xy123.snowflakecomputing.com/proxy").is_err());
+        assert!(SnowflakeEndpoint::parse("https://attacker.example.com").is_err());
         let parsed = SnowflakeEndpoint::parse("https://xy123.snowflakecomputing.com/")
             .expect("valid endpoint");
         assert_eq!(parsed.base_url(), "https://xy123.snowflakecomputing.com");
@@ -2169,6 +2191,27 @@ mod tests {
                 partition: 7,
             }),
             "https://xy12345.us-east-1.snowflakecomputing.com/api/v2/statements/stmt-456?partition=7"
+        );
+    }
+
+    #[test]
+    fn route_components_are_percent_encoded() {
+        let request_id = RequestId::new("req-123&retry=false");
+        let handle = StatementHandle::new("stmt/456?partition=9#frag");
+
+        assert_eq!(
+            endpoint().route_url(&TransportRoute::SubmitRetry { request_id }),
+            "https://xy12345.us-east-1.snowflakecomputing.com/api/v2/statements?requestId=req-123%26retry%3Dfalse&retry=true"
+        );
+        assert_eq!(
+            endpoint().route_url(&TransportRoute::Poll {
+                handle: handle.clone(),
+            }),
+            "https://xy12345.us-east-1.snowflakecomputing.com/api/v2/statements/stmt%2F456%3Fpartition%3D9%23frag"
+        );
+        assert_eq!(
+            endpoint().route_url(&TransportRoute::Cancel { handle }),
+            "https://xy12345.us-east-1.snowflakecomputing.com/api/v2/statements/stmt%2F456%3Fpartition%3D9%23frag/cancel"
         );
     }
 
@@ -2690,6 +2733,22 @@ mod tests {
             body.compression.uncompressed_bytes,
             br#"{"data":[["one"]]}"#.len() as u64
         );
+    }
+
+    #[test]
+    fn compressed_partition_limit_is_checked_before_gzip_decode() {
+        let response = Response::new(200, "OK", b"not a valid gzip body".to_vec())
+            .with_header("content-encoding", "gzip");
+        let limits = BodyLimits {
+            max_partition_compressed_bytes: 3,
+            ..BodyLimits::default()
+        };
+
+        let error = PartitionBody::from_response(response, limits, Some(1))
+            .expect_err("compressed limit should fail before gzip decode");
+
+        assert_eq!(error.code, TransportErrorCode::BodyLimitExceeded);
+        assert!(error.message.contains("compressed partition"));
     }
 
     fn poll_ready<F: Future>(future: F) -> F::Output {
