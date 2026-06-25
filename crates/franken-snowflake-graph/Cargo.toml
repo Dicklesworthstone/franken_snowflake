@@ -1,0 +1,20 @@
+[package]
+name = "franken-snowflake-graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Catalog lineage graph model, algorithms, and Mermaid/SVG rendering for franken_snowflake."
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fnx-algorithms = { version = "0.2.0" }
+fnx-classes = { version = "0.2.0" }
+franken-snowflake-catalog = { path = "../franken-snowflake-catalog" }
+serde = { version = "1", features = ["derive"] }
