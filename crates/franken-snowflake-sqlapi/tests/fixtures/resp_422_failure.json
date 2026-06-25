@@ -1,0 +1,6 @@
+{
+  "code": "001003",
+  "sqlState": "42000",
+  "message": "SQL compilation error: syntax error line 1 at position 7.",
+  "statementHandle": "01b2c3d4-0000-0000-0000-000000000004"
+}

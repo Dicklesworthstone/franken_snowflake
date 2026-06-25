@@ -1,0 +1,8 @@
+{
+  "statement": "select EVENT_DATE, ENTITY_ID, VALUE from ANALYTICS.PUBLIC.EVENTS_DAILY where ENTITY_ID = ? and EVENT_DATE >= ? limit ?",
+  "bindings": {
+    "1": { "type": "TEXT", "value": "ENTITY123" },
+    "2": { "type": "DATE", "value": "19723" },
+    "3": { "type": "FIXED", "value": "1000" }
+  }
+}

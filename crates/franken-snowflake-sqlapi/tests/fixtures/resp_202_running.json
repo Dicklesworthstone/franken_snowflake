@@ -1,0 +1,7 @@
+{
+  "code": "333334",
+  "sqlState": "00000",
+  "message": "Asynchronous execution in progress.",
+  "statementHandle": "01b2c3d4-0000-0000-0000-000000000002",
+  "statementStatusUrl": "/api/v2/statements/01b2c3d4-0000-0000-0000-000000000002"
+}

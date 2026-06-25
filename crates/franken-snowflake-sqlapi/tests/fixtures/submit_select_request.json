@@ -1,0 +1,12 @@
+{
+  "statement": "select EVENT_DATE, ENTITY_ID, VALUE from ANALYTICS.PUBLIC.EVENTS_DAILY where EVENT_DATE >= '2024-01-01' order by EVENT_DATE limit 1000",
+  "timeout": 60,
+  "database": "ANALYTICS",
+  "schema": "PUBLIC",
+  "warehouse": "SNOWFLAKE_XS",
+  "role": "SNOWFLAKE_READONLY",
+  "parameters": {
+    "MULTI_STATEMENT_COUNT": "1",
+    "TIMEZONE": "UTC"
+  }
+}
