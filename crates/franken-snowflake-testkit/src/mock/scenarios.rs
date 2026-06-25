@@ -174,7 +174,11 @@ mod tests {
         let status = running_typed().map_err(|e| e.to_string())?;
         assert_eq!(status["statementHandle"], DEFAULT_HANDLE);
         let timeout = failure_typed(RESP_408_TIMEOUT).map_err(|e| e.to_string())?;
-        assert!(timeout["message"].as_str().is_some_and(|message| !message.is_empty()));
+        assert!(
+            timeout["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty())
+        );
         cancel_typed().map_err(|e| e.to_string())?;
         Ok(())
     }

@@ -49,23 +49,56 @@ pub struct GoldenConfig {
 /// golden needs them zeroed.
 const DEFAULT_VOLATILE_EXACT: &[&str] = &[
     // host / process identity
-    "host", "hostname", "pid", "ppid", "tid", "thread_id",
+    "host",
+    "hostname",
+    "pid",
+    "ppid",
+    "tid",
+    "thread_id",
     // wall-clock
-    "time", "now", "date", "today", "timestamp", "uptime",
+    "time",
+    "now",
+    "date",
+    "today",
+    "timestamp",
+    "uptime",
     // per-run correlation identifiers (ephemeral noise, never under test)
-    "trace_id", "run_id", "session_id", "span_id", "parent_id", "correlation_id",
-    "nonce", "uuid", "etag", "seed",
+    "trace_id",
+    "run_id",
+    "session_id",
+    "span_id",
+    "parent_id",
+    "correlation_id",
+    "nonce",
+    "uuid",
+    "etag",
+    "seed",
 ];
 
 /// Key suffixes (lower-cased) treated as volatile by [`GoldenConfig::default`].
 const DEFAULT_VOLATILE_SUFFIXES: &[&str] = &[
     // time
-    "_at", "_ms", "_ns", "_us", "_secs", "_seconds", "_time", "_timestamp", "_ts",
-    "_duration", "_elapsed", "_latency",
+    "_at",
+    "_ms",
+    "_ns",
+    "_us",
+    "_secs",
+    "_seconds",
+    "_time",
+    "_timestamp",
+    "_ts",
+    "_duration",
+    "_elapsed",
+    "_latency",
     // host
-    "_host", "_hostname",
+    "_host",
+    "_hostname",
     // hash / content address
-    "_hash", "_sha256", "_fingerprint", "_etag", "_uuid",
+    "_hash",
+    "_sha256",
+    "_fingerprint",
+    "_etag",
+    "_uuid",
 ];
 
 impl Default for GoldenConfig {
@@ -105,7 +138,8 @@ impl GoldenConfig {
     /// Treat any key ending in `suffix` (case-insensitively) as volatile.
     #[must_use]
     pub fn with_volatile_suffix(mut self, suffix: impl Into<String>) -> Self {
-        self.volatile_suffixes.push(suffix.into().to_ascii_lowercase());
+        self.volatile_suffixes
+            .push(suffix.into().to_ascii_lowercase());
         self
     }
 
@@ -312,7 +346,12 @@ fn compare_canonical(expected: &Value, actual: &Value, path: &str) -> Result<(),
             if left == right {
                 Ok(())
             } else {
-                Err(value_mismatch(path, left.to_string(), right.to_string(), None))
+                Err(value_mismatch(
+                    path,
+                    left.to_string(),
+                    right.to_string(),
+                    None,
+                ))
             }
         }
         (Value::String(left), Value::String(right)) => {
@@ -482,7 +521,12 @@ pub fn assert_lf_only(bytes: &[u8]) -> Result<(), CrlfViolation> {
     let mut line = 1usize;
     for (offset, byte) in bytes.iter().enumerate() {
         match byte {
-            b'\r' => return Err(CrlfViolation { byte_offset: offset, line }),
+            b'\r' => {
+                return Err(CrlfViolation {
+                    byte_offset: offset,
+                    line,
+                });
+            }
             b'\n' => line += 1,
             _ => {}
         }
@@ -685,7 +729,9 @@ mod tests {
             &json!({ "command_id": "catalog.scan" }),
             &cfg,
         );
-        let mismatch = run.err().ok_or_else(|| "command_id must stay stable".to_owned())?;
+        let mismatch = run
+            .err()
+            .ok_or_else(|| "command_id must stay stable".to_owned())?;
         assert_eq!(mismatch.path, "$.command_id");
         Ok(())
     }

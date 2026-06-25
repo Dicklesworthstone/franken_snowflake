@@ -34,7 +34,9 @@ impl SystemClock {
     /// Anchor a system clock at the current instant.
     #[must_use]
     pub fn new() -> Self {
-        Self { origin: Instant::now() }
+        Self {
+            origin: Instant::now(),
+        }
     }
 }
 
@@ -62,23 +64,29 @@ impl ManualClock {
     /// A manual clock starting at zero.
     #[must_use]
     pub fn new() -> Self {
-        Self { nanos: AtomicU64::new(0) }
+        Self {
+            nanos: AtomicU64::new(0),
+        }
     }
 
     /// A manual clock starting at `start`.
     #[must_use]
     pub fn at(start: Duration) -> Self {
-        Self { nanos: AtomicU64::new(saturating_nanos(start)) }
+        Self {
+            nanos: AtomicU64::new(saturating_nanos(start)),
+        }
     }
 
     /// Advance the clock by `delta`.
     pub fn advance(&self, delta: Duration) {
-        self.nanos.fetch_add(saturating_nanos(delta), Ordering::SeqCst);
+        self.nanos
+            .fetch_add(saturating_nanos(delta), Ordering::SeqCst);
     }
 
     /// Set the clock to `instant` (since epoch).
     pub fn set(&self, instant: Duration) {
-        self.nanos.store(saturating_nanos(instant), Ordering::SeqCst);
+        self.nanos
+            .store(saturating_nanos(instant), Ordering::SeqCst);
     }
 }
 
@@ -139,7 +147,9 @@ impl Deadline {
     /// A deadline `ttl` after the clock's current time.
     #[must_use]
     pub fn after<C: Clock>(clock: &C, ttl: Duration) -> Self {
-        Self { at: clock.now().saturating_add(ttl) }
+        Self {
+            at: clock.now().saturating_add(ttl),
+        }
     }
 
     /// A deadline at an absolute clock time.
@@ -183,7 +193,13 @@ impl BackoffPolicy {
     /// A jitter-free exponential policy (`factor = 2.0`).
     #[must_use]
     pub const fn exponential(base: Duration, max: Duration, attempts: u32) -> Self {
-        Self { base, factor: 2.0, max, jitter: 0.0, attempts }
+        Self {
+            base,
+            factor: 2.0,
+            max,
+            jitter: 0.0,
+            attempts,
+        }
     }
 
     /// This policy with the given symmetric jitter fraction.
@@ -237,12 +253,9 @@ mod tests {
 
     #[test]
     fn backoff_schedule_is_reproducible_for_a_seed() {
-        let policy = BackoffPolicy::exponential(
-            Duration::from_millis(100),
-            Duration::from_secs(10),
-            5,
-        )
-        .with_jitter(0.25);
+        let policy =
+            BackoffPolicy::exponential(Duration::from_millis(100), Duration::from_secs(10), 5)
+                .with_jitter(0.25);
         let first = backoff_schedule(&policy, 0xC0FF_EE00);
         let second = backoff_schedule(&policy, 0xC0FF_EE00);
         let different_seed = backoff_schedule(&policy, 0xDEAD_BEEF);
@@ -254,11 +267,8 @@ mod tests {
 
     #[test]
     fn jitter_free_backoff_is_pure_exponential_and_capped() {
-        let policy = BackoffPolicy::exponential(
-            Duration::from_millis(100),
-            Duration::from_millis(500),
-            4,
-        );
+        let policy =
+            BackoffPolicy::exponential(Duration::from_millis(100), Duration::from_millis(500), 4);
         let schedule = backoff_schedule(&policy, 1);
         assert_eq!(
             schedule,
@@ -311,12 +321,9 @@ mod tests {
 
     #[test]
     fn jittered_backoff_stays_within_symmetric_bounds() {
-        let policy = BackoffPolicy::exponential(
-            Duration::from_millis(100),
-            Duration::from_secs(60),
-            6,
-        )
-        .with_jitter(0.25);
+        let policy =
+            BackoffPolicy::exponential(Duration::from_millis(100), Duration::from_secs(60), 6)
+                .with_jitter(0.25);
         for (attempt, delay) in backoff_schedule(&policy, 99).into_iter().enumerate() {
             let exponent = i32::try_from(attempt).unwrap_or(i32::MAX);
             let capped = (100.0 * 2.0_f64.powi(exponent)).min(60_000.0);

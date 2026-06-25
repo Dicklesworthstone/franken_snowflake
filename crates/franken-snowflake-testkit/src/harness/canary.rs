@@ -109,7 +109,10 @@ impl CanaryGuard {
     /// A guard with no planted canaries and secret-shape scanning enabled.
     #[must_use]
     pub fn new() -> Self {
-        Self { planted: Vec::new(), scan_shapes: true }
+        Self {
+            planted: Vec::new(),
+            scan_shapes: true,
+        }
     }
 
     /// A guard pre-seeded with [`DEFAULT_CANARY`].
@@ -289,7 +292,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn planted_canary_trips_across_stdout_stderr_and_files() -> Result<(), Box<dyn std::error::Error>> {
+    fn planted_canary_trips_across_stdout_stderr_and_files()
+    -> Result<(), Box<dyn std::error::Error>> {
         let dir = std::env::temp_dir().join("fsnow-harness-canary");
         std::fs::create_dir_all(&dir)?;
         let receipt = dir.join("receipt.json");
@@ -298,11 +302,7 @@ mod tests {
         let guard = CanaryGuard::with_default_canary();
 
         // Leak on stdout.
-        let report = guard.scan(
-            &format!("ok {DEFAULT_CANARY}"),
-            "clean stderr",
-            &[],
-        )?;
+        let report = guard.scan(&format!("ok {DEFAULT_CANARY}"), "clean stderr", &[])?;
         assert!(report.leaked());
 
         // Leak on stderr.
@@ -331,7 +331,10 @@ mod tests {
         let guard = CanaryGuard::new();
         // A GitHub-PAT-shaped token (matches the shared needle list). It must be
         // a whitespace-delimited token so it lands on a secret-prefix boundary.
-        let hits = guard.scan_text(Channel::Stdout, "leaked token: ghp_0123456789abcdefABCDEF here");
+        let hits = guard.scan_text(
+            Channel::Stdout,
+            "leaked token: ghp_0123456789abcdefABCDEF here",
+        );
         let shape: Vec<&CanaryHit> = hits
             .iter()
             .filter(|hit| hit.kind == HitKind::SecretShape)
@@ -367,7 +370,10 @@ mod tests {
         assert_ne!(shapes[0].byte_offset, shapes[1].byte_offset);
         // Offsets point at the token starts.
         assert_eq!(shapes[0].byte_offset, 0);
-        assert_eq!(shapes[1].byte_offset, text.find("xoxb-").unwrap_or(usize::MAX));
+        assert_eq!(
+            shapes[1].byte_offset,
+            text.find("xoxb-").unwrap_or(usize::MAX)
+        );
     }
 
     #[test]
@@ -375,7 +381,12 @@ mod tests {
         let mut guard = CanaryGuard::new();
         guard.plant("CANARY_ONE").plant("CANARY_TWO");
         let hits = guard.scan_text(Channel::Stdout, "x CANARY_ONE y CANARY_TWO z");
-        assert_eq!(hits.iter().filter(|h| h.kind == HitKind::PlantedCanary).count(), 2);
+        assert_eq!(
+            hits.iter()
+                .filter(|h| h.kind == HitKind::PlantedCanary)
+                .count(),
+            2
+        );
     }
 
     #[test]

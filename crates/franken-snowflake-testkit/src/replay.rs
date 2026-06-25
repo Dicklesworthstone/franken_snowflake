@@ -61,7 +61,11 @@ pub struct ProtocolPacket {
 impl ProtocolPacket {
     /// Build a packet from a request/response pair.
     #[must_use]
-    pub fn from_exchange(name: impl Into<String>, request: &MockHttpRequest, response: &MockHttpResponse) -> Self {
+    pub fn from_exchange(
+        name: impl Into<String>,
+        request: &MockHttpRequest,
+        response: &MockHttpResponse,
+    ) -> Self {
         Self {
             name: name.into(),
             request_method: request.method.as_str().to_owned(),

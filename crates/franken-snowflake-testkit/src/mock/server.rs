@@ -309,7 +309,8 @@ mod tests {
 
         // An unknown handle is a clean 404, never a panic or a wrong-state reply.
         assert_eq!(
-            mock.respond(&MockHttpRequest::get("/api/v2/statements/nope")).status,
+            mock.respond(&MockHttpRequest::get("/api/v2/statements/nope"))
+                .status,
             404
         );
         Ok(())

@@ -132,7 +132,10 @@ impl RunLogger {
     ///
     /// # Errors
     /// Returns [`LogError::Io`] if the directory or events file cannot be created.
-    pub fn new(artifacts_root: impl AsRef<Path>, trace_id: impl Into<String>) -> Result<Self, LogError> {
+    pub fn new(
+        artifacts_root: impl AsRef<Path>,
+        trace_id: impl Into<String>,
+    ) -> Result<Self, LogError> {
         let trace_id = trace_id.into();
         let artifacts_dir = artifacts_root.as_ref().join(&trace_id);
         fs::create_dir_all(&artifacts_dir)?;
@@ -245,7 +248,14 @@ impl RunLogger {
         step: impl Into<String>,
         reason: impl Into<String>,
     ) -> Result<(), LogError> {
-        self.emit(command_id, step, StepOutcome::Skip, Some(reason.into()), None, None)
+        self.emit(
+            command_id,
+            step,
+            StepOutcome::Skip,
+            Some(reason.into()),
+            None,
+            None,
+        )
     }
 
     /// Log an informational marker.
@@ -258,7 +268,14 @@ impl RunLogger {
         step: impl Into<String>,
         detail: impl Into<String>,
     ) -> Result<(), LogError> {
-        self.emit(command_id, step, StepOutcome::Info, Some(detail.into()), None, None)
+        self.emit(
+            command_id,
+            step,
+            StepOutcome::Info,
+            Some(detail.into()),
+            None,
+            None,
+        )
     }
 
     /// Flush the events, write `summary.json` + `summary.txt`, and return the
@@ -324,7 +341,13 @@ impl fmt::Display for RunSummary {
         writeln!(
             f,
             "run {}: {} steps, {} passed, {} failed, {} skipped, {} info ({} ms)",
-            self.trace_id, self.total, self.passed, self.failed, self.skipped, self.info, self.duration_ms
+            self.trace_id,
+            self.total,
+            self.passed,
+            self.failed,
+            self.skipped,
+            self.info,
+            self.duration_ms
         )?;
         writeln!(f, "artifacts: {}", self.artifacts_dir)?;
         write!(f, "status: {}", if self.ok() { "PASS" } else { "FAIL" })
@@ -407,7 +430,8 @@ mod tests {
     }
 
     #[test]
-    fn event_lines_are_lf_only_and_individually_valid_json() -> Result<(), Box<dyn std::error::Error>> {
+    fn event_lines_are_lf_only_and_individually_valid_json()
+    -> Result<(), Box<dyn std::error::Error>> {
         let root = temp_root("lf");
         let mut logger = RunLogger::new(&root, "trace-lf")?;
         logger.pass("cmd", "first")?;
@@ -451,7 +475,9 @@ mod tests {
             actual: None,
         };
         let value = serde_json::to_value(&event)?;
-        let object = value.as_object().ok_or("event must serialize to an object")?;
+        let object = value
+            .as_object()
+            .ok_or("event must serialize to an object")?;
         let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(
@@ -467,7 +493,9 @@ mod tests {
             ]
         );
         assert_eq!(
-            object.get("schema_version").and_then(serde_json::Value::as_u64),
+            object
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64),
             Some(u64::from(LOG_SCHEMA_VERSION))
         );
         Ok(())
@@ -488,10 +516,21 @@ mod tests {
             actual: Some("202".to_owned()),
         };
         let value = serde_json::to_value(&event)?;
-        let object = value.as_object().ok_or("event must serialize to an object")?;
-        assert_eq!(object.get("outcome").and_then(serde_json::Value::as_str), Some("fail"));
-        assert_eq!(object.get("expected").and_then(serde_json::Value::as_str), Some("200"));
-        assert_eq!(object.get("actual").and_then(serde_json::Value::as_str), Some("202"));
+        let object = value
+            .as_object()
+            .ok_or("event must serialize to an object")?;
+        assert_eq!(
+            object.get("outcome").and_then(serde_json::Value::as_str),
+            Some("fail")
+        );
+        assert_eq!(
+            object.get("expected").and_then(serde_json::Value::as_str),
+            Some("200")
+        );
+        assert_eq!(
+            object.get("actual").and_then(serde_json::Value::as_str),
+            Some("202")
+        );
         // detail stays absent when not set.
         assert!(!object.contains_key("detail"));
         Ok(())

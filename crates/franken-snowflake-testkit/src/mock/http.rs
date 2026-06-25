@@ -246,7 +246,9 @@ mod tests {
         assert!(text.contains("Content-Type: application/json\r\n"));
         // Content-Length is computed from the body and the head ends in a blank line.
         assert!(text.contains("Content-Length: 17\r\n"));
-        let (head, body) = text.split_once("\r\n\r\n").ok_or("missing header terminator")?;
+        let (head, body) = text
+            .split_once("\r\n\r\n")
+            .ok_or("missing header terminator")?;
         assert!(!head.contains("\r\n\r\n"));
         assert_eq!(body, "{\"code\":\"333334\"}");
         Ok(())
@@ -254,9 +256,18 @@ mod tests {
 
     #[test]
     fn class_routes_status_codes() {
-        assert_eq!(MockHttpResponse::json(200, vec![]).class(), ResponseClass::Completed);
-        assert_eq!(MockHttpResponse::json(202, vec![]).class(), ResponseClass::Running);
-        assert_eq!(MockHttpResponse::json(429, vec![]).class(), ResponseClass::RateLimited);
+        assert_eq!(
+            MockHttpResponse::json(200, vec![]).class(),
+            ResponseClass::Completed
+        );
+        assert_eq!(
+            MockHttpResponse::json(202, vec![]).class(),
+            ResponseClass::Running
+        );
+        assert_eq!(
+            MockHttpResponse::json(429, vec![]).class(),
+            ResponseClass::RateLimited
+        );
     }
 
     #[test]

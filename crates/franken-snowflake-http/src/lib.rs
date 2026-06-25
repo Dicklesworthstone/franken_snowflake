@@ -21,8 +21,8 @@ use asupersync::http::compress::{Decompressor, GzipDecompressor, IdentityDecompr
 use asupersync::http::{
     Client as AsupersyncHttpClient, ClientError as AsupersyncClientError, Method, StatusCode,
 };
-use asupersync::{CancelKind, Cx};
-use franken_snowflake_core::budget::{Budget, partition_child_budget};
+use asupersync::{CancelKind, Cx, Time};
+use franken_snowflake_core::budget::Budget;
 use franken_snowflake_core::cancel::{CancelPolicy, CancelReason, cancel_policy};
 use franken_snowflake_core::ids::{RequestId, StatementHandle};
 use franken_snowflake_core::redact::{REDACTION_PLACEHOLDER, redact};
@@ -225,8 +225,6 @@ impl SnowflakeHttpClient {
             Ok(summary) => summary,
             Err(error) => return TransportOutcome::err(error.into_snowflake_error()),
         };
-        let _partition_fetch_budget = partition_child_budget(cx.budget(), request.child_budget);
-
         for partition in request.seed_partitions.iter().cloned() {
             if cx.checkpoint().is_err() {
                 let reason = cancel_reason_or(cx, CancelReason::parent_cancelled);
@@ -252,14 +250,16 @@ impl SnowflakeHttpClient {
                     .cancel_stream_after_local_cancel(cx, &request, &summary, reason)
                     .await;
             }
-            let body = match self
-                .fetch_partition(
+            let body: PartitionBody = match self
+                .execute(
                     cx,
-                    PartitionHttpRequest {
-                        auth: request.auth.clone(),
-                        statement_handle: request.statement_handle.clone(),
+                    PlannedTransportRequest::partition(
+                        request.auth.clone(),
+                        request.statement_handle.clone(),
                         partition,
-                    },
+                        request.child_budget,
+                    ),
+                    TransportRouteKind::Partition,
                 )
                 .await
             {
@@ -340,11 +340,15 @@ impl SnowflakeHttpClient {
                 ));
             }
 
-            let _attempt_budget =
+            let attempt_budget =
                 self.config
                     .retry
                     .attempt_budget(cx.budget(), planned.budget, attempt);
-            let result = self
+            let budget_now = asupersync::time::wall_now();
+            if let Some(reason) = budget_exhaustion_reason_at(attempt_budget, budget_now) {
+                return TransportOutcome::cancelled(reason);
+            }
+            let mut request_builder = self
                 .client
                 .request_builder(route_kind.method(), wire.url.clone())
                 .headers(
@@ -352,9 +356,11 @@ impl SnowflakeHttpClient {
                         .iter()
                         .map(|h| (h.name.as_str(), h.value.as_str())),
                 )
-                .body(wire.body.clone())
-                .send(cx)
-                .await;
+                .body(wire.body.clone());
+            if let Some(timeout) = budget_timeout_at(attempt_budget, budget_now) {
+                request_builder = request_builder.timeout(timeout);
+            }
+            let result = request_builder.send(cx).await;
 
             match result {
                 Ok(response) => {
@@ -814,6 +820,25 @@ struct RetryDecision {
 
 fn duration_millis_saturating(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn budget_timeout_at(budget: Budget, now: Time) -> Option<Duration> {
+    budget
+        .deadline
+        .map(|deadline| Duration::from_nanos(deadline.duration_since(now)))
+}
+
+fn budget_exhaustion_reason_at(budget: Budget, now: Time) -> Option<CancelReason> {
+    if budget_timeout_at(budget, now).is_some_and(|timeout| timeout.is_zero()) {
+        return Some(CancelReason::deadline());
+    }
+    if budget.poll_quota == 0 {
+        return Some(CancelReason::poll_quota());
+    }
+    if matches!(budget.cost_quota, Some(0)) {
+        return Some(CancelReason::cost_budget());
+    }
+    None
 }
 
 impl Default for RetryPolicy {
@@ -1613,6 +1638,28 @@ struct PlannedTransportRequest {
     budget: Budget,
 }
 
+impl PlannedTransportRequest {
+    fn partition(
+        auth: AuthorizationDescriptor,
+        statement_handle: StatementHandle,
+        partition: u32,
+        budget: Budget,
+    ) -> Self {
+        Self {
+            route: TransportRoute::Partition {
+                handle: statement_handle,
+                partition,
+            },
+            auth,
+            body: Vec::new(),
+            retry_resubmit: false,
+            request_id: None,
+            partition: Some(partition),
+            budget,
+        }
+    }
+}
+
 impl From<SubmitHttpRequest> for PlannedTransportRequest {
     fn from(value: SubmitHttpRequest) -> Self {
         let request_id = match &value.route {
@@ -2029,6 +2076,75 @@ mod tests {
                 second.spent_after_ms
             ),
             None
+        );
+    }
+
+    #[test]
+    fn attempt_budget_meets_parent_child_and_attempt_quota_once() {
+        let parent = Budget::new()
+            .with_deadline(Time::from_secs(30))
+            .with_poll_quota(10)
+            .with_cost_quota(100)
+            .with_priority(1);
+        let child = Budget::new()
+            .with_deadline(Time::from_secs(20))
+            .with_poll_quota(8)
+            .with_cost_quota(50)
+            .with_priority(9);
+        let policy = RetryPolicy {
+            max_attempts: 4,
+            ..RetryPolicy::default()
+        };
+
+        let effective = policy.attempt_budget(parent, child, 2);
+        let expected = parent.meet(child).meet(Budget::new().with_poll_quota(3));
+
+        assert_eq!(effective, expected);
+        assert_eq!(effective.deadline, Some(Time::from_secs(20)));
+        assert_eq!(effective.poll_quota, 3);
+        assert_eq!(effective.cost_quota, Some(50));
+        assert_eq!(effective.priority, 9);
+    }
+
+    #[test]
+    fn partition_stream_child_budget_flows_to_internal_partition_plan() {
+        let parent = Budget::new().with_poll_quota(10).with_cost_quota(100);
+        let child = Budget::new().with_poll_quota(2).with_cost_quota(40);
+        let planned =
+            PlannedTransportRequest::partition(auth(), StatementHandle::new("stmt-1"), 7, child);
+
+        assert_eq!(planned.partition, Some(7));
+        assert_eq!(planned.budget, child);
+        assert_eq!(
+            RetryPolicy::default().attempt_budget(parent, planned.budget, 1),
+            parent
+                .meet(child)
+                .meet(Budget::new().with_poll_quota(RetryPolicy::default().max_attempts))
+        );
+    }
+
+    #[test]
+    fn effective_budget_drives_timeout_and_exhaustion_reason() {
+        let now = Time::from_secs(10);
+        let bounded = Budget::new().with_deadline(Time::from_secs(12));
+        assert_eq!(
+            budget_timeout_at(bounded, now),
+            Some(Duration::from_secs(2))
+        );
+        assert!(
+            budget_exhaustion_reason_at(Budget::new().with_deadline(Time::from_secs(10)), now)
+                .expect("deadline exhausted")
+                .is_kind(CancelKind::Deadline)
+        );
+        assert!(
+            budget_exhaustion_reason_at(Budget::new().with_poll_quota(0), now)
+                .expect("poll quota exhausted")
+                .is_kind(CancelKind::PollQuota)
+        );
+        assert!(
+            budget_exhaustion_reason_at(Budget::new().with_cost_quota(0), now)
+                .expect("cost budget exhausted")
+                .is_kind(CancelKind::CostBudget)
         );
     }
 
