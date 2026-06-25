@@ -567,6 +567,7 @@ impl SnowflakeTuiApp {
                 TuiAction::None
             }
             TuiEvent::QuerySubmit => self.plan_query(),
+            TuiEvent::CancelStatement => self.cancel_statement(),
             TuiEvent::Progress(tick) => {
                 self.progress.apply_tick(tick);
                 self.logs.push(TuiLogLine {
@@ -628,6 +629,7 @@ impl SnowflakeTuiApp {
         let request = self.query.to_raw_request();
         match plan_raw_sql_dry_run(&request) {
             Ok(plan) => {
+                self.progress = StatementProgress::default();
                 self.progress.phase = StatementPhase::Planned;
                 self.last_refusals.clear();
                 self.last_plan = Some(plan.clone());
@@ -640,6 +642,7 @@ impl SnowflakeTuiApp {
                 TuiAction::PlanQuery(plan)
             }
             Err(refusals) => {
+                self.progress = StatementProgress::default();
                 self.progress.phase = StatementPhase::Refused;
                 self.last_plan = None;
                 self.last_refusals = refusals.clone();
@@ -654,6 +657,27 @@ impl SnowflakeTuiApp {
                 TuiAction::Refused(refusals)
             }
         }
+    }
+
+    fn cancel_statement(&mut self) -> TuiAction {
+        let Some(handle) = self.progress.statement_handle.clone() else {
+            self.logs.push(TuiLogLine {
+                event: "statement_cancel".to_owned(),
+                outcome: "refusal".to_owned(),
+                message: "no active statement handle".to_owned(),
+                code: None,
+            });
+            return TuiAction::None;
+        };
+
+        self.progress.phase = StatementPhase::Cancelled;
+        self.logs.push(TuiLogLine {
+            event: "statement_cancel".to_owned(),
+            outcome: "cancelled".to_owned(),
+            message: "cancel requested".to_owned(),
+            code: None,
+        });
+        TuiAction::CancelStatement(handle)
     }
 
     fn browser_rows(&self) -> Vec<String> {
@@ -730,6 +754,8 @@ pub enum TuiEvent {
     QuerySubmit,
     /// Apply a progress tick.
     Progress(ProgressTick),
+    /// Request cancellation of the active statement handle.
+    CancelStatement,
     /// Quit the program.
     Quit,
 }
@@ -743,6 +769,8 @@ pub enum TuiAction {
     PlanQuery(QueryPlan),
     /// Query was refused by the shared planner.
     Refused(Vec<PlanRefusal>),
+    /// Request cancellation of a live statement handle.
+    CancelStatement(String),
     /// Exit the UI.
     Quit,
 }
@@ -869,6 +897,7 @@ mod ftui_surface {
             KeyCode::Left | KeyCode::Escape if focus == FocusPane::Catalog => {
                 Some(TuiEvent::CatalogBack)
             }
+            KeyCode::Escape if focus == FocusPane::Progress => Some(TuiEvent::CancelStatement),
             KeyCode::Enter if focus == FocusPane::Query => Some(TuiEvent::QuerySubmit),
             KeyCode::Backspace if focus == FocusPane::Query => Some(TuiEvent::QueryBackspace),
             KeyCode::Char(ch) if focus == FocusPane::Query && !key.ctrl() => {
@@ -961,6 +990,48 @@ mod tests {
     }
 
     #[test]
+    fn query_submit_resets_stale_progress_before_plan_or_refusal() {
+        let mut app = SnowflakeTuiApp {
+            query: QueryDraft {
+                sql: "SELECT ID FROM DB1.PUBLIC.POSITIONS".to_owned(),
+                ..QueryDraft::default()
+            },
+            progress: StatementProgress {
+                statement_handle: Some("old-handle".to_owned()),
+                phase: StatementPhase::Complete,
+                partitions_fetched: 3,
+                partitions_total: Some(3),
+                rows_streamed: 900,
+                ..StatementProgress::default()
+            },
+            ..SnowflakeTuiApp::default()
+        };
+
+        assert!(matches!(
+            app.apply_event(TuiEvent::QuerySubmit),
+            TuiAction::PlanQuery(_)
+        ));
+        assert_eq!(app.progress.phase, StatementPhase::Planned);
+        assert!(app.progress.statement_handle.is_none());
+        assert_eq!(app.progress.partitions_fetched, 0);
+        assert_eq!(app.progress.partitions_total, None);
+        assert_eq!(app.progress.rows_streamed, 0);
+
+        app.progress.statement_handle = Some("stale-cancel-target".to_owned());
+        app.progress.phase = StatementPhase::Polling;
+        app.progress.rows_streamed = 42;
+        app.query.sql = "DELETE FROM DB1.PUBLIC.POSITIONS".to_owned();
+
+        assert!(matches!(
+            app.apply_event(TuiEvent::QuerySubmit),
+            TuiAction::Refused(_)
+        ));
+        assert_eq!(app.progress.phase, StatementPhase::Refused);
+        assert!(app.progress.statement_handle.is_none());
+        assert_eq!(app.progress.rows_streamed, 0);
+    }
+
+    #[test]
     fn progress_tick_uses_budget_and_clamps_partitions() {
         let mut app = SnowflakeTuiApp::default();
         let budget = query_budget(None, 7, Some(55), 200);
@@ -981,6 +1052,29 @@ mod tests {
         assert_eq!(app.progress.budget.poll_quota, 7);
         assert_eq!(app.progress.budget.cost_quota, Some(55));
         assert_eq!(app.progress.budget.priority, 200);
+    }
+
+    #[test]
+    fn cancel_statement_returns_active_handle_and_marks_cancelled() {
+        let mut app = SnowflakeTuiApp {
+            progress: StatementProgress {
+                statement_handle: Some("01abc".to_owned()),
+                phase: StatementPhase::Polling,
+                ..StatementProgress::default()
+            },
+            ..SnowflakeTuiApp::default()
+        };
+
+        assert_eq!(
+            app.apply_event(TuiEvent::CancelStatement),
+            TuiAction::CancelStatement("01abc".to_owned())
+        );
+        assert_eq!(app.progress.phase, StatementPhase::Cancelled);
+        assert!(
+            app.logs
+                .iter()
+                .any(|log| log.event == "statement_cancel" && log.outcome == "cancelled")
+        );
     }
 
     #[test]
@@ -1035,6 +1129,26 @@ mod tests {
         )))));
         assert_eq!(app.query.sql, "q");
         assert!(app.last_plan.is_none());
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn terminal_escape_requests_cancel_when_progress_pane_is_focused() {
+        use ftui::{Event, KeyCode, KeyEvent, Model};
+
+        let mut app = SnowflakeTuiApp {
+            focus: FocusPane::Progress,
+            progress: StatementProgress {
+                statement_handle: Some("01abc".to_owned()),
+                phase: StatementPhase::Polling,
+                ..StatementProgress::default()
+            },
+            ..SnowflakeTuiApp::default()
+        };
+
+        let _ = app.update(TuiMessage::from(Event::Key(KeyEvent::new(KeyCode::Escape))));
+
+        assert_eq!(app.progress.phase, StatementPhase::Cancelled);
     }
 
     fn fixture_snapshot() -> CatalogSnapshot {

@@ -44,7 +44,7 @@ mod fastmcp_surface {
     use franken_snowflake_core::error::SnowflakeErrorCode;
     use serde_json::{Map, Value, json};
 
-    use super::CliContractRunner;
+    use super::{CliContractOutput, CliContractRunner};
 
     const SERVER_NAME: &str = "franken-snowflake";
 
@@ -491,7 +491,7 @@ mod fastmcp_surface {
             let args = self.verb.cli_args(&arguments)?;
             let output = self.runner.run_cli_contract(args);
             ctx.checkpoint()?;
-            Ok(vec![Content::text(output.stdout)])
+            cli_output_to_mcp_result(output)
         }
     }
 
@@ -662,6 +662,28 @@ mod fastmcp_surface {
         )
     }
 
+    fn cli_output_to_mcp_result(output: CliContractOutput) -> McpResult<Vec<Content>> {
+        if output.exit_code <= 1 && output.stderr.is_none() {
+            return Ok(vec![Content::text(output.stdout)]);
+        }
+
+        let mut payload = Map::new();
+        payload.insert(
+            "exit_code".to_string(),
+            Value::Number(serde_json::Number::from(output.exit_code)),
+        );
+        payload.insert("stdout".to_string(), Value::String(output.stdout.clone()));
+        if let Some(stderr) = &output.stderr {
+            payload.insert("stderr".to_string(), Value::String(stderr.clone()));
+        }
+
+        Err(McpError::with_data(
+            McpErrorCode::ToolExecutionError,
+            output.stdout,
+            Value::Object(payload),
+        ))
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -727,6 +749,63 @@ mod fastmcp_surface {
             assert!(schemas.contains("\"name\":\"capabilities\""));
             assert!(schemas.contains("\"name\":\"profile_validate\""));
             assert!(schemas.contains("\"inputSchema\""));
+        }
+
+        #[test]
+        fn cli_refusals_become_mcp_tool_errors_with_cli_envelope() {
+            let stdout = "{\"ok\":false,\"error\":{\"code\":\"FSNOW-3001\"}}".to_string();
+            let stderr = "FSNOW-3001: mutation refused".to_string();
+
+            let err = match cli_output_to_mcp_result(CliContractOutput {
+                exit_code: 2,
+                stdout: stdout.clone(),
+                stderr: Some(stderr.clone()),
+            }) {
+                Ok(_) => {
+                    assert!(
+                        false,
+                        "CLI refusal must not be returned as successful MCP content"
+                    );
+                    return;
+                }
+                Err(err) => err,
+            };
+
+            assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+            assert_eq!(err.message, stdout);
+            let Some(Value::Object(data)) = err.data else {
+                assert!(false, "tool error should carry CLI parity data");
+                return;
+            };
+            assert_eq!(data.get("exit_code").and_then(Value::as_i64), Some(2));
+            assert_eq!(
+                data.get("stdout").and_then(Value::as_str),
+                Some(stdout.as_str())
+            );
+            assert_eq!(
+                data.get("stderr").and_then(Value::as_str),
+                Some(stderr.as_str())
+            );
+        }
+
+        #[test]
+        fn cli_findings_remain_successful_mcp_content() {
+            let content = match cli_output_to_mcp_result(CliContractOutput {
+                exit_code: 1,
+                stdout: "{\"ok\":true,\"outcome_kind\":\"partial_success\"}".to_string(),
+                stderr: None,
+            }) {
+                Ok(content) => content,
+                Err(err) => {
+                    assert!(
+                        false,
+                        "CLI findings are ok=true and should stay successful: {err:?}"
+                    );
+                    return;
+                }
+            };
+
+            assert_eq!(content.len(), 1);
         }
     }
 }

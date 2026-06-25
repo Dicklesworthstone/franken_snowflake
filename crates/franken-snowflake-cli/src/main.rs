@@ -805,10 +805,39 @@ fn parse_mcp(args: &[String], output: OutputFormat) -> Result<Command, Outcome> 
         ));
     }
 
-    let mode = if has_flag(args, "--stdio") {
+    let wants_stdio = has_flag(args, "--stdio");
+    let http_present = flag_present(args, "--http");
+    let http_addr = value_after(args, "--http");
+
+    if wants_stdio && http_present {
+        return Err(usage_error(
+            output,
+            "mcp.serve",
+            "fsnow.mcp.serve.v1",
+            "Conflicting MCP serve modes; choose exactly one of --stdio or --http <addr>.",
+            vec![
+                "franken-snowflake mcp serve --stdio".to_string(),
+                "franken-snowflake mcp serve --http 127.0.0.1:3000".to_string(),
+            ],
+            vec![],
+        ));
+    }
+
+    if http_present && http_addr.is_none() {
+        return Err(usage_error(
+            output,
+            "mcp.serve",
+            "fsnow.mcp.serve.v1",
+            "Missing address for `mcp serve --http`.",
+            vec!["franken-snowflake mcp serve --http 127.0.0.1:3000".to_string()],
+            vec![],
+        ));
+    }
+
+    let mode = if wants_stdio {
         Some("stdio".to_string())
     } else {
-        value_after(args, "--http").map(|addr| format!("http:{addr}"))
+        http_addr.map(|addr| format!("http:{addr}"))
     };
     Ok(Command::McpServe { mode })
 }
@@ -2559,6 +2588,15 @@ fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
 }
 
+fn flag_present(args: &[String], flag: &str) -> bool {
+    args.iter().any(|arg| {
+        arg == flag
+            || arg
+                .strip_prefix(flag)
+                .is_some_and(|suffix| suffix.starts_with('='))
+    })
+}
+
 fn value_after(args: &[String], flag: &str) -> Option<String> {
     value_after_inner(args, flag, false)
 }
@@ -3406,6 +3444,36 @@ mod tests {
             rendered.contains("catalog scan &lt;profile&gt;")
                 || rendered.contains("catalog scan <profile>")
         );
+    }
+
+    #[test]
+    fn mcp_serve_rejects_missing_http_address_and_conflicting_modes() {
+        let missing_addr = execute(vec![
+            "mcp".to_string(),
+            "serve".to_string(),
+            "--http".to_string(),
+        ]);
+        assert_eq!(missing_addr.status.code(), 64);
+        let rendered = match missing_addr.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("Missing address for `mcp serve --http`."));
+        assert!(!rendered.contains("\"context\":null"));
+
+        let conflicting = execute(vec![
+            "mcp".to_string(),
+            "serve".to_string(),
+            "--stdio".to_string(),
+            "--http".to_string(),
+            "127.0.0.1:3000".to_string(),
+        ]);
+        assert_eq!(conflicting.status.code(), 64);
+        let rendered = match conflicting.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("Conflicting MCP serve modes"));
     }
 
     #[test]
