@@ -341,7 +341,7 @@ pub fn enforce_query_safety(
             return Err(SnowflakeError::new(
                 SnowflakeErrorCode::WarehouseRefused,
                 "warehouse is required for cost attribution and guardrails",
-            ))
+            ));
         }
         _ => String::new(),
     };
@@ -510,7 +510,7 @@ pub fn dedupe_redaction_markers(markers: impl IntoIterator<Item = String>) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cancel::{cancel_exit_code, cancel_outcome_kind, CancelKind};
+    use crate::cancel::{CancelKind, cancel_exit_code, cancel_outcome_kind};
     use crate::exit::ExitCode;
     use crate::redact::REDACTION_PLACEHOLDER;
 
@@ -575,10 +575,12 @@ mod tests {
         assert_eq!(bounded.result_row_cap, DEFAULT_MAX_RESULT_ROWS);
         assert_eq!(bounded.result_byte_cap, DEFAULT_MAX_RESULT_BYTES);
         assert!(bounded.warnings.iter().any(|w| w.code == "auto_row_cap"));
-        assert!(bounded
-            .warnings
-            .iter()
-            .any(|w| w.code == "unconstrained_query"));
+        assert!(
+            bounded
+                .warnings
+                .iter()
+                .any(|w| w.code == "unconstrained_query")
+        );
     }
 
     #[test]

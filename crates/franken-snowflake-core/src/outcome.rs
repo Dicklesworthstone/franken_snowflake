@@ -111,7 +111,7 @@ impl<T> SnowflakeOutcomeExt for SnowflakeOutcome<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cancel::{cancel_policy, CancelPolicy};
+    use crate::cancel::{CancelPolicy, cancel_policy};
     use crate::error::{SnowflakeError, SnowflakeErrorCode};
     use asupersync::{CancelKind, CancelReason, Outcome, PanicPayload};
 

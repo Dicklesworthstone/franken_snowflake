@@ -183,7 +183,9 @@ impl SnowflakeErrorCode {
                 retryable: false,
                 policy_boundary: true,
                 summary: "Mutation refused: read-only by default.",
-                safe_next_commands: &["franken-snowflake query plan --profile <profile> --sql <sql> --json"],
+                safe_next_commands: &[
+                    "franken-snowflake query plan --profile <profile> --sql <sql> --json",
+                ],
                 repair_commands: &["franken-snowflake agent-handbook --json"],
             },
             Self::MultiStatementRefused => ErrorEntry {
@@ -193,7 +195,9 @@ impl SnowflakeErrorCode {
                 retryable: false,
                 policy_boundary: true,
                 summary: "Multi-statement request refused by default policy.",
-                safe_next_commands: &["franken-snowflake query run --profile <profile> --sql <single-statement> --json"],
+                safe_next_commands: &[
+                    "franken-snowflake query run --profile <profile> --sql <single-statement> --json",
+                ],
                 repair_commands: &["franken-snowflake agent-handbook --json"],
             },
             Self::RequireLiveRefused => ErrorEntry {
@@ -213,7 +217,9 @@ impl SnowflakeErrorCode {
                 retryable: false,
                 policy_boundary: true,
                 summary: "Result exceeded the row cap; use export or raise the cap.",
-                safe_next_commands: &["franken-snowflake query run --profile <profile> --sql <sql> --max-rows <n> --json"],
+                safe_next_commands: &[
+                    "franken-snowflake query run --profile <profile> --sql <sql> --max-rows <n> --json",
+                ],
                 repair_commands: &["franken-snowflake export --profile <profile> --sql <sql>"],
             },
             Self::SafetyLimitExceeded => ErrorEntry {
@@ -223,8 +229,12 @@ impl SnowflakeErrorCode {
                 retryable: false,
                 policy_boundary: true,
                 summary: "Statement or result safety bound exceeded.",
-                safe_next_commands: &["franken-snowflake query plan --profile <profile> --sql <sql> --json"],
-                repair_commands: &["franken-snowflake query plan --profile <profile> --sql <bounded-sql> --json"],
+                safe_next_commands: &[
+                    "franken-snowflake query plan --profile <profile> --sql <sql> --json",
+                ],
+                repair_commands: &[
+                    "franken-snowflake query plan --profile <profile> --sql <bounded-sql> --json",
+                ],
             },
             Self::WarehouseRefused => ErrorEntry {
                 code: self,
@@ -253,8 +263,12 @@ impl SnowflakeErrorCode {
                 retryable: false,
                 policy_boundary: false,
                 summary: "Statement failed upstream.",
-                safe_next_commands: &["franken-snowflake query plan --profile <profile> --sql <sql> --json"],
-                repair_commands: &["franken-snowflake query plan --profile <profile> --sql <sql> --json"],
+                safe_next_commands: &[
+                    "franken-snowflake query plan --profile <profile> --sql <sql> --json",
+                ],
+                repair_commands: &[
+                    "franken-snowflake query plan --profile <profile> --sql <sql> --json",
+                ],
             },
             Self::StatementTimeout => ErrorEntry {
                 code: self,
@@ -263,8 +277,12 @@ impl SnowflakeErrorCode {
                 retryable: true,
                 policy_boundary: false,
                 summary: "Statement exceeded STATEMENT_TIMEOUT_IN_SECONDS.",
-                safe_next_commands: &["franken-snowflake query run --profile <profile> --sql <sql> --json"],
-                repair_commands: &["franken-snowflake query plan --profile <profile> --sql <sql> --json"],
+                safe_next_commands: &[
+                    "franken-snowflake query run --profile <profile> --sql <sql> --json",
+                ],
+                repair_commands: &[
+                    "franken-snowflake query plan --profile <profile> --sql <sql> --json",
+                ],
             },
             Self::NetworkError => ErrorEntry {
                 code: self,
@@ -294,7 +312,9 @@ impl SnowflakeErrorCode {
                 policy_boundary: false,
                 summary: "Rate limited upstream (429).",
                 safe_next_commands: &["franken-snowflake doctor --json"],
-                repair_commands: &["franken-snowflake query run --profile <profile> --sql <sql> --json"],
+                repair_commands: &[
+                    "franken-snowflake query run --profile <profile> --sql <sql> --json",
+                ],
             },
             Self::QueryStillRunning => ErrorEntry {
                 code: self,
