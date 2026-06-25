@@ -12,12 +12,15 @@
 //! intentionally useful without live Snowflake credentials.
 
 use std::fmt;
+use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use asupersync::http::Response;
 use asupersync::http::compress::{Decompressor, GzipDecompressor, IdentityDecompressor};
-use asupersync::http::{Client as AsupersyncHttpClient, Method, StatusCode};
+use asupersync::http::{
+    Client as AsupersyncHttpClient, ClientError as AsupersyncClientError, Method, StatusCode,
+};
 use asupersync::{CancelKind, Cx};
 use franken_snowflake_core::budget::{Budget, partition_child_budget};
 use franken_snowflake_core::cancel::{CancelPolicy, CancelReason, cancel_policy};
@@ -179,13 +182,16 @@ impl SnowflakeHttpClient {
     ) -> TransportOutcome<CancelHttpResponse> {
         match cancel_policy(reason.kind) {
             CancelPolicy::RemoteCancelAndReceipt | CancelPolicy::BoundedDrain => {
-                self.cancel_statement(
+                run_with_cancellation_mask(
                     cleanup_cx,
-                    CancelHttpRequest {
-                        auth,
-                        statement_handle,
-                        reason_kind: reason.kind,
-                    },
+                    self.cancel_statement(
+                        cleanup_cx,
+                        CancelHttpRequest {
+                            auth,
+                            statement_handle,
+                            reason_kind: reason.kind,
+                        },
+                    ),
                 )
                 .await
             }
@@ -220,39 +226,27 @@ impl SnowflakeHttpClient {
         for partition in request.seed_partitions {
             if cx.checkpoint().is_err() {
                 let reason = cancel_reason_or(cx, CancelReason::parent_cancelled);
-                if request.remote_cancel_on_local_cancel {
-                    return self
-                        .cancel_after_local_cancel(
-                            cx,
-                            request.auth,
-                            request.statement_handle,
-                            reason,
-                        )
-                        .await
-                        .map(|_| summary);
-                }
-                return TransportOutcome::cancelled(reason);
+                return self
+                    .cancel_stream_after_local_cancel(cx, &request, &summary, reason)
+                    .await;
             }
             if let Err(error) = sink.accept(cx, partition).await {
                 return TransportOutcome::err(error.into_snowflake_error());
+            }
+            if cx.checkpoint().is_err() {
+                let reason = cancel_reason_or(cx, CancelReason::parent_cancelled);
+                return self
+                    .cancel_stream_after_local_cancel(cx, &request, &summary, reason)
+                    .await;
             }
         }
 
         for partition in request.first_partition..request.end_partition_exclusive {
             if cx.checkpoint().is_err() {
                 let reason = cancel_reason_or(cx, CancelReason::parent_cancelled);
-                if request.remote_cancel_on_local_cancel {
-                    return self
-                        .cancel_after_local_cancel(
-                            cx,
-                            request.auth,
-                            request.statement_handle,
-                            reason,
-                        )
-                        .await
-                        .map(|_| summary);
-                }
-                return TransportOutcome::cancelled(reason);
+                return self
+                    .cancel_stream_after_local_cancel(cx, &request, &summary, reason)
+                    .await;
             }
             let body = match self
                 .fetch_partition(
@@ -278,9 +272,36 @@ impl SnowflakeHttpClient {
             if let Err(error) = sink.accept(cx, decoded).await {
                 return TransportOutcome::err(error.into_snowflake_error());
             }
+            if cx.checkpoint().is_err() {
+                let reason = cancel_reason_or(cx, CancelReason::parent_cancelled);
+                return self
+                    .cancel_stream_after_local_cancel(cx, &request, &summary, reason)
+                    .await;
+            }
         }
 
         TransportOutcome::ok(summary)
+    }
+
+    async fn cancel_stream_after_local_cancel(
+        &self,
+        cx: &Cx,
+        request: &PartitionStreamRequest,
+        summary: &PartitionStreamSummary,
+        reason: CancelReason,
+    ) -> TransportOutcome<PartitionStreamSummary> {
+        if request.remote_cancel_on_local_cancel {
+            self.cancel_after_local_cancel(
+                cx,
+                request.auth.clone(),
+                request.statement_handle.clone(),
+                reason,
+            )
+            .await
+            .map(|_| summary.clone())
+        } else {
+            TransportOutcome::cancelled(reason)
+        }
     }
 
     async fn execute<R, T>(
@@ -336,16 +357,18 @@ impl SnowflakeHttpClient {
                     let retry_after_ms = retry_after_ms(response.headers.as_slice());
                     let retryable = is_retryable_status(response.status);
                     if retryable {
-                        if let Some(delay) = self.config.retry.delay_for(
+                        if let Some(retry) = self.config.retry.next_retry(
                             planned.request_id.as_ref(),
                             route_kind,
                             attempt,
                             retry_after_ms,
                             retry_spent_ms,
                         ) {
+                            if let Err(reason) = wait_retry_delay(cx, retry.delay).await {
+                                return TransportOutcome::cancelled(reason);
+                            }
                             attempt = attempt.saturating_add(1);
-                            retry_spent_ms =
-                                retry_spent_ms.saturating_add(delay.as_millis() as u64);
+                            retry_spent_ms = retry.spent_after_ms;
                             continue;
                         }
                         return TransportOutcome::err(
@@ -365,31 +388,30 @@ impl SnowflakeHttpClient {
                     };
                 }
                 Err(error) if error.is_cancelled() => {
-                    let reason = cancel_reason_or(cx, CancelReason::parent_cancelled);
-                    if attempt == 1 {
-                        return TransportOutcome::err(
-                            TransportError::new(
-                                TransportErrorCode::CancelledDuringConnect,
-                                format!(
-                                    "{} cancelled before a response was received",
-                                    route_kind.as_str()
-                                ),
-                            )
-                            .into_snowflake_error(),
-                        );
-                    }
-                    return TransportOutcome::cancelled(reason);
+                    return TransportOutcome::cancelled(cancel_reason_or(
+                        cx,
+                        CancelReason::parent_cancelled,
+                    ));
+                }
+                Err(AsupersyncClientError::DeadlineExceeded) => {
+                    return TransportOutcome::cancelled(cancel_reason_or(
+                        cx,
+                        CancelReason::deadline,
+                    ));
                 }
                 Err(error) => {
-                    if let Some(delay) = self.config.retry.delay_for(
+                    if let Some(retry) = self.config.retry.next_retry(
                         planned.request_id.as_ref(),
                         route_kind,
                         attempt,
                         None,
                         retry_spent_ms,
                     ) {
+                        if let Err(reason) = wait_retry_delay(cx, retry.delay).await {
+                            return TransportOutcome::cancelled(reason);
+                        }
                         attempt = attempt.saturating_add(1);
-                        retry_spent_ms = retry_spent_ms.saturating_add(delay.as_millis() as u64);
+                        retry_spent_ms = retry.spent_after_ms;
                         continue;
                     }
                     return TransportOutcome::err(
@@ -736,6 +758,21 @@ impl RetryPolicy {
         }
     }
 
+    fn next_retry(
+        self,
+        request_id: Option<&RequestId>,
+        route: TransportRouteKind,
+        attempt: u32,
+        retry_after_ms: Option<u64>,
+        spent_ms: u64,
+    ) -> Option<RetryDecision> {
+        let delay = self.delay_for(request_id, route, attempt, retry_after_ms, spent_ms)?;
+        Some(RetryDecision {
+            delay,
+            spent_after_ms: spent_ms.saturating_add(duration_millis_saturating(delay)),
+        })
+    }
+
     /// Budget slice for one transport attempt, meet-composed with the caller's
     /// ambient budget and any route-specific child budget.
     #[must_use]
@@ -748,6 +785,16 @@ impl RetryPolicy {
             .meet(route_budget)
             .meet(Budget::new().with_poll_quota(remaining_attempts))
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RetryDecision {
+    delay: Duration,
+    spent_after_ms: u64,
+}
+
+fn duration_millis_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 impl Default for RetryPolicy {
@@ -1254,16 +1301,40 @@ fn retry_after_ms(headers: &[(String, String)]) -> Option<u64> {
 }
 
 fn is_retryable_status(status: u16) -> bool {
+    // A 408 StatementTimeout is terminal: the statement already exceeded its
+    // server-side STATEMENT_TIMEOUT_IN_SECONDS, so retrying re-runs a query that
+    // will time out again and burns the retry budget for nothing. Only transient
+    // conditions (429 overload, 5xx) are retried. This matches the authoritative
+    // `ResponseClass::is_retryable` in franken-snowflake-sqlapi.
     matches!(
         classify_status(StatusCode(status)),
-        StatusClass::StatementTimeout
-            | StatusClass::RateLimited
-            | StatusClass::ServerErrorRetryable
+        StatusClass::RateLimited | StatusClass::ServerErrorRetryable
     )
 }
 
 fn cancel_reason_or(cx: &Cx, fallback: fn() -> CancelReason) -> CancelReason {
     cx.cancel_reason().unwrap_or_else(fallback)
+}
+
+async fn wait_retry_delay(cx: &Cx, delay: Duration) -> Result<(), CancelReason> {
+    if cx.checkpoint().is_err() {
+        return Err(cancel_reason_or(cx, CancelReason::parent_cancelled));
+    }
+    if asupersync::time::budget_sleep(cx, delay, cx.now_for_observability())
+        .await
+        .is_err()
+    {
+        return Err(cancel_reason_or(cx, CancelReason::deadline));
+    }
+    if cx.checkpoint().is_err() {
+        return Err(cancel_reason_or(cx, CancelReason::parent_cancelled));
+    }
+    Ok(())
+}
+
+async fn run_with_cancellation_mask<T>(cx: &Cx, future: impl Future<Output = T>) -> T {
+    let mut future = Box::pin(future);
+    std::future::poll_fn(|task| cx.masked(|| future.as_mut().poll(task))).await
 }
 
 /// Async partition sink.
@@ -1763,6 +1834,46 @@ mod tests {
     }
 
     #[test]
+    fn retry_decision_charges_each_delay_once() {
+        let policy = RetryPolicy {
+            max_attempts: 4,
+            base_delay_ms: 25,
+            max_delay_ms: 100,
+            total_budget_ms: 75,
+            respect_retry_after: false,
+            deterministic_jitter: false,
+        };
+        let first = policy
+            .next_retry(None, TransportRouteKind::Poll, 1, None, 0)
+            .expect("first retry");
+        assert_eq!(first.delay, Duration::from_millis(25));
+        assert_eq!(first.spent_after_ms, 25);
+
+        let second = policy
+            .next_retry(
+                None,
+                TransportRouteKind::Poll,
+                2,
+                None,
+                first.spent_after_ms,
+            )
+            .expect("second retry");
+        assert_eq!(second.delay, Duration::from_millis(50));
+        assert_eq!(second.spent_after_ms, 75);
+
+        assert_eq!(
+            policy.next_retry(
+                None,
+                TransportRouteKind::Poll,
+                3,
+                None,
+                second.spent_after_ms
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn status_classification_keeps_202_and_429_distinct() {
         assert_eq!(classify_status(StatusCode(200)), StatusClass::Completed);
         assert_eq!(classify_status(StatusCode(202)), StatusClass::Running);
@@ -1776,6 +1887,21 @@ mod tests {
             classify_status(StatusCode(503)),
             StatusClass::ServerErrorRetryable
         );
+    }
+
+    #[test]
+    fn statement_timeout_408_is_not_retried() {
+        // Regression: a 408 statement timeout is terminal, never retried — it
+        // would just time out again. Only transient overload/5xx retry. Matches
+        // the authoritative sqlapi ResponseClass::is_retryable.
+        assert!(!is_retryable_status(408));
+        assert!(is_retryable_status(429));
+        assert!(is_retryable_status(500));
+        assert!(is_retryable_status(503));
+        // Terminal/success statuses are never retried.
+        assert!(!is_retryable_status(200));
+        assert!(!is_retryable_status(422));
+        assert!(!is_retryable_status(404));
     }
 
     #[test]
@@ -1874,6 +2000,89 @@ mod tests {
             body.compression.uncompressed_bytes,
             br#"{"data":[["one"]]}"#.len() as u64
         );
+    }
+
+    fn poll_ready<F: Future>(future: F) -> F::Output {
+        let waker = std::task::Waker::noop();
+        let mut task = std::task::Context::from_waker(waker);
+        let mut future = std::pin::pin!(future);
+        match future.as_mut().poll(&mut task) {
+            std::task::Poll::Ready(output) => output,
+            std::task::Poll::Pending => unreachable!("test future unexpectedly pending"),
+        }
+    }
+
+    #[test]
+    fn cancellation_mask_defers_cleanup_checkpoint() {
+        let cx = Cx::for_testing();
+        cx.cancel_with(CancelKind::User, Some("cleanup"));
+
+        let checkpoint_ok = poll_ready(run_with_cancellation_mask(&cx, async {
+            cx.checkpoint().is_ok()
+        }));
+
+        assert!(checkpoint_ok);
+        assert!(cx.checkpoint().is_err());
+    }
+
+    struct CancellingSink {
+        cx: Cx,
+        accepted: u32,
+    }
+
+    impl PartitionSink for CancellingSink {
+        fn accept(
+            &mut self,
+            _cx: &Cx,
+            _partition: DecodedPartition,
+        ) -> impl Future<Output = Result<(), TransportError>> {
+            self.accepted = self.accepted.saturating_add(1);
+            self.cx
+                .cancel_with(CancelKind::User, Some("partition sink cancelled"));
+            std::future::ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn partition_stream_observes_cancel_after_seed_accept() {
+        let cx = Cx::for_testing();
+        let client = SnowflakeHttpClient::new(
+            TransportConfig::new(endpoint()),
+            AsupersyncHttpClient::new(),
+        );
+        let request = PartitionStreamRequest {
+            auth: auth(),
+            statement_handle: StatementHandle::new("stmt-1"),
+            first_partition: 1,
+            end_partition_exclusive: 1,
+            max_concurrent_fetches: 1,
+            child_budget: Budget::unlimited(),
+            remote_cancel_on_local_cancel: false,
+            seed_partitions: vec![DecodedPartition {
+                partition: 0,
+                body: b"[]".to_vec(),
+                compression: CompressionEvidence {
+                    content_encoding: ContentEncoding::Identity,
+                    compressed_bytes: 2,
+                    uncompressed_bytes: 2,
+                },
+            }],
+        };
+        let mut sink = CancellingSink {
+            cx: cx.clone(),
+            accepted: 0,
+        };
+
+        let outcome = poll_ready(client.stream_partitions(&cx, request, &mut sink));
+        let cancel_kind = match outcome {
+            TransportOutcome::Cancelled(reason) => Some(reason.kind),
+            TransportOutcome::Ok(_) | TransportOutcome::Err(_) | TransportOutcome::Panicked(_) => {
+                None
+            }
+        };
+
+        assert_eq!(sink.accepted, 1);
+        assert_eq!(cancel_kind, Some(CancelKind::User));
     }
 
     #[test]

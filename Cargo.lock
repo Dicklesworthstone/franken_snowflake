@@ -791,6 +791,9 @@ dependencies = [
 [[package]]
 name = "franken-snowflake-cli"
 version = "0.0.0"
+dependencies = [
+ "franken-snowflake-core",
+]
 
 [[package]]
 name = "franken-snowflake-core"

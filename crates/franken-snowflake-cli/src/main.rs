@@ -6,6 +6,9 @@
 //! registry, and `--json`/`--toon` output switch are intentionally implemented
 //! early so downstream panes can target one stable shape.
 
+use franken_snowflake_core::error::SnowflakeErrorCode;
+use franken_snowflake_core::exit::ExitCode as CoreExitCode;
+
 use std::env;
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -22,21 +25,6 @@ fn main() -> ExitCode {
 enum OutputFormat {
     Json,
     Toon,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ExitStatus {
-    Success = 0,
-    Findings = 1,
-    SafetyRefusal = 2,
-    Usage = 64,
-    Io = 74,
-}
-
-impl ExitStatus {
-    fn code(self) -> u8 {
-        self as u8
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,10 +110,10 @@ enum Json {
 
 #[derive(Clone, Debug)]
 struct ErrorInfo {
-    code: &'static str,
+    code: SnowflakeErrorCode,
     message: String,
     retryable: bool,
-    policy_boundary: &'static str,
+    policy_boundary: bool,
     evidence: Vec<Json>,
 }
 
@@ -153,7 +141,7 @@ struct Envelope {
 
 #[derive(Debug)]
 struct Outcome {
-    status: ExitStatus,
+    status: CoreExitCode,
     body: Body,
 }
 
@@ -179,133 +167,6 @@ struct CommandSpec {
     mutates_local_state: bool,
     sensitive_output: bool,
 }
-
-struct ErrorSpec {
-    code: &'static str,
-    exit_code: u8,
-    description: &'static str,
-    retryable: bool,
-    policy_boundary: &'static str,
-    safe_next_commands: &'static [&'static str],
-    repair_commands: &'static [&'static str],
-}
-
-const ERROR_SPECS: &[ErrorSpec] = &[
-    ErrorSpec {
-        code: "FSNOW_USAGE",
-        exit_code: 64,
-        description: "The invocation was syntactically invalid or incomplete.",
-        retryable: false,
-        policy_boundary: "cli_parser",
-        safe_next_commands: &["franken-snowflake capabilities --json"],
-        repair_commands: &["franken-snowflake --help"],
-    },
-    ErrorSpec {
-        code: "FSNOW_USAGE_UNKNOWN_COMMAND",
-        exit_code: 64,
-        description: "The top-level command is not recognized.",
-        retryable: false,
-        policy_boundary: "cli_parser",
-        safe_next_commands: &["franken-snowflake capabilities --json"],
-        repair_commands: &["franken-snowflake --help"],
-    },
-    ErrorSpec {
-        code: "FSNOW_USAGE_UNKNOWN_FLAG",
-        exit_code: 64,
-        description: "A flag is not recognized by the draft CLI surface.",
-        retryable: false,
-        policy_boundary: "cli_parser",
-        safe_next_commands: &["franken-snowflake capabilities --json"],
-        repair_commands: &["franken-snowflake --help"],
-    },
-    ErrorSpec {
-        code: "FSNOW_NOT_IMPLEMENTED",
-        exit_code: 2,
-        description: "The command is reserved by the public contract, but its live handler is blocked by lower-level beads.",
-        retryable: true,
-        policy_boundary: "implementation_phase",
-        safe_next_commands: &["franken-snowflake capabilities --json"],
-        repair_commands: &["franken-snowflake doctor --json"],
-    },
-    ErrorSpec {
-        code: "FSNOW_PROFILE_STORE_UNAVAILABLE",
-        exit_code: 3,
-        description: "The profile registry/storage implementation is not linked yet.",
-        retryable: true,
-        policy_boundary: "local_cli_slice",
-        safe_next_commands: &["franken-snowflake capabilities --json"],
-        repair_commands: &["franken-snowflake doctor --json"],
-    },
-    ErrorSpec {
-        code: "FSNOW_PROFILE_DOCTOR_UNAVAILABLE",
-        exit_code: 3,
-        description: "Profile doctor needs the profile registry and optional live transport.",
-        retryable: true,
-        policy_boundary: "local_cli_slice",
-        safe_next_commands: &["franken-snowflake profile validate <profile> --json"],
-        repair_commands: &["franken-snowflake doctor --json"],
-    },
-    ErrorSpec {
-        code: "FSNOW_TUI_FEATURE_DISABLED",
-        exit_code: 2,
-        description: "The optional TUI is not enabled in the default build.",
-        retryable: false,
-        policy_boundary: "feature_gate",
-        safe_next_commands: &["franken-snowflake capabilities --json"],
-        repair_commands: &["franken-snowflake capabilities --json"],
-    },
-    ErrorSpec {
-        code: "FSNOW_MCP_FEATURE_DISABLED",
-        exit_code: 2,
-        description: "The optional MCP server is not enabled in this CLI slice.",
-        retryable: false,
-        policy_boundary: "feature_gate",
-        safe_next_commands: &["franken-snowflake capabilities --json"],
-        repair_commands: &["franken-snowflake capabilities --json"],
-    },
-    ErrorSpec {
-        code: "FSNOW_UNKNOWN_OPERATOR",
-        exit_code: 64,
-        description: "The requested dataset filter operator is not in the draft operator registry.",
-        retryable: false,
-        policy_boundary: "operator_catalog",
-        safe_next_commands: &["franken-snowflake dataset describe-operator between --jsonschema"],
-        repair_commands: &["franken-snowflake dataset describe-operator between --jsonschema"],
-    },
-    ErrorSpec {
-        code: "FSNOW_SQL_MULTIPLE_STATEMENTS_REFUSED",
-        exit_code: 2,
-        description: "Multiple SQL statements are refused by default.",
-        retryable: false,
-        policy_boundary: "sql_safety",
-        safe_next_commands: &[
-            "franken-snowflake query plan --profile <profile> --sql \"select 1\" --json",
-        ],
-        repair_commands: &["franken-snowflake query plan --profile <profile> --sql <sql> --json"],
-    },
-    ErrorSpec {
-        code: "FSNOW_SQL_NON_SELECT_REFUSED",
-        exit_code: 2,
-        description: "Only read-style SQL statements are accepted in the MVP.",
-        retryable: false,
-        policy_boundary: "sql_safety",
-        safe_next_commands: &[
-            "franken-snowflake query plan --profile <profile> --sql \"select 1\" --json",
-        ],
-        repair_commands: &["franken-snowflake query plan --profile <profile> --sql <sql> --json"],
-    },
-    ErrorSpec {
-        code: "FSNOW_SQL_SAFETY_REFUSAL",
-        exit_code: 2,
-        description: "A query run request failed the local read-only safety check.",
-        retryable: false,
-        policy_boundary: "sql_safety",
-        safe_next_commands: &[
-            "franken-snowflake query plan --profile <profile> --sql <sql> --json",
-        ],
-        repair_commands: &["franken-snowflake query plan --profile <profile> --sql <sql> --json"],
-    },
-];
 
 const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
@@ -551,15 +412,13 @@ fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
                 output,
                 "help",
                 "fsnow.help.v1",
-                ExitStatus::Usage,
+                CoreExitCode::Usage,
                 "error",
-                ErrorInfo {
-                    code: "FSNOW_USAGE_UNKNOWN_COMMAND",
-                    message: format!("Unknown command `{other}`."),
-                    retryable: false,
-                    policy_boundary: "cli_parser",
-                    evidence: vec![json_string(format!("command={other}"))],
-                },
+                error_info(
+                    SnowflakeErrorCode::UnknownCommand,
+                    format!("Unknown command `{other}`."),
+                    vec![json_string(format!("command={other}"))],
+                ),
                 vec!["franken-snowflake capabilities --json".to_string()],
                 vec!["franken-snowflake --help".to_string()],
                 suggestions,
@@ -1114,7 +973,7 @@ fn dispatch(invocation: Invocation) -> Outcome {
             "fsnow.tui.launch.v1",
             request_id,
             profile,
-            "FSNOW_TUI_FEATURE_DISABLED",
+            SnowflakeErrorCode::UsageError,
             "The TUI is default-off until its cargo-tree and cross-platform proofs land.",
             vec!["franken-snowflake capabilities --json".to_string()],
         ),
@@ -1124,7 +983,7 @@ fn dispatch(invocation: Invocation) -> Outcome {
             "fsnow.mcp.serve.v1",
             request_id,
             mode,
-            "FSNOW_MCP_FEATURE_DISABLED",
+            SnowflakeErrorCode::UsageError,
             "The MCP server is feature-gated and not linked in this CLI slice.",
             vec!["franken-snowflake capabilities --json".to_string()],
         ),
@@ -1151,7 +1010,7 @@ fn success(
     .with_warnings(warnings)
     .with_safe_next_commands(safe_next_commands);
     Outcome {
-        status: ExitStatus::Success,
+        status: CoreExitCode::Success,
         body: Body::Envelope { envelope, format },
     }
 }
@@ -1176,7 +1035,7 @@ fn findings(
     .with_warnings(warnings)
     .with_safe_next_commands(safe_next_commands);
     Outcome {
-        status: ExitStatus::Findings,
+        status: CoreExitCode::Findings,
         body: Body::Envelope { envelope, format },
     }
 }
@@ -1199,18 +1058,15 @@ fn not_implemented_with_data(
         data,
     );
     envelope.profile_id = profile_id;
-    envelope.error = Some(ErrorInfo {
-        code: "FSNOW_NOT_IMPLEMENTED",
-        message: "This command surface is reserved, but its live handler is blocked by lower-level beads."
-            .to_string(),
-        retryable: true,
-        policy_boundary: "implementation_phase",
-        evidence: vec![json_string("contract-first CLI skeleton")],
-    });
+    envelope.error = Some(error_info(
+        SnowflakeErrorCode::Internal,
+        "This command surface is reserved, but its live handler is blocked by lower-level beads.",
+        vec![json_string("contract-first CLI skeleton")],
+    ));
     envelope.safe_next_commands = safe_next_commands;
     envelope.repair_commands = vec!["franken-snowflake doctor --json".to_string()];
     Outcome {
-        status: ExitStatus::SafetyRefusal,
+        status: SnowflakeErrorCode::Internal.exit_code(),
         body: Body::Envelope { envelope, format },
     }
 }
@@ -1221,7 +1077,7 @@ fn feature_disabled(
     output_contract_id: &'static str,
     request_id: String,
     context: Option<String>,
-    code: &'static str,
+    code: SnowflakeErrorCode,
     message: &'static str,
     safe_next_commands: Vec<String>,
 ) -> Outcome {
@@ -1236,17 +1092,15 @@ fn feature_disabled(
             ("context", option_json(context)),
         ]),
     );
-    envelope.error = Some(ErrorInfo {
+    envelope.error = Some(error_info(
         code,
-        message: message.to_string(),
-        retryable: false,
-        policy_boundary: "feature_gate",
-        evidence: vec![json_string("default build omits this feature")],
-    });
+        message,
+        vec![json_string("default build omits this feature")],
+    ));
     envelope.safe_next_commands = safe_next_commands;
     envelope.repair_commands = vec!["franken-snowflake capabilities --json".to_string()];
     Outcome {
-        status: ExitStatus::SafetyRefusal,
+        status: code.exit_code(),
         body: Body::Envelope { envelope, format },
     }
 }
@@ -1255,7 +1109,7 @@ fn error_outcome(
     format: OutputFormat,
     command_id: &'static str,
     output_contract_id: &'static str,
-    status: ExitStatus,
+    status: CoreExitCode,
     outcome_kind: &'static str,
     error: ErrorInfo,
     safe_next_commands: Vec<String>,
@@ -1302,45 +1156,43 @@ fn usage_error(
         format,
         command_id,
         output_contract_id,
-        ExitStatus::Usage,
+        CoreExitCode::Usage,
         "error",
-        ErrorInfo {
-            code: "FSNOW_USAGE",
-            message: message.to_string(),
-            retryable: false,
-            policy_boundary: "cli_parser",
-            evidence: vec![],
-        },
+        error_info(SnowflakeErrorCode::UsageError, message, vec![]),
         vec!["franken-snowflake capabilities --json".to_string()],
         repair_commands,
         did_you_mean_values,
     )
 }
 
-fn default_safe_next_commands(code: &str) -> Vec<String> {
-    find_error_spec(code)
-        .map(|spec| {
-            spec.safe_next_commands
-                .iter()
-                .map(|cmd| (*cmd).to_string())
-                .collect()
-        })
-        .unwrap_or_else(|| vec!["franken-snowflake capabilities --json".to_string()])
+fn error_info(
+    code: SnowflakeErrorCode,
+    message: impl Into<String>,
+    evidence: Vec<Json>,
+) -> ErrorInfo {
+    ErrorInfo {
+        code,
+        message: message.into(),
+        retryable: code.retryable(),
+        policy_boundary: code.policy_boundary(),
+        evidence,
+    }
 }
 
-fn default_repair_commands(code: &str) -> Vec<String> {
-    find_error_spec(code)
-        .map(|spec| {
-            spec.repair_commands
-                .iter()
-                .map(|cmd| (*cmd).to_string())
-                .collect()
-        })
-        .unwrap_or_else(|| vec!["franken-snowflake doctor --json".to_string()])
+fn default_safe_next_commands(code: SnowflakeErrorCode) -> Vec<String> {
+    code.entry()
+        .safe_next_commands
+        .iter()
+        .map(|cmd| (*cmd).to_string())
+        .collect()
 }
 
-fn find_error_spec(code: &str) -> Option<&'static ErrorSpec> {
-    ERROR_SPECS.iter().find(|spec| spec.code == code)
+fn default_repair_commands(code: SnowflakeErrorCode) -> Vec<String> {
+    code.entry()
+        .repair_commands
+        .iter()
+        .map(|cmd| (*cmd).to_string())
+        .collect()
 }
 
 impl Envelope {
@@ -1434,10 +1286,10 @@ fn envelope_json(envelope: &Envelope) -> Json {
 fn error_json(error: Option<ErrorInfo>) -> Json {
     match error {
         Some(info) => json_object(vec![
-            ("code", json_string(info.code)),
+            ("code", json_string(info.code.stable_code())),
             ("message", json_string(info.message)),
             ("retryable", Json::Bool(info.retryable)),
-            ("policy_boundary", json_string(info.policy_boundary)),
+            ("policy_boundary", Json::Bool(info.policy_boundary)),
             ("evidence", Json::Array(info.evidence)),
         ]),
         None => Json::Null,
@@ -1450,8 +1302,11 @@ fn write_outcome(outcome: Outcome) -> ExitCode {
         Body::Envelope { envelope, format } => {
             if !envelope.ok {
                 let diagnostic = match &envelope.error {
-                    Some(error) => format!("{}: {}\n", error.code, error.message),
-                    None => "FSNOW_ERROR: command failed\n".to_string(),
+                    Some(error) => format!("{}: {}\n", error.code.stable_code(), error.message),
+                    None => format!(
+                        "{}: command failed\n",
+                        SnowflakeErrorCode::Internal.stable_code()
+                    ),
                 };
                 let _ignored = write_stderr(&diagnostic);
             }
@@ -1460,15 +1315,19 @@ fn write_outcome(outcome: Outcome) -> ExitCode {
                 OutputFormat::Toon => render_toon(&envelope_json(&envelope)),
             };
             match write_stdout(&rendered) {
-                Ok(()) => ExitCode::from(status.code()),
-                Err(()) => ExitCode::from(ExitStatus::Io.code()),
+                Ok(()) => process_exit_code(status),
+                Err(()) => process_exit_code(CoreExitCode::Io),
             }
         }
         Body::Raw { data } => match write_stdout(&data) {
-            Ok(()) => ExitCode::from(status.code()),
-            Err(()) => ExitCode::from(ExitStatus::Io.code()),
+            Ok(()) => process_exit_code(status),
+            Err(()) => process_exit_code(CoreExitCode::Io),
         },
     }
+}
+
+fn process_exit_code(status: CoreExitCode) -> ExitCode {
+    ExitCode::from(status.code() as u8)
 }
 
 fn write_stdout(data: &str) -> Result<(), ()> {
@@ -1575,19 +1434,19 @@ fn agent_handbook_data() -> Json {
             "error_recovery",
             json_object(vec![
                 (
-                    "FSNOW_USAGE",
+                    SnowflakeErrorCode::UsageError.stable_code(),
                     json_string(
                         "Run `franken-snowflake capabilities --json` and retry with the shown invocation.",
                     ),
                 ),
                 (
-                    "FSNOW_NOT_IMPLEMENTED",
+                    SnowflakeErrorCode::Internal.stable_code(),
                     json_string(
                         "Use `query plan` or `capabilities`; live handlers land in dependent beads.",
                     ),
                 ),
                 (
-                    "FSNOW_PROFILE_STORE_UNAVAILABLE",
+                    SnowflakeErrorCode::ProfileInvalid.stable_code(),
                     json_string(
                         "Run `franken-snowflake doctor --json`; profile registry is not linked yet.",
                     ),
@@ -1732,7 +1591,7 @@ fn profile_validate_outcome(format: OutputFormat, request_id: String, profile: S
     ]);
     envelope.profile_id = Some(profile);
     Outcome {
-        status: ExitStatus::Findings,
+        status: CoreExitCode::Findings,
         body: Body::Envelope { envelope, format },
     }
 }
@@ -1772,7 +1631,7 @@ fn profile_doctor_outcome(
     ]);
     envelope.profile_id = Some(profile);
     Outcome {
-        status: ExitStatus::Findings,
+        status: CoreExitCode::Findings,
         body: Body::Envelope { envelope, format },
     }
 }
@@ -1956,15 +1815,13 @@ fn operator_schema_outcome(format: OutputFormat, request_id: String, operator: S
                 format,
                 "dataset.describe_operator",
                 "fsnow.dataset.operator_schema.v1",
-                ExitStatus::Usage,
+                CoreExitCode::Usage,
                 "error",
-                ErrorInfo {
-                    code: "FSNOW_UNKNOWN_OPERATOR",
-                    message: format!("Unknown operator `{operator}`."),
-                    retryable: false,
-                    policy_boundary: "operator_catalog",
-                    evidence: vec![json_string("known operators: between, equals")],
-                },
+                error_info(
+                    SnowflakeErrorCode::UsageError,
+                    format!("Unknown operator `{operator}`."),
+                    vec![json_string("known operators: between, equals")],
+                ),
                 vec![
                     "franken-snowflake dataset describe-operator between --jsonschema".to_string(),
                 ],
@@ -2025,7 +1882,7 @@ fn query_plan_outcome(
             "fsnow.query.plan.v1",
             request_id,
             profile,
-            "FSNOW_SQL_MULTIPLE_STATEMENTS_REFUSED",
+            SnowflakeErrorCode::MultiStatementRefused,
             "Multiple SQL statements are refused by default.",
             vec![
                 "franken-snowflake query plan --profile <profile> --sql \"select 1\" --json"
@@ -2041,7 +1898,7 @@ fn query_plan_outcome(
             "fsnow.query.plan.v1",
             request_id,
             profile,
-            "FSNOW_SQL_NON_SELECT_REFUSED",
+            SnowflakeErrorCode::MutationRefused,
             "Only SELECT/WITH/SHOW/DESCRIBE/EXPLAIN-style read statements are accepted in the MVP.",
             vec![
                 "franken-snowflake query plan --profile <profile> --sql \"select 1\" --json"
@@ -2114,7 +1971,7 @@ fn query_run_outcome(
             "fsnow.query.run.v1",
             request_id,
             profile,
-            "FSNOW_SQL_SAFETY_REFUSAL",
+            SnowflakeErrorCode::MutationRefused,
             "The MVP query runner accepts one read-only statement; use `query plan` to inspect refusals.",
             vec!["franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string()],
         );
@@ -2145,7 +2002,7 @@ fn refusal(
     output_contract_id: &'static str,
     request_id: String,
     profile_id: Option<String>,
-    code: &'static str,
+    code: SnowflakeErrorCode,
     message: &'static str,
     safe_next_commands: Vec<String>,
 ) -> Outcome {
@@ -2158,18 +2015,16 @@ fn refusal(
         json_object(vec![]),
     );
     envelope.profile_id = profile_id;
-    envelope.error = Some(ErrorInfo {
+    envelope.error = Some(error_info(
         code,
-        message: message.to_string(),
-        retryable: false,
-        policy_boundary: "sql_safety",
-        evidence: vec![json_string("local SQL safety check")],
-    });
+        message,
+        vec![json_string("local SQL safety check")],
+    ));
     envelope.safe_next_commands = safe_next_commands;
     envelope.repair_commands =
         vec!["franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string()];
     Outcome {
-        status: ExitStatus::SafetyRefusal,
+        status: code.exit_code(),
         body: Body::Envelope { envelope, format },
     }
 }
@@ -2182,13 +2037,13 @@ fn catalog_graph_outcome(
 ) -> Outcome {
     match graph_output {
         GraphOutput::Mermaid => Outcome {
-            status: ExitStatus::Success,
+            status: CoreExitCode::Success,
             body: Body::Raw {
                 data: "graph TD\n  EMPTY[\"catalog graph requires catalog scan fixtures\"]".to_string(),
             },
         },
         GraphOutput::Svg => Outcome {
-            status: ExitStatus::Success,
+            status: CoreExitCode::Success,
             body: Body::Raw {
                 data: "<svg xmlns=\"http://www.w3.org/2000/svg\" role=\"img\" aria-label=\"empty catalog graph\"></svg>"
                     .to_string(),
@@ -2232,19 +2087,22 @@ fn exit_code_json() -> Json {
 
 fn error_registry_json() -> Json {
     Json::Array(
-        ERROR_SPECS
+        SnowflakeErrorCode::ALL
             .iter()
-            .map(|spec| {
+            .copied()
+            .map(|code| {
+                let entry = code.entry();
                 json_object(vec![
-                    ("code", json_string(spec.code)),
-                    ("exit_code", Json::Number(i64::from(spec.exit_code))),
-                    ("description", json_string(spec.description)),
-                    ("retryable", Json::Bool(spec.retryable)),
-                    ("policy_boundary", json_string(spec.policy_boundary)),
+                    ("code", json_string(entry.stable_code)),
+                    ("exit_code", Json::Number(i64::from(entry.exit_code.code()))),
+                    ("description", json_string(entry.summary)),
+                    ("retryable", Json::Bool(entry.retryable)),
+                    ("policy_boundary", Json::Bool(entry.policy_boundary)),
                     (
                         "safe_next_commands",
                         string_array(
-                            spec.safe_next_commands
+                            entry
+                                .safe_next_commands
                                 .iter()
                                 .map(|cmd| (*cmd).to_string())
                                 .collect(),
@@ -2253,7 +2111,8 @@ fn error_registry_json() -> Json {
                     (
                         "repair_commands",
                         string_array(
-                            spec.repair_commands
+                            entry
+                                .repair_commands
                                 .iter()
                                 .map(|cmd| (*cmd).to_string())
                                 .collect(),
@@ -2266,9 +2125,9 @@ fn error_registry_json() -> Json {
 }
 
 fn error_codes() -> Vec<String> {
-    ERROR_SPECS
+    SnowflakeErrorCode::ALL
         .iter()
-        .map(|spec| spec.code.to_string())
+        .map(|code| code.stable_code().to_string())
         .collect()
 }
 
@@ -2361,15 +2220,13 @@ fn validate_known_flags(output: OutputFormat, args: &[String]) -> Result<(), Out
             output,
             "help",
             "fsnow.help.v1",
-            ExitStatus::Usage,
+            CoreExitCode::Usage,
             "error",
-            ErrorInfo {
-                code: "FSNOW_USAGE_UNKNOWN_FLAG",
-                message: format!("Unknown flag `{arg}`."),
-                retryable: false,
-                policy_boundary: "cli_parser",
-                evidence: vec![json_string(format!("flag={arg}"))],
-            },
+            error_info(
+                SnowflakeErrorCode::UsageError,
+                format!("Unknown flag `{arg}`."),
+                vec![json_string(format!("flag={arg}"))],
+            ),
             vec!["franken-snowflake capabilities --json".to_string()],
             vec!["franken-snowflake --help".to_string()],
             did_you_mean(flag_name, &known_flags()),
@@ -2694,6 +2551,13 @@ mod tests {
         }
     }
 
+    fn error_code_for(args: &[&str]) -> Option<&'static str> {
+        match execute(args.iter().map(|arg| (*arg).to_string()).collect()).body {
+            Body::Envelope { envelope, .. } => envelope.error.map(|error| error.code.stable_code()),
+            Body::Raw { .. } => None,
+        }
+    }
+
     #[test]
     fn capabilities_lists_every_required_surface() {
         let rendered = render_json(&envelope_for(&["capabilities", "--json"]));
@@ -2702,7 +2566,7 @@ mod tests {
         assert!(rendered.contains("\"command_id\":\"mcp.serve\""));
         assert!(rendered.contains("\"alternate_outputs\":[\"toon\"]"));
         assert!(rendered.contains("\"error_registry\""));
-        assert!(rendered.contains("FSNOW_USAGE_UNKNOWN_FLAG"));
+        assert!(rendered.contains("FSNOW-1002"));
     }
 
     #[test]
@@ -2720,7 +2584,7 @@ mod tests {
             Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
             Body::Raw { data } => data,
         };
-        assert!(rendered.contains("FSNOW_SQL_MULTIPLE_STATEMENTS_REFUSED"));
+        assert!(rendered.contains("FSNOW-3002"));
     }
 
     #[test]
@@ -2747,7 +2611,7 @@ mod tests {
             Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
             Body::Raw { data } => data,
         };
-        assert!(rendered.contains("FSNOW_USAGE_UNKNOWN_FLAG"));
+        assert!(rendered.contains("FSNOW-1002"));
         assert!(rendered.contains("--json"));
     }
 
@@ -2865,9 +2729,47 @@ mod tests {
 
     #[test]
     fn error_registry_entries_have_default_recovery() {
-        for spec in ERROR_SPECS {
-            assert!(!spec.safe_next_commands.is_empty());
-            assert!(!spec.repair_commands.is_empty());
+        for code in SnowflakeErrorCode::ALL {
+            let entry = code.entry();
+            assert!(!entry.safe_next_commands.is_empty());
+            assert!(!entry.repair_commands.is_empty());
+            assert_eq!(
+                SnowflakeErrorCode::from_stable_code(entry.stable_code),
+                Some(*code)
+            );
+        }
+    }
+
+    #[test]
+    fn cli_error_codes_resolve_against_core_registry() {
+        let emitted_codes = [
+            error_code_for(&["capabilties"]).expect("unknown command emits error"),
+            error_code_for(&["capabilities", "--jsno"]).expect("unknown flag emits error"),
+            error_code_for(&[
+                "query",
+                "plan",
+                "--profile",
+                "demo",
+                "--sql",
+                "select 1; select 2",
+            ])
+            .expect("multi-statement refusal emits error"),
+            error_code_for(&["dataset", "describe-operator", "bogus"])
+                .expect("unknown operator emits error"),
+        ];
+
+        for code in emitted_codes {
+            assert!(
+                SnowflakeErrorCode::from_stable_code(code).is_some(),
+                "{code} did not resolve against core registry"
+            );
+        }
+
+        for code in error_codes() {
+            assert!(
+                SnowflakeErrorCode::from_stable_code(&code).is_some(),
+                "{code} from CLI registry did not resolve against core registry"
+            );
         }
     }
 

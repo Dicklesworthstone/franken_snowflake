@@ -19,3 +19,4 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+franken-snowflake-core = { path = "../franken-snowflake-core" }
