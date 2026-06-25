@@ -222,8 +222,8 @@ impl StatementMachine {
                 let status = parse_query_status(body)?;
                 Ok(Progress::PollAgain(status.statement_handle))
             }
-            ResponseClass::StatementTimeout => Ok(Progress::TimedOut(parse_failure(body)?)),
-            ResponseClass::StatementFailed => Ok(Progress::Failed(parse_failure(body)?)),
+            ResponseClass::StatementTimeout => self.enter_terminal_timeout(parse_failure(body)?),
+            ResponseClass::StatementFailed => self.enter_terminal_failure(parse_failure(body)?),
             ResponseClass::RateLimited | ResponseClass::Other(_) => Err(LifecycleError::new(
                 LifecycleErrorCode::UnexpectedStatus,
                 "submit returned a non-terminal, non-running status",
@@ -244,8 +244,8 @@ impl StatementMachine {
         self.polls_done = self.polls_done.saturating_add(1);
         match class {
             ResponseClass::Completed => self.enter_terminal_result(parse_result_set(body)?),
-            ResponseClass::StatementTimeout => Ok(Progress::TimedOut(parse_failure(body)?)),
-            ResponseClass::StatementFailed => Ok(Progress::Failed(parse_failure(body)?)),
+            ResponseClass::StatementTimeout => self.enter_terminal_timeout(parse_failure(body)?),
+            ResponseClass::StatementFailed => self.enter_terminal_failure(parse_failure(body)?),
             // Still running, or a transient 429 the transport will have backed off
             // on: keep polling unless the quota is spent.
             ResponseClass::Running | ResponseClass::RateLimited => {
@@ -343,6 +343,22 @@ impl StatementMachine {
                 partition: upcoming,
             })
         }
+    }
+
+    fn enter_terminal_timeout(
+        &mut self,
+        failure: QueryFailureStatus,
+    ) -> Result<Progress, LifecycleError> {
+        self.phase = Phase::Done;
+        Ok(Progress::TimedOut(failure))
+    }
+
+    fn enter_terminal_failure(
+        &mut self,
+        failure: QueryFailureStatus,
+    ) -> Result<Progress, LifecycleError> {
+        self.phase = Phase::Done;
+        Ok(Progress::Failed(failure))
     }
 
     /// Enter partition assembly (or finish immediately for a single partition).
@@ -520,6 +536,27 @@ mod tests {
             Ok(Progress::Failed(_))
         ));
         Ok(())
+    }
+
+    #[test]
+    fn timeout_and_failure_close_the_machine() -> Result<(), String> {
+        let timeout = br#"{"code":"000630","message":"timed out","statementHandle":"h"}"#;
+        let completed = br#"{"resultSetMetaData":{"numRows":0,"format":"jsonv2","rowType":[]},
+            "data":[],"code":"090001","statementHandle":"h"}"#;
+        let mut machine = StatementMachine::new(PollPlan::default());
+        assert!(matches!(
+            machine.on_submit(ResponseClass::StatementTimeout, timeout),
+            Ok(Progress::TimedOut(_))
+        ));
+        match machine.on_poll(ResponseClass::Completed, completed) {
+            Err(error) => {
+                assert_eq!(error.code, LifecycleErrorCode::UnexpectedStatus);
+                Ok(())
+            }
+            Ok(progress) => Err(format!(
+                "expected terminal machine refusal, got {progress:?}"
+            )),
+        }
     }
 
     #[test]
