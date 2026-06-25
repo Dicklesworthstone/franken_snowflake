@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{SnowflakeError, SnowflakeErrorCode};
 use crate::ids::{ProfileName, QueryId, ReceiptHash, RequestId, StatementHandle};
-use crate::outcome::{DataSource, OutcomeKind};
+use crate::outcome::{DataSource, OutcomeKind, error_outcome_kind};
 
 /// The current envelope schema version.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -167,20 +167,15 @@ impl EnvelopeMeta {
         Self::new(command_id, output_contract_id, true, OutcomeKind::Success)
     }
 
-    /// An error envelope built from a [`SnowflakeError`]: `ok = false`, refusal
-    /// errors projected as `outcome_kind = refusal`, other errors as
-    /// `outcome_kind = error`, error block attached.
+    /// An error envelope built from a [`SnowflakeError`]: `ok = false`, with the
+    /// error projected into the matching envelope outcome kind and error block.
     #[must_use]
     pub fn error(
         command_id: impl Into<String>,
         output_contract_id: impl Into<String>,
         error: SnowflakeError,
     ) -> Self {
-        let outcome_kind = if error.policy_boundary() {
-            OutcomeKind::Refusal
-        } else {
-            OutcomeKind::Error
-        };
+        let outcome_kind = error_outcome_kind(&error);
         let mut meta = Self::new(command_id, output_contract_id, false, outcome_kind);
         meta.error = Some(error.into());
         meta
@@ -311,6 +306,18 @@ mod tests {
         let json = meta.to_json_string()?;
         assert!(json.contains("\"outcome_kind\":\"refusal\""));
         assert!(json.contains("\"code\":\"FSNOW-3001\""));
+        Ok(())
+    }
+
+    #[test]
+    fn statement_timeout_error_envelope_carries_timeout_outcome() -> Result<(), serde_json::Error> {
+        let err = SnowflakeError::new(SnowflakeErrorCode::StatementTimeout, "timed out");
+        let meta = EnvelopeMeta::error("query", "query.v1", err);
+        assert!(!meta.ok);
+        assert_eq!(meta.outcome_kind, OutcomeKind::Timeout);
+        let json = meta.to_json_string()?;
+        assert!(json.contains("\"outcome_kind\":\"timeout\""));
+        assert!(json.contains("\"code\":\"FSNOW-4003\""));
         Ok(())
     }
 

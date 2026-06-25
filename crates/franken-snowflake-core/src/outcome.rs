@@ -10,7 +10,7 @@ use asupersync::Outcome;
 use serde::{Deserialize, Serialize};
 
 use crate::cancel::{cancel_exit_code, cancel_outcome_kind};
-use crate::error::SnowflakeError;
+use crate::error::{SnowflakeError, SnowflakeErrorCode};
 use crate::exit::ExitCode;
 
 /// The finer-grained outcome class carried in the JSON envelope, independent of
@@ -83,12 +83,23 @@ pub trait SnowflakeOutcomeExt {
     fn is_success(&self) -> bool;
 }
 
+/// Project a registry-backed error into the envelope outcome vocabulary.
+#[must_use]
+pub fn error_outcome_kind(error: &SnowflakeError) -> OutcomeKind {
+    if error.policy_boundary() {
+        OutcomeKind::Refusal
+    } else if error.code == SnowflakeErrorCode::StatementTimeout {
+        OutcomeKind::Timeout
+    } else {
+        OutcomeKind::Error
+    }
+}
+
 impl<T> SnowflakeOutcomeExt for SnowflakeOutcome<T> {
     fn outcome_kind(&self) -> OutcomeKind {
         match self {
             Outcome::Ok(_) => OutcomeKind::Success,
-            Outcome::Err(error) if error.policy_boundary() => OutcomeKind::Refusal,
-            Outcome::Err(_) => OutcomeKind::Error,
+            Outcome::Err(error) => error_outcome_kind(error),
             Outcome::Cancelled(reason) => cancel_outcome_kind(reason.kind),
             Outcome::Panicked(_) => OutcomeKind::Error,
         }
@@ -147,6 +158,15 @@ mod tests {
         let outcome: SnowflakeOutcome<u32> = Outcome::err(err);
         assert_eq!(outcome.outcome_kind(), OutcomeKind::Refusal);
         assert_eq!(outcome.exit_code(), ExitCode::SafetyRefusal);
+        assert!(!outcome.is_success());
+    }
+
+    #[test]
+    fn statement_timeout_err_maps_to_timeout_outcome() {
+        let err = SnowflakeError::new(SnowflakeErrorCode::StatementTimeout, "statement timed out");
+        let outcome: SnowflakeOutcome<u32> = Outcome::err(err);
+        assert_eq!(outcome.outcome_kind(), OutcomeKind::Timeout);
+        assert_eq!(outcome.exit_code(), ExitCode::UpstreamError);
         assert!(!outcome.is_success());
     }
 
