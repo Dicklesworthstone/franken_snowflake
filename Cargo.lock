@@ -824,6 +824,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "franken-snowflake-export"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "franken-snowflake-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "franken-snowflake-frame"
 version = "0.0.0"
 dependencies = [
