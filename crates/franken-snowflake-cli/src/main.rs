@@ -8,6 +8,7 @@
 
 use franken_snowflake_core::error::SnowflakeErrorCode;
 use franken_snowflake_core::exit::ExitCode as CoreExitCode;
+use franken_snowflake_core::redact::redact;
 
 use std::env;
 use std::io::{self, Write};
@@ -16,6 +17,7 @@ use std::process::ExitCode;
 const ENVELOPE_SCHEMA_VERSION: &str = "fsnow.envelope.v1";
 const CLI_CONTRACT_VERSION: &str = "fsnow.cli.contract.v1";
 const DEFAULT_TIME: &str = "1970-01-01T00:00:00Z";
+const CLI_REDACTION_MARKER: &str = "core.redact";
 
 fn main() -> ExitCode {
     write_outcome(execute(env::args().skip(1).collect()))
@@ -364,10 +366,11 @@ const COMMAND_SPECS: &[CommandSpec] = &[
 ];
 
 fn execute(raw_args: Vec<String>) -> Outcome {
-    match parse_invocation(raw_args) {
+    let outcome = match parse_invocation(raw_args) {
         Ok(invocation) => dispatch(invocation),
         Err(outcome) => outcome,
-    }
+    };
+    sanitize_outcome(outcome)
 }
 
 fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
@@ -1277,6 +1280,103 @@ fn base_envelope(
         redactions_applied: vec![],
         data,
         error: None,
+    }
+}
+
+fn sanitize_outcome(mut outcome: Outcome) -> Outcome {
+    match &mut outcome.body {
+        Body::Envelope { envelope, .. } => sanitize_envelope(envelope),
+        Body::Raw { data } => {
+            let redacted = redact(data).into_owned();
+            if redacted != *data {
+                *data = redacted;
+            }
+        }
+    }
+    outcome
+}
+
+fn sanitize_envelope(envelope: &mut Envelope) {
+    let mut changed = false;
+    changed |= redact_option_string(&mut envelope.profile_id);
+    changed |= redact_option_string(&mut envelope.query_id);
+    changed |= redact_option_string(&mut envelope.statement_handle);
+    changed |= redact_option_string(&mut envelope.receipt_hash);
+    changed |= redact_string(&mut envelope.request_id);
+    changed |= redact_string_vec(&mut envelope.safe_next_commands);
+    changed |= redact_string_vec(&mut envelope.repair_commands);
+    changed |= redact_string_vec(&mut envelope.did_you_mean);
+    changed |= redact_json_values(&mut envelope.warnings);
+    changed |= redact_json_value(&mut envelope.budget_consumed);
+    changed |= redact_json_value(&mut envelope.data);
+    if let Some(error) = &mut envelope.error {
+        changed |= redact_string(&mut error.message);
+        changed |= redact_json_values(&mut error.evidence);
+    }
+
+    if changed
+        && !envelope
+            .redactions_applied
+            .iter()
+            .any(|marker| marker == CLI_REDACTION_MARKER)
+    {
+        envelope
+            .redactions_applied
+            .push(CLI_REDACTION_MARKER.to_string());
+    }
+}
+
+fn redact_option_string(value: &mut Option<String>) -> bool {
+    match value {
+        Some(value) => redact_string(value),
+        None => false,
+    }
+}
+
+fn redact_string_vec(values: &mut [String]) -> bool {
+    let mut changed = false;
+    for value in values {
+        changed |= redact_string(value);
+    }
+    changed
+}
+
+fn redact_json_values(values: &mut [Json]) -> bool {
+    let mut changed = false;
+    for value in values {
+        changed |= redact_json_value(value);
+    }
+    changed
+}
+
+fn redact_json_value(value: &mut Json) -> bool {
+    match value {
+        Json::Null | Json::Bool(_) | Json::Number(_) => false,
+        Json::String(value) => redact_string(value),
+        Json::Array(values) => {
+            let mut changed = false;
+            for value in values {
+                changed |= redact_json_value(value);
+            }
+            changed
+        }
+        Json::Object(entries) => {
+            let mut changed = false;
+            for (_key, value) in entries {
+                changed |= redact_json_value(value);
+            }
+            changed
+        }
+    }
+}
+
+fn redact_string(value: &mut String) -> bool {
+    let redacted = redact(value).into_owned();
+    if redacted == *value {
+        false
+    } else {
+        *value = redacted;
+        true
     }
 }
 
@@ -2413,10 +2513,226 @@ fn has_multiple_statements(sql: &str) -> bool {
 }
 
 fn is_select_like(sql: &str) -> bool {
-    let lower = sql.trim_start().to_ascii_lowercase();
-    ["select", "with", "show", "describe", "desc", "explain"]
+    let start = skip_sql_ws_and_comments(sql, 0);
+    if consume_sql_keyword(sql, start, "with").is_some() {
+        return cte_select_tail_is_read(sql, start);
+    }
+    ["select", "show", "describe", "desc", "explain"]
         .iter()
-        .any(|prefix| lower.starts_with(prefix))
+        .any(|keyword| consume_sql_keyword(sql, start, keyword).is_some())
+}
+
+fn cte_select_tail_is_read(sql: &str, start: usize) -> bool {
+    let Some(mut index) = consume_sql_keyword(sql, start, "with") else {
+        return false;
+    };
+    index = skip_sql_ws_and_comments(sql, index);
+    if let Some(after_recursive) = consume_sql_keyword(sql, index, "recursive") {
+        index = skip_sql_ws_and_comments(sql, after_recursive);
+    }
+
+    loop {
+        let Some(after_name) = consume_sql_identifier(sql, index) else {
+            return false;
+        };
+        index = skip_sql_ws_and_comments(sql, after_name);
+
+        if sql[index..].starts_with('(') {
+            let Some(after_columns) = skip_balanced_sql_parens(sql, index) else {
+                return false;
+            };
+            index = skip_sql_ws_and_comments(sql, after_columns);
+        }
+
+        let Some(after_as) = consume_sql_keyword(sql, index, "as") else {
+            return false;
+        };
+        index = skip_sql_ws_and_comments(sql, after_as);
+
+        let Some(after_cte_query) = skip_balanced_sql_parens(sql, index) else {
+            return false;
+        };
+        index = skip_sql_ws_and_comments(sql, after_cte_query);
+
+        if sql[index..].starts_with(',') {
+            index = skip_sql_ws_and_comments(sql, index + 1);
+            continue;
+        }
+
+        return consume_sql_keyword(sql, index, "select").is_some();
+    }
+}
+
+fn skip_sql_ws_and_comments(sql: &str, mut index: usize) -> usize {
+    loop {
+        while let Some(ch) = sql[index..].chars().next() {
+            if !ch.is_whitespace() {
+                break;
+            }
+            index += ch.len_utf8();
+        }
+
+        if sql[index..].starts_with("--") {
+            match sql[index..].find('\n') {
+                Some(line_end) => {
+                    index += line_end + 1;
+                    continue;
+                }
+                None => return sql.len(),
+            }
+        }
+
+        if sql[index..].starts_with("/*") {
+            match sql[index + 2..].find("*/") {
+                Some(block_end) => {
+                    index += block_end + 4;
+                    continue;
+                }
+                None => return sql.len(),
+            }
+        }
+
+        return index;
+    }
+}
+
+fn consume_sql_keyword(sql: &str, index: usize, keyword: &str) -> Option<usize> {
+    let rest = sql.get(index..)?;
+    if rest.len() < keyword.len() || !rest[..keyword.len()].eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    let end = index + keyword.len();
+    match sql[end..].chars().next() {
+        Some(ch) if is_sql_identifier_continue(ch) => None,
+        _ => Some(end),
+    }
+}
+
+fn consume_sql_identifier(sql: &str, index: usize) -> Option<usize> {
+    let rest = sql.get(index..)?;
+    if rest.starts_with('"') {
+        let bytes = sql.as_bytes();
+        let mut cursor = index + 1;
+        while cursor < bytes.len() {
+            if bytes[cursor] == b'"' {
+                if bytes.get(cursor + 1) == Some(&b'"') {
+                    cursor += 2;
+                    continue;
+                }
+                return Some(cursor + 1);
+            }
+            cursor += 1;
+        }
+        return None;
+    }
+
+    let mut end = index;
+    let mut saw_char = false;
+    for (offset, ch) in rest.char_indices() {
+        if !is_sql_identifier_continue(ch) {
+            break;
+        }
+        saw_char = true;
+        end = index + offset + ch.len_utf8();
+    }
+    saw_char.then_some(end)
+}
+
+fn is_sql_identifier_continue(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$')
+}
+
+fn skip_balanced_sql_parens(sql: &str, index: usize) -> Option<usize> {
+    if !sql[index..].starts_with('(') {
+        return None;
+    }
+
+    let bytes = sql.as_bytes();
+    let mut cursor = index;
+    let mut depth = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while cursor < bytes.len() {
+        if in_line_comment {
+            in_line_comment = bytes[cursor] != b'\n';
+            cursor += 1;
+            continue;
+        }
+
+        if in_block_comment {
+            if bytes[cursor] == b'*' && bytes.get(cursor + 1) == Some(&b'/') {
+                in_block_comment = false;
+                cursor += 2;
+            } else {
+                cursor += 1;
+            }
+            continue;
+        }
+
+        if in_single_quote {
+            if bytes[cursor] == b'\'' {
+                if bytes.get(cursor + 1) == Some(&b'\'') {
+                    cursor += 2;
+                } else {
+                    in_single_quote = false;
+                    cursor += 1;
+                }
+            } else {
+                cursor += 1;
+            }
+            continue;
+        }
+
+        if in_double_quote {
+            if bytes[cursor] == b'"' {
+                if bytes.get(cursor + 1) == Some(&b'"') {
+                    cursor += 2;
+                } else {
+                    in_double_quote = false;
+                    cursor += 1;
+                }
+            } else {
+                cursor += 1;
+            }
+            continue;
+        }
+
+        match bytes[cursor] {
+            b'\'' => {
+                in_single_quote = true;
+                cursor += 1;
+            }
+            b'"' => {
+                in_double_quote = true;
+                cursor += 1;
+            }
+            b'-' if bytes.get(cursor + 1) == Some(&b'-') => {
+                in_line_comment = true;
+                cursor += 2;
+            }
+            b'/' if bytes.get(cursor + 1) == Some(&b'*') => {
+                in_block_comment = true;
+                cursor += 2;
+            }
+            b'(' => {
+                depth += 1;
+                cursor += 1;
+            }
+            b')' => {
+                depth = depth.checked_sub(1)?;
+                cursor += 1;
+                if depth == 0 {
+                    return Some(cursor);
+                }
+            }
+            _ => cursor += 1,
+        }
+    }
+
+    None
 }
 
 fn compact_sql(sql: &str) -> String {
@@ -2578,7 +2894,7 @@ fn render_toon(value: &Json) -> String {
     toon::encode(
         toon_json_value(value),
         Some(toon::EncodeOptions {
-            indent: Some(2),
+            indent: Some(1),
             delimiter: None,
             key_folding: None,
             flatten_depth: None,
@@ -2664,6 +2980,30 @@ mod tests {
     }
 
     #[test]
+    fn cte_fronted_selects_are_read_but_cte_fronted_dml_is_not() {
+        assert!(is_select_like("with cte as (select 1) select * from cte"));
+        assert!(is_select_like(
+            "with recursive cte as (select 1) select * from cte"
+        ));
+        assert!(is_select_like(
+            "with cte(id) as (select 1), c2 as (select id from cte) select * from c2"
+        ));
+
+        assert!(!is_select_like(
+            "with cte as (select 1) delete from t using cte where t.id = cte.id"
+        ));
+        assert!(!is_select_like(
+            "with cte as (select 1) update t set id = 2 from cte"
+        ));
+        assert!(!is_select_like(
+            "with cte as (select 1) insert into t select * from cte"
+        ));
+        assert!(!is_select_like(
+            "with cte as (select 1) merge into t using cte on t.id = cte.id"
+        ));
+    }
+
+    #[test]
     fn toon_renderer_uses_same_envelope_keys() {
         let envelope = envelope_for(&["agent-handbook", "--toon"]);
         let rendered = render_toon(&envelope);
@@ -2673,6 +3013,60 @@ mod tests {
         assert!(rendered.contains("exit_codes["));
         assert!(rendered.contains("error_registry["));
         assert!(!rendered.contains("\"ok\""));
+    }
+
+    #[test]
+    fn toon_output_round_trips_to_same_logical_envelope() {
+        let envelope = envelope_for(&["capabilities", "--json"]);
+        let rendered = render_toon(&envelope);
+        let decoded = toon::try_decode(
+            &rendered,
+            Some(toon::DecodeOptions {
+                indent: Some(1),
+                strict: Some(true),
+                expand_paths: None,
+            }),
+        )
+        .expect("toon decodes");
+        assert_eq!(decoded, toon_json_value(&envelope));
+    }
+
+    #[test]
+    fn toon_output_is_smaller_for_large_agent_payload() {
+        let envelope = envelope_for(&["capabilities", "--json"]);
+        let rendered_json = render_json(&envelope);
+        let rendered_toon = render_toon(&envelope);
+        assert!(
+            rendered_toon.len() < rendered_json.len(),
+            "TOON should be smaller than JSON for capabilities: toon={}, json={}",
+            rendered_toon.len(),
+            rendered_json.len()
+        );
+    }
+
+    #[test]
+    fn query_plan_redacts_secret_shaped_sql_preview() {
+        let rendered = render_json(&envelope_for(&[
+            "query",
+            "plan",
+            "--profile",
+            "demo",
+            "--sql",
+            "select * from t where token = 'ghp_realSecret0123'",
+        ]));
+        assert!(rendered.contains("\"normalized_sql_preview\""));
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(rendered.contains("\"redactions_applied\":[\"core.redact\"]"));
+        assert!(!rendered.contains("ghp_realSecret0123"));
+    }
+
+    #[test]
+    fn unknown_flag_redacts_secret_shaped_value_in_message_and_evidence() {
+        let rendered = render_json(&envelope_for(&["doctor", "--tokn=ghp_realSecret0123"]));
+        assert!(rendered.contains("Unknown flag `--tokn=[REDACTED]`."));
+        assert!(rendered.contains("\"flag=--tokn=[REDACTED]\""));
+        assert!(rendered.contains("\"redactions_applied\":[\"core.redact\"]"));
+        assert!(!rendered.contains("ghp_realSecret0123"));
     }
 
     #[test]
