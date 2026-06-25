@@ -1444,12 +1444,15 @@ fn is_retryable_status(status: u16) -> bool {
 
 fn route_allows_automatic_retry(route: &TransportRoute) -> bool {
     // Snowflake warns that ambiguous resubmission of a statement can execute
-    // the SQL twice. Automatic submit retry is allowed only when the URL carries
-    // the documented requestId + retry=true contract recorded above.
+    // the SQL twice. Plain submit retry is allowed only when the URL carries
+    // the documented requestId + retry=true contract recorded above. Poll,
+    // partition, and cancel are idempotent transport follow-ups.
     route.has_retry_contract()
         || matches!(
             route,
-            TransportRoute::Poll { .. } | TransportRoute::Partition { .. }
+            TransportRoute::Poll { .. }
+                | TransportRoute::Partition { .. }
+                | TransportRoute::Cancel { .. }
         )
 }
 
@@ -2217,7 +2220,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_submit_post_is_not_blindly_retried() {
+    fn plain_submit_post_is_not_blindly_retried_but_cancel_is_retry_safe() {
         assert_eq!(SNOWFLAKE_SQL_API_RESUBMIT_DOC_CONSULTED, "2026-06-25");
         assert!(
             SNOWFLAKE_SQL_API_RESUBMIT_DOC_URL
@@ -2237,7 +2240,7 @@ mod tests {
             handle: StatementHandle::new("stmt-1"),
             partition: 1,
         }));
-        assert!(!route_allows_automatic_retry(&TransportRoute::Cancel {
+        assert!(route_allows_automatic_retry(&TransportRoute::Cancel {
             handle: StatementHandle::new("stmt-1")
         }));
     }
