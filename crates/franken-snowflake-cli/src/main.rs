@@ -2506,9 +2506,20 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 }
 
 fn value_after(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2)
-        .find(|pair| pair.first().map(String::as_str) == Some(flag))
-        .and_then(|pair| pair.get(1).cloned())
+    for (index, arg) in args.iter().enumerate() {
+        if arg == flag {
+            return args.get(index + 1).cloned();
+        }
+
+        if let Some(value) = arg
+            .strip_prefix(flag)
+            .and_then(|suffix| suffix.strip_prefix('='))
+        {
+            return Some(value.to_string());
+        }
+    }
+
+    None
 }
 
 fn has_multiple_statements(sql: &str) -> bool {
@@ -3196,6 +3207,37 @@ mod tests {
         };
         assert!(rendered.contains("Missing --profile for `query plan`."));
         assert!(rendered.contains("franken-snowflake query plan --profile"));
+    }
+
+    #[test]
+    fn equals_style_flags_are_read_by_command_parsers() {
+        let rendered = render_json(&envelope_for(&[
+            "query",
+            "plan",
+            "--profile=demo",
+            "--sql=select 1",
+        ]));
+        assert!(rendered.contains("\"command_id\":\"query.plan\""));
+        assert!(rendered.contains("\"ok\":true"));
+        assert!(rendered.contains("\"normalized_sql_preview\":\"select 1\""));
+        assert!(!rendered.contains("Missing --profile"));
+        assert!(!rendered.contains("Missing --sql"));
+
+        let outcome = execute(vec![
+            "catalog".to_string(),
+            "scan".to_string(),
+            "demo".to_string(),
+            "--database=ANALYTICS".to_string(),
+            "--schema=PUBLIC".to_string(),
+        ]);
+        let rendered = match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("\"requested_database\":\"ANALYTICS\""));
+        assert!(rendered.contains("\"requested_schema\":\"PUBLIC\""));
+        assert!(!rendered.contains("Missing --database"));
+        assert!(!rendered.contains("Missing --schema"));
     }
 
     #[test]
