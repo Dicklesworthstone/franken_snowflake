@@ -513,6 +513,46 @@ def run_self_test() -> None:
         raise SystemExit(1)
     emit("self_test_verdict", fixture="fp-io-orc-rust-tokio", violations=found)
 
+    feature_packages: list[dict[str, object]] = [
+        {"name": "franken-snowflake-cli", "features": {"default": [], "toon": []}},
+        {"name": "franken-snowflake-export", "features": {"export": []}},
+        {"name": "franken-snowflake-frame", "features": {"frankenpandas": []}},
+        {"name": "franken-snowflake-graph", "features": {"default": [], "graph": []}},
+        {
+            "name": "franken-snowflake-http",
+            "features": {"compression": [], "live": []},
+        },
+        {"name": "franken-snowflake-mcp", "features": {"mcp": []}},
+        {
+            "name": "franken-snowflake-text-indexing",
+            "features": {"frankensearch": [], "rerank": []},
+        },
+        {"name": "franken-snowflake-tui", "features": {"tui": []}},
+    ]
+    owners = production_feature_owners(feature_packages)
+    missing_owners = sorted(PRODUCTION_FEATURES.difference(owners))
+    workspace_lanes = workspace_feature_lanes(feature_packages)
+    lane_names = {lane.name for lane in workspace_lanes}
+    expected_lanes = {
+        "workspace-production-no-default-features",
+        "workspace-production-features:combined",
+        *(f"workspace-production-feature:{feature}" for feature in PRODUCTION_FEATURES),
+    }
+    missing_lanes = sorted(expected_lanes.difference(lane_names))
+    if missing_owners or missing_lanes:
+        emit_error(
+            "self_test_failure",
+            fixture="production-feature-workspace-lanes",
+            missing_owners=missing_owners,
+            missing_lanes=missing_lanes,
+        )
+        raise SystemExit(1)
+    emit(
+        "self_test_verdict",
+        fixture="production-feature-workspace-lanes",
+        lane_count=len(workspace_lanes),
+    )
+
 
 def workspace_packages(metadata: dict[str, object]) -> list[dict[str, object]]:
     workspace_members = set(metadata.get("workspace_members", []))
