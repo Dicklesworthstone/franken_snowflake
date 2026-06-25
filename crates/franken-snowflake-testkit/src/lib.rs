@@ -27,6 +27,7 @@
 //! `fsnow-deterministic-testkit-bak`; the VirtualTcp/DPOR race suite lands in
 //! `fsnow-native-snowflake-connector-w0i.4`.
 
+pub mod e2e;
 pub mod harness;
 pub mod mock;
 pub mod race;
@@ -38,6 +39,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The most commonly used harness types, re-exported for terse dev-dependency
 /// imports: `use franken_snowflake_testkit::prelude::*;`.
 pub mod prelude {
+    pub use crate::e2e::{
+        DEFAULT_E2E_TRACE_ID, E2eHarnessConfig, E2eHarnessError, E2eHarnessReport,
+        run_mock_sqlapi_e2e,
+    };
     pub use crate::harness::canary::{
         CanaryGuard, CanaryHit, CanaryReport, Channel, DEFAULT_CANARY,
     };
