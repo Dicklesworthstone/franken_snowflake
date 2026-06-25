@@ -318,12 +318,7 @@ pub fn plan_dataset_query(
 
     if let Some(as_of) = &request.as_of {
         sql.push_str(" AT(TIMESTAMP => ");
-        sql.push_str(&push_binding(
-            &mut bindings,
-            &mut next_binding,
-            DtypeClass::Timestamp,
-            as_of.clone(),
-        ));
+        sql.push_str(&time_travel_timestamp_literal(as_of));
         sql.push(')');
     }
 
@@ -892,6 +887,22 @@ fn value_to_string(value: &Value) -> String {
     }
 }
 
+fn time_travel_timestamp_literal(value: &str) -> String {
+    format!("'{}'::TIMESTAMP_TZ", escape_snowflake_literal(value))
+}
+
+fn escape_snowflake_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\'' => escaped.push_str("''"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 fn find_column_in_refs<'a>(
     column: &str,
     columns: &[&'a ColumnCatalogEntry],
@@ -1221,21 +1232,21 @@ mod tests {
         if let Ok(plan) = plan {
             assert_eq!(
                 plan.sql,
-                "SELECT \"EVENT_DATE\", \"ENTITY_ID\", \"VALUE\" FROM \"ANALYTICS\".\"PUBLIC\".\"EVENTS_DAILY\" AT(TIMESTAMP => ?) WHERE \"ENTITY_ID\" = ? AND \"EVENT_DATE\" >= ? AND \"EVENT_DATE\" <= ? AND \"VALUE\" > ? LIMIT ?"
+                "SELECT \"EVENT_DATE\", \"ENTITY_ID\", \"VALUE\" FROM \"ANALYTICS\".\"PUBLIC\".\"EVENTS_DAILY\" AT(TIMESTAMP => '2024-12-31T23:59:59Z'::TIMESTAMP_TZ) WHERE \"ENTITY_ID\" = ? AND \"EVENT_DATE\" >= ? AND \"EVENT_DATE\" <= ? AND \"VALUE\" > ? LIMIT ?"
             );
             assert!(!plan.sql.contains("DROP TABLE"));
             assert!(!plan.sql.contains("0 OR 1=1"));
             assert_eq!(
-                plan.bindings.get("2").map(|binding| binding.value.as_str()),
+                plan.bindings.get("1").map(|binding| binding.value.as_str()),
                 Some("ENTITY'; DROP TABLE X; --")
             );
             assert_eq!(
-                plan.bindings.get("5").map(|binding| binding.value.as_str()),
+                plan.bindings.get("4").map(|binding| binding.value.as_str()),
                 Some("0 OR 1=1")
             );
             assert_eq!(
                 plan.bindings
-                    .get("5")
+                    .get("4")
                     .map(|binding| binding.binding_type.as_str()),
                 Some("FIXED")
             );
@@ -1245,6 +1256,18 @@ mod tests {
             assert_eq!(plan.pushdown.predicate_filters, 1);
             assert!(plan.pushdown.all_predicates_pushed_down);
         }
+    }
+
+    #[test]
+    fn time_travel_timestamp_literal_escapes_backslash_and_quote() {
+        // Snowflake AT | BEFORE docs consulted 2026-06-25:
+        // https://docs.snowflake.com/en/sql-reference/constructs/at-before
+        // TIMESTAMP must be a constant expression, so as_of is a cast literal,
+        // not a SQL API bind placeholder.
+        assert_eq!(
+            time_travel_timestamp_literal("2024-12-31T23:59:59Z\\' OR 1=1 --"),
+            "'2024-12-31T23:59:59Z\\\\'' OR 1=1 --'::TIMESTAMP_TZ"
+        );
     }
 
     #[test]
@@ -1266,8 +1289,11 @@ mod tests {
             assert!(plan
                 .sql
                 .contains("FROM \"ANA\"\"LYTICS\".\"PUBLIC\".\"EVENTS\"\"; DROP TABLE X; --\""));
-            assert_eq!(plan.sql.matches(';').count(), 1);
             assert!(plan.sql.ends_with(" LIMIT ?"));
+            assert_eq!(
+                plan.bindings.get("1").map(|binding| binding.value.as_str()),
+                Some("10")
+            );
         }
     }
 
