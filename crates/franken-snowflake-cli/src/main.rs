@@ -223,7 +223,8 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         id: "profile.validate",
         invocation: "franken-snowflake profile validate <profile> --json",
         output_contract_id: "fsnow.profile.validate.v1",
-        description: "Validate profile shape and referenced environment variables without live I/O.",
+        description:
+            "Validate profile shape and referenced environment variables without live I/O.",
         read_only: true,
         provider_network: false,
         mutates_local_state: false,
@@ -241,7 +242,8 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "catalog.scan",
-        invocation: "franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json",
+        invocation:
+            "franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json",
         output_contract_id: "fsnow.catalog.scan.v1",
         description: "Discover catalog metadata through Information Schema.",
         read_only: true,
@@ -301,9 +303,9 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "query.run",
-        invocation: "franken-snowflake query run --profile <profile> --sql <sql> --json",
+        invocation: "franken-snowflake query [run] --profile <profile> --sql <sql> --json",
         output_contract_id: "fsnow.query.run.v1",
-        description: "Submit a SQL API statement once the statement lifecycle lands.",
+        description: "Submit a SQL API statement; `query --sql` shorthand maps to this surface.",
         read_only: true,
         provider_network: true,
         mutates_local_state: false,
@@ -1510,6 +1512,16 @@ fn doctor_data() -> Json {
                     "command registry and envelope renderer are linked",
                 ),
                 check_json(
+                    "cli_required_surfaces",
+                    "pass",
+                    "capabilities, robot-docs, agent-handbook, doctor, profile validate, query plan/run/cancel, and mcp serve are registered",
+                ),
+                check_json(
+                    "security_guardrails",
+                    "pass",
+                    "core redaction, rights, and cost guardrails are linked",
+                ),
+                check_json(
                     "live_transport",
                     "not_checked",
                     "blocked until SQL API transport lands",
@@ -1538,7 +1550,16 @@ fn selftest_data() -> Json {
             Json::Array(vec![
                 check_json("json_envelope_contract", "pass", "renderer available"),
                 check_json("sqlapi_protocol", "not_checked", "testkit bead pending"),
-                check_json("secret_redaction", "not_checked", "guardrail bead pending"),
+                check_json(
+                    "secret_redaction",
+                    "pass",
+                    "core redactor and credential canary needle list are linked",
+                ),
+                check_json(
+                    "credential_debug_gate",
+                    "pass",
+                    "auth credential Debug leak gate is linked through the checked workspace",
+                ),
             ]),
         ),
     ])
@@ -1657,6 +1678,10 @@ fn profile_diagnostics_data(profile: &str, online: bool, status: &'static str) -
             "redaction_policy",
             json_string("env var names only; token/private-key values are never emitted"),
         ),
+        (
+            "credential_lifetime_warnings",
+            Json::Array(credential_lifetime_warnings()),
+        ),
         ("profile_env_prefix", json_string(env_prefix.clone())),
         (
             "supported_auth_lanes",
@@ -1700,6 +1725,44 @@ fn profile_diagnostics_data(profile: &str, online: bool, status: &'static str) -
             ]),
         ),
     ])
+}
+
+fn credential_lifetime_warnings() -> Vec<Json> {
+    vec![
+        json_object(vec![
+            ("auth_lane", json_string("programmatic_access_token")),
+            ("severity", json_string("warning")),
+            (
+                "message",
+                json_string(
+                    "PAT profiles should track the administrator expiry window; warn before the default 15-day lifetime ends",
+                ),
+            ),
+            ("secret_values_read", Json::Bool(false)),
+        ]),
+        json_object(vec![
+            ("auth_lane", json_string("key_pair_jwt")),
+            ("severity", json_string("warning")),
+            (
+                "message",
+                json_string(
+                    "JWT exp values beyond the one-hour cap are refused or capped by the signer before submission",
+                ),
+            ),
+            ("secret_values_read", Json::Bool(false)),
+        ]),
+        json_object(vec![
+            ("auth_lane", json_string("oauth_bearer_token")),
+            ("severity", json_string("warning")),
+            (
+                "message",
+                json_string(
+                    "OAuth bearer profiles should refresh before short-lived access tokens approach their roughly 10-minute lifetime",
+                ),
+            ),
+            ("secret_values_read", Json::Bool(false)),
+        ]),
+    ]
 }
 
 fn profile_env_handle_sets(env_prefix: &str) -> Vec<Json> {
@@ -2562,8 +2625,15 @@ mod tests {
     fn capabilities_lists_every_required_surface() {
         let rendered = render_json(&envelope_for(&["capabilities", "--json"]));
         assert!(rendered.contains("\"command_id\":\"capabilities\""));
+        assert!(rendered.contains("\"command_id\":\"robot-docs.guide\""));
+        assert!(rendered.contains("\"command_id\":\"agent-handbook\""));
+        assert!(rendered.contains("\"command_id\":\"doctor\""));
+        assert!(rendered.contains("\"command_id\":\"profile.validate\""));
+        assert!(rendered.contains("\"command_id\":\"query.plan\""));
         assert!(rendered.contains("\"command_id\":\"query.run\""));
+        assert!(rendered.contains("\"command_id\":\"query.cancel\""));
         assert!(rendered.contains("\"command_id\":\"mcp.serve\""));
+        assert!(rendered.contains("franken-snowflake query [run] --profile"));
         assert!(rendered.contains("\"alternate_outputs\":[\"toon\"]"));
         assert!(rendered.contains("\"error_registry\""));
         assert!(rendered.contains("FSNOW-1002"));
@@ -2719,6 +2789,40 @@ mod tests {
         assert!(rendered.contains("\"live_probe_requested\":true"));
         assert!(rendered.contains("\"live_probe_attempted\":false"));
         assert!(rendered.contains("FRANKEN_SNOWFLAKE_DEMO_OAUTH_BEARER"));
+    }
+
+    #[test]
+    fn profile_doctor_reports_lifetime_warnings_without_secret_values() {
+        let rendered = render_json(&envelope_for(&["profile", "doctor", "demo-prod"]));
+        assert!(rendered.contains("\"credential_lifetime_warnings\""));
+        assert!(rendered.contains("programmatic_access_token"));
+        assert!(rendered.contains("15-day lifetime"));
+        assert!(rendered.contains("key_pair_jwt"));
+        assert!(rendered.contains("one-hour cap"));
+        assert!(rendered.contains("oauth_bearer_token"));
+        assert!(rendered.contains("roughly 10-minute lifetime"));
+        assert!(rendered.contains("\"secret_values_read\":false"));
+        assert!(!rendered.contains("snowflake_pat_"));
+        assert!(!rendered.contains("BEGIN PRIVATE KEY"));
+        assert!(!rendered.contains("eyJ"));
+    }
+
+    #[test]
+    fn selftest_reports_redaction_and_debug_gate_linkage() {
+        let rendered = render_json(&envelope_for(&["selftest", "--json"]));
+        assert!(rendered.contains("\"command_id\":\"selftest\""));
+        assert!(rendered.contains("\"name\":\"secret_redaction\""));
+        assert!(rendered.contains("\"name\":\"credential_debug_gate\""));
+        assert!(rendered.contains("\"status\":\"pass\""));
+    }
+
+    #[test]
+    fn query_cancel_surface_is_versioned_and_stable() {
+        let rendered = render_json(&envelope_for(&["query", "cancel", "01bcaafe-0000"]));
+        assert!(rendered.contains("\"command_id\":\"query.cancel\""));
+        assert!(rendered.contains("\"output_contract_id\":\"fsnow.query.cancel.v1\""));
+        assert!(rendered.contains("\"statement_handle\":\"01bcaafe-0000\""));
+        assert!(rendered.contains("FSNOW-9001"));
     }
 
     #[test]
