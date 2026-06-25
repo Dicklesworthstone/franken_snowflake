@@ -472,7 +472,15 @@ fn type_name(value: &Value) -> &'static str {
 fn short_render(value: &Value) -> String {
     let rendered = value.to_string();
     if rendered.len() > 80 {
-        format!("{}…", &rendered[..79])
+        // Truncate at or below byte 79, but never inside a multi-byte UTF-8
+        // sequence — `&rendered[..79]` would panic when byte 79 is not a char
+        // boundary (e.g. a non-ASCII value over 80 bytes), which the workspace's
+        // `clippy::panic` deny forbids on this diagnostics path.
+        let mut end = 79;
+        while end > 0 && !rendered.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &rendered[..end])
     } else {
         rendered
     }
@@ -685,6 +693,27 @@ mod tests {
         assert_eq!(mismatch.path, "$.xs");
         assert_eq!(mismatch.expected, "3");
         assert_eq!(mismatch.actual, "2");
+        Ok(())
+    }
+
+    #[test]
+    fn missing_key_diff_truncates_long_multibyte_values_without_panicking() -> Result<(), String> {
+        // Regression: short_render truncated with a raw byte slice `[..79]`, which
+        // panics when byte 79 lands inside a multi-byte UTF-8 sequence. A missing
+        // key whose value is a >80-byte string with `é` straddling that boundary
+        // must produce a clean, ellipsized diff rather than a panic.
+        let cfg = GoldenConfig::strict();
+        let long_value = format!("{}é{}", "a".repeat(77), "b".repeat(40));
+        let mismatch = compare(&json!({ "k": long_value }), &json!({}), &cfg)
+            .err()
+            .ok_or_else(|| "missing key must mismatch".to_owned())?;
+        assert_eq!(mismatch.kind, MismatchKind::MissingKey);
+        assert_eq!(mismatch.path, "$.k");
+        assert!(
+            mismatch.expected.ends_with('…'),
+            "long value should be ellipsized: {}",
+            mismatch.expected
+        );
         Ok(())
     }
 
