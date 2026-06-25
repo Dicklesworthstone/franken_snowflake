@@ -26,8 +26,8 @@ use std::env;
 use std::error::Error;
 use std::fmt;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rsa::pkcs1::EncodeRsaPrivateKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePublicKey};
 use rsa::traits::PublicKeyParts;
@@ -180,7 +180,7 @@ pub enum SecretSourceKind {
 /// This never stores the secret value. Environment variable names are accepted
 /// while deserializing profiles, but skipped in serialized diagnostics so JSON
 /// output only carries opaque credential handles.
-#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SecretSource {
     EnvVar {
@@ -190,6 +190,29 @@ pub enum SecretSource {
     SecretProvider {
         handle: String,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SecretSourceWire {
+    EnvVar { name: String },
+    SecretProvider { handle: String },
+}
+
+impl<'de> Deserialize<'de> for SecretSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match SecretSourceWire::deserialize(deserializer)? {
+            SecretSourceWire::EnvVar { name } => {
+                Self::env_var(name).map_err(serde::de::Error::custom)
+            }
+            SecretSourceWire::SecretProvider { handle } => {
+                Self::secret_provider(handle).map_err(serde::de::Error::custom)
+            }
+        }
+    }
 }
 
 impl SecretSource {
@@ -1530,10 +1553,10 @@ fn is_secret_delimiter(ch: char) -> bool {
 mod tests {
     use std::cell::Cell;
 
-    use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+    use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
     use rand::rngs::OsRng;
-    use rsa::RsaPrivateKey;
     use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
+    use rsa::RsaPrivateKey;
 
     use super::*;
 
@@ -1652,8 +1675,8 @@ dQIDAQAB
     }
 
     #[test]
-    fn pat_auth_constructs_bearer_headers_with_pat_token_type()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn pat_auth_constructs_bearer_headers_with_pat_token_type(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut auth = ProgrammaticAccessTokenAuth::from_bearer_token(
             "pat-secret-value",
             Some(1_800_000_000),
@@ -1674,8 +1697,8 @@ dQIDAQAB
     }
 
     #[test]
-    fn oauth_auth_constructs_bearer_headers_with_oauth_token_type()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn oauth_auth_constructs_bearer_headers_with_oauth_token_type(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut auth = OAuthBearerAuth::from_bearer_token(
             "oauth-secret-value",
             Some(1_800_000_000),
@@ -1691,8 +1714,8 @@ dQIDAQAB
     }
 
     #[test]
-    fn profile_env_source_probes_presence_without_reading_secret()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn profile_env_source_probes_presence_without_reading_secret(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let resolver = FakeResolver::with_env("SNOWFLAKE_PAT", "pat-secret-value");
         let source = SecretSource::env_var("SNOWFLAKE_PAT")?;
         let profile = AuthProfile::pat(source);
@@ -1708,8 +1731,8 @@ dQIDAQAB
     }
 
     #[test]
-    fn missing_env_var_teaches_exact_next_command_without_secret()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn missing_env_var_teaches_exact_next_command_without_secret(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let resolver = FakeResolver::missing("SNOWFLAKE_PAT");
         let source = SecretSource::env_var("SNOWFLAKE_PAT")?;
         let error = match source.resolve(&resolver) {
@@ -1751,6 +1774,26 @@ dQIDAQAB
     }
 
     #[test]
+    fn deserialized_secret_sources_reject_raw_credential_shapes() {
+        let raw_secret = "sfpat_deserializedCredentialHandle001";
+        let profile_json = format!(
+            r#"{{
+                "kind":"pat",
+                "source":{{"kind":"secret_provider","handle":"{raw_secret}"}},
+                "issued_at_unix_seconds":null,
+                "expires_at_unix_seconds":null
+            }}"#
+        );
+
+        let error = serde_json::from_str::<AuthProfile>(&profile_json)
+            .expect_err("secret-shaped deserialized handle should be refused");
+        let message = error.to_string();
+
+        assert!(message.contains("secret provider secret source looks like raw credential"));
+        assert!(!message.contains(raw_secret));
+    }
+
+    #[test]
     fn auth_profile_resolves_pat_from_source() -> Result<(), Box<dyn std::error::Error>> {
         let resolver = FakeResolver::with_env("SNOWFLAKE_PAT", "pat-secret-value");
         let profile = AuthProfile::Pat {
@@ -1781,8 +1824,8 @@ dQIDAQAB
     }
 
     #[test]
-    fn signs_rs256_claims_with_snowflake_issuer_and_subject()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn signs_rs256_claims_with_snowflake_issuer_and_subject(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let signer = signer()?;
         let signed = signer.sign_at(1_800_000_000, 900)?;
         assert_eq!(
@@ -1867,25 +1910,21 @@ dQIDAQAB
         )?;
         let jwt = KeyPairJwtAuth::from_signer(signer()?, MAX_JWT_VALIDITY_SECONDS + 1);
 
-        assert!(
-            pat.lifetime()
-                .doctor_warning_at(1_800_000_000)
-                .map(|warning| warning.message.contains("expires in"))
-                .unwrap_or(false)
-        );
-        assert!(
-            oauth
-                .lifetime()
-                .doctor_warning_at(1_800_000_000)
-                .map(|warning| warning.message.contains("refresh"))
-                .unwrap_or(false)
-        );
-        assert!(
-            jwt.lifetime()
-                .doctor_warning_at(1_800_000_000)
-                .map(|warning| warning.message.contains("3600s cap"))
-                .unwrap_or(false)
-        );
+        assert!(pat
+            .lifetime()
+            .doctor_warning_at(1_800_000_000)
+            .map(|warning| warning.message.contains("expires in"))
+            .unwrap_or(false));
+        assert!(oauth
+            .lifetime()
+            .doctor_warning_at(1_800_000_000)
+            .map(|warning| warning.message.contains("refresh"))
+            .unwrap_or(false));
+        assert!(jwt
+            .lifetime()
+            .doctor_warning_at(1_800_000_000)
+            .map(|warning| warning.message.contains("3600s cap"))
+            .unwrap_or(false));
         Ok(())
     }
 
