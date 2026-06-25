@@ -41,7 +41,7 @@ mod fastmcp_surface {
         Content, McpContext, McpError, McpErrorCode, McpResult, Server, Tool, ToolAnnotations,
         ToolHandler,
     };
-    use franken_snowflake_core::error::SnowflakeErrorCode;
+    use franken_snowflake_core::{error::SnowflakeErrorCode, redact::redact};
     use serde_json::{Map, Value, json};
 
     use super::{CliContractOutput, CliContractRunner};
@@ -644,6 +644,7 @@ mod fastmcp_surface {
     }
 
     fn invalid_params(message: impl Into<String>, data: Option<Value>) -> McpError {
+        let message = redact(&message.into()).into_owned();
         let mut payload = Map::new();
         payload.insert("recoverable".to_string(), Value::Bool(true));
         payload.insert(
@@ -657,7 +658,7 @@ mod fastmcp_surface {
         }
         McpError::with_data(
             McpErrorCode::InvalidParams,
-            message.into(),
+            message,
             Value::Object(payload),
         )
     }
@@ -806,6 +807,29 @@ mod fastmcp_surface {
             };
 
             assert_eq!(content.len(), 1);
+        }
+
+        #[test]
+        fn invalid_params_redacts_secret_shaped_argument_values() {
+            let raw_secret = "sfpat_mcpBadFormat001";
+            let err = match ReadVerb::CatalogGraph.cli_args(
+                &json!({"profile": "demo", "format": raw_secret}),
+            ) {
+                Ok(_) => {
+                    assert!(
+                        false,
+                        "secret-shaped unsupported graph format should be rejected"
+                    );
+                    return;
+                }
+                Err(err) => err,
+            };
+
+            assert_eq!(err.code, McpErrorCode::InvalidParams);
+            assert!(!err.message.contains(raw_secret));
+            assert!(err.message.contains("[REDACTED]"));
+            let data = serde_json::to_string(&err.data).expect("MCP error data serializes");
+            assert!(!data.contains(raw_secret));
         }
     }
 }
