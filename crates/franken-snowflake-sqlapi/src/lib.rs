@@ -30,6 +30,7 @@
 //! See `docs/protocol/schema_draft.md` for the field-by-field rationale and
 //! `docs/proof_lanes.md` (Lane 1) for the proof obligations these types satisfy.
 
+pub mod lifecycle;
 pub mod request;
 pub mod response;
 pub mod status;
