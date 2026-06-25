@@ -5,8 +5,9 @@
 //! [`SECRET_PREFIXES`] is that constant; [`redact`] and [`contains_secret`] share
 //! one span-finder so a string is redacted exactly where it is detected.
 //!
-//! [`CREDENTIAL_FIELD_SUFFIXES`] is consumed by the compile-time credential
-//! `Debug`-leak gate (bead `fsnow-native-snowflake-connector-w0i.5`).
+//! [`CREDENTIAL_FIELD_EXACT`] / [`CREDENTIAL_FIELD_SUFFIXES`] are consumed by the
+//! compile-time credential `Debug`-leak gate (bead
+//! `fsnow-native-snowflake-connector-w0i.5`).
 
 use std::borrow::Cow;
 
@@ -41,6 +42,20 @@ pub const CREDENTIAL_FIELD_SUFFIXES: &[&str] = &[
     "_private_key",
     "_secret",
     "_token",
+];
+
+/// Exact field names that are credential-shaped even without a separator.
+pub const CREDENTIAL_FIELD_EXACT: &[&str] = &[
+    "api_key",
+    "apikey",
+    "authorization",
+    "credential",
+    "password",
+    "passphrase",
+    "pat",
+    "private_key",
+    "secret",
+    "token",
 ];
 
 /// The text substituted for a detected secret.
@@ -173,11 +188,13 @@ fn pem_private_key_end(input: &str, byte_start: usize) -> usize {
         .map_or(input.len(), |line_end| byte_start + line_end)
 }
 
-/// Whether `field_name` is credential-shaped per [`CREDENTIAL_FIELD_SUFFIXES`].
+/// Whether `field_name` is credential-shaped per [`CREDENTIAL_FIELD_EXACT`] /
+/// [`CREDENTIAL_FIELD_SUFFIXES`].
 #[must_use]
 pub fn is_credential_field(field_name: &str) -> bool {
     let lowered = field_name.to_ascii_lowercase();
-    CREDENTIAL_FIELD_SUFFIXES
+    CREDENTIAL_FIELD_EXACT.contains(&lowered.as_str())
+        || CREDENTIAL_FIELD_SUFFIXES
         .iter()
         .any(|suffix| lowered.ends_with(suffix))
 }
@@ -276,7 +293,13 @@ mod tests {
         assert!(is_credential_field("snowflake_private_key"));
         assert!(is_credential_field("SNOWFLAKE_PAT_TOKEN"));
         assert!(is_credential_field("db_password"));
+        assert!(is_credential_field("token"));
+        assert!(is_credential_field("password"));
+        assert!(is_credential_field("secret"));
+        assert!(is_credential_field("api_key"));
+        assert!(is_credential_field("authorization"));
         assert!(!is_credential_field("username"));
         assert!(!is_credential_field("account"));
+        assert!(!is_credential_field("token_type"));
     }
 }
