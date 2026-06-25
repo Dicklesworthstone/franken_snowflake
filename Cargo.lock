@@ -1796,6 +1796,7 @@ dependencies = [
  "fnx-classes",
  "franken-snowflake-catalog",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

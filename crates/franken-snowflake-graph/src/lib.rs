@@ -167,7 +167,7 @@ pub struct FnxAlgorithmEvidence {
 }
 
 /// Typed directed multigraph with deterministic adjacency indexes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CatalogGraph {
     /// Nodes keyed by stable catalog identity.
     pub nodes: BTreeMap<NodeKey, CatalogNode>,
@@ -179,6 +179,30 @@ pub struct CatalogGraph {
     incoming: BTreeMap<NodeKey, BTreeSet<EdgeIndex>>,
     #[serde(skip)]
     edge_keys: BTreeSet<(NodeKey, CatalogEdgeKind, NodeKey, Option<String>)>,
+}
+
+#[derive(Deserialize)]
+struct CatalogGraphWire {
+    nodes: BTreeMap<NodeKey, CatalogNode>,
+    edges: Vec<CatalogEdge>,
+}
+
+impl<'de> Deserialize<'de> for CatalogGraph {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = CatalogGraphWire::deserialize(deserializer)?;
+        let mut graph = Self {
+            nodes: wire.nodes,
+            edges: wire.edges,
+            outgoing: BTreeMap::new(),
+            incoming: BTreeMap::new(),
+            edge_keys: BTreeSet::new(),
+        };
+        graph.rebuild_indexes();
+        Ok(graph)
+    }
 }
 
 impl CatalogGraph {
@@ -693,6 +717,40 @@ impl CatalogGraph {
         }
         graph
     }
+
+    fn rebuild_indexes(&mut self) {
+        self.outgoing.clear();
+        self.incoming.clear();
+        self.edge_keys.clear();
+        for key in self.nodes.keys() {
+            self.outgoing.entry(key.clone()).or_default();
+            self.incoming.entry(key.clone()).or_default();
+        }
+
+        let mut rebuilt_edges = Vec::with_capacity(self.edges.len());
+        for edge in self.edges.drain(..) {
+            let edge_key = (
+                edge.source.clone(),
+                edge.kind,
+                edge.target.clone(),
+                edge.detail.clone(),
+            );
+            if !self.edge_keys.insert(edge_key) {
+                continue;
+            }
+            let index = rebuilt_edges.len();
+            self.outgoing
+                .entry(edge.source.clone())
+                .or_default()
+                .insert(index);
+            self.incoming
+                .entry(edge.target.clone())
+                .or_default()
+                .insert(index);
+            rebuilt_edges.push(edge);
+        }
+        self.edges = rebuilt_edges;
+    }
 }
 
 impl Default for CatalogGraph {
@@ -1174,6 +1232,33 @@ mod tests {
             vec!["cyc_a".to_owned(), "cyc_c".to_owned(), "cyc_b".to_owned()],
             "cycle must keep loop order rotated to its min node, not be alphabetized"
         );
+    }
+
+    #[test]
+    fn serde_roundtrip_rebuilds_traversal_indexes_and_edge_dedupe() -> Result<(), String> {
+        let graph = CatalogGraph::from_snapshot(&fixture_snapshot());
+        let column = column_key("demo", "ANALYTICS", "PUBLIC", "EVENTS_DAILY", "VALUE");
+        let profile = profile_key("demo");
+        let encoded = serde_json::to_string(&graph).map_err(|error| error.to_string())?;
+        let mut roundtrip: CatalogGraph =
+            serde_json::from_str(&encoded).map_err(|error| error.to_string())?;
+
+        assert_eq!(roundtrip.ancestors(&column), graph.ancestors(&column));
+        assert_eq!(roundtrip.descendants(&profile), graph.descendants(&profile));
+
+        let edge_count = roundtrip.edge_count();
+        let duplicate = roundtrip
+            .edges
+            .first()
+            .cloned()
+            .ok_or_else(|| "fixture graph should have edges".to_owned())?;
+        roundtrip.add_edge(duplicate);
+        assert_eq!(
+            roundtrip.edge_count(),
+            edge_count,
+            "deserialized edge_keys index must prevent duplicate edges"
+        );
+        Ok(())
     }
 
     #[test]
