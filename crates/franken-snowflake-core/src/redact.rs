@@ -41,9 +41,18 @@ pub const CREDENTIAL_FIELD_SUFFIXES: &[&str] = &[
 /// The text substituted for a detected secret.
 pub const REDACTION_PLACEHOLDER: &str = "[REDACTED]";
 
-/// Characters that continue a secret token once a prefix has matched.
+/// Characters that continue a secret token to the right once a prefix has
+/// matched (includes base64 `+`/`/`/`=` padding and url-safe `-`/`_`).
 fn is_token_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | '+' | '=' | ':')
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | '+' | '=')
+}
+
+/// Whether `c`, immediately preceding a candidate prefix, keeps a token going
+/// leftward (so the candidate is *not* at a token boundary). Separators that
+/// commonly precede secrets — `=`, `:`, whitespace, quotes — are excluded here,
+/// so `key=eyJ...` and `Authorization: eyJ...` are still detected.
+fn continues_token_left(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | '+')
 }
 
 /// Byte spans `[start, end)` of secret-shaped tokens, in order.
@@ -53,7 +62,7 @@ fn secret_spans(input: &str) -> Vec<(usize, usize)> {
     let mut idx = 0;
     while idx < chars.len() {
         let (byte_start, _) = chars[idx];
-        let at_boundary = idx == 0 || !is_token_char(chars[idx - 1].1);
+        let at_boundary = idx == 0 || !continues_token_left(chars[idx - 1].1);
         if at_boundary {
             let rest = &input[byte_start..];
             if SECRET_PREFIXES.iter().any(|p| rest.starts_with(*p)) {
