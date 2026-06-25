@@ -84,6 +84,7 @@ pub enum AuthError {
     EmptyAccount,
     EmptyUser,
     EmptySecretSource { source_kind: &'static str },
+    SecretSourceLooksSensitive { source_kind: &'static str },
     EmptySecretValue,
     MissingEnvVar { name: String, next_command: String },
     UnsupportedSecretProvider { handle: String },
@@ -103,6 +104,10 @@ impl fmt::Display for AuthError {
             Self::EmptySecretSource { source_kind } => {
                 write!(f, "{source_kind} secret source is empty")
             }
+            Self::SecretSourceLooksSensitive { source_kind } => write!(
+                f,
+                "{source_kind} secret source looks like raw credential material; use a non-secret handle instead"
+            ),
             Self::EmptySecretValue => f.write_str("resolved credential value is empty"),
             Self::MissingEnvVar { name, next_command } => {
                 write!(
@@ -190,21 +195,13 @@ pub enum SecretSource {
 impl SecretSource {
     pub fn env_var(name: impl Into<String>) -> Result<Self, AuthError> {
         let name = name.into();
-        if name.trim().is_empty() {
-            return Err(AuthError::EmptySecretSource {
-                source_kind: "environment variable",
-            });
-        }
+        validate_secret_source_handle("environment variable", &name)?;
         Ok(Self::EnvVar { name })
     }
 
     pub fn secret_provider(handle: impl Into<String>) -> Result<Self, AuthError> {
         let handle = handle.into();
-        if handle.trim().is_empty() {
-            return Err(AuthError::EmptySecretSource {
-                source_kind: "secret provider",
-            });
-        }
+        validate_secret_source_handle("secret provider", &handle)?;
         Ok(Self::SecretProvider { handle })
     }
 
@@ -1481,6 +1478,16 @@ fn opaque_credential_handle(prefix: &str, value: &str) -> String {
     format!("cred_{prefix}_{suffix}")
 }
 
+fn validate_secret_source_handle(source_kind: &'static str, handle: &str) -> Result<(), AuthError> {
+    if handle.trim().is_empty() {
+        return Err(AuthError::EmptySecretSource { source_kind });
+    }
+    if contains_secret_needle(handle) {
+        return Err(AuthError::SecretSourceLooksSensitive { source_kind });
+    }
+    Ok(())
+}
+
 fn export_env_next_command(name: &str) -> String {
     format!("export {name}=<redacted>")
 }
@@ -1714,6 +1721,33 @@ dQIDAQAB
         assert!(message.contains("export SNOWFLAKE_PAT=<redacted>"));
         assert!(!message.contains("pat-secret-value"));
         Ok(())
+    }
+
+    #[test]
+    fn secret_source_handles_reject_raw_credential_shapes() {
+        for (source_kind, rejected) in [
+            (
+                "environment variable",
+                SecretSource::env_var("sfpat_rawCredentialHandle001"),
+            ),
+            (
+                "secret provider",
+                SecretSource::secret_provider("vault://snowflake/ghp_rawCredentialHandle001"),
+            ),
+        ] {
+            let error = rejected.expect_err("secret-shaped handle should be refused");
+            let message = error.to_string();
+
+            assert!(matches!(
+                error,
+                AuthError::SecretSourceLooksSensitive {
+                    source_kind: actual
+                } if actual == source_kind
+            ));
+            assert!(message.contains(source_kind));
+            assert!(!message.contains("sfpat_rawCredentialHandle001"));
+            assert!(!message.contains("ghp_rawCredentialHandle001"));
+        }
     }
 
     #[test]
