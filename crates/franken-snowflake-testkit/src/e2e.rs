@@ -12,12 +12,12 @@ use std::path::{Path, PathBuf};
 
 use franken_snowflake_core::redact::redact;
 use franken_snowflake_sqlapi::lifecycle::{PollPlan, Progress, StatementMachine};
-use franken_snowflake_sqlapi::response::StatementCancelResponse;
+use franken_snowflake_sqlapi::response::{QueryFailureStatus, StatementCancelResponse};
 use franken_snowflake_sqlapi::status::ResponseClass as SqlResponseClass;
 use serde::{Deserialize, Serialize};
 
 use crate::harness::logger::{LogError, RunLogger, RunSummary};
-use crate::harness::paths::{PortableDirKind, resolve_project_dir};
+use crate::harness::paths::{resolve_project_dir, PortableDirKind};
 use crate::mock::http::{MockHttpRequest, MockHttpResponse};
 use crate::mock::scenarios;
 use crate::mock::server::{MockSqlApi, RecordedRequest};
@@ -387,6 +387,10 @@ fn run_cancel_lane(
         .respond(&MockHttpRequest::post(cancel_path, Vec::<u8>::new()).with_bearer(raw_token));
     let typed: StatementCancelResponse = serde_json::from_slice(&cancel_response.body)?;
     let cancelled = cancel_mock.is_cancelled(&handle);
+    let post_cancel_poll = cancel_mock.respond(
+        &MockHttpRequest::get(format!("/api/v2/statements/{handle}")).with_bearer(raw_token),
+    );
+    let failure: QueryFailureStatus = serde_json::from_slice(&post_cancel_poll.body)?;
     log_check(
         logger,
         failures,
@@ -398,7 +402,22 @@ fn run_cancel_lane(
             cancel_response.status, typed.code
         ),
     )?;
-    Ok(cancel_response.status == 200 && cancelled && !typed.code.is_empty())
+    log_check(
+        logger,
+        failures,
+        "post-cancel-poll-terminal",
+        post_cancel_poll.status == 422 && failure.sql_state.as_deref() == Some("57014"),
+        "post-cancel poll returns terminal cancellation failure",
+        &format!(
+            "status={}, code={}, sql_state={:?}",
+            post_cancel_poll.status, failure.code, failure.sql_state
+        ),
+    )?;
+    Ok(cancel_response.status == 200
+        && cancelled
+        && !typed.code.is_empty()
+        && post_cancel_poll.status == 422
+        && failure.sql_state.as_deref() == Some("57014"))
 }
 
 fn run_redaction_lane(

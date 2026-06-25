@@ -188,6 +188,9 @@ impl MockSqlApi {
         if handle != self.statement_handle {
             return not_found();
         }
+        if self.is_cancelled(handle) {
+            return cancelled_status(handle);
+        }
         let count = self.poll_counts.entry(handle.to_owned()).or_insert(0);
         *count += 1;
         if *count > self.polls_before_complete {
@@ -200,6 +203,9 @@ impl MockSqlApi {
     fn on_partition(&self, handle: &str, partition: u32) -> MockHttpResponse {
         if handle != self.statement_handle {
             return not_found();
+        }
+        if self.is_cancelled(handle) {
+            return cancelled_status(handle);
         }
         self.partitions
             .get(&partition)
@@ -248,6 +254,23 @@ fn not_found() -> MockHttpResponse {
         404,
         br#"{"code":"390404","message":"Statement handle not found."}"#.to_vec(),
     )
+}
+
+fn cancelled_status(handle: &str) -> MockHttpResponse {
+    // Snowflake SQL API reference consulted 2026-06-25:
+    // https://docs.snowflake.com/en/developer-guide/sql-api/reference
+    // Cancel returns code 000604 / SQLSTATE 57014; later status checks must not
+    // turn a locally cancelled handle into a successful ResultSet.
+    let body = serde_json::json!({
+        "code": "000604",
+        "sqlState": "57014",
+        "message": "SQL execution canceled",
+        "statementHandle": handle,
+        "statementStatusUrl": format!("/api/v2/statements/{handle}"),
+    })
+    .to_string()
+    .into_bytes();
+    MockHttpResponse::json(422, body)
 }
 
 #[cfg(test)]
@@ -340,5 +363,30 @@ mod tests {
         let recorded = mock.requests().first().expect("request should be recorded");
         assert!(recorded.path.contains("[REDACTED]"));
         assert!(!recorded.path.contains("sfpat_SECRET123"));
+    }
+
+    #[test]
+    fn cancelled_handle_no_longer_completes_or_serves_partitions() -> Result<(), String> {
+        let mut mock = scenarios::default_async_lifecycle();
+        let handle = mock.statement_handle().to_owned();
+        let cancel_path = format!("/api/v2/statements/{handle}/cancel");
+        assert_eq!(
+            mock.respond(&MockHttpRequest::post(cancel_path, Vec::new()))
+                .status,
+            200
+        );
+
+        let poll_path = format!("/api/v2/statements/{handle}");
+        let poll = mock.respond(&MockHttpRequest::get(&poll_path));
+        assert_eq!(poll.status, 422);
+        let poll_body = std::str::from_utf8(&poll.body).map_err(|error| error.to_string())?;
+        assert!(poll_body.contains("\"code\":\"000604\""));
+        assert!(poll_body.contains("\"sqlState\":\"57014\""));
+        assert!(poll_body.contains("SQL execution canceled"));
+
+        let partition_path = format!("/api/v2/statements/{handle}?partition=1");
+        let partition = mock.respond(&MockHttpRequest::get(&partition_path));
+        assert_eq!(partition.status, 422);
+        Ok(())
     }
 }
