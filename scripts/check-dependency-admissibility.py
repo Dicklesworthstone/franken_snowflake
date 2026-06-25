@@ -3,8 +3,9 @@
 
 The gate scans every workspace package across default, no-default, production
 feature, combined-production-feature, and dev/test feature lanes. It fails if a
-forbidden runtime/framework/ORM crate, fp-io/orc-rust, or a third-party
-Snowflake driver appears in any resolved lane.
+forbidden runtime/framework/ORM crate, fp-io/orc-rust, a third-party Snowflake
+driver, or more than one version of the single-version Franken runtime packages
+appears in any resolved lane.
 """
 
 from __future__ import annotations
@@ -49,6 +50,14 @@ THIRD_PARTY_SNOWFLAKE_PACKAGES = {
     "snowflake-rust",
     "snowflake-sql-api",
     "snowflakedb",
+}
+
+SINGLE_VERSION_PACKAGES = {
+    "asupersync",
+    "asupersync-macros",
+    "franken-decision",
+    "franken-evidence",
+    "franken-kernel",
 }
 
 CANDIDATE_GROUPS = {
@@ -196,6 +205,7 @@ DEV_FEATURES = {
 }
 
 PACKAGE_RE = re.compile(r"^([A-Za-z0-9_.+-]+)\s+v[0-9]")
+PACKAGE_VERSION_RE = re.compile(r"^([A-Za-z0-9_.+-]+)\s+v([0-9][^\s]*)")
 
 
 @dataclass(frozen=True)
@@ -249,6 +259,18 @@ def package_names_from_tree(tree_output: str) -> set[str]:
     return names
 
 
+def package_versions_from_tree(tree_output: str) -> dict[str, set[str]]:
+    versions: dict[str, set[str]] = {}
+    for raw_line in tree_output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = PACKAGE_VERSION_RE.match(line)
+        if match:
+            versions.setdefault(match.group(1), set()).add(match.group(2))
+    return versions
+
+
 def candidate_groups_present(packages: set[str]) -> list[str]:
     present: list[str] = []
     for group, group_packages in CANDIDATE_GROUPS.items():
@@ -273,6 +295,17 @@ def violations(packages: set[str]) -> list[str]:
     direct = packages.intersection(FORBIDDEN_PACKAGES)
     snowflake = third_party_snowflake_packages(packages)
     return sorted(direct.union(snowflake))
+
+
+def single_version_violations(
+    package_versions: dict[str, set[str]],
+) -> list[dict[str, object]]:
+    lane_violations: list[dict[str, object]] = []
+    for package in sorted(SINGLE_VERSION_PACKAGES):
+        versions = sorted(package_versions.get(package, set()))
+        if len(versions) > 1:
+            lane_violations.append({"package": package, "versions": versions})
+    return lane_violations
 
 
 def classify_features(features: dict[str, list[str]]) -> tuple[list[str], list[str]]:
@@ -457,7 +490,7 @@ def dedupe_lanes(lanes: Iterable[Lane]) -> list[Lane]:
     return deduped
 
 
-def scan_lane(lane: Lane) -> list[str]:
+def scan_lane(lane: Lane) -> int:
     command = ["cargo", "tree", "--locked"]
     if lane.package == WORKSPACE_LANE_PACKAGE:
         command.extend(lane.args)
@@ -466,7 +499,9 @@ def scan_lane(lane: Lane) -> list[str]:
     command.extend(["--prefix", "none", "--format", "{p}"])
     result = run_command(command)
     packages = package_names_from_tree(result.stdout)
+    package_versions = package_versions_from_tree(result.stdout)
     lane_violations = violations(packages)
+    lane_single_version_violations = single_version_violations(package_versions)
     emit(
         "lane_verdict",
         package=lane.package,
@@ -475,16 +510,18 @@ def scan_lane(lane: Lane) -> list[str]:
         package_count=len(packages),
         candidate_groups=candidate_groups_present(packages),
         violations=lane_violations,
+        single_version_violations=lane_single_version_violations,
     )
-    if lane_violations:
+    if lane_violations or lane_single_version_violations:
         emit_error(
             "lane_failure",
             package=lane.package,
             lane=lane.name,
             scope=lane.scope,
             violations=lane_violations,
+            single_version_violations=lane_single_version_violations,
         )
-    return lane_violations
+    return len(lane_violations) + len(lane_single_version_violations)
 
 
 def is_fsqlite_windows_prereq_lane(lane: Lane) -> bool:
@@ -503,6 +540,10 @@ def run_self_test() -> None:
     orc-rust v0.8.0
     tokio v1.48.0
     snowflake-rs v0.4.0
+    asupersync v0.3.4
+    asupersync v0.3.5 (/dp/asupersync)
+    franken-kernel v0.3.4
+    franken-kernel v0.3.5 (/dp/asupersync/franken_kernel)
     """
     packages = package_names_from_tree(synthetic_tree)
     found = violations(packages)
@@ -512,6 +553,29 @@ def run_self_test() -> None:
         emit_error("self_test_failure", missing=missing, found=found)
         raise SystemExit(1)
     emit("self_test_verdict", fixture="fp-io-orc-rust-tokio", violations=found)
+
+    package_versions = package_versions_from_tree(synthetic_tree)
+    found_single_versions = {
+        str(item["package"]): item["versions"]
+        for item in single_version_violations(package_versions)
+    }
+    expected_single_versions = {
+        "asupersync": ["0.3.4", "0.3.5"],
+        "franken-kernel": ["0.3.4", "0.3.5"],
+    }
+    if found_single_versions != expected_single_versions:
+        emit_error(
+            "self_test_failure",
+            fixture="single-version-runtime-packages",
+            expected=expected_single_versions,
+            found=found_single_versions,
+        )
+        raise SystemExit(1)
+    emit(
+        "self_test_verdict",
+        fixture="single-version-runtime-packages",
+        violations=found_single_versions,
+    )
 
     feature_packages: list[dict[str, object]] = [
         {"name": "franken-snowflake-cli", "features": {"default": [], "toon": []}},
@@ -582,6 +646,7 @@ def main() -> int:
         cwd=str(Path.cwd()),
         cargo_target_dir=os.environ.get("CARGO_TARGET_DIR"),
         forbidden_packages=sorted(FORBIDDEN_PACKAGES),
+        single_version_packages=sorted(SINGLE_VERSION_PACKAGES),
         third_party_snowflake_packages=sorted(THIRD_PARTY_SNOWFLAKE_PACKAGES),
     )
     run_self_test()
@@ -625,7 +690,7 @@ def main() -> int:
                 reason="upstream fsqlite-vfs/fsqlite-mvcc must gate nix with cfg(unix) before Windows cache-feature scanning",
             )
             continue
-        failure_count += len(scan_lane(lane))
+        failure_count += scan_lane(lane)
 
     if failure_count:
         emit_error(

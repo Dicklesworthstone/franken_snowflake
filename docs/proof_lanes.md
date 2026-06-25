@@ -97,14 +97,19 @@ disabled), and exit non-zero on any envelope/exit-code deviation.
   as `graph` and `toon` cannot be missed by per-crate scanning. Any lane that
   resolves Tokio, reqwest, hyper, hyper-util, axum, tower, tower-http, sqlx,
   diesel, sea-orm, sea-orm-migration, `fp-io`, `orc-rust`, or a third-party
-  Snowflake driver fails the gate. Each lane emits a structured JSON verdict; a built-in parser
-  self-test injects the known-bad `fp-io → orc-rust → tokio` path plus a
-  third-party Snowflake package and asserts the gate catches it (`--self-test-only`
-  runs it without invoking cargo). FrankenSuite candidate groups
+  Snowflake driver fails the gate. It also fails any lane that resolves multiple
+  versions of `asupersync`, `asupersync-macros`, `franken-kernel`,
+  `franken-decision`, or `franken-evidence`, including workspace production
+  feature lanes such as `--features mcp`. Each lane emits a structured JSON
+  verdict; a built-in parser self-test injects the known-bad
+  `fp-io → orc-rust → tokio` path, a third-party Snowflake package, and
+  duplicate Franken runtime versions, then asserts the gate catches them
+  (`--self-test-only` runs it without invoking cargo). FrankenSuite candidate groups
   (`CANDIDATE_GROUPS`) are reported per lane but admitted; an unknown feature flag
   fails closed as production until the harness classifies it as test-only.
 - Single-`asupersync`-version gate (`scripts/check-asupersync-single-version.sh`):
-  CI fails if `cargo tree` reports more than one `asupersync`.
+  a focused metadata/tree smoke check remains in CI, while the admissibility gate
+  enforces the same single-version policy per package/feature lane.
 - Per-candidate-dependency cargo-tree admissibility proof, with dev-only and
   feature-gated paths scanned in their own configurations.
 

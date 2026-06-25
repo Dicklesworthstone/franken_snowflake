@@ -22,6 +22,12 @@ diesel, sea-orm, `fp-io`, `orc-rust`, or a third-party Snowflake driver. The
 `fp-io` / `orc-rust` negative assertion is global, so future frame and export
 crates are covered as soon as they enter the workspace.
 
+Each lane also fails if the single-version Franken runtime packages resolve at
+more than one version. This currently covers `asupersync`, `asupersync-macros`,
+`franken-kernel`, `franken-decision`, and `franken-evidence`, including feature
+graphs such as workspace `--features mcp` that can pull those packages through
+FastMCP as well as through this workspace's core crates.
+
 The policy-listed production features must also have at least one workspace
 crate owner. Missing owners fail the gate before any `cargo tree` scan, which
 keeps product-level lanes such as `graph` and `toon` from silently dropping out
@@ -43,8 +49,8 @@ scripts/check-dependency-admissibility.py
 ```
 
 The script has a built-in parser self-test that injects the known bad
-`fp-io -> orc-rust -> tokio` path plus a third-party Snowflake package and
-asserts that the gate catches it.
+`fp-io -> orc-rust -> tokio` path, a third-party Snowflake package, and duplicate
+Franken runtime package versions, then asserts that the gate catches them.
 
 Windows CI has one explicit upstream prerequisite for the non-default cache
 feature: FrankenSQLite must re-gate the Unix-only `nix` dependency in
