@@ -22,9 +22,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Convenient re-exports for callers and tests.
 pub mod prelude {
     pub use crate::discovery::{
-        build_information_schema_requests, build_snapshot_from_information_schema,
-        persist_snapshot, CatalogDiscoveryInput, CatalogDiscoverySql, CatalogDiscoveryTables,
-        DiscoveryStatementKind, InformationSchemaRow,
+        CatalogDiscoveryInput, CatalogDiscoverySql, CatalogDiscoveryTables, DiscoveryStatementKind,
+        InformationSchemaRow, build_information_schema_requests,
+        build_snapshot_from_information_schema, persist_snapshot,
     };
     pub use crate::model::{
         CatalogSnapshot, ColumnCatalogEntry, DataSourceClass, DatasetField, DatasetKind,
@@ -32,15 +32,15 @@ pub mod prelude {
         RoleConfidence, SCHEMA_VERSION,
     };
     pub use crate::operator::{
-        built_in_operator_catalog, describe_operator_json_schema, OperatorArity,
-        OperatorCatalogEntry, OutputDtypeRule,
+        OperatorArity, OperatorCatalogEntry, OutputDtypeRule, built_in_operator_catalog,
+        describe_operator_json_schema,
     };
     pub use crate::planner::{
-        plan_dataset_query, plan_raw_sql_dry_run, plan_refusal_log_line, plan_success_log_line,
         DatasetQueryRequest, PlanGuardrails, PlanMode, PlanRefusal, PlanWarning, PlannerLogLine,
-        PredicatePushdownPlan, QueryPlan, RawSqlPlanRequest, TypedBinding,
+        PredicatePushdownPlan, QueryPlan, RawSqlPlanRequest, TypedBinding, plan_dataset_query,
+        plan_raw_sql_dry_run, plan_refusal_log_line, plan_success_log_line,
     };
     pub use crate::predicate::{
-        validate_predicate, LeafPredicate, PredicateAst, PredicateRefusal, PredicateRefusalCode,
+        LeafPredicate, PredicateAst, PredicateRefusal, PredicateRefusalCode, validate_predicate,
     };
 }

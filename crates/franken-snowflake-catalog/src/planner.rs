@@ -4,19 +4,19 @@ use std::collections::BTreeMap;
 
 use franken_snowflake_core::error::SnowflakeErrorCode;
 use franken_snowflake_core::guardrails::{
-    enforce_query_safety, QueryPlanGuard, QuerySafetyLimits, DEFAULT_MAX_RESULT_BYTES,
-    DEFAULT_MAX_RESULT_ROWS,
+    DEFAULT_MAX_RESULT_BYTES, DEFAULT_MAX_RESULT_ROWS, QueryPlanGuard, QuerySafetyLimits,
+    enforce_query_safety,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::{
-    normalize_identifier, ColumnCatalogEntry, DatasetManifest, DtypeClass, FieldRole,
+    ColumnCatalogEntry, DatasetManifest, DtypeClass, FieldRole, normalize_identifier,
 };
 use crate::operator::OperatorCatalogEntry;
 use crate::predicate::{
-    validate_predicate, CompoundPredicate, LeafPredicate, PredicateAst, PredicateRefusal,
-    PredicateRefusalCode,
+    CompoundPredicate, LeafPredicate, PredicateAst, PredicateRefusal, PredicateRefusalCode,
+    validate_predicate,
 };
 
 const PLANNER_LOG_SCHEMA_VERSION: u16 = 1;
@@ -1234,7 +1234,7 @@ mod tests {
         DataSourceClass, DatasetField, DatasetKind, Provenance, ProvenanceSource, RightsClass,
         RoleConfidence,
     };
-    use crate::operator::{built_in_operator_catalog, OperatorArity, OutputDtypeRule};
+    use crate::operator::{OperatorArity, OutputDtypeRule, built_in_operator_catalog};
 
     #[test]
     fn dataset_plan_pushes_safe_predicates_with_typed_bindings() {
@@ -1328,9 +1328,10 @@ mod tests {
 
         assert!(plan.is_ok());
         if let Ok(plan) = plan {
-            assert!(plan
-                .sql
-                .contains("FROM \"ANA\"\"LYTICS\".\"PUBLIC\".\"EVENTS\"\"; DROP TABLE X; --\""));
+            assert!(
+                plan.sql
+                    .contains("FROM \"ANA\"\"LYTICS\".\"PUBLIC\".\"EVENTS\"\"; DROP TABLE X; --\"")
+            );
             assert!(plan.sql.ends_with(" LIMIT ?"));
             assert_eq!(
                 plan.bindings.get("1").map(|binding| binding.value.as_str()),
@@ -1357,13 +1358,15 @@ mod tests {
         ));
 
         request.confirmation_token = Some("confirm-large-result".to_owned());
-        assert!(plan_dataset_query(
-            &fixture_manifest("events_daily"),
-            &fixture_columns("events_daily"),
-            &built_in_operator_catalog(),
-            &request,
-        )
-        .is_ok());
+        assert!(
+            plan_dataset_query(
+                &fixture_manifest("events_daily"),
+                &fixture_columns("events_daily"),
+                &built_in_operator_catalog(),
+                &request,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1470,10 +1473,11 @@ mod tests {
                 Some("10000")
             );
             assert_eq!(plan.guardrails.query_tag, "trace-raw");
-            assert!(plan
-                .warnings
-                .iter()
-                .any(|warning| warning.code == "FSNOW_UNCONSTRAINED_QUERY_ADVISORY"));
+            assert!(
+                plan.warnings
+                    .iter()
+                    .any(|warning| warning.code == "FSNOW_UNCONSTRAINED_QUERY_ADVISORY")
+            );
         }
     }
 

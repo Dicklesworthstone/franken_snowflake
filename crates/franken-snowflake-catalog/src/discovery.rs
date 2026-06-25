@@ -18,8 +18,8 @@ use franken_snowflake_sqlapi::response::ColumnType;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    normalize_identifier, CatalogSnapshot, ColumnCatalogEntry, DataSourceClass, DatasetField,
-    DatasetKind, DtypeClass, FieldRole, Provenance, ProvenanceSource, RightsClass, RoleConfidence,
+    CatalogSnapshot, ColumnCatalogEntry, DataSourceClass, DatasetField, DatasetKind, DtypeClass,
+    FieldRole, Provenance, ProvenanceSource, RightsClass, RoleConfidence, normalize_identifier,
 };
 use crate::operator::built_in_operator_catalog;
 
@@ -714,9 +714,11 @@ mod tests {
             bindings.get("3").map(|b| b.value_type.as_str()),
             Some("TEXT")
         );
-        assert!(columns
-            .statement
-            .ends_with("ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"));
+        assert!(
+            columns
+                .statement
+                .ends_with("ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION")
+        );
     }
 
     #[test]

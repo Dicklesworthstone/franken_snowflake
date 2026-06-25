@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
-use crate::model::{normalize_identifier, ColumnCatalogEntry};
+use crate::model::{ColumnCatalogEntry, normalize_identifier};
 use crate::operator::OperatorCatalogEntry;
 
 /// Structural predicate expression. Values are data, never SQL.
