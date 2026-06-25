@@ -82,12 +82,26 @@ disabled), and exit non-zero on any envelope/exit-code deviation.
 
 > Owned by the toolchain bead (`fsnow-native-snowflake-connector-w0i.3`) and the
 > per-dependency admissibility bead (`fsnow-native-snowflake-connector-w0i.7`);
-> listed here so the proof surface is complete.
+> listed here so the proof surface is complete. The admissibility gate is
+> implemented in `scripts/check-dependency-admissibility.py` and documented in
+> `docs/dependency_admissibility.md`.
 
-- Forbidden-dependency scan: the production feature graph fails if Tokio,
-  reqwest, hyper, axum, tower, sqlx, diesel, or sea-orm appear.
-- Single-`asupersync`-version gate: CI fails if `cargo tree` reports more than one
-  `asupersync`.
+- Forbidden-dependency scan (`scripts/check-dependency-admissibility.py`): runs
+  `cargo metadata --locked`, then `cargo tree --locked` for every workspace
+  package across each lane — default production graph, `--no-default-features`,
+  each production feature, all production features combined, and **each dev/test
+  feature in its own lane** (`--edges all`, so dev-deps are scanned too, not just
+  the production `normal,build` edges). Any lane that resolves Tokio, reqwest,
+  hyper, hyper-util, axum, tower, tower-http, sqlx, diesel, sea-orm,
+  sea-orm-migration, `fp-io`, `orc-rust`, or a third-party Snowflake driver fails
+  the gate. Each lane emits a structured JSON verdict; a built-in parser
+  self-test injects the known-bad `fp-io → orc-rust → tokio` path plus a
+  third-party Snowflake package and asserts the gate catches it (`--self-test-only`
+  runs it without invoking cargo). FrankenSuite candidate groups
+  (`CANDIDATE_GROUPS`) are reported per lane but admitted; an unknown feature flag
+  fails closed as production until the harness classifies it as test-only.
+- Single-`asupersync`-version gate (`scripts/check-asupersync-single-version.sh`):
+  CI fails if `cargo tree` reports more than one `asupersync`.
 - Per-candidate-dependency cargo-tree admissibility proof, with dev-only and
   feature-gated paths scanned in their own configurations.
 
