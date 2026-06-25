@@ -29,7 +29,6 @@ enum ExitStatus {
     Success = 0,
     Findings = 1,
     SafetyRefusal = 2,
-    CredentialProfile = 3,
     Usage = 64,
     Io = 74,
 }
@@ -988,38 +987,11 @@ fn dispatch(invocation: Invocation) -> Outcome {
             )],
             vec!["franken-snowflake doctor --json".to_string()],
         ),
-        Command::ProfileValidate { profile } => not_available(
-            invocation.output,
-            "profile.validate",
-            "fsnow.profile.validate.v1",
-            request_id,
-            Some(profile),
-            "FSNOW_PROFILE_STORE_UNAVAILABLE",
-            "Profile registry is not implemented in this CLI slice.",
-            vec![
-                "franken-snowflake capabilities --json".to_string(),
-                "franken-snowflake profile doctor <profile> --json".to_string(),
-            ],
-        ),
+        Command::ProfileValidate { profile } => {
+            profile_validate_outcome(invocation.output, request_id, profile)
+        }
         Command::ProfileDoctor { profile, online } => {
-            let detail = if online {
-                "Profile doctor --online is blocked until live transport lands."
-            } else {
-                "Profile doctor is blocked until profile registry and credential checks land."
-            };
-            not_available(
-                invocation.output,
-                "profile.doctor",
-                "fsnow.profile.doctor.v1",
-                request_id,
-                Some(profile),
-                "FSNOW_PROFILE_DOCTOR_UNAVAILABLE",
-                detail,
-                vec![
-                    "franken-snowflake profile validate <profile> --json".to_string(),
-                    "franken-snowflake doctor --json".to_string(),
-                ],
-            )
+            profile_doctor_outcome(invocation.output, request_id, profile, online)
         }
         Command::CatalogScan {
             profile,
@@ -1205,42 +1177,6 @@ fn findings(
     .with_safe_next_commands(safe_next_commands);
     Outcome {
         status: ExitStatus::Findings,
-        body: Body::Envelope { envelope, format },
-    }
-}
-
-fn not_available(
-    format: OutputFormat,
-    command_id: &'static str,
-    output_contract_id: &'static str,
-    request_id: String,
-    profile_id: Option<String>,
-    code: &'static str,
-    message: &'static str,
-    repair_commands: Vec<String>,
-) -> Outcome {
-    let mut envelope = base_envelope(
-        false,
-        "error",
-        command_id,
-        output_contract_id,
-        request_id,
-        json_object(vec![("implemented", Json::Bool(false))]),
-    );
-    envelope.profile_id = profile_id;
-    envelope.error = Some(ErrorInfo {
-        code,
-        message: message.to_string(),
-        retryable: true,
-        policy_boundary: "local_cli_slice",
-        evidence: vec![json_string(
-            "lower-level storage/transport bead not complete",
-        )],
-    });
-    envelope.safe_next_commands = vec!["franken-snowflake capabilities --json".to_string()];
-    envelope.repair_commands = repair_commands;
-    Outcome {
-        status: ExitStatus::CredentialProfile,
         body: Body::Envelope { envelope, format },
     }
 }
@@ -1755,6 +1691,217 @@ fn check_json(name: &'static str, status: &'static str, detail: &'static str) ->
         ("status", json_string(status)),
         ("detail", json_string(detail)),
     ])
+}
+
+fn check_json_owned(name: &'static str, status: &'static str, detail: String) -> Json {
+    json_object(vec![
+        ("name", json_string(name)),
+        ("status", json_string(status)),
+        ("detail", json_string(detail)),
+    ])
+}
+
+fn profile_validate_outcome(format: OutputFormat, request_id: String, profile: String) -> Outcome {
+    let syntax_valid = is_valid_profile_id(&profile);
+    let warnings = if syntax_valid {
+        vec![json_string(
+            "profile registry is not linked yet; only offline profile-id and env-handle contract checks ran",
+        )]
+    } else {
+        vec![json_string(
+            "profile id contains unsupported characters for stable handles",
+        )]
+    };
+    let status = if syntax_valid {
+        "offline_validated"
+    } else {
+        "findings"
+    };
+    let mut envelope = base_envelope(
+        true,
+        "partial_success",
+        "profile.validate",
+        "fsnow.profile.validate.v1",
+        request_id,
+        profile_diagnostics_data(&profile, false, status),
+    )
+    .with_warnings(warnings)
+    .with_safe_next_commands(vec![
+        format!("franken-snowflake profile doctor {profile} --json"),
+        format!("franken-snowflake query plan --profile {profile} --sql \"select 1\" --json"),
+    ]);
+    envelope.profile_id = Some(profile);
+    Outcome {
+        status: ExitStatus::Findings,
+        body: Body::Envelope { envelope, format },
+    }
+}
+
+fn profile_doctor_outcome(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    online: bool,
+) -> Outcome {
+    let syntax_valid = is_valid_profile_id(&profile);
+    let warning = if online {
+        "online profile probe requested but not attempted because live transport is not linked"
+    } else {
+        "profile doctor ran offline only; live transport is not linked"
+    };
+    let mut envelope = base_envelope(
+        true,
+        "partial_success",
+        "profile.doctor",
+        "fsnow.profile.doctor.v1",
+        request_id,
+        profile_diagnostics_data(
+            &profile,
+            online,
+            if syntax_valid {
+                "offline_findings"
+            } else {
+                "findings"
+            },
+        ),
+    )
+    .with_warnings(vec![json_string(warning)])
+    .with_safe_next_commands(vec![
+        format!("franken-snowflake profile validate {profile} --json"),
+        "franken-snowflake doctor --json".to_string(),
+    ]);
+    envelope.profile_id = Some(profile);
+    Outcome {
+        status: ExitStatus::Findings,
+        body: Body::Envelope { envelope, format },
+    }
+}
+
+fn profile_diagnostics_data(profile: &str, online: bool, status: &'static str) -> Json {
+    let env_prefix = profile_env_prefix(profile);
+    let syntax_detail = if is_valid_profile_id(profile) {
+        "profile id is a stable handle"
+    } else {
+        "profile id must be 1-128 ASCII letters, digits, dot, dash, or underscore"
+    };
+
+    json_object(vec![
+        ("profile_id", json_string(profile)),
+        ("status", json_string(status)),
+        ("offline_only", Json::Bool(true)),
+        ("profile_registry_linked", Json::Bool(false)),
+        ("profile_config_loaded", Json::Bool(false)),
+        ("live_probe_requested", Json::Bool(online)),
+        ("live_probe_attempted", Json::Bool(false)),
+        ("secret_values_read", Json::Bool(false)),
+        (
+            "redaction_policy",
+            json_string("env var names only; token/private-key values are never emitted"),
+        ),
+        ("profile_env_prefix", json_string(env_prefix.clone())),
+        (
+            "supported_auth_lanes",
+            string_array(vec![
+                "programmatic_access_token".to_string(),
+                "key_pair_jwt".to_string(),
+                "oauth_bearer_token".to_string(),
+            ]),
+        ),
+        (
+            "expected_env_handles",
+            Json::Array(profile_env_handle_sets(&env_prefix)),
+        ),
+        (
+            "checks",
+            Json::Array(vec![
+                check_json_owned(
+                    "profile_id_syntax",
+                    if is_valid_profile_id(profile) {
+                        "pass"
+                    } else {
+                        "fail"
+                    },
+                    syntax_detail.to_string(),
+                ),
+                check_json(
+                    "profile_registry",
+                    "not_checked",
+                    "profile storage lands in a lower-level bead",
+                ),
+                check_json(
+                    "credential_handles",
+                    "not_checked",
+                    "profile registry has not supplied env var names yet",
+                ),
+                check_json(
+                    "live_probe",
+                    "not_checked",
+                    "live transport is not linked in this CLI slice",
+                ),
+            ]),
+        ),
+    ])
+}
+
+fn profile_env_handle_sets(env_prefix: &str) -> Vec<Json> {
+    let account = format!("{env_prefix}_ACCOUNT");
+    let user = format!("{env_prefix}_USER");
+    vec![
+        json_object(vec![
+            ("auth_lane", json_string("programmatic_access_token")),
+            (
+                "env_vars",
+                string_array(vec![
+                    account.clone(),
+                    user.clone(),
+                    format!("{env_prefix}_PAT"),
+                ]),
+            ),
+        ]),
+        json_object(vec![
+            ("auth_lane", json_string("key_pair_jwt")),
+            (
+                "env_vars",
+                string_array(vec![
+                    account.clone(),
+                    user.clone(),
+                    format!("{env_prefix}_PRIVATE_KEY_PEM"),
+                    format!("{env_prefix}_PRIVATE_KEY_PASSPHRASE"),
+                ]),
+            ),
+        ]),
+        json_object(vec![
+            ("auth_lane", json_string("oauth_bearer_token")),
+            (
+                "env_vars",
+                string_array(vec![account, user, format!("{env_prefix}_OAUTH_BEARER")]),
+            ),
+        ]),
+    ]
+}
+
+fn is_valid_profile_id(profile: &str) -> bool {
+    !profile.is_empty()
+        && profile.len() <= 128
+        && profile
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
+fn profile_env_prefix(profile: &str) -> String {
+    let mut suffix = String::new();
+    for byte in profile.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            suffix.push(byte.to_ascii_uppercase() as char);
+        } else if matches!(byte, b'.' | b'-' | b'_') {
+            suffix.push('_');
+        }
+    }
+    if suffix.is_empty() {
+        "FRANKEN_SNOWFLAKE_PROFILE".to_string()
+    } else {
+        format!("FRANKEN_SNOWFLAKE_{suffix}")
+    }
 }
 
 fn operator_schema_outcome(format: OutputFormat, request_id: String, operator: String) -> Outcome {
@@ -2671,6 +2818,43 @@ mod tests {
             rendered.contains("catalog scan &lt;profile&gt;")
                 || rendered.contains("catalog scan <profile>")
         );
+    }
+
+    #[test]
+    fn profile_validate_is_offline_and_secret_safe() {
+        let outcome = execute(vec![
+            "profile".to_string(),
+            "validate".to_string(),
+            "demo-prod".to_string(),
+        ]);
+        assert_eq!(outcome.status.code(), 1);
+        let rendered = match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("\"command_id\":\"profile.validate\""));
+        assert!(rendered.contains("\"profile_registry_linked\":false"));
+        assert!(rendered.contains("\"secret_values_read\":false"));
+        assert!(rendered.contains("FRANKEN_SNOWFLAKE_DEMO_PROD_PAT"));
+    }
+
+    #[test]
+    fn profile_doctor_online_never_attempts_live_probe_in_mvp() {
+        let outcome = execute(vec![
+            "profile".to_string(),
+            "doctor".to_string(),
+            "demo".to_string(),
+            "--online".to_string(),
+        ]);
+        assert_eq!(outcome.status.code(), 1);
+        let rendered = match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("\"command_id\":\"profile.doctor\""));
+        assert!(rendered.contains("\"live_probe_requested\":true"));
+        assert!(rendered.contains("\"live_probe_attempted\":false"));
+        assert!(rendered.contains("FRANKEN_SNOWFLAKE_DEMO_OAUTH_BEARER"));
     }
 
     #[test]
