@@ -558,9 +558,28 @@ fn parse_catalog(args: &[String], output: OutputFormat) -> Result<Command, Outco
         },
         Some("graph") => match args.get(2) {
             Some(profile) => {
-                let graph_output = if has_flag(args, "--mermaid") {
+                let wants_mermaid = has_flag(args, "--mermaid");
+                let wants_svg = has_flag(args, "--svg");
+                let raw_output_count =
+                    (if wants_mermaid { 1 } else { 0 }) + (if wants_svg { 1 } else { 0 });
+                if raw_output_count > 1 || (output == OutputFormat::Toon && raw_output_count > 0) {
+                    return Err(usage_error(
+                        output,
+                        "catalog.graph",
+                        "fsnow.catalog.graph.v1",
+                        "Conflicting catalog graph output formats; choose exactly one of --json, --toon, --mermaid, or --svg.",
+                        vec![
+                            "franken-snowflake catalog graph <profile> --json".to_string(),
+                            "franken-snowflake catalog graph <profile> --toon".to_string(),
+                            "franken-snowflake catalog graph <profile> --mermaid".to_string(),
+                            "franken-snowflake catalog graph <profile> --svg".to_string(),
+                        ],
+                        vec![],
+                    ));
+                }
+                let graph_output = if wants_mermaid {
                     GraphOutput::Mermaid
-                } else if has_flag(args, "--svg") {
+                } else if wants_svg {
                     GraphOutput::Svg
                 } else if output == OutputFormat::Toon {
                     GraphOutput::Toon
@@ -3185,6 +3204,38 @@ mod tests {
             Body::Raw { .. } => false,
         };
         assert!(is_toon);
+    }
+
+    #[test]
+    fn catalog_graph_rejects_conflicting_output_formats() {
+        let mermaid_svg = execute(vec![
+            "catalog".to_string(),
+            "graph".to_string(),
+            "demo".to_string(),
+            "--mermaid".to_string(),
+            "--svg".to_string(),
+        ]);
+        assert_eq!(mermaid_svg.status.code(), 64);
+        let rendered = match mermaid_svg.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("Conflicting catalog graph output formats"));
+        assert!(rendered.contains("franken-snowflake catalog graph &lt;profile&gt; --toon")
+            || rendered.contains("franken-snowflake catalog graph <profile> --toon"));
+
+        let toon_mermaid = execute(vec![
+            "catalog".to_string(),
+            "graph".to_string(),
+            "demo".to_string(),
+            "--toon".to_string(),
+            "--mermaid".to_string(),
+        ]);
+        assert_eq!(toon_mermaid.status.code(), 64);
+        match toon_mermaid.body {
+            Body::Envelope { format, .. } => assert_eq!(format, OutputFormat::Toon),
+            Body::Raw { .. } => panic!("conflicting graph output must return an envelope"),
+        }
     }
 
     #[test]
