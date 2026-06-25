@@ -14,10 +14,14 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-# kx6 is pure protocol data + serde + the jsonv2 wire codec: no asupersync, no
-# network. The statement lifecycle / transport beads (ofl, https-ofq) add the
-# runtime later. Reuses core's identifier newtypes and OutcomeKind.
+# kx6 schemas + the jsonv2 wire codec are pure serde. The ofl statement
+# lifecycle adds the async driver (`driver`), which pumps the pure state machine
+# (`lifecycle`) against the Asupersync-native transport and fires the remote
+# cancel endpoint on local cancellation. The pure `lifecycle` machine itself
+# needs none of these — only `driver` does.
 franken-snowflake-core = { path = "../franken-snowflake-core" }
+franken-snowflake-http = { path = "../franken-snowflake-http" }
+asupersync = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
