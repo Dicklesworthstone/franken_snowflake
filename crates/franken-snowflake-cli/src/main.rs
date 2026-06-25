@@ -181,6 +181,133 @@ struct CommandSpec {
     sensitive_output: bool,
 }
 
+struct ErrorSpec {
+    code: &'static str,
+    exit_code: u8,
+    description: &'static str,
+    retryable: bool,
+    policy_boundary: &'static str,
+    safe_next_commands: &'static [&'static str],
+    repair_commands: &'static [&'static str],
+}
+
+const ERROR_SPECS: &[ErrorSpec] = &[
+    ErrorSpec {
+        code: "FSNOW_USAGE",
+        exit_code: 64,
+        description: "The invocation was syntactically invalid or incomplete.",
+        retryable: false,
+        policy_boundary: "cli_parser",
+        safe_next_commands: &["franken-snowflake capabilities --json"],
+        repair_commands: &["franken-snowflake --help"],
+    },
+    ErrorSpec {
+        code: "FSNOW_USAGE_UNKNOWN_COMMAND",
+        exit_code: 64,
+        description: "The top-level command is not recognized.",
+        retryable: false,
+        policy_boundary: "cli_parser",
+        safe_next_commands: &["franken-snowflake capabilities --json"],
+        repair_commands: &["franken-snowflake --help"],
+    },
+    ErrorSpec {
+        code: "FSNOW_USAGE_UNKNOWN_FLAG",
+        exit_code: 64,
+        description: "A flag is not recognized by the draft CLI surface.",
+        retryable: false,
+        policy_boundary: "cli_parser",
+        safe_next_commands: &["franken-snowflake capabilities --json"],
+        repair_commands: &["franken-snowflake --help"],
+    },
+    ErrorSpec {
+        code: "FSNOW_NOT_IMPLEMENTED",
+        exit_code: 2,
+        description: "The command is reserved by the public contract, but its live handler is blocked by lower-level beads.",
+        retryable: true,
+        policy_boundary: "implementation_phase",
+        safe_next_commands: &["franken-snowflake capabilities --json"],
+        repair_commands: &["franken-snowflake doctor --json"],
+    },
+    ErrorSpec {
+        code: "FSNOW_PROFILE_STORE_UNAVAILABLE",
+        exit_code: 3,
+        description: "The profile registry/storage implementation is not linked yet.",
+        retryable: true,
+        policy_boundary: "local_cli_slice",
+        safe_next_commands: &["franken-snowflake capabilities --json"],
+        repair_commands: &["franken-snowflake doctor --json"],
+    },
+    ErrorSpec {
+        code: "FSNOW_PROFILE_DOCTOR_UNAVAILABLE",
+        exit_code: 3,
+        description: "Profile doctor needs the profile registry and optional live transport.",
+        retryable: true,
+        policy_boundary: "local_cli_slice",
+        safe_next_commands: &["franken-snowflake profile validate <profile> --json"],
+        repair_commands: &["franken-snowflake doctor --json"],
+    },
+    ErrorSpec {
+        code: "FSNOW_TUI_FEATURE_DISABLED",
+        exit_code: 2,
+        description: "The optional TUI is not enabled in the default build.",
+        retryable: false,
+        policy_boundary: "feature_gate",
+        safe_next_commands: &["franken-snowflake capabilities --json"],
+        repair_commands: &["franken-snowflake capabilities --json"],
+    },
+    ErrorSpec {
+        code: "FSNOW_MCP_FEATURE_DISABLED",
+        exit_code: 2,
+        description: "The optional MCP server is not enabled in this CLI slice.",
+        retryable: false,
+        policy_boundary: "feature_gate",
+        safe_next_commands: &["franken-snowflake capabilities --json"],
+        repair_commands: &["franken-snowflake capabilities --json"],
+    },
+    ErrorSpec {
+        code: "FSNOW_UNKNOWN_OPERATOR",
+        exit_code: 64,
+        description: "The requested dataset filter operator is not in the draft operator registry.",
+        retryable: false,
+        policy_boundary: "operator_catalog",
+        safe_next_commands: &["franken-snowflake dataset describe-operator between --jsonschema"],
+        repair_commands: &["franken-snowflake dataset describe-operator between --jsonschema"],
+    },
+    ErrorSpec {
+        code: "FSNOW_SQL_MULTIPLE_STATEMENTS_REFUSED",
+        exit_code: 2,
+        description: "Multiple SQL statements are refused by default.",
+        retryable: false,
+        policy_boundary: "sql_safety",
+        safe_next_commands: &[
+            "franken-snowflake query plan --profile <profile> --sql \"select 1\" --json",
+        ],
+        repair_commands: &["franken-snowflake query plan --profile <profile> --sql <sql> --json"],
+    },
+    ErrorSpec {
+        code: "FSNOW_SQL_NON_SELECT_REFUSED",
+        exit_code: 2,
+        description: "Only read-style SQL statements are accepted in the MVP.",
+        retryable: false,
+        policy_boundary: "sql_safety",
+        safe_next_commands: &[
+            "franken-snowflake query plan --profile <profile> --sql \"select 1\" --json",
+        ],
+        repair_commands: &["franken-snowflake query plan --profile <profile> --sql <sql> --json"],
+    },
+    ErrorSpec {
+        code: "FSNOW_SQL_SAFETY_REFUSAL",
+        exit_code: 2,
+        description: "A query run request failed the local read-only safety check.",
+        retryable: false,
+        policy_boundary: "sql_safety",
+        safe_next_commands: &[
+            "franken-snowflake query plan --profile <profile> --sql <sql> --json",
+        ],
+        repair_commands: &["franken-snowflake query plan --profile <profile> --sql <sql> --json"],
+    },
+];
+
 const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         id: "capabilities",
@@ -236,8 +363,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         id: "profile.validate",
         invocation: "franken-snowflake profile validate <profile> --json",
         output_contract_id: "fsnow.profile.validate.v1",
-        description:
-            "Validate profile shape and referenced environment variables without live I/O.",
+        description: "Validate profile shape and referenced environment variables without live I/O.",
         read_only: true,
         provider_network: false,
         mutates_local_state: false,
@@ -255,8 +381,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "catalog.scan",
-        invocation:
-            "franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json",
+        invocation: "franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json",
         output_contract_id: "fsnow.catalog.scan.v1",
         description: "Discover catalog metadata through Information Schema.",
         read_only: true,
@@ -387,6 +512,8 @@ fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
     let (output, args) = extract_output_format(raw_args);
     let args_for_request_id = args.clone();
 
+    validate_known_flags(output, &args)?;
+
     if args.is_empty() {
         return Ok(Invocation {
             args_for_request_id,
@@ -405,20 +532,20 @@ fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
 
     let command = match args[0].as_str() {
         "capabilities" => Command::Capabilities,
-        "robot-docs" => parse_robot_docs(&args)?,
+        "robot-docs" => parse_robot_docs(&args, output)?,
         "agent-handbook" => Command::AgentHandbook,
         "doctor" => Command::Doctor,
         "selftest" => Command::Selftest,
-        "profile" => parse_profile(&args)?,
+        "profile" => parse_profile(&args, output)?,
         "catalog" => parse_catalog(&args, output)?,
-        "dataset" => parse_dataset(&args)?,
-        "query" => parse_query(&args)?,
-        "receipt" => parse_receipt(&args)?,
+        "dataset" => parse_dataset(&args, output)?,
+        "query" => parse_query(&args, output)?,
+        "receipt" => parse_receipt(&args, output)?,
         "export" => Command::ExportPlan,
         "tui" => Command::Tui {
             profile: value_after(&args, "--profile"),
         },
-        "mcp" => parse_mcp(&args)?,
+        "mcp" => parse_mcp(&args, output)?,
         other => {
             let suggestions = did_you_mean(other, &top_level_commands());
             return Err(error_outcome(
@@ -448,11 +575,12 @@ fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
     })
 }
 
-fn parse_robot_docs(args: &[String]) -> Result<Command, Outcome> {
+fn parse_robot_docs(args: &[String], output: OutputFormat) -> Result<Command, Outcome> {
     if args.get(1).map(String::as_str) == Some("guide") {
         Ok(Command::RobotDocsGuide)
     } else {
         Err(usage_error(
+            output,
             "robot-docs.guide",
             "fsnow.robot_docs.guide.v1",
             "Expected `franken-snowflake robot-docs guide`.",
@@ -462,13 +590,14 @@ fn parse_robot_docs(args: &[String]) -> Result<Command, Outcome> {
     }
 }
 
-fn parse_profile(args: &[String]) -> Result<Command, Outcome> {
+fn parse_profile(args: &[String], output: OutputFormat) -> Result<Command, Outcome> {
     match args.get(1).map(String::as_str) {
         Some("validate") => match args.get(2) {
             Some(profile) => Ok(Command::ProfileValidate {
                 profile: profile.clone(),
             }),
             None => Err(usage_error(
+                output,
                 "profile.validate",
                 "fsnow.profile.validate.v1",
                 "Missing profile name for `profile validate`.",
@@ -482,6 +611,7 @@ fn parse_profile(args: &[String]) -> Result<Command, Outcome> {
                 online: has_flag(args, "--online"),
             }),
             None => Err(usage_error(
+                output,
                 "profile.doctor",
                 "fsnow.profile.doctor.v1",
                 "Missing profile name for `profile doctor`.",
@@ -490,6 +620,7 @@ fn parse_profile(args: &[String]) -> Result<Command, Outcome> {
             )),
         },
         Some(other) => Err(usage_error(
+            output,
             "profile",
             "fsnow.profile.v1",
             &format!("Unknown profile subcommand `{other}`."),
@@ -500,6 +631,7 @@ fn parse_profile(args: &[String]) -> Result<Command, Outcome> {
             did_you_mean(other, &["validate", "doctor"]),
         )),
         None => Err(usage_error(
+            output,
             "profile",
             "fsnow.profile.v1",
             "Missing profile subcommand.",
@@ -521,6 +653,7 @@ fn parse_catalog(args: &[String], output: OutputFormat) -> Result<Command, Outco
                 schema: value_after(args, "--schema"),
             }),
             None => Err(usage_error(
+                output,
                 "catalog.scan",
                 "fsnow.catalog.scan.v1",
                 "Missing profile for `catalog scan`.",
@@ -548,6 +681,7 @@ fn parse_catalog(args: &[String], output: OutputFormat) -> Result<Command, Outco
                 })
             }
             None => Err(usage_error(
+                output,
                 "catalog.graph",
                 "fsnow.catalog.graph.v1",
                 "Missing profile for `catalog graph`.",
@@ -556,6 +690,7 @@ fn parse_catalog(args: &[String], output: OutputFormat) -> Result<Command, Outco
             )),
         },
         Some(other) => Err(usage_error(
+            output,
             "catalog",
             "fsnow.catalog.v1",
             &format!("Unknown catalog subcommand `{other}`."),
@@ -567,6 +702,7 @@ fn parse_catalog(args: &[String], output: OutputFormat) -> Result<Command, Outco
             did_you_mean(other, &["scan", "graph"]),
         )),
         None => Err(usage_error(
+            output,
             "catalog",
             "fsnow.catalog.v1",
             "Missing catalog subcommand.",
@@ -580,13 +716,14 @@ fn parse_catalog(args: &[String], output: OutputFormat) -> Result<Command, Outco
     }
 }
 
-fn parse_dataset(args: &[String]) -> Result<Command, Outcome> {
+fn parse_dataset(args: &[String], output: OutputFormat) -> Result<Command, Outcome> {
     match args.get(1).map(String::as_str) {
         Some("inspect") => match args.get(2) {
             Some(dataset_id) => Ok(Command::DatasetInspect {
                 dataset_id: dataset_id.clone(),
             }),
             None => Err(usage_error(
+                output,
                 "dataset.inspect",
                 "fsnow.dataset.inspect.v1",
                 "Missing dataset id for `dataset inspect`.",
@@ -599,6 +736,7 @@ fn parse_dataset(args: &[String]) -> Result<Command, Outcome> {
                 dataset_id: dataset_id.clone(),
             }),
             None => Err(usage_error(
+                output,
                 "dataset.profile",
                 "fsnow.dataset.profile.v1",
                 "Missing dataset id for `dataset profile`.",
@@ -611,6 +749,7 @@ fn parse_dataset(args: &[String]) -> Result<Command, Outcome> {
                 operator: operator.clone(),
             }),
             None => Err(usage_error(
+                output,
                 "dataset.describe_operator",
                 "fsnow.dataset.operator_schema.v1",
                 "Missing operator for `dataset describe-operator`.",
@@ -621,6 +760,7 @@ fn parse_dataset(args: &[String]) -> Result<Command, Outcome> {
             )),
         },
         Some(other) => Err(usage_error(
+            output,
             "dataset",
             "fsnow.dataset.v1",
             &format!("Unknown dataset subcommand `{other}`."),
@@ -632,6 +772,7 @@ fn parse_dataset(args: &[String]) -> Result<Command, Outcome> {
             did_you_mean(other, &["inspect", "profile", "describe-operator"]),
         )),
         None => Err(usage_error(
+            output,
             "dataset",
             "fsnow.dataset.v1",
             "Missing dataset subcommand.",
@@ -645,8 +786,14 @@ fn parse_dataset(args: &[String]) -> Result<Command, Outcome> {
     }
 }
 
-fn parse_query(args: &[String]) -> Result<Command, Outcome> {
+fn parse_query(args: &[String], output: OutputFormat) -> Result<Command, Outcome> {
     match args.get(1).map(String::as_str) {
+        Some(value) if value.starts_with("--") && value_after(args, "--sql").is_some() => {
+            Ok(Command::QueryRun {
+                profile: value_after(args, "--profile"),
+                sql: value_after(args, "--sql"),
+            })
+        }
         Some("plan") => Ok(Command::QueryPlan {
             profile: value_after(args, "--profile"),
             sql: value_after(args, "--sql"),
@@ -660,6 +807,7 @@ fn parse_query(args: &[String]) -> Result<Command, Outcome> {
                 statement_handle: statement_handle.clone(),
             }),
             None => Err(usage_error(
+                output,
                 "query.cancel",
                 "fsnow.query.cancel.v1",
                 "Missing statement handle for `query cancel`.",
@@ -668,6 +816,7 @@ fn parse_query(args: &[String]) -> Result<Command, Outcome> {
             )),
         },
         Some(other) => Err(usage_error(
+            output,
             "query",
             "fsnow.query.v1",
             &format!("Unknown query subcommand `{other}`."),
@@ -679,6 +828,7 @@ fn parse_query(args: &[String]) -> Result<Command, Outcome> {
             did_you_mean(other, &["plan", "run", "cancel"]),
         )),
         None => Err(usage_error(
+            output,
             "query",
             "fsnow.query.v1",
             "Missing query subcommand.",
@@ -692,9 +842,10 @@ fn parse_query(args: &[String]) -> Result<Command, Outcome> {
     }
 }
 
-fn parse_receipt(args: &[String]) -> Result<Command, Outcome> {
+fn parse_receipt(args: &[String], output: OutputFormat) -> Result<Command, Outcome> {
     if args.get(1).map(String::as_str) != Some("show") {
         return Err(usage_error(
+            output,
             "receipt.show",
             "fsnow.receipt.show.v1",
             "Expected `franken-snowflake receipt show <receipt-hash> --json`.",
@@ -711,6 +862,7 @@ fn parse_receipt(args: &[String]) -> Result<Command, Outcome> {
             receipt_hash: receipt_hash.clone(),
         }),
         None => Err(usage_error(
+            output,
             "receipt.show",
             "fsnow.receipt.show.v1",
             "Missing receipt hash for `receipt show`.",
@@ -720,9 +872,10 @@ fn parse_receipt(args: &[String]) -> Result<Command, Outcome> {
     }
 }
 
-fn parse_mcp(args: &[String]) -> Result<Command, Outcome> {
+fn parse_mcp(args: &[String], output: OutputFormat) -> Result<Command, Outcome> {
     if args.get(1).map(String::as_str) != Some("serve") {
         return Err(usage_error(
+            output,
             "mcp.serve",
             "fsnow.mcp.serve.v1",
             "Expected `franken-snowflake mcp serve [--stdio | --http <addr>]`.",
@@ -1142,6 +1295,16 @@ fn error_outcome(
     repair_commands: Vec<String>,
     did_you_mean_values: Vec<String>,
 ) -> Outcome {
+    let safe_next_commands = if safe_next_commands.is_empty() {
+        default_safe_next_commands(error.code)
+    } else {
+        safe_next_commands
+    };
+    let repair_commands = if repair_commands.is_empty() {
+        default_repair_commands(error.code)
+    } else {
+        repair_commands
+    };
     let mut envelope = base_envelope(
         false,
         outcome_kind,
@@ -1161,6 +1324,7 @@ fn error_outcome(
 }
 
 fn usage_error(
+    format: OutputFormat,
     command_id: &'static str,
     output_contract_id: &'static str,
     message: &str,
@@ -1168,7 +1332,7 @@ fn usage_error(
     did_you_mean_values: Vec<String>,
 ) -> Outcome {
     error_outcome(
-        OutputFormat::Json,
+        format,
         command_id,
         output_contract_id,
         ExitStatus::Usage,
@@ -1184,6 +1348,32 @@ fn usage_error(
         repair_commands,
         did_you_mean_values,
     )
+}
+
+fn default_safe_next_commands(code: &str) -> Vec<String> {
+    find_error_spec(code)
+        .map(|spec| {
+            spec.safe_next_commands
+                .iter()
+                .map(|cmd| (*cmd).to_string())
+                .collect()
+        })
+        .unwrap_or_else(|| vec!["franken-snowflake capabilities --json".to_string()])
+}
+
+fn default_repair_commands(code: &str) -> Vec<String> {
+    find_error_spec(code)
+        .map(|spec| {
+            spec.repair_commands
+                .iter()
+                .map(|cmd| (*cmd).to_string())
+                .collect()
+        })
+        .unwrap_or_else(|| vec!["franken-snowflake doctor --json".to_string()])
+}
+
+fn find_error_spec(code: &str) -> Option<&'static ErrorSpec> {
+    ERROR_SPECS.iter().find(|spec| spec.code == code)
 }
 
 impl Envelope {
@@ -1348,6 +1538,7 @@ fn capabilities_data() -> Json {
         ),
         ("commands", Json::Array(command_registry())),
         ("exit_codes", exit_code_json()),
+        ("error_registry", error_registry_json()),
         ("envelope_keys", envelope_key_json()),
         (
             "non_goals",
@@ -1382,14 +1573,7 @@ fn command_spec_json(spec: &CommandSpec) -> Json {
             ]),
         ),
         ("output_contract_id", json_string(spec.output_contract_id)),
-        (
-            "error_families",
-            string_array(vec![
-                "FSNOW_USAGE".to_string(),
-                "FSNOW_NOT_IMPLEMENTED".to_string(),
-                "FSNOW_PROFILE_STORE_UNAVAILABLE".to_string(),
-            ]),
-        ),
+        ("error_families", string_array(error_codes())),
         (
             "examples",
             Json::Array(vec![json_object(vec![(
@@ -1412,24 +1596,34 @@ fn command_spec_json(spec: &CommandSpec) -> Json {
 fn agent_handbook_data() -> Json {
     json_object(vec![
         ("contract_version", json_string(CLI_CONTRACT_VERSION)),
-        ("envelope_schema_version", json_string(ENVELOPE_SCHEMA_VERSION)),
+        (
+            "envelope_schema_version",
+            json_string(ENVELOPE_SCHEMA_VERSION),
+        ),
         ("first_commands", string_array(first_commands())),
         ("exit_codes", exit_code_json()),
         ("envelope_keys", envelope_key_json()),
+        ("error_registry", error_registry_json()),
         (
             "error_recovery",
             json_object(vec![
                 (
                     "FSNOW_USAGE",
-                    json_string("Run `franken-snowflake capabilities --json` and retry with the shown invocation."),
+                    json_string(
+                        "Run `franken-snowflake capabilities --json` and retry with the shown invocation.",
+                    ),
                 ),
                 (
                     "FSNOW_NOT_IMPLEMENTED",
-                    json_string("Use `query plan` or `capabilities`; live handlers land in dependent beads."),
+                    json_string(
+                        "Use `query plan` or `capabilities`; live handlers land in dependent beads.",
+                    ),
                 ),
                 (
                     "FSNOW_PROFILE_STORE_UNAVAILABLE",
-                    json_string("Run `franken-snowflake doctor --json`; profile registry is not linked yet."),
+                    json_string(
+                        "Run `franken-snowflake doctor --json`; profile registry is not linked yet.",
+                    ),
                 ),
             ]),
         ),
@@ -1551,11 +1745,17 @@ fn operator_schema_outcome(format: OutputFormat, request_id: String, operator: S
                 json_object(vec![
                     (
                         "lower",
-                        json_object(vec![("type", json_string(["number", "string"].join("|")))]),
+                        json_object(vec![(
+                            "type",
+                            string_array(vec!["number".to_string(), "string".to_string()]),
+                        )]),
                     ),
                     (
                         "upper",
-                        json_object(vec![("type", json_string(["number", "string"].join("|")))]),
+                        json_object(vec![(
+                            "type",
+                            string_array(vec!["number".to_string(), "string".to_string()]),
+                        )]),
                     ),
                 ]),
             ),
@@ -1620,6 +1820,7 @@ fn query_plan_outcome(
 ) -> Outcome {
     let Some(sql_text) = sql else {
         return usage_error(
+            format,
             "query.plan",
             "fsnow.query.plan.v1",
             "Missing --sql for `query plan`.",
@@ -1697,6 +1898,7 @@ fn query_run_outcome(
 ) -> Outcome {
     let Some(sql_text) = sql else {
         return usage_error(
+            format,
             "query.run",
             "fsnow.query.run.v1",
             "Missing --sql for `query run`.",
@@ -1828,6 +2030,48 @@ fn exit_code_json() -> Json {
     ])
 }
 
+fn error_registry_json() -> Json {
+    Json::Array(
+        ERROR_SPECS
+            .iter()
+            .map(|spec| {
+                json_object(vec![
+                    ("code", json_string(spec.code)),
+                    ("exit_code", Json::Number(i64::from(spec.exit_code))),
+                    ("description", json_string(spec.description)),
+                    ("retryable", Json::Bool(spec.retryable)),
+                    ("policy_boundary", json_string(spec.policy_boundary)),
+                    (
+                        "safe_next_commands",
+                        string_array(
+                            spec.safe_next_commands
+                                .iter()
+                                .map(|cmd| (*cmd).to_string())
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "repair_commands",
+                        string_array(
+                            spec.repair_commands
+                                .iter()
+                                .map(|cmd| (*cmd).to_string())
+                                .collect(),
+                        ),
+                    ),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn error_codes() -> Vec<String> {
+    ERROR_SPECS
+        .iter()
+        .map(|spec| spec.code.to_string())
+        .collect()
+}
+
 fn exit_code_entry(code: i64, meaning: &'static str) -> Json {
     json_object(vec![
         ("code", Json::Number(code)),
@@ -1889,6 +2133,100 @@ fn extract_output_format(raw_args: Vec<String>) -> (OutputFormat, Vec<String>) {
         }
     }
     (output, filtered)
+}
+
+fn validate_known_flags(output: OutputFormat, args: &[String]) -> Result<(), Outcome> {
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+
+        if !arg.starts_with('-') {
+            continue;
+        }
+
+        let flag_name = arg
+            .split_once('=')
+            .map_or(arg.as_str(), |(name, _value)| name);
+        if known_flags().iter().any(|known| known == &flag_name) {
+            if flag_requires_value(flag_name) && !arg.contains('=') {
+                skip_next = true;
+            }
+            continue;
+        }
+
+        return Err(error_outcome(
+            output,
+            "help",
+            "fsnow.help.v1",
+            ExitStatus::Usage,
+            "error",
+            ErrorInfo {
+                code: "FSNOW_USAGE_UNKNOWN_FLAG",
+                message: format!("Unknown flag `{arg}`."),
+                retryable: false,
+                policy_boundary: "cli_parser",
+                evidence: vec![json_string(format!("flag={arg}"))],
+            },
+            vec!["franken-snowflake capabilities --json".to_string()],
+            vec!["franken-snowflake --help".to_string()],
+            did_you_mean(flag_name, &known_flags()),
+        ));
+    }
+
+    Ok(())
+}
+
+fn known_flags() -> Vec<&'static str> {
+    vec![
+        "--as-of",
+        "--confirm",
+        "--database",
+        "--dataset",
+        "--dry-run",
+        "--entity",
+        "--from",
+        "--help",
+        "--http",
+        "--json",
+        "--jsonschema",
+        "--limit",
+        "--mermaid",
+        "--no-color",
+        "--online",
+        "--profile",
+        "--role",
+        "--schema",
+        "--sql",
+        "--stdio",
+        "--svg",
+        "--to",
+        "--toon",
+        "--warehouse",
+        "-h",
+    ]
+}
+
+fn flag_requires_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--as-of"
+            | "--confirm"
+            | "--database"
+            | "--dataset"
+            | "--entity"
+            | "--from"
+            | "--http"
+            | "--limit"
+            | "--profile"
+            | "--role"
+            | "--schema"
+            | "--sql"
+            | "--to"
+            | "--warehouse"
+    )
 }
 
 fn has_any(args: &[String], needles: &[&str]) -> bool {
@@ -2163,6 +2501,8 @@ mod tests {
         assert!(rendered.contains("\"command_id\":\"query.run\""));
         assert!(rendered.contains("\"command_id\":\"mcp.serve\""));
         assert!(rendered.contains("\"alternate_outputs\":[\"toon\"]"));
+        assert!(rendered.contains("\"error_registry\""));
+        assert!(rendered.contains("FSNOW_USAGE_UNKNOWN_FLAG"));
     }
 
     #[test]
@@ -2190,12 +2530,70 @@ mod tests {
         assert!(rendered.contains("ok: true"));
         assert!(rendered.contains("output_contract_id: \"fsnow.agent_handbook.v1\""));
         assert!(rendered.contains("exit_codes:"));
+        assert!(rendered.contains("error_registry:"));
     }
 
     #[test]
     fn did_you_mean_catches_near_miss() {
         let suggestions = did_you_mean("capabilties", &["capabilities", "catalog"]);
         assert_eq!(suggestions, vec!["capabilities".to_string()]);
+    }
+
+    #[test]
+    fn unknown_flag_teaches_json_typo() {
+        let outcome = execute(vec!["capabilities".to_string(), "--jsno".to_string()]);
+        assert_eq!(outcome.status.code(), 64);
+        let rendered = match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("FSNOW_USAGE_UNKNOWN_FLAG"));
+        assert!(rendered.contains("--json"));
+    }
+
+    #[test]
+    fn parse_errors_keep_requested_toon_format() {
+        let outcome = execute(vec![
+            "profile".to_string(),
+            "validate".to_string(),
+            "--toon".to_string(),
+        ]);
+        let is_toon = match outcome.body {
+            Body::Envelope { format, .. } => format == OutputFormat::Toon,
+            Body::Raw { .. } => false,
+        };
+        assert!(is_toon);
+    }
+
+    #[test]
+    fn query_shorthand_maps_to_run_surface() {
+        let outcome = execute(vec![
+            "query".to_string(),
+            "--profile".to_string(),
+            "demo".to_string(),
+            "--sql".to_string(),
+            "select 1".to_string(),
+        ]);
+        let rendered = match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("\"command_id\":\"query.run\""));
+        assert!(rendered.contains("sql_accepted_by_local_safety_check"));
+    }
+
+    #[test]
+    fn operator_schema_uses_json_schema_type_array() {
+        let rendered = render_json(&envelope_for(&["dataset", "describe-operator", "between"]));
+        assert!(rendered.contains("\"type\":[\"number\",\"string\"]"));
+    }
+
+    #[test]
+    fn error_registry_entries_have_default_recovery() {
+        for spec in ERROR_SPECS {
+            assert!(!spec.safe_next_commands.is_empty());
+            assert!(!spec.repair_commands.is_empty());
+        }
     }
 
     #[test]
