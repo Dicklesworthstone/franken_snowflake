@@ -378,7 +378,7 @@ impl CopyIntoPlan {
     fn file_format_clause(&self) -> String {
         match self.options.format {
             ExportFormat::Csv => format!(
-                "TYPE = CSV COMPRESSION = {} FIELD_OPTIONALLY_ENCLOSED_BY = '\\\"' NULL_IF = () EMPTY_FIELD_AS_NULL = FALSE",
+                "TYPE = CSV COMPRESSION = {} FIELD_OPTIONALLY_ENCLOSED_BY = '\"' NULL_IF = () EMPTY_FIELD_AS_NULL = FALSE",
                 self.options.compression.snowflake_sql()
             ),
             ExportFormat::Jsonl => format!(
@@ -1175,10 +1175,10 @@ mod tests {
         };
         assert_eq!(
             String::from_utf8_lossy(&artifact.bytes),
-            "id,name,active,payload\n1,Ada,true,{\"rank\":1}\n2,\"Grace, Hopper\",false,\n3,\"quote \"\"inside\"\"\",true,\"[1,2]\"\n"
+            "id,name,active,payload\n1,Ada,true,\"{\"\"rank\"\":1}\"\n2,\"Grace, Hopper\",false,\n3,\"quote \"\"inside\"\"\",true,\"[1,2]\"\n"
         );
         assert_eq!(artifact.receipt.row_count, Some(3));
-        assert_eq!(artifact.receipt.content_address.byte_len, 104);
+        assert_eq!(artifact.receipt.content_address.byte_len, 108);
         assert!(
             artifact
                 .receipt
