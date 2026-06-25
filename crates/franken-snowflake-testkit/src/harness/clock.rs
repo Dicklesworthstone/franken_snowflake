@@ -79,8 +79,12 @@ impl ManualClock {
 
     /// Advance the clock by `delta`.
     pub fn advance(&self, delta: Duration) {
+        let delta_nanos = saturating_nanos(delta);
         self.nanos
-            .fetch_add(saturating_nanos(delta), Ordering::SeqCst);
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_add(delta_nanos))
+            })
+            .expect("saturating manual clock advance always returns Some");
     }
 
     /// Set the clock to `instant` (since epoch).
@@ -317,6 +321,17 @@ mod tests {
         let deadline = Deadline::at(Duration::from_secs(10));
         assert!(!deadline.is_expired(&clock));
         assert_eq!(deadline.remaining(&clock), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn manual_clock_advance_saturates_instead_of_wrapping() {
+        let clock = ManualClock::at(Duration::from_nanos(u64::MAX - 2));
+        clock.advance(Duration::from_nanos(10));
+        assert_eq!(clock.now(), Duration::from_nanos(u64::MAX));
+
+        let deadline = Deadline::at(Duration::from_nanos(u64::MAX - 1));
+        assert!(deadline.is_expired(&clock));
+        assert_eq!(deadline.remaining(&clock), Duration::ZERO);
     }
 
     #[test]

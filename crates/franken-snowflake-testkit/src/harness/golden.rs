@@ -73,6 +73,13 @@ const DEFAULT_VOLATILE_EXACT: &[&str] = &[
     "uuid",
     "etag",
     "seed",
+    // content hashes that are fixture implementation details. Stable contract
+    // identifiers such as receipt_hash must remain visible to comparison.
+    "content_hash",
+    "payload_hash",
+    "result_hash",
+    "normalized_sql_hash",
+    "schema_hash",
 ];
 
 /// Key suffixes (lower-cased) treated as volatile by [`GoldenConfig::default`].
@@ -93,8 +100,8 @@ const DEFAULT_VOLATILE_SUFFIXES: &[&str] = &[
     // host
     "_host",
     "_hostname",
-    // hash / content address
-    "_hash",
+    // hash / content address. Keep this list narrow: a generic "_hash" suffix
+    // would mask stable contract fields such as receipt_hash.
     "_sha256",
     "_fingerprint",
     "_etag",
@@ -812,6 +819,39 @@ mod tests {
             .ok_or_else(|| "command_id must stay stable".to_owned())?;
         assert_eq!(mismatch.path, "$.command_id");
         Ok(())
+    }
+
+    #[test]
+    fn stable_receipt_hash_is_not_zeroed_by_default() -> Result<(), String> {
+        // receipt_hash is a deterministic receipt content address. The default
+        // golden config must not erase it, or receipt regressions can pass.
+        let cfg = GoldenConfig::default();
+        assert!(!cfg.is_volatile("receipt_hash"));
+        let run = compare(
+            &json!({ "receipt_hash": "sha256:aaa" }),
+            &json!({ "receipt_hash": "sha256:bbb" }),
+            &cfg,
+        );
+        let mismatch = run
+            .err()
+            .ok_or_else(|| "receipt_hash must stay stable".to_owned())?;
+        assert_eq!(mismatch.path, "$.receipt_hash");
+        assert_eq!(mismatch.kind, MismatchKind::Value);
+        Ok(())
+    }
+
+    #[test]
+    fn known_payload_hash_fields_are_zeroed_by_default() {
+        let cfg = GoldenConfig::default();
+        for key in [
+            "content_hash",
+            "payload_hash",
+            "result_hash",
+            "normalized_sql_hash",
+            "schema_hash",
+        ] {
+            assert!(cfg.is_volatile(key), "{key} should be volatile");
+        }
     }
 
     #[test]
