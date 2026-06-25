@@ -456,17 +456,48 @@ pub fn classify_sql_operation(sql: &str) -> SqlOperationClass {
 }
 
 fn first_sql_keyword(sql: &str) -> Option<String> {
-    let without_comments = sql
-        .lines()
-        .map(|line| line.split_once("--").map_or(line, |(before, _)| before))
-        .collect::<Vec<_>>()
-        .join(" ");
-    without_comments
-        .trim_start()
-        .trim_start_matches(';')
-        .split(|ch: char| !ch.is_ascii_alphabetic())
-        .find(|part| !part.is_empty())
-        .map(|part| part.to_ascii_lowercase())
+    let mut index = 0usize;
+    loop {
+        index = skip_sql_ws(sql, index);
+        if sql[index..].starts_with("--") {
+            match sql[index..].find('\n') {
+                Some(line_end) => {
+                    index += line_end + 1;
+                    continue;
+                }
+                None => return None,
+            }
+        }
+        if sql[index..].starts_with("/*") {
+            match sql[index + 2..].find("*/") {
+                Some(block_end) => {
+                    index += block_end + 4;
+                    continue;
+                }
+                None => return None,
+            }
+        }
+        break;
+    }
+
+    let mut keyword = String::new();
+    for ch in sql[index..].chars() {
+        if !ch.is_ascii_alphabetic() {
+            break;
+        }
+        keyword.push(ch.to_ascii_lowercase());
+    }
+    (!keyword.is_empty()).then_some(keyword)
+}
+
+fn skip_sql_ws(sql: &str, mut index: usize) -> usize {
+    while let Some(ch) = sql[index..].chars().next() {
+        if !ch.is_whitespace() {
+            break;
+        }
+        index += ch.len_utf8();
+    }
+    index
 }
 
 fn looks_unconstrained(sql: &str) -> bool {
@@ -557,6 +588,19 @@ mod tests {
         plan.warehouse = Some("SNOWFLAKE_XS".to_string());
         let error = enforce_query_safety(plan, &limits).expect_err("mutation must be refused");
         assert_eq!(error.code, SnowflakeErrorCode::MutationRefused);
+    }
+
+    #[test]
+    fn block_comment_prefixed_mutation_is_refused_by_default() {
+        let limits = QuerySafetyLimits::default();
+        let mut plan = QueryPlanGuard::new("/* release hint */ delete from table_x");
+        plan.warehouse = Some("SNOWFLAKE_XS".to_string());
+        let error = enforce_query_safety(plan, &limits).expect_err("mutation must be refused");
+        assert_eq!(error.code, SnowflakeErrorCode::MutationRefused);
+        assert_eq!(
+            classify_sql_operation("/* read hint */ select * from table_x"),
+            SqlOperationClass::Read
+        );
     }
 
     #[test]
