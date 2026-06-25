@@ -317,11 +317,11 @@ impl CopyIntoPlan {
 
     /// Render deterministic COPY INTO SQL.
     pub fn to_sql(&self) -> ExportResult<String> {
-        validate_copy_location(&self.location)?;
+        let location_sql = copy_location_sql(&self.location)?;
         let source_sql = self.source.to_sql()?;
         let mut sql = format!(
             "COPY INTO {} FROM ({}) FILE_FORMAT = ({})",
-            self.location,
+            location_sql,
             source_sql,
             self.file_format_clause()
         );
@@ -951,27 +951,27 @@ mod local {
 
 #[cfg(feature = "export")]
 pub use local::{
-    AddressingSink, ExportByteSink, ExportColumn, LocalExportArtifact, LocalExportInput,
-    ResultPartition, export_csv, export_jsonl, write_csv_stream, write_jsonl_stream,
+    export_csv, export_jsonl, write_csv_stream, write_jsonl_stream, AddressingSink, ExportByteSink,
+    ExportColumn, LocalExportArtifact, LocalExportInput, ResultPartition,
 };
 
 /// Convenient re-exports for callers.
 pub mod prelude {
     pub use super::{
-        COPY_INTO_PLAN_CONTRACT_ID, ContentAddress, CopyCompression, CopyIntoOptions, CopyIntoPlan,
-        CopySource, EXPORT_LOG_CONTRACT_ID, EXPORT_RECEIPT_CONTRACT_ID, ExportError, ExportFormat,
-        ExportLogEvent, ExportReceipt, ExportReceiptKind, ExportResult, LOCAL_BACKENDS_ENABLED,
-        VERSION,
+        ContentAddress, CopyCompression, CopyIntoOptions, CopyIntoPlan, CopySource, ExportError,
+        ExportFormat, ExportLogEvent, ExportReceipt, ExportReceiptKind, ExportResult,
+        COPY_INTO_PLAN_CONTRACT_ID, EXPORT_LOG_CONTRACT_ID, EXPORT_RECEIPT_CONTRACT_ID,
+        LOCAL_BACKENDS_ENABLED, VERSION,
     };
 
     #[cfg(feature = "export")]
     pub use super::{
-        AddressingSink, ExportByteSink, ExportColumn, LocalExportArtifact, LocalExportInput,
-        ResultPartition, export_csv, export_jsonl, write_csv_stream, write_jsonl_stream,
+        export_csv, export_jsonl, write_csv_stream, write_jsonl_stream, AddressingSink,
+        ExportByteSink, ExportColumn, LocalExportArtifact, LocalExportInput, ResultPartition,
     };
 }
 
-fn validate_copy_location(location: &str) -> ExportResult<()> {
+fn copy_location_sql(location: &str) -> ExportResult<String> {
     let trimmed = location.trim();
     if trimmed.is_empty() || !trimmed.starts_with('@') {
         return Err(ExportError::InvalidCopyLocation {
@@ -985,10 +985,10 @@ fn validate_copy_location(location: &str) -> ExportResult<()> {
             reason: "leading or trailing whitespace is not allowed".to_owned(),
         });
     }
-    if location.chars().any(|ch| ch.is_control() || ch == ';') {
+    if location.len() == 1 {
         return Err(ExportError::InvalidCopyLocation {
             location: location.to_owned(),
-            reason: "control characters and semicolons are refused".to_owned(),
+            reason: "location must name a stage or stage path after @".to_owned(),
         });
     }
     if franken_snowflake_core::redact::contains_secret(location) {
@@ -997,7 +997,26 @@ fn validate_copy_location(location: &str) -> ExportResult<()> {
             reason: "location appears to contain a secret-shaped token".to_owned(),
         });
     }
-    Ok(())
+    if !location.bytes().all(is_copy_location_byte) {
+        return Err(ExportError::InvalidCopyLocation {
+            location: location.to_owned(),
+            reason: "location contains characters outside the safe stage URI allowlist".to_owned(),
+        });
+    }
+    if location.contains("--") {
+        return Err(ExportError::InvalidCopyLocation {
+            location: location.to_owned(),
+            reason: "location must not contain SQL comment markers".to_owned(),
+        });
+    }
+    Ok(location.to_owned())
+}
+
+fn is_copy_location_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'@' | b'~' | b'%' | b'_' | b'/' | b'.' | b'-' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z'
+    )
 }
 
 fn validate_single_statement_sql(sql: &str) -> ExportResult<()> {
@@ -1017,7 +1036,81 @@ fn validate_single_statement_sql(sql: &str) -> ExportResult<()> {
             reason: "source query must begin with SELECT or WITH".to_owned(),
         });
     }
+    validate_wrapped_copy_source_sql(trimmed)?;
     Ok(())
+}
+
+fn validate_wrapped_copy_source_sql(sql: &str) -> ExportResult<()> {
+    let mut paren_depth = 0i32;
+    let mut chars = sql.char_indices().peekable();
+    while let Some((_, ch)) = chars.next() {
+        match ch {
+            '\'' => scan_single_quoted_sql_string(&mut chars)?,
+            '"' => scan_double_quoted_sql_identifier(&mut chars)?,
+            '(' => paren_depth = paren_depth.saturating_add(1),
+            ')' => {
+                paren_depth -= 1;
+                if paren_depth < 0 {
+                    return Err(ExportError::UnsafeCopySource {
+                        reason: "source query closes the COPY INTO wrapper".to_owned(),
+                    });
+                }
+            }
+            '-' if matches!(chars.peek(), Some((_, '-'))) => {
+                return Err(ExportError::UnsafeCopySource {
+                    reason: "source query must not contain SQL comments".to_owned(),
+                });
+            }
+            '/' if matches!(chars.peek(), Some((_, '*'))) => {
+                return Err(ExportError::UnsafeCopySource {
+                    reason: "source query must not contain SQL comments".to_owned(),
+                });
+            }
+            _ => {}
+        }
+    }
+    if paren_depth != 0 {
+        return Err(ExportError::UnsafeCopySource {
+            reason: "source query has unbalanced parentheses".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn scan_single_quoted_sql_string<I>(chars: &mut std::iter::Peekable<I>) -> ExportResult<()>
+where
+    I: Iterator<Item = (usize, char)>,
+{
+    while let Some((_, ch)) = chars.next() {
+        if ch == '\'' {
+            if matches!(chars.peek(), Some((_, '\''))) {
+                chars.next();
+            } else {
+                return Ok(());
+            }
+        }
+    }
+    Err(ExportError::UnsafeCopySource {
+        reason: "source query has an unterminated string literal".to_owned(),
+    })
+}
+
+fn scan_double_quoted_sql_identifier<I>(chars: &mut std::iter::Peekable<I>) -> ExportResult<()>
+where
+    I: Iterator<Item = (usize, char)>,
+{
+    while let Some((_, ch)) = chars.next() {
+        if ch == '"' {
+            if matches!(chars.peek(), Some((_, '"'))) {
+                chars.next();
+            } else {
+                return Ok(());
+            }
+        }
+    }
+    Err(ExportError::UnsafeCopySource {
+        reason: "source query has an unterminated quoted identifier".to_owned(),
+    })
 }
 
 fn starts_with_keyword(input: &str, keyword: &str) -> bool {
@@ -1163,6 +1256,58 @@ mod tests {
     }
 
     #[test]
+    fn copy_into_plan_refuses_injectable_stage_locations() {
+        let source = CopySource::Query {
+            sql: "select id from analytics.people".to_owned(),
+        };
+        for location in [
+            "@evil FROM (SELECT * FROM SENSITIVE) FILE_FORMAT=(TYPE=CSV) --",
+            "@evil/path'quote",
+            "@evil/path;drop",
+            "@evil/path(comment)",
+            "@evil/path--comment",
+        ] {
+            let plan = CopyIntoPlan::new(location, source.clone());
+            assert!(matches!(
+                plan.to_sql(),
+                Err(ExportError::InvalidCopyLocation { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn copy_into_plan_refuses_source_breakout_attempts() {
+        for sql in [
+            "select 1) FILE_FORMAT=(TYPE=CSV) --",
+            "select (1",
+            "select 1 -- hide wrapper",
+            "select 1 /* hide wrapper */",
+        ] {
+            let plan = CopyIntoPlan::new(
+                "@exports/run_001",
+                CopySource::Query {
+                    sql: sql.to_owned(),
+                },
+            );
+            assert!(matches!(
+                plan.to_sql(),
+                Err(ExportError::UnsafeCopySource { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn copy_into_plan_allows_comment_markers_inside_string_literals() {
+        let plan = CopyIntoPlan::new(
+            "@exports/run_001",
+            CopySource::Query {
+                sql: "select '--not-comment', '/*not-comment*/'".to_owned(),
+            },
+        );
+        assert!(plan.to_sql().is_ok());
+    }
+
+    #[test]
     fn local_csv_export_has_golden_bytes_and_receipt() {
         let artifact = export_csv(&fixture_input(), "artifacts/people.csv", 1234);
         assert!(artifact.is_ok());
@@ -1179,13 +1324,11 @@ mod tests {
         );
         assert_eq!(artifact.receipt.row_count, Some(3));
         assert_eq!(artifact.receipt.content_address.byte_len, 108);
-        assert!(
-            artifact
-                .receipt
-                .content_address
-                .verify(&artifact.bytes)
-                .is_ok()
-        );
+        assert!(artifact
+            .receipt
+            .content_address
+            .verify(&artifact.bytes)
+            .is_ok());
         assert!(artifact.log_line.contains("\"record_hash\""));
     }
 
@@ -1205,13 +1348,11 @@ mod tests {
             "{\"id\":1,\"name\":\"Ada\",\"active\":true,\"payload\":{\"rank\":1}}\n{\"id\":2,\"name\":\"Grace, Hopper\",\"active\":false,\"payload\":null}\n{\"id\":3,\"name\":\"quote \\\"inside\\\"\",\"active\":true,\"payload\":[1,2]}\n"
         );
         assert_eq!(artifact.receipt.row_count, Some(3));
-        assert!(
-            artifact
-                .receipt
-                .content_address
-                .verify(&artifact.bytes)
-                .is_ok()
-        );
+        assert!(artifact
+            .receipt
+            .content_address
+            .verify(&artifact.bytes)
+            .is_ok());
     }
 
     #[test]
