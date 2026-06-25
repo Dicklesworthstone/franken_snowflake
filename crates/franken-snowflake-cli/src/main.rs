@@ -2575,71 +2575,37 @@ fn escape_json_string(value: &str) -> String {
 }
 
 fn render_toon(value: &Json) -> String {
-    let mut out = String::new();
-    render_toon_into(value, 0, &mut out);
-    out.trim_end().to_string()
+    toon::encode(
+        toon_json_value(value),
+        Some(toon::EncodeOptions {
+            indent: Some(2),
+            delimiter: None,
+            key_folding: None,
+            flatten_depth: None,
+            replacer: None,
+        }),
+    )
 }
 
-fn render_toon_into(value: &Json, indent: usize, out: &mut String) {
+fn toon_json_value(value: &Json) -> toon::JsonValue {
     match value {
-        Json::Object(entries) => {
-            for (key, item) in entries {
-                push_indent(indent, out);
-                out.push_str(key);
-                match item {
-                    Json::Object(_) | Json::Array(_) => {
-                        out.push_str(":\n");
-                        render_toon_into(item, indent + 2, out);
-                    }
-                    _ => {
-                        out.push_str(": ");
-                        render_toon_scalar(item, out);
-                        out.push('\n');
-                    }
-                }
-            }
+        Json::Null => toon::JsonValue::Primitive(toon::StringOrNumberOrBoolOrNull::Null),
+        Json::Bool(value) => {
+            toon::JsonValue::Primitive(toon::StringOrNumberOrBoolOrNull::Bool(*value))
         }
-        Json::Array(values) => {
-            for item in values {
-                push_indent(indent, out);
-                out.push_str("- ");
-                match item {
-                    Json::Object(_) | Json::Array(_) => {
-                        out.push('\n');
-                        render_toon_into(item, indent + 2, out);
-                    }
-                    _ => {
-                        render_toon_scalar(item, out);
-                        out.push('\n');
-                    }
-                }
-            }
+        Json::Number(value) => {
+            toon::JsonValue::Primitive(toon::StringOrNumberOrBoolOrNull::Number(*value as f64))
         }
-        _ => {
-            push_indent(indent, out);
-            render_toon_scalar(value, out);
-            out.push('\n');
-        }
-    }
-}
-
-fn render_toon_scalar(value: &Json, out: &mut String) {
-    match value {
-        Json::Null => out.push_str("null"),
-        Json::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
-        Json::Number(value) => out.push_str(&value.to_string()),
         Json::String(value) => {
-            out.push('"');
-            out.push_str(&escape_json_string(value));
-            out.push('"');
+            toon::JsonValue::Primitive(toon::StringOrNumberOrBoolOrNull::String(value.clone()))
         }
-        Json::Array(_) | Json::Object(_) => render_toon_into(value, 0, out),
-    }
-}
-
-fn push_indent(indent: usize, out: &mut String) {
-    for _ in 0..indent {
-        out.push(' ');
+        Json::Array(values) => toon::JsonValue::Array(values.iter().map(toon_json_value).collect()),
+        Json::Object(entries) => toon::JsonValue::Object(
+            entries
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), toon_json_value(value)))
+                .collect(),
+        ),
     }
 }
 
@@ -2702,9 +2668,11 @@ mod tests {
         let envelope = envelope_for(&["agent-handbook", "--toon"]);
         let rendered = render_toon(&envelope);
         assert!(rendered.contains("ok: true"));
-        assert!(rendered.contains("output_contract_id: \"fsnow.agent_handbook.v1\""));
-        assert!(rendered.contains("exit_codes:"));
-        assert!(rendered.contains("error_registry:"));
+        assert!(rendered.contains("output_contract_id: fsnow.agent_handbook.v1"));
+        assert!(rendered.contains("schema_version: fsnow.envelope.v1"));
+        assert!(rendered.contains("exit_codes["));
+        assert!(rendered.contains("error_registry["));
+        assert!(!rendered.contains("\"ok\""));
     }
 
     #[test]

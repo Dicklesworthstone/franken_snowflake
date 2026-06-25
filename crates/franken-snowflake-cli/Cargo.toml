@@ -20,3 +20,4 @@ workspace = true
 
 [dependencies]
 franken-snowflake-core = { path = "../franken-snowflake-core" }
+toon = { package = "tru", version = "0.2.3", default-features = false }
