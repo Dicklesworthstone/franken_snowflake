@@ -57,13 +57,19 @@ when requested; tokens and private keys are **always** redacted.
    credential-shaped field (`*_api_key`, `*_password`, `*_private_key`,
    `*_token`, ...) without a hand-rolled redacting `Debug`. Owned by bead
    `fsnow-native-snowflake-connector-w0i.5`.
-2. **One composable redactor, one needle list.** A single redactor sources its
-   needle list from one shared constant so the redactor and the last-mile output
-   scanner **cannot drift**. It uses longest-prefix secret detection over known
-   secret shapes (`eyJ`, `AKIA`, `ghp_`, `sk-`, `xoxb-`, `glpat-`, `AIza`, ...).
-   The canary-secret leak guards (`docs/proof_lanes.md`) plant fake-but-detectable
-   secrets in fixtures and scan all stdout / stderr / receipts / logs / exports;
-   any leak fails the build.
+2. **One composable redactor, one needle list.** The redactor sources its needle
+   list from **one shared constant** — `franken-snowflake-core::redact::SECRET_PREFIXES`
+   — so the redactor and the last-mile output scanner **cannot drift**. It uses
+   token-boundary, longest-prefix detection over known secret shapes (`eyJ`,
+   `AKIA`, `ASIA`, `ghp_`, `gho_`, `github_pat_`, `sk-`, `xoxb-`, `xoxp-`,
+   `glpat-`, `AIza`, ...) via `redact::redact()` / `redact::contains_secret()`,
+   replacing each match with `redact::REDACTION_PLACEHOLDER` (`[REDACTED]`). The
+   canary-secret leak guards (`docs/proof_lanes.md`) **import the same
+   `SECRET_PREFIXES` constant**: the testkit guard plants fake-but-detectable
+   secrets in fixtures and scans all stdout / stderr / receipts / logs / exports,
+   and any leak fails the build. Because the production redactor and the test-time
+   guard read one constant, a newly observed secret shape is added in exactly one
+   place and both sides stay in lock-step.
 
 ## Auth Lanes
 
@@ -138,3 +144,53 @@ allowlist.
 This is public open-source infrastructure. No private downstream product names,
 non-public use cases, or deployment-specific business context appear in any repo
 file, fixture, doc, or Beads comment.
+
+## Stable Error Codes And Exact Next Commands
+
+Every diagnostic carries a stable `error.code` and a default recovery path, so an
+agent always has an exact next command. These are owned by
+`franken-snowflake-core::error`:
+
+- **`SnowflakeErrorCode`** is the closed set of stable `FSNOW-<range><n>` codes:
+  `1xxx` usage, `2xxx` credential/profile, `3xxx` safety refusal, `4xxx` upstream
+  Snowflake, `5xxx` network/retry, `6xxx` async, `7xxx` local cache/metadata,
+  `9xxx` internal. It serializes on the wire as its stable string (e.g.
+  `FSNOW-2001`) and round-trips via `SnowflakeErrorCode::from_stable_code`.
+- **The central registry** (`SnowflakeErrorCode::entry` → `ErrorEntry`) maps each
+  code to its `ExitCode`, `retryable` / `policy_boundary` flags, a one-line
+  summary, and default `safe_next_commands` / `repair_commands`.
+- **`SnowflakeError::new(code, message)`** auto-populates those recovery commands
+  from the registry, so **every error code ships a default recovery path** even
+  when the caller passes none. A registry-completeness unit test asserts that no
+  code is missing a `safe_next_commands` / `repair_commands` entry, and that
+  stable codes are unique and `FSNOW-`prefixed.
+
+For example, a missing profile is `FSNOW-2001` (`ProfileNotFound`, exit code 3,
+non-retryable, not a policy boundary) whose default `safe_next_commands` is
+`franken-snowflake profile validate <profile> --json`. The message itself is
+passed through the redactor before it reaches any output channel, so an error
+that quotes user input can never leak a secret. See `docs/agent_cli_contract.md`
+for the full envelope and exit-code dictionary.
+
+## Core Implementation Map
+
+The security properties above are implemented (and unit-tested) in
+`franken-snowflake-core`:
+
+| Security property | `franken-snowflake-core` symbol |
+|---|---|
+| Single shared secret needle list | `redact::SECRET_PREFIXES` |
+| Composable redactor / detector | `redact::redact`, `redact::contains_secret`, `redact::REDACTION_PLACEHOLDER` |
+| Credential-shaped field detection | `redact::CREDENTIAL_FIELD_SUFFIXES`, `redact::is_credential_field` |
+| Stable error codes + ranges | `error::SnowflakeErrorCode` (`FSNOW-*`) |
+| Default recovery paths | `error::SnowflakeError`, `error::ErrorEntry` |
+| Exit-code dictionary | `exit::ExitCode` |
+| Outcome / provenance contract | `outcome::OutcomeKind`, `outcome::DataSource` |
+
+The compile-time credential `Debug`-leak gate (bead
+`fsnow-native-snowflake-connector-w0i.5`) keys off `redact::CREDENTIAL_FIELD_SUFFIXES`
+(`*_api_key`, `*_password`, `*_private_key`, `*_token`, `*_secret`,
+`*_passphrase`, ...): it fails the build if a `#[derive(Debug)]` struct has a
+field whose name ends with one of those suffixes without a hand-rolled redacting
+`Debug`. This is the type-level half of "no secret values in `Debug`"; the shared
+needle list above is the value-level half.
