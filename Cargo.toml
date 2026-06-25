@@ -16,6 +16,7 @@ resolver = "3"
 members = [
     "crates/franken-snowflake-core",
     "crates/franken-snowflake-auth",
+    "crates/franken-snowflake-http",
     "crates/franken-snowflake-sqlapi",
     "crates/franken-snowflake-testkit",
     "crates/franken-snowflake-cli",

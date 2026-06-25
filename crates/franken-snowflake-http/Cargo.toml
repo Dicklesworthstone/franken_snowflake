@@ -1,0 +1,26 @@
+[package]
+name = "franken-snowflake-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Asupersync-native HTTPS transport API for the franken_snowflake Snowflake SQL API connector."
+publish.workspace = true
+
+[features]
+default = []
+live = []
+testkit = []
+compression = []
+
+[lints]
+workspace = true
+
+[dependencies]
+asupersync = { workspace = true }
+franken-snowflake-core = { path = "../franken-snowflake-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

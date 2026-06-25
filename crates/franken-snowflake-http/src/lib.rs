@@ -1,0 +1,1511 @@
+//! `franken-snowflake-http` -- Asupersync-native HTTPS transport API draft.
+//!
+//! This crate owns the transport boundary for Snowflake SQL API calls:
+//! endpoint validation, TLS/root policy configuration, redacted header
+//! construction, request/response body limits, deterministic retry planning,
+//! attempt-log vocabulary, partition streaming plans, and the live Asupersync
+//! HTTP client seam. It deliberately does not own SQL API schemas, credential
+//! lookup/signing, receipts, CLI envelopes, or local cache state.
+//!
+//! The live transport path is shaped around Asupersync's explicit `&Cx` API and
+//! high-level pooled HTTP/1.1 client. The no-account code in this first slice is
+//! intentionally useful without live Snowflake credentials.
+
+use std::fmt;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use asupersync::http::{Client as AsupersyncHttpClient, Method, StatusCode};
+use asupersync::{CancelKind, Cx};
+use franken_snowflake_core::ids::{RequestId, StatementHandle};
+use serde::{Deserialize, Serialize};
+
+/// Crate version string.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const SQL_API_STATEMENTS_PATH: &str = "/api/v2/statements";
+const HEADER_AUTHORIZATION: &str = "Authorization";
+const HEADER_TOKEN_TYPE: &str = "X-Snowflake-Authorization-Token-Type";
+const HEADER_CONTENT_TYPE: &str = "Content-Type";
+const HEADER_ACCEPT: &str = "Accept";
+const JSON_MEDIA_TYPE: &str = "application/json";
+
+/// Transport APIs preserve the connector's in-process outcome carrier.
+pub type TransportOutcome<T> = franken_snowflake_core::outcome::SnowflakeOutcome<T>;
+
+/// Asupersync capability marker for this crate's effectful transport boundary.
+///
+/// Public APIs accept `&Cx` directly for now because the upstream capability
+/// aliases are still settling, but this marker documents the intended authority:
+/// IO + TIME + SPAWN, never REMOTE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TransportCaps;
+
+/// Asupersync-native Snowflake SQL API HTTP client facade.
+#[derive(Clone)]
+pub struct SnowflakeHttpClient {
+    config: TransportConfig,
+    client: AsupersyncHttpClient,
+}
+
+impl fmt::Debug for SnowflakeHttpClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnowflakeHttpClient")
+            .field("config", &self.config)
+            .field("client", &"<asupersync-http-client>")
+            .finish()
+    }
+}
+
+impl SnowflakeHttpClient {
+    /// Create a client with an explicit Asupersync HTTP client handle.
+    #[must_use]
+    pub fn new(config: TransportConfig, client: AsupersyncHttpClient) -> Self {
+        Self { config, client }
+    }
+
+    /// Create a client from the runtime-owned pooled Asupersync HTTP client.
+    #[must_use]
+    pub fn default_for_runtime(config: TransportConfig, cx: &Cx) -> Self {
+        Self {
+            config,
+            client: AsupersyncHttpClient::default_for_runtime(cx),
+        }
+    }
+
+    /// Access the immutable transport configuration.
+    #[must_use]
+    pub const fn config(&self) -> &TransportConfig {
+        &self.config
+    }
+
+    /// Build a submit request plan without performing network I/O.
+    #[must_use]
+    pub fn submit_plan(&self, request: &SubmitHttpRequest) -> Result<WireRequest, TransportError> {
+        let route = TransportRoute::Submit;
+        self.wire_request(
+            Method::Post,
+            route,
+            request.body.clone(),
+            &request.auth,
+            false,
+        )
+    }
+
+    /// Build a poll request plan without performing network I/O.
+    #[must_use]
+    pub fn poll_plan(&self, request: &PollHttpRequest) -> Result<WireRequest, TransportError> {
+        let route = TransportRoute::Poll {
+            handle: request.statement_handle.clone(),
+        };
+        self.wire_request(Method::Get, route, Vec::new(), &request.auth, false)
+    }
+
+    /// Build a partition request plan without performing network I/O.
+    #[must_use]
+    pub fn partition_plan(
+        &self,
+        request: &PartitionHttpRequest,
+    ) -> Result<WireRequest, TransportError> {
+        let route = TransportRoute::Partition {
+            handle: request.statement_handle.clone(),
+            partition: request.partition,
+        };
+        self.wire_request(Method::Get, route, Vec::new(), &request.auth, false)
+    }
+
+    /// Build a cancel request plan without performing network I/O.
+    #[must_use]
+    pub fn cancel_plan(&self, request: &CancelHttpRequest) -> Result<WireRequest, TransportError> {
+        let route = TransportRoute::Cancel {
+            handle: request.statement_handle.clone(),
+        };
+        self.wire_request(Method::Post, route, Vec::new(), &request.auth, false)
+    }
+
+    /// Draft live submit API. Network execution lands once SQL API schemas,
+    /// auth, and testkit seams are ready.
+    pub async fn submit_statement(
+        &self,
+        cx: &Cx,
+        request: SubmitHttpRequest,
+    ) -> TransportOutcome<SubmitHttpResponse> {
+        self.execute(cx, request, TransportRouteKind::Submit).await
+    }
+
+    /// Draft live poll API.
+    pub async fn poll_statement(
+        &self,
+        cx: &Cx,
+        request: PollHttpRequest,
+    ) -> TransportOutcome<PollHttpResponse> {
+        self.execute(cx, request, TransportRouteKind::Poll).await
+    }
+
+    /// Draft live partition fetch API.
+    pub async fn fetch_partition(
+        &self,
+        cx: &Cx,
+        request: PartitionHttpRequest,
+    ) -> TransportOutcome<PartitionBody> {
+        self.execute(cx, request, TransportRouteKind::Partition)
+            .await
+    }
+
+    /// Draft live cancel API.
+    pub async fn cancel_statement(
+        &self,
+        cx: &Cx,
+        request: CancelHttpRequest,
+    ) -> TransportOutcome<CancelHttpResponse> {
+        self.execute(cx, request, TransportRouteKind::Cancel).await
+    }
+
+    /// Draft partition streaming API. This first slice validates the streaming
+    /// plan and sink contract without starting child fetchers yet.
+    pub async fn stream_partitions<S>(
+        &self,
+        cx: &Cx,
+        request: PartitionStreamRequest,
+        sink: &mut S,
+    ) -> TransportOutcome<PartitionStreamSummary>
+    where
+        S: PartitionSink,
+    {
+        if cx.checkpoint().is_err() {
+            return TransportOutcome::Cancelled(
+                franken_snowflake_core::outcome::CancelReason::Upstream,
+            );
+        }
+        match request.plan() {
+            Ok(summary) => {
+                for partition in request.seed_partitions {
+                    if let Err(error) = sink.accept(cx, partition).await {
+                        return TransportOutcome::Error(error.into_snowflake_error());
+                    }
+                }
+                TransportOutcome::Success(summary)
+            }
+            Err(error) => TransportOutcome::Error(error.into_snowflake_error()),
+        }
+    }
+
+    async fn execute<R, T>(
+        &self,
+        cx: &Cx,
+        request: R,
+        route_kind: TransportRouteKind,
+    ) -> TransportOutcome<T>
+    where
+        R: Into<PlannedTransportRequest>,
+        T: FromResponseBody,
+    {
+        if cx.checkpoint().is_err() {
+            return TransportOutcome::Cancelled(
+                franken_snowflake_core::outcome::CancelReason::Upstream,
+            );
+        }
+        let planned = request.into();
+        let wire = match self.wire_request(
+            route_kind.method(),
+            planned.route,
+            planned.body,
+            &planned.auth,
+            planned.retry_resubmit,
+        ) {
+            Ok(wire) => wire,
+            Err(error) => return TransportOutcome::Error(error.into_snowflake_error()),
+        };
+        let result = self
+            .client
+            .request_builder(route_kind.method(), wire.url)
+            .headers(
+                wire.headers
+                    .iter()
+                    .map(|h| (h.name.as_str(), h.value.as_str())),
+            )
+            .body(wire.body)
+            .send(cx)
+            .await;
+
+        match result {
+            Ok(response) => match T::from_response(response.status.into(), response.body) {
+                Ok(value) => TransportOutcome::Success(value),
+                Err(error) => TransportOutcome::Error(error.into_snowflake_error()),
+            },
+            Err(error) if error.is_cancelled() => {
+                TransportOutcome::Cancelled(franken_snowflake_core::outcome::CancelReason::Upstream)
+            }
+            Err(error) => TransportOutcome::Error(
+                TransportError::new(
+                    TransportErrorCode::NetworkError,
+                    format!("Asupersync HTTP client error: {error}"),
+                )
+                .into_snowflake_error(),
+            ),
+        }
+    }
+
+    fn wire_request(
+        &self,
+        method: Method,
+        route: TransportRoute,
+        body: Vec<u8>,
+        auth: &AuthorizationDescriptor,
+        retry_resubmit: bool,
+    ) -> Result<WireRequest, TransportError> {
+        let route_kind = route.kind();
+        self.config.limits.enforce(route_kind, body.len())?;
+        if matches!(route_kind, TransportRouteKind::Submit)
+            && retry_resubmit
+            && !route.has_retry_contract()
+        {
+            return Err(TransportError::new(
+                TransportErrorCode::NonIdempotentSubmitRetryRefused,
+                "submit retry requires requestId plus retry=true",
+            ));
+        }
+
+        let mut headers = auth.wire_headers()?;
+        headers.push(Header::new(HEADER_ACCEPT, JSON_MEDIA_TYPE)?);
+        if matches!(method, Method::Post) {
+            headers.push(Header::new(HEADER_CONTENT_TYPE, JSON_MEDIA_TYPE)?);
+        }
+        Ok(WireRequest {
+            method,
+            url: self.config.endpoint.route_url(&route),
+            route,
+            headers,
+            body,
+        })
+    }
+}
+
+/// Immutable transport configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransportConfig {
+    /// Canonical Snowflake SQL API endpoint.
+    pub endpoint: SnowflakeEndpoint,
+    /// TLS root policy.
+    pub tls_roots: TlsRootPolicy,
+    /// Connection-pool constraints.
+    pub pool: PoolConfig,
+    /// Body-size limits.
+    pub limits: BodyLimits,
+    /// Retry/backoff behavior.
+    pub retry: RetryPolicy,
+    /// Attempt-log behavior.
+    pub log: AttemptLogPolicy,
+}
+
+impl TransportConfig {
+    /// Create a config with conservative defaults.
+    #[must_use]
+    pub fn new(endpoint: SnowflakeEndpoint) -> Self {
+        Self {
+            endpoint,
+            tls_roots: TlsRootPolicy::NativeRoots,
+            pool: PoolConfig::default(),
+            limits: BodyLimits::default(),
+            retry: RetryPolicy::default(),
+            log: AttemptLogPolicy::default(),
+        }
+    }
+}
+
+/// Validated HTTPS endpoint for a Snowflake account host.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SnowflakeEndpoint {
+    base_url: String,
+    host: String,
+}
+
+impl SnowflakeEndpoint {
+    /// Validate and canonicalize a Snowflake SQL API base endpoint.
+    pub fn parse(raw: impl AsRef<str>) -> Result<Self, TransportError> {
+        let raw = raw.as_ref().trim();
+        if raw.is_empty() {
+            return Err(TransportError::new(
+                TransportErrorCode::InvalidSnowflakeHost,
+                "Snowflake endpoint is empty",
+            ));
+        }
+        let Some(rest) = raw.strip_prefix("https://") else {
+            return Err(TransportError::new(
+                TransportErrorCode::InvalidSnowflakeHost,
+                "Snowflake endpoint must use https://",
+            ));
+        };
+        if rest.contains('@') || raw.contains('#') || raw.contains('?') {
+            return Err(TransportError::new(
+                TransportErrorCode::InvalidSnowflakeHost,
+                "Snowflake endpoint must not contain credentials, fragments, or query strings",
+            ));
+        }
+        let trimmed = rest.trim_end_matches('/');
+        let host = trimmed
+            .split('/')
+            .next()
+            .filter(|candidate| !candidate.is_empty())
+            .ok_or_else(|| {
+                TransportError::new(
+                    TransportErrorCode::InvalidSnowflakeHost,
+                    "Snowflake endpoint host is missing",
+                )
+            })?;
+        validate_host(host)?;
+        let base_url = format!("https://{trimmed}");
+        Ok(Self {
+            base_url,
+            host: host.to_owned(),
+        })
+    }
+
+    /// Canonical base URL without a trailing slash.
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Canonical host portion.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Build an absolute URL for a SQL API route.
+    #[must_use]
+    pub fn route_url(&self, route: &TransportRoute) -> String {
+        format!("{}{}", self.base_url, route.path_and_query())
+    }
+}
+
+fn validate_host(host: &str) -> Result<(), TransportError> {
+    let valid = host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+        && host.contains('.')
+        && !host.starts_with('.')
+        && !host.ends_with('.')
+        && !host.contains("..");
+    if valid {
+        Ok(())
+    } else {
+        Err(TransportError::new(
+            TransportErrorCode::InvalidSnowflakeHost,
+            "Snowflake endpoint host is not canonical",
+        ))
+    }
+}
+
+/// TLS root source for live HTTPS.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TlsRootPolicy {
+    /// Use the OS trust store through Asupersync/rustls native roots.
+    NativeRoots,
+    /// Use a caller-provided PEM bundle.
+    ExplicitPemBundle(PathBuf),
+    /// Test-only marker. Refused unless a testkit path explicitly consumes it.
+    TestOnlyInsecureDisabledByDefault,
+}
+
+/// Connection-pool policy. This mirrors the plan-level contract without exposing
+/// unstable internals from Asupersync's pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PoolConfig {
+    /// Maximum idle connections retained per endpoint.
+    pub max_idle_per_endpoint: usize,
+    /// Maximum in-flight requests per endpoint.
+    pub max_in_flight_per_endpoint: usize,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            max_idle_per_endpoint: 8,
+            max_in_flight_per_endpoint: 16,
+        }
+    }
+}
+
+/// Response/request body limits enforced before decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BodyLimits {
+    /// Maximum submit response bytes.
+    pub max_submit_response_bytes: u64,
+    /// Maximum poll response bytes.
+    pub max_poll_response_bytes: u64,
+    /// Maximum compressed partition bytes.
+    pub max_partition_compressed_bytes: u64,
+    /// Maximum uncompressed partition bytes.
+    pub max_partition_uncompressed_bytes: u64,
+    /// Maximum submit request body bytes.
+    pub max_submit_request_bytes: u64,
+}
+
+impl BodyLimits {
+    /// Enforce request body limits for a route.
+    pub fn enforce(self, route: TransportRouteKind, body_len: usize) -> Result<(), TransportError> {
+        let max = match route {
+            TransportRouteKind::Submit => self.max_submit_request_bytes,
+            TransportRouteKind::Poll
+            | TransportRouteKind::Partition
+            | TransportRouteKind::Cancel => u64::MAX,
+        };
+        if body_len as u64 > max {
+            Err(TransportError::new(
+                TransportErrorCode::BodyLimitExceeded,
+                format!("request body has {body_len} bytes, limit is {max}"),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Enforce partition compressed/uncompressed limits.
+    pub fn enforce_partition_sizes(
+        self,
+        compressed: u64,
+        uncompressed: u64,
+    ) -> Result<(), TransportError> {
+        if compressed > self.max_partition_compressed_bytes {
+            return Err(TransportError::new(
+                TransportErrorCode::BodyLimitExceeded,
+                format!(
+                    "compressed partition has {compressed} bytes, limit is {}",
+                    self.max_partition_compressed_bytes
+                ),
+            ));
+        }
+        if uncompressed > self.max_partition_uncompressed_bytes {
+            return Err(TransportError::new(
+                TransportErrorCode::BodyLimitExceeded,
+                format!(
+                    "uncompressed partition has {uncompressed} bytes, limit is {}",
+                    self.max_partition_uncompressed_bytes
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for BodyLimits {
+    fn default() -> Self {
+        Self {
+            max_submit_response_bytes: 8 * 1024 * 1024,
+            max_poll_response_bytes: 8 * 1024 * 1024,
+            max_partition_compressed_bytes: 64 * 1024 * 1024,
+            max_partition_uncompressed_bytes: 512 * 1024 * 1024,
+            max_submit_request_bytes: 2 * 1024 * 1024,
+        }
+    }
+}
+
+/// Retry/backoff policy for transport calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RetryPolicy {
+    /// Maximum number of attempts including the first try.
+    pub max_attempts: u32,
+    /// Base exponential delay.
+    pub base_delay_ms: u64,
+    /// Maximum delay after exponentiation.
+    pub max_delay_ms: u64,
+    /// Total retry sleep budget.
+    pub total_budget_ms: u64,
+    /// Whether to honor `Retry-After` when present.
+    pub respect_retry_after: bool,
+    /// Whether deterministic jitter is applied.
+    pub deterministic_jitter: bool,
+}
+
+impl RetryPolicy {
+    /// Compute the next retry delay.
+    #[must_use]
+    pub fn delay_for(
+        self,
+        request_id: Option<&RequestId>,
+        route: TransportRouteKind,
+        attempt: u32,
+        retry_after_ms: Option<u64>,
+        spent_ms: u64,
+    ) -> Option<Duration> {
+        if attempt == 0 || attempt >= self.max_attempts || spent_ms >= self.total_budget_ms {
+            return None;
+        }
+        let from_header = retry_after_ms.filter(|_| self.respect_retry_after);
+        let exponential = self
+            .base_delay_ms
+            .saturating_mul(2_u64.saturating_pow(attempt.saturating_sub(1)))
+            .min(self.max_delay_ms);
+        let mut delay = from_header.unwrap_or(exponential);
+        if from_header.is_none() && self.deterministic_jitter {
+            delay = delay.saturating_add(deterministic_jitter_ms(request_id, route, attempt));
+        }
+        let remaining = self.total_budget_ms.saturating_sub(spent_ms);
+        if delay > remaining {
+            None
+        } else {
+            Some(Duration::from_millis(delay))
+        }
+    }
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 4,
+            base_delay_ms: 100,
+            max_delay_ms: 2_000,
+            total_budget_ms: 10_000,
+            respect_retry_after: true,
+            deterministic_jitter: true,
+        }
+    }
+}
+
+fn deterministic_jitter_ms(
+    request_id: Option<&RequestId>,
+    route: TransportRouteKind,
+    attempt: u32,
+) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in request_id
+        .map_or("no-request-id", RequestId::as_str)
+        .bytes()
+        .chain(route.as_str().bytes())
+        .chain(attempt.to_le_bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash % 31
+}
+
+/// Attempt-log controls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AttemptLogPolicy {
+    /// Emit per-attempt events.
+    pub enabled: bool,
+    /// Hash statement handles in logs.
+    pub hash_statement_handles: bool,
+    /// Redact account/host identifiers.
+    pub redact_account_identifiers: bool,
+}
+
+impl Default for AttemptLogPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hash_statement_handles: true,
+            redact_account_identifiers: true,
+        }
+    }
+}
+
+/// Snowflake auth token class for the SQL API token-type header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SnowflakeAuthTokenType {
+    /// Programmatic access token.
+    ProgrammaticAccessToken,
+    /// Key-pair JWT.
+    KeypairJwt,
+    /// OAuth bearer token.
+    OAuth,
+}
+
+impl SnowflakeAuthTokenType {
+    /// Wire value for `X-Snowflake-Authorization-Token-Type`.
+    #[must_use]
+    pub const fn as_header_value(self) -> &'static str {
+        match self {
+            Self::ProgrammaticAccessToken => "PROGRAMMATIC_ACCESS_TOKEN",
+            Self::KeypairJwt => "KEYPAIR_JWT",
+            Self::OAuth => "OAUTH",
+        }
+    }
+}
+
+/// Redacted authorization descriptor supplied by the auth crate.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuthorizationDescriptor {
+    token_type: SnowflakeAuthTokenType,
+    bearer_token: String,
+    redacted_fingerprint: String,
+}
+
+impl AuthorizationDescriptor {
+    /// Create a descriptor from an already-resolved bearer token.
+    ///
+    /// The token is intentionally not exposed through `Debug`, `Display`, or
+    /// serde. The auth crate owns secret-source resolution.
+    #[must_use]
+    pub fn bearer(
+        token_type: SnowflakeAuthTokenType,
+        bearer_token: impl Into<String>,
+        redacted_fingerprint: impl Into<String>,
+    ) -> Self {
+        Self {
+            token_type,
+            bearer_token: bearer_token.into(),
+            redacted_fingerprint: redacted_fingerprint.into(),
+        }
+    }
+
+    /// Redacted fingerprint for logs.
+    #[must_use]
+    pub fn redacted_fingerprint(&self) -> &str {
+        &self.redacted_fingerprint
+    }
+
+    fn wire_headers(&self) -> Result<Vec<Header>, TransportError> {
+        Ok(vec![
+            Header::new(
+                HEADER_AUTHORIZATION,
+                format!("Bearer {}", self.bearer_token),
+            )?,
+            Header::new(HEADER_TOKEN_TYPE, self.token_type.as_header_value())?,
+        ])
+    }
+}
+
+impl fmt::Debug for AuthorizationDescriptor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthorizationDescriptor")
+            .field("token_type", &self.token_type)
+            .field("redacted_fingerprint", &self.redacted_fingerprint)
+            .finish_non_exhaustive()
+    }
+}
+
+/// HTTP header pair.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Header {
+    /// Header name.
+    pub name: String,
+    /// Header value.
+    pub value: String,
+}
+
+impl Header {
+    /// Validate and construct a header.
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Result<Self, TransportError> {
+        let name = name.into();
+        let value = value.into();
+        if !is_header_name(&name) || !is_header_value(&value) {
+            return Err(TransportError::new(
+                TransportErrorCode::HeaderRejected,
+                "header contains invalid characters",
+            ));
+        }
+        Ok(Self { name, value })
+    }
+}
+
+fn is_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-'))
+}
+
+fn is_header_value(value: &str) -> bool {
+    value.bytes().all(|b| matches!(b, b'\t' | b' '..=b'~'))
+}
+
+/// SQL API transport route.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TransportRoute {
+    /// `POST /api/v2/statements`.
+    Submit,
+    /// `POST /api/v2/statements?requestId=...&retry=true`.
+    SubmitRetry {
+        /// Stable idempotency request id.
+        request_id: RequestId,
+    },
+    /// `GET /api/v2/statements/{statementHandle}`.
+    Poll {
+        /// Statement handle.
+        handle: StatementHandle,
+    },
+    /// `GET /api/v2/statements/{statementHandle}?partition=<n>`.
+    Partition {
+        /// Statement handle.
+        handle: StatementHandle,
+        /// Partition number.
+        partition: u32,
+    },
+    /// `POST /api/v2/statements/{statementHandle}/cancel`.
+    Cancel {
+        /// Statement handle.
+        handle: StatementHandle,
+    },
+}
+
+impl TransportRoute {
+    /// Coarse route kind.
+    #[must_use]
+    pub const fn kind(&self) -> TransportRouteKind {
+        match self {
+            Self::Submit | Self::SubmitRetry { .. } => TransportRouteKind::Submit,
+            Self::Poll { .. } => TransportRouteKind::Poll,
+            Self::Partition { .. } => TransportRouteKind::Partition,
+            Self::Cancel { .. } => TransportRouteKind::Cancel,
+        }
+    }
+
+    /// Whether this submit has the Snowflake idempotent resubmit contract.
+    #[must_use]
+    pub const fn has_retry_contract(&self) -> bool {
+        matches!(self, Self::SubmitRetry { .. })
+    }
+
+    /// Path and query for the SQL API route.
+    #[must_use]
+    pub fn path_and_query(&self) -> String {
+        match self {
+            Self::Submit => SQL_API_STATEMENTS_PATH.to_owned(),
+            Self::SubmitRetry { request_id } => {
+                format!(
+                    "{SQL_API_STATEMENTS_PATH}?requestId={}&retry=true",
+                    request_id.as_str()
+                )
+            }
+            Self::Poll { handle } => {
+                format!("{SQL_API_STATEMENTS_PATH}/{}", handle.as_str())
+            }
+            Self::Partition { handle, partition } => {
+                format!(
+                    "{SQL_API_STATEMENTS_PATH}/{}?partition={partition}",
+                    handle.as_str()
+                )
+            }
+            Self::Cancel { handle } => {
+                format!("{SQL_API_STATEMENTS_PATH}/{}/cancel", handle.as_str())
+            }
+        }
+    }
+}
+
+/// Coarse transport route kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportRouteKind {
+    /// Submit statement.
+    Submit,
+    /// Poll statement handle.
+    Poll,
+    /// Fetch result partition.
+    Partition,
+    /// Cancel statement handle.
+    Cancel,
+}
+
+impl TransportRouteKind {
+    /// Stable string for logs and jitter seeds.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Submit => "submit",
+            Self::Poll => "poll",
+            Self::Partition => "partition",
+            Self::Cancel => "cancel",
+        }
+    }
+
+    /// HTTP method for this route kind.
+    #[must_use]
+    pub const fn method(self) -> Method {
+        match self {
+            Self::Submit | Self::Cancel => Method::Post,
+            Self::Poll | Self::Partition => Method::Get,
+        }
+    }
+}
+
+/// Fully planned wire request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WireRequest {
+    /// HTTP method.
+    pub method: Method,
+    /// Absolute URL.
+    pub url: String,
+    /// SQL API route.
+    pub route: TransportRoute,
+    /// Wire headers.
+    pub headers: Vec<Header>,
+    /// Request body bytes.
+    pub body: Vec<u8>,
+}
+
+/// Status classification for Snowflake SQL API responses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusClass {
+    /// 200 completed.
+    Completed,
+    /// 202 accepted/still running.
+    Running,
+    /// 408 server statement timeout.
+    StatementTimeout,
+    /// 422 SQL/query failure.
+    QueryFailure,
+    /// 429 rate limited.
+    RateLimited,
+    /// Retryable 5xx.
+    ServerErrorRetryable,
+    /// Any other unexpected status.
+    Unexpected,
+}
+
+/// Classify Snowflake SQL API status codes without conflating 202 and 429.
+#[must_use]
+pub fn classify_status(status: StatusCode) -> StatusClass {
+    match status.as_u16() {
+        200 => StatusClass::Completed,
+        202 => StatusClass::Running,
+        408 => StatusClass::StatementTimeout,
+        422 => StatusClass::QueryFailure,
+        429 => StatusClass::RateLimited,
+        500..=599 => StatusClass::ServerErrorRetryable,
+        _ => StatusClass::Unexpected,
+    }
+}
+
+/// Attempt-log event target schema.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptLogEvent {
+    /// Schema id.
+    pub schema: &'static str,
+    /// Redacted or generated trace id.
+    pub trace_id: String,
+    /// Route kind.
+    pub route: TransportRouteKind,
+    /// HTTP method.
+    pub method: String,
+    /// 1-based attempt number.
+    pub attempt: u32,
+    /// Redacted request fingerprint.
+    pub request_fingerprint: String,
+    /// Optional hashed statement handle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub statement_handle_hash: Option<String>,
+    /// Optional partition index.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition: Option<u32>,
+    /// HTTP status if a response was received.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// Whether the outcome is retryable.
+    pub retryable: bool,
+    /// Retry-After value in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    /// Elapsed milliseconds.
+    pub elapsed_ms: u64,
+    /// Compressed bytes observed.
+    pub compressed_bytes: u64,
+    /// Uncompressed bytes observed.
+    pub uncompressed_bytes: u64,
+    /// `ok`, `error`, or `cancelled`.
+    pub outcome: AttemptOutcome,
+    /// Stable transport error code if applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<TransportErrorCode>,
+}
+
+impl AttemptLogEvent {
+    /// Schema identifier.
+    pub const SCHEMA: &'static str = "franken_snowflake.transport_attempt.v1";
+}
+
+/// Attempt outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptOutcome {
+    /// Request completed successfully.
+    Ok,
+    /// Request failed with a typed error.
+    Error,
+    /// Request was cancelled.
+    Cancelled,
+}
+
+/// Compression metadata and decoded body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodedPartition {
+    /// Partition index.
+    pub partition: u32,
+    /// Raw decoded bytes.
+    pub body: Vec<u8>,
+    /// Compression metadata.
+    pub compression: CompressionEvidence,
+}
+
+/// Compression metadata captured for evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CompressionEvidence {
+    /// Original content encoding.
+    pub content_encoding: ContentEncoding,
+    /// Compressed bytes observed.
+    pub compressed_bytes: u64,
+    /// Uncompressed bytes observed.
+    pub uncompressed_bytes: u64,
+}
+
+/// Supported content encodings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentEncoding {
+    /// No content encoding header.
+    Identity,
+    /// Gzip-compressed response.
+    Gzip,
+}
+
+impl ContentEncoding {
+    /// Parse a content-encoding header.
+    pub fn parse(raw: Option<&str>) -> Result<Self, TransportError> {
+        match raw.map(str::trim).filter(|value| !value.is_empty()) {
+            None => Ok(Self::Identity),
+            Some(value) if value.eq_ignore_ascii_case("identity") => Ok(Self::Identity),
+            Some(value) if value.eq_ignore_ascii_case("gzip") => Ok(Self::Gzip),
+            Some(_) => Err(TransportError::new(
+                TransportErrorCode::UnsupportedContentEncoding,
+                "unsupported partition content-encoding",
+            )),
+        }
+    }
+}
+
+/// Async partition sink.
+pub trait PartitionSink {
+    /// Accept a decoded partition in order.
+    fn accept(
+        &mut self,
+        cx: &Cx,
+        partition: DecodedPartition,
+    ) -> impl std::future::Future<Output = Result<(), TransportError>>;
+}
+
+/// Partition stream request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartitionStreamRequest {
+    /// Statement handle.
+    pub statement_handle: StatementHandle,
+    /// First partition index to fetch.
+    pub first_partition: u32,
+    /// Exclusive end partition index.
+    pub end_partition_exclusive: u32,
+    /// Maximum concurrent fetches.
+    pub max_concurrent_fetches: usize,
+    /// Seed partitions already decoded, normally inline partition zero.
+    pub seed_partitions: Vec<DecodedPartition>,
+}
+
+impl PartitionStreamRequest {
+    /// Validate and summarize the streaming plan.
+    pub fn plan(&self) -> Result<PartitionStreamSummary, TransportError> {
+        if self.end_partition_exclusive < self.first_partition {
+            return Err(TransportError::new(
+                TransportErrorCode::InvalidPartitionPlan,
+                "partition end must be greater than or equal to start",
+            ));
+        }
+        if self.max_concurrent_fetches == 0 {
+            return Err(TransportError::new(
+                TransportErrorCode::InvalidPartitionPlan,
+                "partition fetch concurrency must be at least one",
+            ));
+        }
+        Ok(PartitionStreamSummary {
+            statement_handle: self.statement_handle.clone(),
+            planned_partitions: self.end_partition_exclusive - self.first_partition,
+            accepted_seed_partitions: self.seed_partitions.len() as u32,
+            max_concurrent_fetches: self.max_concurrent_fetches,
+        })
+    }
+}
+
+/// Partition streaming summary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionStreamSummary {
+    /// Statement handle.
+    pub statement_handle: StatementHandle,
+    /// Number of non-seed partitions planned.
+    pub planned_partitions: u32,
+    /// Number of seed partitions pushed to the sink.
+    pub accepted_seed_partitions: u32,
+    /// Concurrency bound.
+    pub max_concurrent_fetches: usize,
+}
+
+/// Request body wrapper for submit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubmitHttpRequest {
+    /// Submit route.
+    pub route: TransportRoute,
+    /// Authorization.
+    pub auth: AuthorizationDescriptor,
+    /// JSON body bytes owned by the SQL API crate.
+    pub body: Vec<u8>,
+    /// Whether this call is a retry/resubmit attempt.
+    pub retry_resubmit: bool,
+}
+
+/// Submit response body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubmitHttpResponse {
+    /// HTTP status class.
+    pub status: StatusClass,
+    /// Raw response body.
+    pub body: Vec<u8>,
+}
+
+/// Poll request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PollHttpRequest {
+    /// Authorization.
+    pub auth: AuthorizationDescriptor,
+    /// Statement handle.
+    pub statement_handle: StatementHandle,
+}
+
+/// Poll response body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PollHttpResponse {
+    /// HTTP status class.
+    pub status: StatusClass,
+    /// Raw response body.
+    pub body: Vec<u8>,
+}
+
+/// Partition fetch request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartitionHttpRequest {
+    /// Authorization.
+    pub auth: AuthorizationDescriptor,
+    /// Statement handle.
+    pub statement_handle: StatementHandle,
+    /// Partition index.
+    pub partition: u32,
+}
+
+/// Partition response body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartitionBody {
+    /// HTTP status class.
+    pub status: StatusClass,
+    /// Raw response body.
+    pub body: Vec<u8>,
+}
+
+/// Cancel request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CancelHttpRequest {
+    /// Authorization.
+    pub auth: AuthorizationDescriptor,
+    /// Statement handle.
+    pub statement_handle: StatementHandle,
+    /// Cancellation reason kind.
+    pub reason_kind: CancelKind,
+}
+
+/// Cancel response body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CancelHttpResponse {
+    /// HTTP status class.
+    pub status: StatusClass,
+    /// Raw response body.
+    pub body: Vec<u8>,
+}
+
+struct PlannedTransportRequest {
+    route: TransportRoute,
+    auth: AuthorizationDescriptor,
+    body: Vec<u8>,
+    retry_resubmit: bool,
+}
+
+impl From<SubmitHttpRequest> for PlannedTransportRequest {
+    fn from(value: SubmitHttpRequest) -> Self {
+        Self {
+            route: value.route,
+            auth: value.auth,
+            body: value.body,
+            retry_resubmit: value.retry_resubmit,
+        }
+    }
+}
+
+impl From<PollHttpRequest> for PlannedTransportRequest {
+    fn from(value: PollHttpRequest) -> Self {
+        Self {
+            route: TransportRoute::Poll {
+                handle: value.statement_handle,
+            },
+            auth: value.auth,
+            body: Vec::new(),
+            retry_resubmit: false,
+        }
+    }
+}
+
+impl From<PartitionHttpRequest> for PlannedTransportRequest {
+    fn from(value: PartitionHttpRequest) -> Self {
+        Self {
+            route: TransportRoute::Partition {
+                handle: value.statement_handle,
+                partition: value.partition,
+            },
+            auth: value.auth,
+            body: Vec::new(),
+            retry_resubmit: false,
+        }
+    }
+}
+
+impl From<CancelHttpRequest> for PlannedTransportRequest {
+    fn from(value: CancelHttpRequest) -> Self {
+        Self {
+            route: TransportRoute::Cancel {
+                handle: value.statement_handle,
+            },
+            auth: value.auth,
+            body: Vec::new(),
+            retry_resubmit: false,
+        }
+    }
+}
+
+trait FromResponseBody: Sized {
+    fn from_response(status: u16, body: Vec<u8>) -> Result<Self, TransportError>;
+}
+
+impl FromResponseBody for SubmitHttpResponse {
+    fn from_response(status: u16, body: Vec<u8>) -> Result<Self, TransportError> {
+        Ok(Self {
+            status: classify_status(StatusCode(status)),
+            body,
+        })
+    }
+}
+
+impl FromResponseBody for PollHttpResponse {
+    fn from_response(status: u16, body: Vec<u8>) -> Result<Self, TransportError> {
+        Ok(Self {
+            status: classify_status(StatusCode(status)),
+            body,
+        })
+    }
+}
+
+impl FromResponseBody for PartitionBody {
+    fn from_response(status: u16, body: Vec<u8>) -> Result<Self, TransportError> {
+        Ok(Self {
+            status: classify_status(StatusCode(status)),
+            body,
+        })
+    }
+}
+
+impl FromResponseBody for CancelHttpResponse {
+    fn from_response(status: u16, body: Vec<u8>) -> Result<Self, TransportError> {
+        Ok(Self {
+            status: classify_status(StatusCode(status)),
+            body,
+        })
+    }
+}
+
+/// Stable transport error codes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportErrorCode {
+    /// TLS root policy refused.
+    TlsRootPolicyRefused,
+    /// Invalid Snowflake host or endpoint.
+    InvalidSnowflakeHost,
+    /// Body size limit exceeded.
+    BodyLimitExceeded,
+    /// Header failed validation.
+    HeaderRejected,
+    /// Retry budget exhausted.
+    RetryBudgetExhausted,
+    /// Cancelled during TCP connect or TLS handshake.
+    CancelledDuringConnect,
+    /// Remote cancel after submit failed.
+    CancelAfterSubmitFailed,
+    /// Unexpected HTTP status.
+    HttpStatusUnexpected,
+    /// Response decode failed.
+    ResponseDecodeFailed,
+    /// Gzip decode failed.
+    GzipDecodeFailed,
+    /// Unsupported content encoding.
+    UnsupportedContentEncoding,
+    /// Submit retry lacks the requestId + retry=true contract.
+    NonIdempotentSubmitRetryRefused,
+    /// Invalid partition streaming plan.
+    InvalidPartitionPlan,
+    /// Asupersync HTTP/network error.
+    NetworkError,
+}
+
+/// Transport error with a stable code and redacted message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportError {
+    /// Stable transport error code.
+    pub code: TransportErrorCode,
+    /// Redacted message.
+    pub message: String,
+}
+
+impl TransportError {
+    /// Create a transport error.
+    #[must_use]
+    pub fn new(code: TransportErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// Map to the shared connector error registry.
+    #[must_use]
+    pub fn into_snowflake_error(self) -> franken_snowflake_core::error::SnowflakeError {
+        use franken_snowflake_core::error::{SnowflakeError, SnowflakeErrorCode};
+        let code = match self.code {
+            TransportErrorCode::RetryBudgetExhausted => SnowflakeErrorCode::RetryBudgetExhausted,
+            TransportErrorCode::HttpStatusUnexpected | TransportErrorCode::ResponseDecodeFailed => {
+                SnowflakeErrorCode::UpstreamError
+            }
+            TransportErrorCode::NetworkError
+            | TransportErrorCode::TlsRootPolicyRefused
+            | TransportErrorCode::InvalidSnowflakeHost
+            | TransportErrorCode::CancelledDuringConnect
+            | TransportErrorCode::CancelAfterSubmitFailed => SnowflakeErrorCode::NetworkError,
+            TransportErrorCode::BodyLimitExceeded
+            | TransportErrorCode::HeaderRejected
+            | TransportErrorCode::GzipDecodeFailed
+            | TransportErrorCode::UnsupportedContentEncoding
+            | TransportErrorCode::NonIdempotentSubmitRetryRefused
+            | TransportErrorCode::InvalidPartitionPlan => SnowflakeErrorCode::UsageError,
+        };
+        SnowflakeError::new(code, self.message)
+    }
+}
+
+impl fmt::Display for TransportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for TransportError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn endpoint() -> SnowflakeEndpoint {
+        SnowflakeEndpoint::parse("https://xy12345.us-east-1.snowflakecomputing.com")
+            .expect("valid endpoint")
+    }
+
+    fn auth() -> AuthorizationDescriptor {
+        AuthorizationDescriptor::bearer(
+            SnowflakeAuthTokenType::ProgrammaticAccessToken,
+            "secret-token",
+            "sha256:abc123",
+        )
+    }
+
+    #[test]
+    fn endpoint_requires_https_and_rejects_credentials() {
+        assert!(SnowflakeEndpoint::parse("http://xy123.snowflakecomputing.com").is_err());
+        assert!(SnowflakeEndpoint::parse("https://user@xy123.snowflakecomputing.com").is_err());
+        assert!(SnowflakeEndpoint::parse("https://xy123.snowflakecomputing.com?role=x").is_err());
+        let parsed = SnowflakeEndpoint::parse("https://xy123.snowflakecomputing.com/")
+            .expect("valid endpoint");
+        assert_eq!(parsed.base_url(), "https://xy123.snowflakecomputing.com");
+    }
+
+    #[test]
+    fn route_urls_are_canonical() {
+        let request_id = RequestId::new("req-123");
+        let handle = StatementHandle::new("stmt-456");
+        assert_eq!(
+            endpoint().route_url(&TransportRoute::SubmitRetry { request_id }),
+            "https://xy12345.us-east-1.snowflakecomputing.com/api/v2/statements?requestId=req-123&retry=true"
+        );
+        assert_eq!(
+            endpoint().route_url(&TransportRoute::Partition {
+                handle,
+                partition: 7,
+            }),
+            "https://xy12345.us-east-1.snowflakecomputing.com/api/v2/statements/stmt-456?partition=7"
+        );
+    }
+
+    #[test]
+    fn auth_debug_redacts_secret_bearer() {
+        let rendered = format!("{:?}", auth());
+        assert!(rendered.contains("sha256:abc123"));
+        assert!(!rendered.contains("secret-token"));
+    }
+
+    #[test]
+    fn auth_headers_wire_token_type_without_logging_secret() {
+        let headers = auth().wire_headers().expect("headers");
+        assert!(
+            headers
+                .iter()
+                .any(|h| { h.name == HEADER_AUTHORIZATION && h.value == "Bearer secret-token" })
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|h| { h.name == HEADER_TOKEN_TYPE && h.value == "PROGRAMMATIC_ACCESS_TOKEN" })
+        );
+    }
+
+    #[test]
+    fn body_limits_refuse_oversize_submit_request() {
+        let limits = BodyLimits {
+            max_submit_request_bytes: 3,
+            ..BodyLimits::default()
+        };
+        assert!(limits.enforce(TransportRouteKind::Submit, 4).is_err());
+        assert!(limits.enforce(TransportRouteKind::Poll, 4).is_ok());
+    }
+
+    #[test]
+    fn partition_limits_count_both_compressed_and_uncompressed() {
+        let limits = BodyLimits {
+            max_partition_compressed_bytes: 10,
+            max_partition_uncompressed_bytes: 20,
+            ..BodyLimits::default()
+        };
+        assert!(limits.enforce_partition_sizes(10, 20).is_ok());
+        assert!(limits.enforce_partition_sizes(11, 20).is_err());
+        assert!(limits.enforce_partition_sizes(10, 21).is_err());
+    }
+
+    #[test]
+    fn retry_after_wins_before_exponential_jitter() {
+        let policy = RetryPolicy::default();
+        let request_id = RequestId::new("req-123");
+        assert_eq!(
+            policy.delay_for(Some(&request_id), TransportRouteKind::Poll, 1, Some(500), 0),
+            Some(Duration::from_millis(500))
+        );
+        let exponential = policy
+            .delay_for(Some(&request_id), TransportRouteKind::Poll, 2, None, 0)
+            .expect("delay");
+        assert!(exponential >= Duration::from_millis(200));
+        assert!(exponential <= Duration::from_millis(230));
+    }
+
+    #[test]
+    fn retry_budget_stops_before_sleeping_past_total_budget() {
+        let policy = RetryPolicy {
+            total_budget_ms: 50,
+            ..RetryPolicy::default()
+        };
+        assert_eq!(
+            policy.delay_for(None, TransportRouteKind::Poll, 1, Some(100), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn status_classification_keeps_202_and_429_distinct() {
+        assert_eq!(classify_status(StatusCode(200)), StatusClass::Completed);
+        assert_eq!(classify_status(StatusCode(202)), StatusClass::Running);
+        assert_eq!(
+            classify_status(StatusCode(408)),
+            StatusClass::StatementTimeout
+        );
+        assert_eq!(classify_status(StatusCode(422)), StatusClass::QueryFailure);
+        assert_eq!(classify_status(StatusCode(429)), StatusClass::RateLimited);
+        assert_eq!(
+            classify_status(StatusCode(503)),
+            StatusClass::ServerErrorRetryable
+        );
+    }
+
+    #[test]
+    fn content_encoding_fails_closed() {
+        assert_eq!(
+            ContentEncoding::parse(None).expect("identity"),
+            ContentEncoding::Identity
+        );
+        assert_eq!(
+            ContentEncoding::parse(Some("gzip")).expect("gzip"),
+            ContentEncoding::Gzip
+        );
+        assert!(ContentEncoding::parse(Some("br")).is_err());
+    }
+
+    #[test]
+    fn submit_retry_requires_idempotency_contract() {
+        let client = SnowflakeHttpClient::new(
+            TransportConfig::new(endpoint()),
+            AsupersyncHttpClient::new(),
+        );
+        let request = SubmitHttpRequest {
+            route: TransportRoute::Submit,
+            auth: auth(),
+            body: b"{}".to_vec(),
+            retry_resubmit: true,
+        };
+        assert!(client.submit_plan(&request).is_err());
+        let request = SubmitHttpRequest {
+            route: TransportRoute::SubmitRetry {
+                request_id: RequestId::new("req-123"),
+            },
+            auth: auth(),
+            body: b"{}".to_vec(),
+            retry_resubmit: true,
+        };
+        assert!(client.submit_plan(&request).is_ok());
+    }
+
+    #[test]
+    fn wire_plan_adds_json_headers() {
+        let client = SnowflakeHttpClient::new(
+            TransportConfig::new(endpoint()),
+            AsupersyncHttpClient::new(),
+        );
+        let request = SubmitHttpRequest {
+            route: TransportRoute::Submit,
+            auth: auth(),
+            body: b"{}".to_vec(),
+            retry_resubmit: false,
+        };
+        let plan = client.submit_plan(&request).expect("submit plan");
+        assert_eq!(plan.method, Method::Post);
+        assert!(plan.headers.iter().any(|h| h.name == HEADER_ACCEPT));
+        assert!(plan.headers.iter().any(|h| h.name == HEADER_CONTENT_TYPE));
+    }
+
+    #[test]
+    fn partition_stream_plan_validates_concurrency() {
+        let request = PartitionStreamRequest {
+            statement_handle: StatementHandle::new("stmt-1"),
+            first_partition: 1,
+            end_partition_exclusive: 3,
+            max_concurrent_fetches: 2,
+            seed_partitions: Vec::new(),
+        };
+        assert_eq!(request.plan().expect("plan").planned_partitions, 2);
+
+        let invalid = PartitionStreamRequest {
+            max_concurrent_fetches: 0,
+            ..request
+        };
+        assert!(invalid.plan().is_err());
+    }
+}
