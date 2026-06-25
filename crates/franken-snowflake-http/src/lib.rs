@@ -1137,11 +1137,36 @@ fn render_submit_query(query: &[(&'static str, String)]) -> String {
     let mut rendered = String::from(SQL_API_STATEMENTS_PATH);
     for (index, (key, value)) in query.iter().enumerate() {
         rendered.push(if index == 0 { '?' } else { '&' });
-        rendered.push_str(key);
+        rendered.push_str(&percent_encode_query_component(key));
         rendered.push('=');
-        rendered.push_str(value);
+        rendered.push_str(&percent_encode_query_component(value));
     }
     rendered
+}
+
+fn percent_encode_query_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if is_query_unreserved(byte) {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(hex_digit(byte >> 4));
+            encoded.push(hex_digit(byte & 0x0f));
+        }
+    }
+    encoded
+}
+
+const fn is_query_unreserved(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+}
+
+const fn hex_digit(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        _ => (b'A' + (nibble - 10)) as char,
+    }
 }
 
 fn submit_query_has_retry_contract(query: &[(&'static str, String)]) -> bool {
@@ -2086,6 +2111,23 @@ mod tests {
             }),
             "https://xy12345.us-east-1.snowflakecomputing.com/api/v2/statements/stmt-456?partition=7"
         );
+    }
+
+    #[test]
+    fn submit_query_values_are_percent_encoded() {
+        let route = TransportRoute::SubmitWithQuery {
+            query: vec![
+                ("requestId", "req-123&retry=false".to_owned()),
+                ("retry", "true".to_owned()),
+                ("nullable", "false".to_owned()),
+            ],
+        };
+
+        assert_eq!(
+            endpoint().route_url(&route),
+            "https://xy12345.us-east-1.snowflakecomputing.com/api/v2/statements?requestId=req-123%26retry%3Dfalse&retry=true&nullable=false"
+        );
+        assert!(route.has_retry_contract());
     }
 
     #[test]
