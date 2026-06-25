@@ -21,6 +21,7 @@ from typing import Iterable
 
 
 GATE = "dependency-admissibility"
+FSNOW_SKIP_FSQLITE_WINDOWS_PREREQ = "FSNOW_SKIP_FSQLITE_WINDOWS_PREREQ"
 
 FORBIDDEN_PACKAGES = {
     "tokio",
@@ -411,6 +412,15 @@ def scan_lane(lane: Lane) -> list[str]:
     return lane_violations
 
 
+def is_fsqlite_windows_prereq_lane(lane: Lane) -> bool:
+    return (
+        sys.platform.startswith("win")
+        and os.environ.get(FSNOW_SKIP_FSQLITE_WINDOWS_PREREQ) == "1"
+        and lane.package == "franken-snowflake-cache"
+        and any(arg == "frankensqlite" for arg in lane.args)
+    )
+
+
 def run_self_test() -> None:
     synthetic_tree = """
     franken-snowflake-frame v0.0.0 (/repo/crates/franken-snowflake-frame)
@@ -486,14 +496,35 @@ def main() -> int:
     )
 
     failure_count = 0
+    skipped_count = 0
     for lane in lanes:
+        if is_fsqlite_windows_prereq_lane(lane):
+            skipped_count += 1
+            emit(
+                "lane_skipped",
+                package=lane.package,
+                lane=lane.name,
+                scope=lane.scope,
+                reason="upstream fsqlite-vfs/fsqlite-mvcc must gate nix with cfg(unix) before Windows cache-feature scanning",
+            )
+            continue
         failure_count += len(scan_lane(lane))
 
     if failure_count:
-        emit_error("failure", lanes_scanned=len(lanes), violation_count=failure_count)
+        emit_error(
+            "failure",
+            lanes_scanned=len(lanes) - skipped_count,
+            lanes_skipped=skipped_count,
+            violation_count=failure_count,
+        )
         return 1
 
-    emit("success", lanes_scanned=len(lanes), violation_count=0)
+    emit(
+        "success",
+        lanes_scanned=len(lanes) - skipped_count,
+        lanes_skipped=skipped_count,
+        violation_count=0,
+    )
     return 0
 
 

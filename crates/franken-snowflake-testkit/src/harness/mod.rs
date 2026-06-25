@@ -21,6 +21,8 @@
 //!   (`trace_id`/`command_id`/`seq`/timing/outcome, plus expected-vs-actual on
 //!   failure) written to a per-run artifacts directory, with a human-readable
 //!   run summary.
+//! - [`paths`] — portable config/cache/artifacts directory resolution with
+//!   explicit path > environment variable > platform default precedence.
 //! - [`clock`] — the injected/deterministic [`clock::Clock`], a seeded
 //!   [`clock::DeterministicRng`], and a reproducible [`clock::backoff_schedule`]
 //!   for backoff/TTL.
@@ -37,3 +39,4 @@ pub mod canary;
 pub mod clock;
 pub mod golden;
 pub mod logger;
+pub mod paths;

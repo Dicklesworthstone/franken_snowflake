@@ -17,6 +17,7 @@ use franken_snowflake_sqlapi::status::ResponseClass as SqlResponseClass;
 use serde::{Deserialize, Serialize};
 
 use crate::harness::logger::{LogError, RunLogger, RunSummary};
+use crate::harness::paths::{PortableDirKind, resolve_project_dir};
 use crate::mock::http::{MockHttpRequest, MockHttpResponse};
 use crate::mock::scenarios;
 use crate::mock::server::{MockSqlApi, RecordedRequest};
@@ -51,7 +52,7 @@ impl E2eHarnessConfig {
 impl Default for E2eHarnessConfig {
     fn default() -> Self {
         Self {
-            artifacts_root: std::env::temp_dir().join("fsnow-e2e-artifacts"),
+            artifacts_root: resolve_project_dir(PortableDirKind::Artifacts, None),
             trace_id: DEFAULT_E2E_TRACE_ID.to_owned(),
         }
     }

@@ -196,6 +196,34 @@ pub fn canonical_bytes(value: &Value, cfg: &GoldenConfig) -> Vec<u8> {
     to_canonical_json(value, cfg).into_bytes()
 }
 
+/// Normalize platform line endings for logical golden comparison.
+///
+/// Committed fixtures are still required to be LF-only by `.gitattributes` and
+/// `scripts/check-golden-lf.py`. This normalization protects local comparisons
+/// on a checkout that was created with an over-eager CRLF conversion setting.
+#[must_use]
+pub fn normalize_line_endings(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => {
+                normalized.push(b'\n');
+                index += 2;
+            }
+            b'\r' => {
+                normalized.push(b'\n');
+                index += 1;
+            }
+            byte => {
+                normalized.push(byte);
+                index += 1;
+            }
+        }
+    }
+    normalized
+}
+
 /// Recursive canonical writer: sorts object keys itself so the result does not
 /// depend on `serde_json::Map`'s ordering semantics.
 fn write_canonical(value: &Value, out: &mut String) {
@@ -605,8 +633,8 @@ pub fn check_golden_file(
         return write_golden(path, actual, cfg);
     }
     let bytes = std::fs::read(path)?;
-    assert_lf_only(&bytes).map_err(GoldenError::Crlf)?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| GoldenError::Utf8)?;
+    let normalized = normalize_line_endings(&bytes);
+    let text = std::str::from_utf8(&normalized).map_err(|_| GoldenError::Utf8)?;
     let expected: Value = serde_json::from_str(text).map_err(GoldenError::Parse)?;
     compare(&expected, actual, cfg).map_err(GoldenError::Mismatch)
 }
@@ -668,6 +696,27 @@ mod tests {
         assert_eq!(violation.byte_offset, 5);
         assert_eq!(violation.line, 1);
         Ok(())
+    }
+
+    #[test]
+    fn golden_comparison_normalizes_crlf_checkout_bytes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let cfg = GoldenConfig::strict();
+        let dir = std::env::temp_dir().join("fsnow-harness-golden-crlf");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("crlf.golden.json");
+        std::fs::write(&path, b"{\r\n  \"a\": 1\r\n}\r\n")?;
+
+        check_golden_file(&path, &json!({ "a": 1 }), &cfg)?;
+        assert!(assert_lf_only(&std::fs::read(&path)?).is_err());
+
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_line_endings_handles_crlf_and_bare_cr() {
+        assert_eq!(normalize_line_endings(b"a\r\nb\rc\n"), b"a\nb\nc\n");
     }
 
     #[test]

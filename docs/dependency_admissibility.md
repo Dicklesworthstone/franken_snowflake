@@ -36,3 +36,11 @@ scripts/check-dependency-admissibility.py
 The script has a built-in parser self-test that injects the known bad
 `fp-io -> orc-rust -> tokio` path plus a third-party Snowflake package and
 asserts that the gate catches it.
+
+Windows CI has one explicit upstream prerequisite for the non-default cache
+feature: FrankenSQLite must re-gate the Unix-only `nix` dependency in
+`fsqlite-vfs` and `fsqlite-mvcc` from `cfg(not(target_arch = "wasm32"))` to
+`cfg(unix)`, then add its own full-workspace Windows build. Until that lands,
+the CI matrix runs this gate on Windows with only the cache crate's
+`frankensqlite` lane skipped and emits a structured `lane_skipped` event. The
+default cache crate and all other workspace lanes still run on Windows.
