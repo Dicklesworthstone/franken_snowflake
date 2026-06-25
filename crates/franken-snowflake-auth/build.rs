@@ -108,6 +108,88 @@ fn run_controls() -> Result<(), Vec<String>> {
         ]);
     }
 
+    let fail_open_controls = [
+        (
+            "tuple struct derived Debug leaked SecretValue",
+            r#"
+                #[derive(Debug)]
+                pub struct TupleLeakyControl(SecretValue);
+            "#,
+        ),
+        (
+            "prefix impl match leaked missing Debug impl",
+            r#"
+                pub struct PrefixLeakyControl {
+                    api_token: String,
+                }
+
+                pub struct PrefixLeakyControlExtra;
+
+                impl fmt::Debug for PrefixLeakyControlExtra {
+                    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        f.write_str(REDACTED)
+                    }
+                }
+            "#,
+        ),
+        (
+            "generic comma field split hid SecretValue type",
+            r#"
+                #[derive(Debug)]
+                pub struct GenericCommaLeakyControl {
+                    creds: HashMap<UserId, SecretValue>,
+                }
+            "#,
+        ),
+        (
+            "destructure Debug impl leaked secret binding",
+            r#"
+                pub struct DestructureLeakyControl {
+                    api_token: String,
+                    display_name: String,
+                }
+
+                impl fmt::Debug for DestructureLeakyControl {
+                    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        let Self { api_token, .. } = self;
+                        f.debug_struct("DestructureLeakyControl")
+                            .field("display_name", &REDACTED)
+                            .field("api_token", &format_args!("{api_token}"))
+                            .finish()
+                    }
+                }
+            "#,
+        ),
+        (
+            "multi-line derive Debug leaked token field",
+            r#"
+                #[derive(
+                    Clone,
+                    Debug,
+                )]
+                pub struct MultilineDeriveLeakyControl {
+                    api_token: String,
+                }
+            "#,
+        ),
+        (
+            "cfg_attr derive Debug leaked token field",
+            r#"
+                #[cfg_attr(feature = "leak", derive(Debug))]
+                pub struct CfgAttrDeriveLeakyControl {
+                    api_token: String,
+                }
+            "#,
+        ),
+    ];
+    for (name, source) in fail_open_controls {
+        if scan_source(source).is_ok() {
+            return Err(vec![format!(
+                "negative control unexpectedly passed: {name}"
+            )]);
+        }
+    }
+
     Ok(())
 }
 
@@ -216,38 +298,81 @@ fn structs(source: &str) -> Vec<StructItem> {
             continue;
         }
         let name = source[name_start..cursor].to_string();
-        let next_open = source[cursor..].find('{').map(|offset| cursor + offset);
-        let next_semicolon = source[cursor..].find(';').map(|offset| cursor + offset);
-        let semicolon_before_open = match (next_semicolon, next_open) {
-            (Some(semicolon), Some(open)) => semicolon < open,
-            (Some(_), None) => true,
-            _ => false,
-        };
-        if semicolon_before_open {
-            index = cursor.saturating_add(1);
-            continue;
+        match next_struct_body(source, cursor) {
+            Some(StructBody::Named { open, close }) => {
+                let body = &source[open + 1..close];
+                items.push(StructItem {
+                    name,
+                    derives_debug,
+                    fields: parse_named_fields(body),
+                });
+                index = close.saturating_add(1);
+            }
+            Some(StructBody::Tuple { open, close }) => {
+                let body = &source[open + 1..close];
+                items.push(StructItem {
+                    name,
+                    derives_debug,
+                    fields: parse_tuple_fields(body),
+                });
+                index = close.saturating_add(1);
+            }
+            Some(StructBody::Unit { semicolon }) => {
+                index = semicolon.saturating_add(1);
+            }
+            None => {
+                index = cursor.saturating_add(1);
+            }
         }
-        let Some(open) = next_open else {
-            index = cursor;
-            continue;
-        };
-        let Some(close) = matching_brace(source, open) else {
-            index = open.saturating_add(1);
-            continue;
-        };
-        let body = &source[open + 1..close];
-        items.push(StructItem {
-            name,
-            derives_debug,
-            fields: parse_fields(body),
-        });
-        index = close.saturating_add(1);
     }
     items
 }
 
-fn parse_fields(body: &str) -> Vec<FieldItem> {
-    body.split(',')
+enum StructBody {
+    Named { open: usize, close: usize },
+    Tuple { open: usize, close: usize },
+    Unit { semicolon: usize },
+}
+
+fn next_struct_body(source: &str, from: usize) -> Option<StructBody> {
+    let bytes = source.as_bytes();
+    let mut cursor = from;
+    let mut angle_depth = 0usize;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'<' => {
+                angle_depth = angle_depth.saturating_add(1);
+                cursor = cursor.saturating_add(1);
+            }
+            b'>' => {
+                angle_depth = angle_depth.saturating_sub(1);
+                cursor = cursor.saturating_add(1);
+            }
+            b'{' if angle_depth == 0 => {
+                let close = matching_delimiter(source, cursor, b'{', b'}')?;
+                return Some(StructBody::Named {
+                    open: cursor,
+                    close,
+                });
+            }
+            b'(' if angle_depth == 0 => {
+                let close = matching_delimiter(source, cursor, b'(', b')')?;
+                return Some(StructBody::Tuple {
+                    open: cursor,
+                    close,
+                });
+            }
+            b';' if angle_depth == 0 => {
+                return Some(StructBody::Unit { semicolon: cursor });
+            }
+            _ => cursor = cursor.saturating_add(1),
+        }
+    }
+    None
+}
+
+fn parse_named_fields(body: &str) -> Vec<FieldItem> {
+    split_top_level_commas(body)
         .filter_map(|raw| {
             let line = raw
                 .lines()
@@ -275,6 +400,67 @@ fn parse_fields(body: &str) -> Vec<FieldItem> {
         .collect()
 }
 
+fn parse_tuple_fields(body: &str) -> Vec<FieldItem> {
+    split_top_level_commas(body)
+        .enumerate()
+        .filter_map(|(index, raw)| {
+            let ty = raw
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim();
+                    !trimmed.starts_with("#[") && !trimmed.starts_with("///")
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let normalized = ty
+                .trim()
+                .trim_start_matches("pub ")
+                .trim_start_matches("pub(crate) ")
+                .trim();
+            if normalized.is_empty() {
+                return None;
+            }
+            Some(FieldItem {
+                name: index.to_string(),
+                ty: normalized.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn split_top_level_commas(input: &str) -> impl Iterator<Item = &str> {
+    let mut spans = Vec::new();
+    let bytes = input.as_bytes();
+    let mut start = 0usize;
+    let mut cursor = 0usize;
+    let mut angle = 0usize;
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'<' => angle = angle.saturating_add(1),
+            b'>' => angle = angle.saturating_sub(1),
+            b'(' => paren = paren.saturating_add(1),
+            b')' => paren = paren.saturating_sub(1),
+            b'[' => bracket = bracket.saturating_add(1),
+            b']' => bracket = bracket.saturating_sub(1),
+            b'{' => brace = brace.saturating_add(1),
+            b'}' => brace = brace.saturating_sub(1),
+            b',' if angle == 0 && paren == 0 && bracket == 0 && brace == 0 => {
+                spans.push((start, cursor));
+                start = cursor.saturating_add(1);
+            }
+            _ => {}
+        }
+        cursor = cursor.saturating_add(1);
+    }
+    spans.push((start, input.len()));
+    spans
+        .into_iter()
+        .map(move |(start, end)| &input[start..end])
+}
+
 fn is_secret_field(struct_name: &str, field: &FieldItem) -> bool {
     let field_name = field.name.to_ascii_lowercase();
     let ty = field.ty.to_ascii_lowercase();
@@ -299,22 +485,62 @@ fn is_secret_field(struct_name: &str, field: &FieldItem) -> bool {
 }
 
 fn preceding_attrs_derive_debug(source: &str, struct_index: usize) -> bool {
-    let prefix = &source[..struct_index];
+    let mut cursor = source[..struct_index].trim_end().len();
     let mut attrs = Vec::new();
-    for line in prefix.lines().rev() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("///") || trimmed.starts_with("//") {
-            continue;
-        }
-        if trimmed.starts_with("#[") {
-            attrs.push(trimmed);
-            continue;
-        }
-        break;
+
+    while cursor > 0 && source.as_bytes().get(cursor.saturating_sub(1)) == Some(&b']') {
+        let Some(start) = matching_attr_start(source, cursor - 1) else {
+            break;
+        };
+        attrs.push(&source[start..cursor]);
+        cursor = source[..start].trim_end().len();
     }
-    attrs
-        .iter()
-        .any(|attr| attr.starts_with("#[derive") && attr.contains("Debug"))
+
+    if attrs.is_empty() {
+        for line in source[..struct_index].lines().rev() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("///") || trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.starts_with("#[") {
+                attrs.push(trimmed);
+                continue;
+            }
+            break;
+        }
+    }
+
+    attrs.iter().any(|attr| attr_derives_debug(attr))
+}
+
+fn attr_derives_debug(attr: &str) -> bool {
+    attr.contains("derive") && attr.contains("Debug")
+}
+
+fn matching_attr_start(source: &str, close: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut depth = 0usize;
+    let mut cursor = close;
+    loop {
+        match bytes[cursor] {
+            b']' => depth = depth.saturating_add(1),
+            b'[' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    let hash = cursor.checked_sub(1)?;
+                    if bytes.get(hash) == Some(&b'#') {
+                        return Some(hash);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if cursor == 0 {
+            break;
+        }
+        cursor = cursor.saturating_sub(1);
+    }
+    None
 }
 
 fn impl_body<'a>(source: &'a str, trait_name: &str, type_name: &str) -> Option<&'a str> {
@@ -325,7 +551,22 @@ fn impl_body<'a>(source: &'a str, trait_name: &str, type_name: &str) -> Option<&
     ];
     let (start, pattern_len) = candidates
         .iter()
-        .filter_map(|pattern| source.find(pattern).map(|start| (start, pattern.len())))
+        .filter_map(|pattern| {
+            let mut search_from = 0usize;
+            while let Some(offset) = source[search_from..].find(pattern) {
+                let start = search_from + offset;
+                let after = start + pattern.len();
+                let boundary_ok = source
+                    .as_bytes()
+                    .get(after)
+                    .map_or(true, |byte| !is_ident_byte(*byte));
+                if boundary_ok {
+                    return Some((start, pattern.len()));
+                }
+                search_from = after;
+            }
+            None
+        })
         .min_by_key(|(start, _)| *start)?;
     let after_pattern = start + pattern_len;
     let open = source[after_pattern..].find('{')? + after_pattern;
@@ -334,6 +575,15 @@ fn impl_body<'a>(source: &'a str, trait_name: &str, type_name: &str) -> Option<&
 }
 
 fn debug_impl_references_field(body: &str, field: &str) -> bool {
+    if debug_impl_references_self_field(body, field) {
+        return true;
+    }
+    destructured_bindings(body, field)
+        .into_iter()
+        .any(|(binding, from)| binding_referenced_after(body, &binding, from))
+}
+
+fn debug_impl_references_self_field(body: &str, field: &str) -> bool {
     let direct = format!("self.{field}");
     let mut search_from = 0usize;
     while let Some(offset) = body[search_from..].find(&direct) {
@@ -343,6 +593,126 @@ fn debug_impl_references_field(body: &str, field: &str) -> bool {
             return true;
         }
         search_from = index + direct.len();
+    }
+    false
+}
+
+fn destructured_bindings(body: &str, field: &str) -> Vec<(String, usize)> {
+    let mut bindings = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(offset) = body[search_from..].find("let Self") {
+        let start = search_from + offset;
+        let mut cursor = start + "let Self".len();
+        skip_ws(body.as_bytes(), &mut cursor);
+        match body.as_bytes().get(cursor) {
+            Some(b'{') => {
+                let Some(close) = matching_delimiter(body, cursor, b'{', b'}') else {
+                    search_from = cursor.saturating_add(1);
+                    continue;
+                };
+                let Some(statement_end) = body[close..].find(';').map(|end| close + end + 1) else {
+                    search_from = close.saturating_add(1);
+                    continue;
+                };
+                if !body[close..statement_end].contains("= self") {
+                    search_from = statement_end;
+                    continue;
+                }
+                let pattern = &body[cursor + 1..close];
+                for part in split_top_level_commas(pattern) {
+                    if let Some(binding) = named_destructure_binding(part, field) {
+                        bindings.push((binding, statement_end));
+                    }
+                }
+                search_from = statement_end;
+            }
+            Some(b'(') => {
+                let Some(close) = matching_delimiter(body, cursor, b'(', b')') else {
+                    search_from = cursor.saturating_add(1);
+                    continue;
+                };
+                let Some(statement_end) = body[close..].find(';').map(|end| close + end + 1) else {
+                    search_from = close.saturating_add(1);
+                    continue;
+                };
+                if !body[close..statement_end].contains("= self") {
+                    search_from = statement_end;
+                    continue;
+                }
+                if let Ok(position) = field.parse::<usize>() {
+                    if let Some(raw) =
+                        split_top_level_commas(&body[cursor + 1..close]).nth(position)
+                    {
+                        if let Some(binding) = normalize_binding(raw) {
+                            bindings.push((binding, statement_end));
+                        }
+                    }
+                }
+                search_from = statement_end;
+            }
+            _ => {
+                search_from = cursor.saturating_add(1);
+            }
+        }
+    }
+    bindings
+}
+
+fn named_destructure_binding(part: &str, field: &str) -> Option<String> {
+    let normalized = part.trim();
+    if normalized == ".." {
+        return None;
+    }
+    if normalized == field {
+        return Some(field.to_string());
+    }
+    let (name, binding) = normalized.split_once(':')?;
+    if name.trim() != field {
+        return None;
+    }
+    normalize_binding(binding)
+}
+
+fn normalize_binding(raw: &str) -> Option<String> {
+    let mut value = raw
+        .trim()
+        .trim_start_matches("ref ")
+        .trim_start_matches("mut ")
+        .trim();
+    if value.starts_with('&') {
+        value = value
+            .trim_start_matches('&')
+            .trim_start_matches("mut ")
+            .trim();
+    }
+    if value.is_empty()
+        || value == "_"
+        || value.starts_with('_')
+        || !value.bytes().all(is_ident_byte)
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn binding_referenced_after(body: &str, binding: &str, from: usize) -> bool {
+    let suffix = &body[from..];
+    if suffix.contains(&format!("{{{binding}}}")) {
+        return true;
+    }
+    let mut search_from = 0usize;
+    while let Some(offset) = suffix[search_from..].find(binding) {
+        let index = search_from + offset;
+        let before = index
+            .checked_sub(1)
+            .and_then(|idx| suffix.as_bytes().get(idx));
+        let after = suffix.as_bytes().get(index + binding.len());
+        let before_ok = before.map_or(true, |byte| !is_ident_byte(*byte));
+        let after_ok = after.map_or(true, |byte| !is_ident_byte(*byte));
+        if before_ok && after_ok {
+            return true;
+        }
+        search_from = index + binding.len();
     }
     false
 }
@@ -370,13 +740,20 @@ fn find_word(source: &str, word: &str, from: usize) -> Option<usize> {
 }
 
 fn matching_brace(source: &str, open: usize) -> Option<usize> {
+    matching_delimiter(source, open, b'{', b'}')
+}
+
+fn matching_delimiter(source: &str, open: usize, open_byte: u8, close_byte: u8) -> Option<usize> {
     let bytes = source.as_bytes();
+    if bytes.get(open) != Some(&open_byte) {
+        return None;
+    }
     let mut depth = 0usize;
     let mut index = open;
     while index < bytes.len() {
         match bytes[index] {
-            b'{' => depth = depth.saturating_add(1),
-            b'}' => {
+            byte if byte == open_byte => depth = depth.saturating_add(1),
+            byte if byte == close_byte => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
                     return Some(index);
