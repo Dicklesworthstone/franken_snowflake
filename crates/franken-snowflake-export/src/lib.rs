@@ -951,23 +951,23 @@ mod local {
 
 #[cfg(feature = "export")]
 pub use local::{
-    AddressingSink, ExportByteSink, ExportColumn, LocalExportArtifact, LocalExportInput,
-    ResultPartition, export_csv, export_jsonl, write_csv_stream, write_jsonl_stream,
+    export_csv, export_jsonl, write_csv_stream, write_jsonl_stream, AddressingSink, ExportByteSink,
+    ExportColumn, LocalExportArtifact, LocalExportInput, ResultPartition,
 };
 
 /// Convenient re-exports for callers.
 pub mod prelude {
     pub use super::{
-        COPY_INTO_PLAN_CONTRACT_ID, ContentAddress, CopyCompression, CopyIntoOptions, CopyIntoPlan,
-        CopySource, EXPORT_LOG_CONTRACT_ID, EXPORT_RECEIPT_CONTRACT_ID, ExportError, ExportFormat,
-        ExportLogEvent, ExportReceipt, ExportReceiptKind, ExportResult, LOCAL_BACKENDS_ENABLED,
-        VERSION,
+        ContentAddress, CopyCompression, CopyIntoOptions, CopyIntoPlan, CopySource, ExportError,
+        ExportFormat, ExportLogEvent, ExportReceipt, ExportReceiptKind, ExportResult,
+        COPY_INTO_PLAN_CONTRACT_ID, EXPORT_LOG_CONTRACT_ID, EXPORT_RECEIPT_CONTRACT_ID,
+        LOCAL_BACKENDS_ENABLED, VERSION,
     };
 
     #[cfg(feature = "export")]
     pub use super::{
-        AddressingSink, ExportByteSink, ExportColumn, LocalExportArtifact, LocalExportInput,
-        ResultPartition, export_csv, export_jsonl, write_csv_stream, write_jsonl_stream,
+        export_csv, export_jsonl, write_csv_stream, write_jsonl_stream, AddressingSink,
+        ExportByteSink, ExportColumn, LocalExportArtifact, LocalExportInput, ResultPartition,
     };
 }
 
@@ -1082,6 +1082,12 @@ where
     I: Iterator<Item = (usize, char)>,
 {
     while let Some((_, ch)) = chars.next() {
+        if ch == '\\' {
+            if chars.next().is_none() {
+                break;
+            }
+            continue;
+        }
         if ch == '\'' {
             if matches!(chars.peek(), Some((_, '\''))) {
                 chars.next();
@@ -1133,26 +1139,44 @@ fn validate_result_scan_query_id(query_id: &str) -> ExportResult<()> {
             reason: "RESULT_SCAN query id is empty".to_owned(),
         });
     }
-    if query_id
-        .chars()
-        .any(|ch| ch.is_control() || matches!(ch, ';' | '\'' | '"'))
-    {
+    if query_id.trim() != query_id {
         return Err(ExportError::UnsafeCopySource {
-            reason: "RESULT_SCAN query id contains unsafe characters".to_owned(),
+            reason: "RESULT_SCAN query id must not contain leading or trailing whitespace"
+                .to_owned(),
+        });
+    }
+    if franken_snowflake_core::redact::contains_secret(query_id) {
+        return Err(ExportError::UnsafeCopySource {
+            reason: "RESULT_SCAN query id appears to contain a secret-shaped token".to_owned(),
+        });
+    }
+    if !query_id.bytes().all(is_result_scan_query_id_byte) {
+        return Err(ExportError::UnsafeCopySource {
+            reason: "RESULT_SCAN query id contains characters outside the safe allowlist"
+                .to_owned(),
         });
     }
     Ok(())
+}
+
+fn is_result_scan_query_id_byte(byte: u8) -> bool {
+    matches!(byte, b'-' | b'_' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
 }
 
 fn sql_string_literal(input: &str) -> String {
     let mut out = String::with_capacity(input.len() + 2);
     out.push('\'');
     for ch in input.chars() {
-        if ch == '\'' {
-            out.push('\'');
-            out.push('\'');
-        } else {
-            out.push(ch);
+        match ch {
+            '\'' => {
+                out.push('\'');
+                out.push('\'');
+            }
+            '\\' => {
+                out.push('\\');
+                out.push('\\');
+            }
+            _ => out.push(ch),
         }
     }
     out.push('\'');
@@ -1282,11 +1306,75 @@ mod tests {
             "select (1",
             "select 1 -- hide wrapper",
             "select 1 /* hide wrapper */",
+            "select 'safe\\'s fine') FILE_FORMAT=(TYPE=CSV)",
         ] {
             let plan = CopyIntoPlan::new(
                 "@exports/run_001",
                 CopySource::Query {
                     sql: sql.to_owned(),
+                },
+            );
+            assert!(matches!(
+                plan.to_sql(),
+                Err(ExportError::UnsafeCopySource { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn copy_into_plan_handles_snowflake_backslash_escaped_source_literals() {
+        // Snowflake string literal escapes checked 2026-06-25:
+        // https://docs.snowflake.com/en/sql-reference/data-types-text
+        let plan = CopyIntoPlan::new(
+            "@exports/run_001",
+            CopySource::Query {
+                sql: "select 'it\\'s fine', 'path\\\\file'".to_owned(),
+            },
+        );
+
+        assert!(plan.to_sql().is_ok());
+    }
+
+    #[test]
+    fn copy_into_plan_keeps_backslash_escaped_breakout_inside_source_literal() {
+        let plan = CopyIntoPlan::new(
+            "@exports/run_001",
+            CopySource::Query {
+                sql: "select 'safe\\') FILE_FORMAT=(TYPE=CSV) --'".to_owned(),
+            },
+        );
+
+        assert!(plan.to_sql().is_ok());
+    }
+
+    #[test]
+    fn copy_into_plan_refuses_trailing_backslash_source_literal() {
+        let plan = CopyIntoPlan::new(
+            "@exports/run_001",
+            CopySource::Query {
+                sql: "select 'unterminated\\".to_owned(),
+            },
+        );
+
+        assert!(matches!(
+            plan.to_sql(),
+            Err(ExportError::UnsafeCopySource { .. })
+        ));
+    }
+
+    #[test]
+    fn copy_into_result_scan_refuses_source_id_injection_attempts() {
+        for query_id in [
+            "01bad) FILE_FORMAT=(TYPE=CSV)--",
+            " 01bcaafe-0000 ",
+            "01bcaafe.0000",
+            "sfpat_resultScanCredential001",
+            "01bcaafe\\",
+        ] {
+            let plan = CopyIntoPlan::new(
+                "@exports/run_001",
+                CopySource::ResultScan {
+                    query_id: query_id.to_owned(),
                 },
             );
             assert!(matches!(
@@ -1324,13 +1412,11 @@ mod tests {
         );
         assert_eq!(artifact.receipt.row_count, Some(3));
         assert_eq!(artifact.receipt.content_address.byte_len, 108);
-        assert!(
-            artifact
-                .receipt
-                .content_address
-                .verify(&artifact.bytes)
-                .is_ok()
-        );
+        assert!(artifact
+            .receipt
+            .content_address
+            .verify(&artifact.bytes)
+            .is_ok());
         assert!(artifact.log_line.contains("\"record_hash\""));
     }
 
@@ -1350,13 +1436,11 @@ mod tests {
             "{\"id\":1,\"name\":\"Ada\",\"active\":true,\"payload\":{\"rank\":1}}\n{\"id\":2,\"name\":\"Grace, Hopper\",\"active\":false,\"payload\":null}\n{\"id\":3,\"name\":\"quote \\\"inside\\\"\",\"active\":true,\"payload\":[1,2]}\n"
         );
         assert_eq!(artifact.receipt.row_count, Some(3));
-        assert!(
-            artifact
-                .receipt
-                .content_address
-                .verify(&artifact.bytes)
-                .is_ok()
-        );
+        assert!(artifact
+            .receipt
+            .content_address
+            .verify(&artifact.bytes)
+            .is_ok());
     }
 
     #[test]
