@@ -6,14 +6,19 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
-  CARGO_TARGET_DIR: /tmp/franken-snowflake-target
 
 jobs:
   toolchain-and-dependency-gates:
     name: toolchain and dependency gates
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: /tmp/franken-snowflake-target
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,3 +40,40 @@ jobs:
 
       - name: Assert dependency admissibility
         run: scripts/check-dependency-admissibility.py
+
+  cross-platform-check:
+    name: cross-platform cargo check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/franken-snowflake-target
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show pinned toolchain
+        run: |
+          rustup show
+          rustc --version --verbose
+          cargo --version --verbose
+
+      - name: Cargo check
+        run: cargo check --workspace --locked
+
+      - name: Assert dependency admissibility
+        run: python scripts/check-dependency-admissibility.py
+
+      # w0i.14 CRLF discipline: goldens stay LF-normalized via .gitattributes,
+      # and tests compare golden fixtures as raw bytes so Windows cannot hide
+      # newline drift behind text-mode normalization.
+      - name: CRLF-safe golden handling note
+        shell: bash
+        run: |
+          printf '%s\n' 'golden fixtures must be LF-only and byte-compared'
