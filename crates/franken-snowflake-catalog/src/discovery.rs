@@ -13,7 +13,7 @@ use franken_snowflake_cache::{
     VerifiedPayload,
 };
 use franken_snowflake_sqlapi::lifecycle::CompletedStatement;
-use franken_snowflake_sqlapi::request::SubmitStatementRequest;
+use franken_snowflake_sqlapi::request::{Binding, SubmitStatementRequest};
 use franken_snowflake_sqlapi::response::ColumnType;
 use serde::{Deserialize, Serialize};
 
@@ -155,16 +155,27 @@ pub fn build_information_schema_requests(
 
 fn discovery_sql(
     kind: DiscoveryStatementKind,
-    statement: String,
+    built: BuiltStatement,
     input: &CatalogDiscoveryInput,
 ) -> CatalogDiscoverySql {
-    let mut request = SubmitStatementRequest::new(statement);
+    let mut request = SubmitStatementRequest::new(built.sql);
     request.timeout = Some(60);
     request.database = input
         .database
         .as_ref()
         .map(|database| database.as_str().into());
     request.schema = input.schema.as_ref().map(|schema| schema.as_str().into());
+    // Filter values are bound as positional typed parameters, never interpolated
+    // into the SQL text (quote-doubling alone is not a sound defense: Snowflake
+    // string literals also honor backslash escapes, so a value such as `x\'` can
+    // break out of a doubled-quote literal). Mirrors the planner's `push_binding`.
+    if !built.binding_values.is_empty() {
+        let mut bindings = BTreeMap::new();
+        for (index, value) in built.binding_values.into_iter().enumerate() {
+            bindings.insert((index + 1).to_string(), Binding::new("TEXT", value));
+        }
+        request.bindings = Some(bindings);
+    }
     CatalogDiscoverySql { kind, request }
 }
 
@@ -330,81 +341,83 @@ fn row_from_values(columns: &[ColumnType], values: &[Option<String>]) -> Informa
     InformationSchemaRow { fields }
 }
 
-fn databases_sql(input: &CatalogDiscoveryInput) -> String {
-    let mut sql = "SELECT DATABASE_NAME, COMMENT FROM INFORMATION_SCHEMA.DATABASES".to_owned();
-    let mut clauses = Vec::new();
-    if let Some(database) = &input.database {
-        clauses.push(format!("DATABASE_NAME = '{}'", escape_literal(database)));
-    }
-    append_where_order(&mut sql, &clauses, "DATABASE_NAME");
-    sql
+/// A discovery statement plus its ordered positional binding values. The `?`
+/// placeholders in `sql` are bound 1-based in `binding_values` order.
+struct BuiltStatement {
+    sql: String,
+    binding_values: Vec<String>,
 }
 
-fn schemas_sql(input: &CatalogDiscoveryInput) -> String {
-    let mut sql =
-        "SELECT CATALOG_NAME, SCHEMA_NAME, COMMENT FROM INFORMATION_SCHEMA.SCHEMATA".to_owned();
-    let mut clauses = Vec::new();
-    if let Some(database) = &input.database {
-        clauses.push(format!("CATALOG_NAME = '{}'", escape_literal(database)));
-    }
-    if let Some(schema) = &input.schema {
-        clauses.push(format!("SCHEMA_NAME = '{}'", escape_literal(schema)));
-    }
-    append_where_order(&mut sql, &clauses, "CATALOG_NAME, SCHEMA_NAME");
-    sql
+fn databases_sql(input: &CatalogDiscoveryInput) -> BuiltStatement {
+    build_statement(
+        "SELECT DATABASE_NAME, COMMENT FROM INFORMATION_SCHEMA.DATABASES",
+        &[("DATABASE_NAME", input.database.as_deref())],
+        "DATABASE_NAME",
+    )
 }
 
-fn tables_sql(input: &CatalogDiscoveryInput) -> String {
-    let mut sql = "SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, COMMENT FROM INFORMATION_SCHEMA.TABLES".to_owned();
-    let mut clauses = Vec::new();
-    if let Some(database) = &input.database {
-        clauses.push(format!("TABLE_CATALOG = '{}'", escape_literal(database)));
-    }
-    if let Some(schema) = &input.schema {
-        clauses.push(format!("TABLE_SCHEMA = '{}'", escape_literal(schema)));
-    }
-    if let Some(object) = &input.object {
-        clauses.push(format!("TABLE_NAME = '{}'", escape_literal(object)));
-    }
-    append_where_order(
-        &mut sql,
-        &clauses,
+fn schemas_sql(input: &CatalogDiscoveryInput) -> BuiltStatement {
+    build_statement(
+        "SELECT CATALOG_NAME, SCHEMA_NAME, COMMENT FROM INFORMATION_SCHEMA.SCHEMATA",
+        &[
+            ("CATALOG_NAME", input.database.as_deref()),
+            ("SCHEMA_NAME", input.schema.as_deref()),
+        ],
+        "CATALOG_NAME, SCHEMA_NAME",
+    )
+}
+
+fn tables_sql(input: &CatalogDiscoveryInput) -> BuiltStatement {
+    build_statement(
+        "SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, COMMENT FROM INFORMATION_SCHEMA.TABLES",
+        &[
+            ("TABLE_CATALOG", input.database.as_deref()),
+            ("TABLE_SCHEMA", input.schema.as_deref()),
+            ("TABLE_NAME", input.object.as_deref()),
+        ],
         "TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME",
-    );
-    sql
+    )
 }
 
-fn columns_sql(input: &CatalogDiscoveryInput) -> String {
-    let mut sql = "SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE, COMMENT FROM INFORMATION_SCHEMA.COLUMNS".to_owned();
-    let mut clauses = Vec::new();
-    if let Some(database) = &input.database {
-        clauses.push(format!("TABLE_CATALOG = '{}'", escape_literal(database)));
-    }
-    if let Some(schema) = &input.schema {
-        clauses.push(format!("TABLE_SCHEMA = '{}'", escape_literal(schema)));
-    }
-    if let Some(object) = &input.object {
-        clauses.push(format!("TABLE_NAME = '{}'", escape_literal(object)));
-    }
-    append_where_order(
-        &mut sql,
-        &clauses,
+fn columns_sql(input: &CatalogDiscoveryInput) -> BuiltStatement {
+    build_statement(
+        "SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE, COMMENT FROM INFORMATION_SCHEMA.COLUMNS",
+        &[
+            ("TABLE_CATALOG", input.database.as_deref()),
+            ("TABLE_SCHEMA", input.schema.as_deref()),
+            ("TABLE_NAME", input.object.as_deref()),
+        ],
         "TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION",
-    );
-    sql
+    )
 }
 
-fn append_where_order(sql: &mut String, clauses: &[String], order_by: &str) {
+/// Build a deterministic `SELECT ... [WHERE col = ? AND ...] ORDER BY ...`
+/// statement using positional `?` placeholders for every present filter value,
+/// never string interpolation. `filters` preserves placeholder order.
+fn build_statement(
+    select_from: &str,
+    filters: &[(&str, Option<&str>)],
+    order_by: &str,
+) -> BuiltStatement {
+    let mut sql = select_from.to_owned();
+    let mut clauses = Vec::new();
+    let mut binding_values = Vec::new();
+    for (column, value) in filters {
+        if let Some(value) = value {
+            clauses.push(format!("{column} = ?"));
+            binding_values.push((*value).to_owned());
+        }
+    }
     if !clauses.is_empty() {
         sql.push_str(" WHERE ");
         sql.push_str(&clauses.join(" AND "));
     }
     sql.push_str(" ORDER BY ");
     sql.push_str(order_by);
-}
-
-fn escape_literal(value: &str) -> String {
-    value.replace('\'', "''")
+    BuiltStatement {
+        sql,
+        binding_values,
+    }
 }
 
 fn in_scope(input: &CatalogDiscoveryInput, database: &str, schema: &str, object: &str) -> bool {
@@ -654,7 +667,7 @@ mod tests {
     #[test]
     fn discovery_requests_are_scoped_and_stable() {
         let mut input = fixture_input();
-        input.object = Some("EVENTS'Q".to_owned());
+        input.object = Some("EVENTS\\' OR 1=1 --".to_owned());
 
         let requests = build_information_schema_requests(&input);
 
@@ -680,12 +693,28 @@ mod tests {
                 .map(|value| value.as_str()),
             Some("PUBLIC")
         );
-        assert!(requests[3]
-            .request
-            .statement
-            .contains("TABLE_NAME = 'EVENTS''Q'"));
-        assert!(requests[3]
-            .request
+        // The filter value is a positional binding, never interpolated into SQL.
+        let columns = &requests[3].request;
+        assert!(columns.statement.contains("TABLE_NAME = ?"));
+        assert!(!columns.statement.contains("EVENTS"));
+        assert!(!columns.statement.contains("OR 1=1"));
+        assert!(!columns.statement.contains('\''));
+        let bindings = columns
+            .bindings
+            .as_ref()
+            .expect("columns scan has bound filters");
+        // database, schema, object bind 1-based in placeholder order.
+        assert_eq!(bindings.get("1").map(|b| b.value.as_str()), Some("DB"));
+        assert_eq!(bindings.get("2").map(|b| b.value.as_str()), Some("PUBLIC"));
+        assert_eq!(
+            bindings.get("3").map(|b| b.value.as_str()),
+            Some("EVENTS\\' OR 1=1 --")
+        );
+        assert_eq!(
+            bindings.get("3").map(|b| b.value_type.as_str()),
+            Some("TEXT")
+        );
+        assert!(columns
             .statement
             .ends_with("ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"));
     }
