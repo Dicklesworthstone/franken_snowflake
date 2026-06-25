@@ -1,0 +1,38 @@
+# Dependency Admissibility Gate
+
+`scripts/check-dependency-admissibility.py` is the CI gate for
+`fsnow-native-snowflake-connector-w0i.7`.
+
+It runs `cargo metadata --locked`, discovers workspace packages, then runs
+`cargo tree --locked` for each package across these lanes:
+
+- default production graph
+- `--no-default-features` production graph
+- each production feature
+- all production features combined
+- each dev/test feature as a separate lane
+
+Every lane emits a structured JSON verdict. The gate fails if any lane, including
+a dev/test feature lane, resolves Tokio, reqwest, hyper, axum, tower, sqlx,
+diesel, sea-orm, `fp-io`, `orc-rust`, or a third-party Snowflake driver. The
+`fp-io` / `orc-rust` negative assertion is global, so future frame and export
+crates are covered as soon as they enter the workspace.
+
+To extend the harness for a new dependency:
+
+1. Add the dependency normally in the owning bead.
+2. If it is a FrankenSuite candidate, add its package names to
+   `CANDIDATE_GROUPS` in `scripts/check-dependency-admissibility.py`.
+3. If it introduces a new feature flag, classify that feature in
+   `PRODUCTION_FEATURES` or `DEV_FEATURES`. Unknown features are treated as
+   production by default.
+4. Run the script under the required target dir:
+
+```bash
+export CARGO_TARGET_DIR=/data/tmp/fsnow_targets/pane10
+scripts/check-dependency-admissibility.py
+```
+
+The script has a built-in parser self-test that injects the known bad
+`fp-io -> orc-rust -> tokio` path plus a third-party Snowflake package and
+asserts that the gate catches it.

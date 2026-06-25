@@ -32,3 +32,6 @@ jobs:
 
       - name: Assert single Asupersync version
         run: scripts/check-asupersync-single-version.sh
+
+      - name: Assert dependency admissibility
+        run: scripts/check-dependency-admissibility.py
