@@ -292,15 +292,27 @@ impl ContentAddress {
                 actual,
             });
         }
-        if self.algorithm == "blake3" {
-            let actual_hash = blake3_hex(payload);
-            if self.digest_hex != actual_hash {
-                return Err(CacheError::HashMismatch {
-                    entity,
-                    expected: self.digest_hex.clone(),
-                    actual: actual_hash,
-                });
-            }
+        if self.algorithm != "blake3" {
+            // Fail closed: an unrecognized algorithm label must not bypass digest
+            // verification. Previously the digest check was gated on
+            // `algorithm == "blake3"`, so any other label (corruption, tampering,
+            // or a future algorithm) silently passed after only the length check,
+            // defeating content-address integrity on every insert path.
+            return Err(CacheError::InvalidRow {
+                field: entity,
+                message: format!(
+                    "unsupported content-address algorithm {:?}; only blake3 is verifiable",
+                    self.algorithm
+                ),
+            });
+        }
+        let actual_hash = blake3_hex(payload);
+        if self.digest_hex != actual_hash {
+            return Err(CacheError::HashMismatch {
+                entity,
+                expected: self.digest_hex.clone(),
+                actual: actual_hash,
+            });
         }
         Ok(())
     }
@@ -1772,6 +1784,39 @@ mod tests {
             SECRET_PREFIXES,
             franken_snowflake_core::redact::SECRET_PREFIXES
         );
+    }
+
+    #[test]
+    fn content_address_verify_rejects_unsupported_algorithm() {
+        let payload: &[u8] = b"franken-snowflake-cache-content";
+        let blake3 = ContentAddress::blake3(payload);
+
+        // The canonical blake3 address still verifies.
+        assert!(blake3.verify("unit", payload).is_ok());
+
+        // A non-blake3 algorithm must fail closed instead of skipping the digest
+        // check. Regression: verification previously returned Ok for any label
+        // other than "blake3", silently bypassing content-address integrity.
+        let foreign = ContentAddress {
+            algorithm: "sha256".to_owned(),
+            digest_hex: blake3.digest_hex.clone(),
+            byte_len: blake3.byte_len,
+        };
+        assert!(matches!(
+            foreign.verify("unit", payload),
+            Err(CacheError::InvalidRow { field: "unit", .. })
+        ));
+
+        // A genuine blake3 digest mismatch still surfaces as HashMismatch.
+        let tampered = ContentAddress {
+            algorithm: "blake3".to_owned(),
+            digest_hex: "00".to_owned(),
+            byte_len: blake3.byte_len,
+        };
+        assert!(matches!(
+            tampered.verify("unit", payload),
+            Err(CacheError::HashMismatch { .. })
+        ));
     }
 
     #[test]
