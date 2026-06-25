@@ -5,6 +5,10 @@
 //! `fastapi_rust` handler) and the codec lane ([`MockHttpResponse::to_wire`]
 //! over a `VirtualTcpStream`). No `asupersync`, no sockets.
 
+use std::fmt;
+
+use franken_snowflake_core::redact::redact;
+
 /// The HTTP method, as the mock distinguishes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Method {
@@ -61,7 +65,7 @@ impl ResponseClass {
 }
 
 /// A request the mock receives.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MockHttpRequest {
     /// HTTP method.
     pub method: Method,
@@ -71,6 +75,17 @@ pub struct MockHttpRequest {
     pub headers: Vec<(String, String)>,
     /// Request body bytes (empty for a `GET`).
     pub body: Vec<u8>,
+}
+
+impl fmt::Debug for MockHttpRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MockHttpRequest")
+            .field("method", &self.method)
+            .field("path", &redact(&self.path))
+            .field("headers", &redacted_headers(&self.headers))
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 impl MockHttpRequest {
@@ -126,7 +141,7 @@ impl MockHttpRequest {
 }
 
 /// A response the mock returns.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MockHttpResponse {
     /// HTTP status code.
     pub status: u16,
@@ -135,6 +150,16 @@ pub struct MockHttpResponse {
     pub headers: Vec<(String, String)>,
     /// Response body bytes (already gzip-compressed when `Content-Encoding: gzip`).
     pub body: Vec<u8>,
+}
+
+impl fmt::Debug for MockHttpResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MockHttpResponse")
+            .field("status", &self.status)
+            .field("headers", &redacted_headers(&self.headers))
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 impl MockHttpResponse {
@@ -211,6 +236,13 @@ impl MockHttpResponse {
     }
 }
 
+fn redacted_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(name, value)| (name.clone(), redact(value).into_owned()))
+        .collect()
+}
+
 fn extend(buffer: &mut Vec<u8>, text: &str) {
     buffer.extend_from_slice(text.as_bytes());
 }
@@ -276,6 +308,29 @@ mod tests {
         assert_eq!(request.header("authorization"), Some("Bearer tok"));
         assert_eq!(request.authorization(), Some("Bearer tok"));
         assert_eq!(request.header("missing"), None);
+    }
+
+    #[test]
+    fn mock_http_debug_redacts_paths_headers_and_body_bytes() {
+        let request = MockHttpRequest::post(
+            "/api/v2/statements?requestId=sfpat_mock_path_secret_123",
+            b"sfpat_mock_body_secret_123".to_vec(),
+        )
+        .with_bearer("ghp_mock_header_secret_123");
+        let response = MockHttpResponse::json(200, b"sfpat_mock_response_secret_123".to_vec())
+            .with_header("X-Token", "ghp_mock_response_header_secret_123");
+        let decimal_secret_prefix = "115, 102, 112, 97, 116";
+
+        for rendered in [format!("{request:?}"), format!("{response:?}")] {
+            assert!(!rendered.contains("sfpat_mock_path_secret_123"));
+            assert!(!rendered.contains("ghp_mock_header_secret_123"));
+            assert!(!rendered.contains("sfpat_mock_body_secret_123"));
+            assert!(!rendered.contains("sfpat_mock_response_secret_123"));
+            assert!(!rendered.contains("ghp_mock_response_header_secret_123"));
+            assert!(!rendered.contains(decimal_secret_prefix));
+            assert!(rendered.contains("[REDACTED]"));
+            assert!(rendered.contains("body_len"));
+        }
     }
 
     #[test]
