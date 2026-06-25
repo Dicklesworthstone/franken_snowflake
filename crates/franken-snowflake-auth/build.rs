@@ -1,3 +1,10 @@
+// The credential `Debug`-leak gate (bead fsnow-native-snowflake-connector-w0i.5)
+// runs as a build script. Failing the build by panicking is the idiomatic
+// build-script mechanism, so the workspace `clippy::panic` / `clippy::expect_used`
+// denials — which target library/CLI runtime code — are allowed here. (The
+// `allow-*-in-tests` clippy.toml switches do not cover build scripts.)
+#![allow(clippy::expect_used, clippy::panic)]
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};

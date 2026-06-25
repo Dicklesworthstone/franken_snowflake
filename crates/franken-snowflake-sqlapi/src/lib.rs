@@ -60,3 +60,29 @@ pub mod endpoints {
         format!("/api/v2/statements/{handle}/cancel")
     }
 }
+
+#[cfg(test)]
+mod redaction_drift_tests {
+    use std::collections::BTreeSet;
+
+    /// `franken-snowflake-auth` re-declares the secret-needle list because its
+    /// build script `include!`s that file for the credential-`Debug`-leak gate and
+    /// a build script cannot depend on `core`. This crate is the only one that
+    /// links both, so it fails CI if the two lists ever drift apart — a missing
+    /// prefix would silently leave a whole secret class un-redacted on one path.
+    #[test]
+    fn secret_needle_lists_do_not_drift() {
+        let core: BTreeSet<&str> = franken_snowflake_core::redact::SECRET_PREFIXES
+            .iter()
+            .copied()
+            .collect();
+        let auth: BTreeSet<&str> = franken_snowflake_auth::SECRET_VALUE_NEEDLE_PREFIXES
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            core, auth,
+            "core::redact::SECRET_PREFIXES and auth::SECRET_VALUE_NEEDLE_PREFIXES drifted"
+        );
+    }
+}

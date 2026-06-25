@@ -316,6 +316,33 @@ impl ContentAddress {
         }
         Ok(())
     }
+
+    /// Validate that the address is internally well-formed without the addressed
+    /// payload.
+    ///
+    /// Some addressed content lives at an external location — exports are written
+    /// to object storage or local files — so the cache never holds the bytes and
+    /// cannot recompute the digest. This checks the address shape and fails closed
+    /// on an unsupported algorithm or an empty digest, mirroring the fail-closed
+    /// policy of [`ContentAddress::verify`].
+    pub fn verify_well_formed(&self, entity: &'static str) -> CacheResult<()> {
+        if self.algorithm != "blake3" {
+            return Err(CacheError::InvalidRow {
+                field: entity,
+                message: format!(
+                    "unsupported content-address algorithm {:?}; only blake3 is verifiable",
+                    self.algorithm
+                ),
+            });
+        }
+        if self.digest_hex.is_empty() {
+            return Err(CacheError::InvalidRow {
+                field: entity,
+                message: "content-address digest is empty".to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Canonical payload plus its content address.
@@ -672,9 +699,12 @@ impl CacheBackend for InMemoryCache {
     }
 
     fn append_export(&self, record: ExportRecord) -> CacheResult<()> {
-        record
-            .content_address
-            .verify("export_record", record.target_uri_redacted.as_bytes())?;
+        // The export content lives at an external target (object storage / local
+        // file), so the cache cannot recompute its digest; only the address shape
+        // can be checked here. Verifying against `target_uri_redacted` was wrong —
+        // that string is the destination, not the addressed content — and rejected
+        // every real export while the SQLite backend accepted it.
+        record.content_address.verify_well_formed("export_record")?;
         self.exports
             .borrow_mut()
             .insert(record.export_id.clone(), record);
@@ -1045,6 +1075,10 @@ impl CacheBackend for FrankenSqliteCache {
     }
 
     fn append_export(&self, record: ExportRecord) -> CacheResult<()> {
+        // Symmetric with the in-memory backend: validate the address shape (the
+        // exported bytes live at an external target, so the digest is not
+        // recomputable here) and fail closed on a malformed address.
+        record.content_address.verify_well_formed("export_record")?;
         self.execute(
             "INSERT OR IGNORE INTO exports \
              (export_id, receipt_id, export_kind, target_uri_redacted, content_hash, byte_len, \
@@ -1188,20 +1222,29 @@ pub fn lint_append_only_audit_sql(sql: &str) -> CacheResult<()> {
         .map(str::to_ascii_uppercase)
         .collect();
 
-    for window in tokens.windows(2) {
-        if window == ["UPDATE", "QUERY_AUDIT_LOG"] || window == ["DELETE", "QUERY_AUDIT_LOG"] {
-            return Err(CacheError::AuditMutationRefused {
-                statement: sql.to_owned(),
-            });
-        }
+    // Only statements that reference the audit table are constrained.
+    if !tokens.iter().any(|token| token == "QUERY_AUDIT_LOG") {
+        return Ok(());
     }
 
-    for window in tokens.windows(3) {
-        if window == ["DELETE", "FROM", "QUERY_AUDIT_LOG"] {
-            return Err(CacheError::AuditMutationRefused {
-                statement: sql.to_owned(),
-            });
-        }
+    // The audit log is append-only: a referencing statement may INSERT, SELECT, or
+    // run DDL (CREATE/DROP for migrations), but never mutate existing rows. Reject
+    // any row-mutating verb anywhere in the statement rather than scanning a fixed
+    // token window next to the table name — a positional `windows(2)` check missed
+    // `REPLACE INTO query_audit_log`, `INSERT OR REPLACE`, and
+    // `INSERT ... ON CONFLICT ... DO UPDATE` (where `UPDATE` is far from the name).
+    // `UPDATE` also catches `ON CONFLICT DO UPDATE`; `REPLACE` catches both
+    // `REPLACE INTO` and `INSERT OR REPLACE`. None of the legitimate audit
+    // statements (INSERT OR IGNORE, SELECT, CREATE TABLE/INDEX, DROP TABLE) contain
+    // these verbs, so this is a sound allowlist-by-exclusion.
+    const FORBIDDEN_VERBS: &[&str] = &["UPDATE", "DELETE", "REPLACE", "TRUNCATE"];
+    if tokens
+        .iter()
+        .any(|token| FORBIDDEN_VERBS.contains(&token.as_str()))
+    {
+        return Err(CacheError::AuditMutationRefused {
+            statement: sql.to_owned(),
+        });
     }
 
     Ok(())
@@ -1392,6 +1435,15 @@ fn row_u64(row: &Row, index: usize, field: &'static str) -> CacheResult<u64> {
 }
 
 #[cfg(feature = "frankensqlite")]
+fn row_u32(row: &Row, index: usize, field: &'static str) -> CacheResult<u32> {
+    let value = row_u64(row, index, field)?;
+    // Narrow with a checked conversion: a stored value >= 2^32 must surface as a
+    // typed overflow, never silently wrap (a truncating `as u32` of e.g.
+    // 4_294_967_296 would read back as 0 and collide with partition 0).
+    u32::try_from(value).map_err(|_| CacheError::NumericOverflow { field, value })
+}
+
+#[cfg(feature = "frankensqlite")]
 fn row_opt_u64(row: &Row, index: usize, field: &'static str) -> CacheResult<Option<u64>> {
     match row.get(index) {
         Some(Value::Null) | None => Ok(None),
@@ -1533,7 +1585,7 @@ fn row_query_receipt(row: &Row) -> CacheResult<QueryReceiptRecord> {
 fn row_partition_metadata(row: &Row) -> CacheResult<PartitionMetadataRecord> {
     Ok(PartitionMetadataRecord {
         receipt_id: row_text(row, 0, "receipt_id")?,
-        partition_index: row_u64(row, 1, "partition_index")? as u32,
+        partition_index: row_u32(row, 1, "partition_index")?,
         row_count: row_u64(row, 2, "row_count")?,
         compressed_bytes: row_opt_u64(row, 3, "compressed_bytes")?,
         uncompressed_bytes: row_opt_u64(row, 4, "uncompressed_bytes")?,
@@ -1823,6 +1875,66 @@ mod tests {
     }
 
     #[test]
+    fn append_export_accepts_external_content_address_and_rejects_malformed() -> CacheResult<()> {
+        let cache = InMemoryCache::new();
+        // The export bytes live at an external target, so the cache never holds
+        // them. The content address covers that external content and is unrelated
+        // to the redacted target URI; appending must not recompute it against the
+        // URI string. Regression: append_export previously verified the address
+        // against `target_uri_redacted.as_bytes()`, rejecting every real export on
+        // the in-memory backend while the SQLite backend accepted it.
+        let exported_content = b"row-a,row-b\n";
+        let record = ExportRecord {
+            export_id: "exp-1".to_owned(),
+            receipt_id: "r1".to_owned(),
+            export_kind: ExportKind::LocalCsv,
+            target_uri_redacted: "file:///exports/[REDACTED]/part-0.csv".to_owned(),
+            content_address: ContentAddress::blake3(exported_content),
+            row_count: Some(2),
+            created_at_ms: 7,
+        };
+        cache.append_export(record.clone())?;
+        assert_eq!(cache.exports_for_receipt("r1")?, vec![record]);
+
+        // A malformed address still fails closed: unsupported algorithm.
+        let mut malformed = ExportRecord {
+            export_id: "exp-2".to_owned(),
+            receipt_id: "r1".to_owned(),
+            export_kind: ExportKind::LocalCsv,
+            target_uri_redacted: "file:///exports/[REDACTED]/part-1.csv".to_owned(),
+            content_address: ContentAddress {
+                algorithm: "md5".to_owned(),
+                digest_hex: "00".to_owned(),
+                byte_len: 12,
+            },
+            row_count: Some(2),
+            created_at_ms: 8,
+        };
+        assert!(matches!(
+            cache.append_export(malformed.clone()),
+            Err(CacheError::InvalidRow {
+                field: "export_record",
+                ..
+            })
+        ));
+
+        // ...and an empty digest under the blake3 label.
+        malformed.content_address = ContentAddress {
+            algorithm: "blake3".to_owned(),
+            digest_hex: String::new(),
+            byte_len: 12,
+        };
+        assert!(matches!(
+            cache.append_export(malformed),
+            Err(CacheError::InvalidRow {
+                field: "export_record",
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn profile_storage_rejects_secret_shaped_reference() {
         let cache = InMemoryCache::new();
         let mut profile = sample_profile("demo");
@@ -1921,6 +2033,45 @@ mod tests {
             delete,
             Err(CacheError::AuditMutationRefused { .. })
         ));
+    }
+
+    #[test]
+    fn append_only_audit_lint_rejects_replace_and_on_conflict_paths() {
+        // These destructive forms were missed by the old token-window scan.
+        for statement in [
+            "REPLACE INTO query_audit_log (event_id) VALUES ('x')",
+            "INSERT OR REPLACE INTO query_audit_log (event_id) VALUES ('x')",
+            "INSERT INTO query_audit_log (event_id) VALUES ('x') ON CONFLICT(event_id) DO UPDATE SET event_json = '{}'",
+            "DROP TABLE other; UPDATE query_audit_log SET created_at_ms = 0",
+        ] {
+            assert!(
+                matches!(
+                    lint_append_only_audit_sql(statement),
+                    Err(CacheError::AuditMutationRefused { .. })
+                ),
+                "expected refusal for: {statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn append_only_audit_lint_allows_append_select_and_ddl() {
+        // The legitimate audit statements must still pass: idempotent insert,
+        // select, the create/index migration, the down-migration drop, and an
+        // unrelated statement that does not touch the audit table.
+        for statement in [
+            "INSERT OR IGNORE INTO query_audit_log (event_id) VALUES ('x')",
+            "SELECT event_id FROM query_audit_log ORDER BY created_at_ms, event_id",
+            "CREATE TABLE IF NOT EXISTS query_audit_log (event_id TEXT PRIMARY KEY)",
+            "CREATE INDEX IF NOT EXISTS idx_audit ON query_audit_log(receipt_id)",
+            "DROP TABLE IF EXISTS query_audit_log",
+            "UPDATE query_plans SET plan_json = '{}' WHERE plan_id = 'p'",
+        ] {
+            assert!(
+                lint_append_only_audit_sql(statement).is_ok(),
+                "expected acceptance for: {statement}"
+            );
+        }
     }
 
     #[test]

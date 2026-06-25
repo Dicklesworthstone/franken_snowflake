@@ -1,0 +1,18 @@
+# Workspace clippy configuration.
+#
+# The root `Cargo.toml` `[workspace.lints.clippy]` table DENIES the restriction
+# lints `unwrap_used`, `expect_used`, and `panic` so that library and CLI runtime
+# code surfaces typed errors instead of panicking. Those restriction lints,
+# unlike `pedantic`/`nursery`, also fire inside `#[cfg(test)]` modules and `#[test]`
+# functions by default — where `unwrap`/`expect`/`panic` are the idiomatic, terse
+# way to assert. Without the switches below, the CI gate
+# `cargo clippy --workspace --all-targets --locked -- -D warnings` would fail on
+# test code even though production code is panic-free.
+#
+# These switches scope the denials to non-test code only. Build scripts are not
+# "tests", so the credential `Debug`-leak gate in
+# `crates/franken-snowflake-auth/build.rs` carries its own `#![allow(...)]`
+# (panicking is the idiomatic way a build script fails the build).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

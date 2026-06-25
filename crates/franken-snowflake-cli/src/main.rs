@@ -225,8 +225,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         id: "profile.validate",
         invocation: "franken-snowflake profile validate <profile> --json",
         output_contract_id: "fsnow.profile.validate.v1",
-        description:
-            "Validate profile shape and referenced environment variables without live I/O.",
+        description: "Validate profile shape and referenced environment variables without live I/O.",
         read_only: true,
         provider_network: false,
         mutates_local_state: false,
@@ -244,8 +243,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "catalog.scan",
-        invocation:
-            "franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json",
+        invocation: "franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json",
         output_contract_id: "fsnow.catalog.scan.v1",
         description: "Discover catalog metadata through Information Schema.",
         read_only: true,

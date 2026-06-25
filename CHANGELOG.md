@@ -7,33 +7,33 @@ release.
 
 ## Scope and method
 
-This project is at the early scaffold stage. The Cargo workspace and its
-minimal-five crate skeletons now exist (no runtime/connector logic yet), and
-there is no crate publish, git tag, or GitHub Release, so this changelog has no
-version history to reconstruct. The record below is drawn from the two durable
-sources in the repository:
+This project is at the no-account MVP and release-readiness stage. The Cargo
+workspace, protocol/auth/catalog/cache/export/text-indexing/TUI/MCP boundary
+crates, deterministic testkit, structured e2e harness, dependency gates, and
+cross-platform CI scaffolding are in place. There is still no crate publish, git
+tag, or GitHub Release, so this changelog has no version history to reconstruct.
+The record below is drawn from the durable sources in the repository:
 
 - the design documents (`COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md` and
   `docs/asupersync_leverage.md`)
 - the executable task graph in `.beads/issues.jsonl`, tracked with Beads (`br`)
+- the release-readiness checklist in `RELEASE.md`
 
-When implementation begins, each landed capability will get a dated entry with
-links to the commits that delivered it.
+Once the first public release is tagged, each landed capability will get a dated
+entry with links to the commits that delivered it.
 
 ## [Unreleased]
 
-Planning and scaffold phase (2026-06-24). No runtime code; the deliverable so far
-is the architecture, the contracts, and a 33-issue task graph that another agent
-can pick up and execute.
+No-account MVP and release-readiness phase (2026-06-24 to 2026-06-25). The
+deliverable is the agent-facing connector substrate, deterministic proof lanes,
+and the release checklist required before any public tag or crates.io publish.
 
 ### Added
 
-- **Workspace scaffold (Phase 0).** A Cargo workspace (`resolver = "3"`, edition
-  2024) with the minimal-five crate skeletons —
-  `franken-snowflake-{core,auth,sqlapi,testkit,cli}` — building clean and
-  producing the `franken-snowflake` binary. The remaining crates (`http`,
-  `catalog`, `frame`, `export`, `graph`, `cache`, `tui`, `mcp`) are deferred to
-  their boundary-owning beads rather than created in one blind sweep.
+- **Workspace scaffold and boundary crates.** A Cargo workspace (`resolver = "3"`,
+  edition 2024) with the `franken-snowflake-{core,auth,http,sqlapi,catalog,frame,
+  graph,cache,export,text-indexing,testkit,cli,mcp,tui}` crates building as one
+  release candidate workspace and producing the `franken-snowflake` binary.
 - **Workspace lint policy.** `forbid(unsafe_code)` plus `deny` on
   `clippy::unwrap_used` / `expect_used` / `panic` / `todo` / `dbg_macro`, inherited
   by every crate via `[lints] workspace = true` and verified to actually fail a
@@ -81,6 +81,15 @@ can pick up and execute.
 - **Task graph.** 33 Beads issues under the `fsnow-native-snowflake-connector-w0i`
   epic, dependency-wired across seven phases with no cycles, in
   [`.beads/issues.jsonl`](.beads/issues.jsonl).
+- **No-account implementation proof lanes.** Auth-header construction, SQL API
+  statement lifecycle, polling, partition streaming, cancellation, pagination,
+  golden fixture comparison, CRLF-safe goldens, and redaction lanes are covered
+  by deterministic unit/integration tests and the structured JSON-line e2e
+  harness.
+- **Release and dependency gates.** Linux/macOS/Windows CI runs workspace checks,
+  the per-crate forbidden-dependency admissibility gate, the single-Asupersync
+  gate, LF-golden validation, and the deterministic e2e harness. `RELEASE.md`
+  records the commands and evidence expected before a public tag.
 
 ### Notes for agents
 
@@ -88,8 +97,8 @@ can pick up and execute.
   graph health.
 - The full rationale is in
   [`COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md`](COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md).
-- No connector logic is implemented yet. The workspace skeleton builds and the
-  `franken-snowflake` binary runs, but it does nothing — treat the CLI and MCP
-  surfaces in the README as the target contract, not as working commands.
+- Live Snowflake use remains pre-release and opt-in. Do not treat local fixtures
+  as live data; every live lane must either provide explicit credential evidence
+  or emit a typed skip/refusal.
 
 [Unreleased]: https://github.com/Dicklesworthstone/franken_snowflake

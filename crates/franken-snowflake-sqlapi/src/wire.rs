@@ -145,10 +145,15 @@ pub fn decode_cell(raw: Option<&str>, column: &ColumnType) -> Result<CellValue, 
             let encoded_offset = offset_part
                 .parse::<i32>()
                 .map_err(|_| make_err("TIMESTAMP_TZ offset must be an integer"))?;
+            // The wire encodes the offset as offset_minutes + 1440 (UTC == 1440),
+            // so the encoded value is in [0, 2880]. Validate the range before
+            // subtracting so a malformed cell cannot underflow i32.
+            if !(0..=2880).contains(&encoded_offset) {
+                return Err(make_err("TIMESTAMP_TZ offset is out of range"));
+            }
             Ok(CellValue::TimestampTz {
                 seconds,
                 nanos,
-                // The wire encodes the offset as offset_minutes + 1440.
                 offset_minutes: encoded_offset - 1440,
             })
         }
@@ -296,8 +301,8 @@ mod tests {
 
     #[test]
     fn timestamp_is_fractional_epoch_seconds_not_nanos() -> Result<(), String> {
-        let value =
-            decode_cell(Some("82919.000000000"), &col("TIMESTAMP_NTZ")).map_err(|e| e.to_string())?;
+        let value = decode_cell(Some("82919.000000000"), &col("TIMESTAMP_NTZ"))
+            .map_err(|e| e.to_string())?;
         assert_eq!(
             value,
             CellValue::Timestamp {
@@ -306,8 +311,7 @@ mod tests {
             }
         );
         // Sub-second precision is preserved as nanos.
-        let value =
-            decode_cell(Some("100.5"), &col("TIME")).map_err(|e| e.to_string())?;
+        let value = decode_cell(Some("100.5"), &col("TIME")).map_err(|e| e.to_string())?;
         assert_eq!(
             value,
             CellValue::Timestamp {
@@ -341,11 +345,11 @@ mod tests {
         // timestamps must satisfy value = seconds + nanos/1e9 with nanos in
         // [0, 1e9). Before the fix, "-1.5" decoded to (-1, 5e8) = -0.5s.
         let cases: &[(&str, i64, u32)] = &[
-            ("-1.5", -2, 500_000_000),                  // -1.5s
-            ("-0.5", -1, 500_000_000),                  // -0.5s; integer part "-0" parses to 0
-            ("-1.0", -1, 0),                            // exact: no borrow
-            ("-1", -1, 0),                              // no fraction at all
-            ("-86400.250000000", -86401, 750_000_000),  // one day before epoch, .25s
+            ("-1.5", -2, 500_000_000),                 // -1.5s
+            ("-0.5", -1, 500_000_000),                 // -0.5s; integer part "-0" parses to 0
+            ("-1.0", -1, 0),                           // exact: no borrow
+            ("-1", -1, 0),                             // no fraction at all
+            ("-86400.250000000", -86401, 750_000_000), // one day before epoch, .25s
         ];
         for (raw, seconds, nanos) in cases {
             let value = decode_cell(Some(raw), &col("TIMESTAMP_NTZ")).map_err(|e| e.to_string())?;

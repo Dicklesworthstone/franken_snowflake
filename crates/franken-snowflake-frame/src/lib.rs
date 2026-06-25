@@ -484,6 +484,12 @@ mod frankenpandas {
                 let encoded_offset = offset_part
                     .parse::<i32>()
                     .map_err(|_| decode_error(source, "TIMESTAMP_TZ offset must be an integer"))?;
+                // Snowflake encodes the UTC offset as offset_minutes + 1440 (UTC ==
+                // 1440), so the encoded value is in [0, 2880]. Validate the range
+                // before subtracting so a malformed cell cannot underflow i32.
+                if !(0..=2880).contains(&encoded_offset) {
+                    return Err(decode_error(source, "TIMESTAMP_TZ offset is out of range"));
+                }
                 return Ok(MaterializedCell {
                     scalar: Scalar::Datetime64(seconds_to_nanos(seconds, nanos, source)?),
                     missing_kind: None,
@@ -818,10 +824,12 @@ mod frankenpandas {
 
         #[test]
         fn fixed_decimal_values_remain_exact_strings() -> Result<(), String> {
-            let columns = vec![col("AMOUNT", "NUMBER")
-                .with_scale(2)
-                .with_precision(38)
-                .nullable(false)];
+            let columns = vec![
+                col("AMOUNT", "NUMBER")
+                    .with_scale(2)
+                    .with_precision(38)
+                    .nullable(false),
+            ];
             let partitions = vec![ResultPartition::new(
                 0,
                 vec![vec![Some("12345678901234567.89".to_owned())]],
@@ -843,10 +851,12 @@ mod frankenpandas {
 
         #[test]
         fn number_38_scale0_values_beyond_i64_remain_exact_strings() -> Result<(), String> {
-            let columns = vec![col("BIG_ID", "NUMBER")
-                .with_scale(0)
-                .with_precision(38)
-                .nullable(false)];
+            let columns = vec![
+                col("BIG_ID", "NUMBER")
+                    .with_scale(0)
+                    .with_precision(38)
+                    .nullable(false),
+            ];
             let partitions = vec![ResultPartition::new(
                 0,
                 vec![vec![Some("99999999999999999999".to_owned())]],

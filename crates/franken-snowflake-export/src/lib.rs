@@ -951,23 +951,23 @@ mod local {
 
 #[cfg(feature = "export")]
 pub use local::{
-    export_csv, export_jsonl, write_csv_stream, write_jsonl_stream, AddressingSink, ExportByteSink,
-    ExportColumn, LocalExportArtifact, LocalExportInput, ResultPartition,
+    AddressingSink, ExportByteSink, ExportColumn, LocalExportArtifact, LocalExportInput,
+    ResultPartition, export_csv, export_jsonl, write_csv_stream, write_jsonl_stream,
 };
 
 /// Convenient re-exports for callers.
 pub mod prelude {
     pub use super::{
-        ContentAddress, CopyCompression, CopyIntoOptions, CopyIntoPlan, CopySource, ExportError,
-        ExportFormat, ExportLogEvent, ExportReceipt, ExportReceiptKind, ExportResult,
-        COPY_INTO_PLAN_CONTRACT_ID, EXPORT_LOG_CONTRACT_ID, EXPORT_RECEIPT_CONTRACT_ID,
-        LOCAL_BACKENDS_ENABLED, VERSION,
+        COPY_INTO_PLAN_CONTRACT_ID, ContentAddress, CopyCompression, CopyIntoOptions, CopyIntoPlan,
+        CopySource, EXPORT_LOG_CONTRACT_ID, EXPORT_RECEIPT_CONTRACT_ID, ExportError, ExportFormat,
+        ExportLogEvent, ExportReceipt, ExportReceiptKind, ExportResult, LOCAL_BACKENDS_ENABLED,
+        VERSION,
     };
 
     #[cfg(feature = "export")]
     pub use super::{
-        export_csv, export_jsonl, write_csv_stream, write_jsonl_stream, AddressingSink,
-        ExportByteSink, ExportColumn, LocalExportArtifact, LocalExportInput, ResultPartition,
+        AddressingSink, ExportByteSink, ExportColumn, LocalExportArtifact, LocalExportInput,
+        ResultPartition, export_csv, export_jsonl, write_csv_stream, write_jsonl_stream,
     };
 }
 
@@ -1324,11 +1324,13 @@ mod tests {
         );
         assert_eq!(artifact.receipt.row_count, Some(3));
         assert_eq!(artifact.receipt.content_address.byte_len, 108);
-        assert!(artifact
-            .receipt
-            .content_address
-            .verify(&artifact.bytes)
-            .is_ok());
+        assert!(
+            artifact
+                .receipt
+                .content_address
+                .verify(&artifact.bytes)
+                .is_ok()
+        );
         assert!(artifact.log_line.contains("\"record_hash\""));
     }
 
@@ -1348,11 +1350,13 @@ mod tests {
             "{\"id\":1,\"name\":\"Ada\",\"active\":true,\"payload\":{\"rank\":1}}\n{\"id\":2,\"name\":\"Grace, Hopper\",\"active\":false,\"payload\":null}\n{\"id\":3,\"name\":\"quote \\\"inside\\\"\",\"active\":true,\"payload\":[1,2]}\n"
         );
         assert_eq!(artifact.receipt.row_count, Some(3));
-        assert!(artifact
-            .receipt
-            .content_address
-            .verify(&artifact.bytes)
-            .is_ok());
+        assert!(
+            artifact
+                .receipt
+                .content_address
+                .verify(&artifact.bytes)
+                .is_ok()
+        );
     }
 
     #[test]

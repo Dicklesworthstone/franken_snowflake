@@ -5,17 +5,18 @@
 **A clean-room, Rust-first Snowflake SQL API connector built for coding agents.**
 
 ![License](https://img.shields.io/badge/license-MIT%20%2B%20OpenAI%2FAnthropic%20rider-blue)
-![Status](https://img.shields.io/badge/status-planning%20%2F%20task--graph%20scaffold-orange)
+![Status](https://img.shields.io/badge/status-no--account%20MVP%20%2F%20pre--release-orange)
 ![Language](https://img.shields.io/badge/language-Rust%202024-dea584)
 ![Runtime](https://img.shields.io/badge/runtime-Asupersync-8A2BE2)
 ![Forbidden deps](https://img.shields.io/badge/no-Tokio%20%C2%B7%20reqwest%20%C2%B7%20hyper-critical)
 
 </div>
 
-> **Status: planning and task-graph scaffold. No production driver is implemented yet.**
-> This repository currently holds the architecture plan, the executable task graph
-> (Beads), and the design docs. The CLI surfaces below describe the **target**
-> interface, not working commands. Watch the repo if you want to follow the build.
+> **Status: no-account MVP and release-readiness pass.**
+> The workspace now includes the core contracts, CLI surfaces, deterministic
+> testkit, structured e2e harness, dependency gates, and cross-platform CI
+> scaffolding. Live Snowflake use remains opt-in and pre-release; there is no
+> crates.io package, installer, or production live-account release yet.
 
 ---
 
@@ -49,7 +50,8 @@ tool. A no-account testkit proves the protocol before any live credential exists
 
 ## Design Goals
 
-These are the guarantees the design targets. They are goals, not yet shipped code.
+These are the guarantees the implementation is built around. Live-account
+hardening is still pre-release, but the no-account proof substrate is in place.
 
 | Goal | How |
 |---|---|
@@ -72,10 +74,11 @@ and local receipts that downstream systems can audit later.
 
 ---
 
-## Planned Interface
+## MVP Interface
 
-The target CLI. None of these run yet; they define the contract the
-implementation is being built against.
+The CLI contract is implemented as deterministic, agent-readable surfaces first.
+Live-account lanes require explicit opt-in credentials and refuse clearly when
+credentials are absent.
 
 ```bash
 # Discover the tool itself
@@ -147,10 +150,11 @@ reaches Snowflake's remote cancel endpoint and no statement is orphaned.
 
 ## How It Compares
 
-Positioning against the existing options. `franken_snowflake` is the only column
-that is not yet built, and the table says so.
+Positioning against the existing options. `franken_snowflake` is still
+pre-release for live Snowflake use; the no-account CLI, protocol, and testkit
+contracts are the current shipped surface.
 
-| | franken_snowflake (planned) | Official drivers (Python/Go/JDBC/…) | Third-party Rust crates | ODBC / JDBC bridge |
+| | franken_snowflake (pre-release) | Official drivers (Python/Go/JDBC/...) | Third-party Rust crates | ODBC / JDBC bridge |
 |---|---|---|---|---|
 | Language / runtime | Rust on Asupersync | Per language | Rust on Tokio | Native lib + bridge |
 | Hidden Tokio/reqwest graph | None (by policy) | n/a | Usually | n/a |
@@ -158,7 +162,7 @@ that is not yet built, and the table says so.
 | No-account deterministic tests | Yes | Varies | Rare | No |
 | Read-only-by-default capability security | Compile-time | No | No | No |
 | Secret-leak compile gate | Yes | No | No | No |
-| Maturity | Planning | Production | Varies | Production |
+| Maturity | No-account MVP / pre-release | Production | Varies | Production |
 
 If you need a production Snowflake client today and you are not in Rust, use an
 official driver. `franken_snowflake` exists for the Rust-first, agent-first,
@@ -249,8 +253,9 @@ user-facing semantics.
 
 ## Limitations
 
-- **Nothing is implemented yet.** This is a plan and a task graph. There is no
-  binary, no crate on crates.io, and no installer.
+- **No production live-account release yet.** The no-account contracts, testkit,
+  and release proof lanes exist; crates.io publishing, an installer, and a
+  production live-account claim are still deferred.
 - Read, query, catalog, and export come first. Write and update support is
   deliberately deferred behind a write-intent ladder; DDL stays disabled until
   there is a documented public use case.
@@ -267,8 +272,9 @@ user-facing semantics.
 
 ## FAQ
 
-**Is this usable today?** No. It is a plan and an executable task graph. The
-commands above describe the target interface.
+**Is this usable today?** Yes for no-account contract work, deterministic
+fixtures, dependency proof lanes, and the agent-facing CLI surfaces. Treat live
+Snowflake use as pre-release and opt-in only.
 
 **Why not just use an official driver?** Snowflake publishes none for Rust, and
 the goal here is a Rust-first, Tokio-free, agent-ergonomic client, a niche the
