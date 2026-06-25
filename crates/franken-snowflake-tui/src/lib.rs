@@ -955,8 +955,7 @@ mod tests {
         let action = app.apply_event(TuiEvent::QuerySubmit);
 
         let TuiAction::PlanQuery(plan) = action else {
-            assert!(false, "expected accepted raw SQL plan");
-            return;
+            unreachable!("expected accepted raw SQL plan")
         };
         assert!(plan.sql.contains("SELECT ID FROM DB1.PUBLIC.POSITIONS"));
         assert!(plan.sql.contains("LIMIT ?"));
@@ -981,8 +980,7 @@ mod tests {
         let action = app.apply_event(TuiEvent::QuerySubmit);
 
         let TuiAction::Refused(refusals) = action else {
-            assert!(false, "expected raw SQL refusal");
-            return;
+            unreachable!("expected raw SQL refusal")
         };
         assert_eq!(refusals[0].code, "FSNOW_RAW_SQL_UNSAFE");
         assert_eq!(app.progress.phase, StatementPhase::Refused);

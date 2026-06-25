@@ -840,7 +840,7 @@ impl KeyPairJwtRefreshSession {
         &mut self,
         now_unix_seconds: i64,
     ) -> Result<&SignedKeyPairJwt, AuthError> {
-        let should_refresh = self.current.as_ref().map_or(true, |signed| {
+        let should_refresh = self.current.as_ref().is_none_or(|signed| {
             let seconds_until_expiry = signed
                 .expires_at_unix_seconds
                 .saturating_sub(now_unix_seconds);
@@ -994,7 +994,7 @@ impl AuthProfile {
                 *requested_validity_seconds,
                 resolver,
             )
-            .map(AuthMechanism::KeyPairJwt),
+            .map(|auth| AuthMechanism::KeyPairJwt(Box::new(auth))),
             Self::OAuthBearer {
                 source,
                 issued_at_unix_seconds,
@@ -1097,7 +1097,11 @@ pub trait SnowflakeAuth {
 /// Resolved auth mechanism. Runtime credentials are redacted in all formatting.
 pub enum AuthMechanism {
     ProgrammaticAccessToken(ProgrammaticAccessTokenAuth),
-    KeyPairJwt(KeyPairJwtAuth),
+    // Boxed: `KeyPairJwtAuth` holds the RSA signer/key material and is ~352 bytes,
+    // far larger than the other variants (~136); boxing keeps `AuthMechanism`
+    // pointer-sized for that variant (clippy::large_enum_variant) and keeps the
+    // secret key off the stack. Match arms auto-deref through the `Box`.
+    KeyPairJwt(Box<KeyPairJwtAuth>),
     OAuthBearer(OAuthBearerAuth),
 }
 
@@ -1575,8 +1579,14 @@ fn redact_prefixed_tokens(input: &str, prefix: &str) -> String {
         output.push_str(&remaining[..start]);
         let secret_tail = &remaining[start..];
         if prefix.chars().any(char::is_whitespace) {
+            // A whitespace-containing needle is a PEM private-key header; the
+            // secret is the whole block, not just the header line. Consume
+            // through the matching `-----END ...-----` line (or to the end of
+            // the input when it is absent) so the base64 key body never survives
+            // in cleartext. Advancing by only `prefix.len()` leaked the entire
+            // key body past the redacted header.
             output.push_str(REDACTED);
-            remaining = &secret_tail[prefix.len()..];
+            remaining = &secret_tail[pem_block_len(secret_tail)..];
             continue;
         }
         let end = secret_tail
@@ -1588,6 +1598,21 @@ fn redact_prefixed_tokens(input: &str, prefix: &str) -> String {
     }
     output.push_str(remaining);
     output
+}
+
+/// Byte length of the PEM private-key block starting at `secret_tail` (which
+/// begins at a `-----BEGIN ...-----` header): through the end of the matching
+/// `-----END ...-----` line, or the whole remainder if no closing marker exists.
+/// Mirrors `franken_snowflake_core::redact`'s PEM span so the two redactors agree.
+fn pem_block_len(secret_tail: &str) -> usize {
+    if let Some(end_marker) = secret_tail.find("-----END ") {
+        let after_end = &secret_tail[end_marker..];
+        if let Some(line_end) = after_end.find('\n') {
+            return end_marker + line_end;
+        }
+        return secret_tail.len();
+    }
+    secret_tail.len()
 }
 
 fn is_secret_delimiter(ch: char) -> bool {
@@ -1877,6 +1902,30 @@ dQIDAQAB
     }
 
     #[test]
+    fn redactor_redacts_full_pem_private_key_body_not_just_header() {
+        // The whitespace-bearing PEM header needle previously redacted only the
+        // `-----BEGIN ...-----` line, leaking the entire base64 key body. The
+        // whole block (through `-----END ...-----`) must be removed.
+        let body = "MIIBVgIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA0secretKeyMaterial";
+        let pem = format!(
+            "configured key:\n-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----\ntrailing log line"
+        );
+        let redacted = redact_with_policy(&pem, &[]);
+
+        assert!(!redacted.contains(body), "key body leaked: {redacted}");
+        assert!(!redacted.contains("-----BEGIN PRIVATE KEY-----"));
+        assert!(redacted.contains(REDACTED));
+        // Non-secret context on either side of the block is preserved.
+        assert!(redacted.contains("configured key:"));
+        assert!(redacted.contains("trailing log line"));
+
+        // A truncated block with no `-----END` marker is still fully redacted.
+        let truncated = format!("-----BEGIN RSA PRIVATE KEY-----\n{body}");
+        let redacted_truncated = redact_with_policy(&truncated, &[]);
+        assert!(!redacted_truncated.contains(body));
+    }
+
+    #[test]
     fn signs_rs256_claims_with_snowflake_issuer_and_subject(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let signer = signer()?;
@@ -1937,10 +1986,10 @@ dQIDAQAB
 
     #[test]
     fn jwt_signer_is_available_behind_auth_trait() -> Result<(), Box<dyn std::error::Error>> {
-        let mut auth = AuthMechanism::KeyPairJwt(KeyPairJwtAuth::from_signer(
+        let mut auth = AuthMechanism::KeyPairJwt(Box::new(KeyPairJwtAuth::from_signer(
             signer()?,
             MAX_JWT_VALIDITY_SECONDS,
-        ));
+        )));
         let headers = auth.headers_at(1_800_000_000)?;
 
         assert_eq!(auth.lane(), AuthLane::KeyPairJwt);

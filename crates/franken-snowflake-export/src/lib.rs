@@ -767,6 +767,7 @@ mod local {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn local_artifact(
         bytes: Vec<u8>,
         address: ContentAddress,

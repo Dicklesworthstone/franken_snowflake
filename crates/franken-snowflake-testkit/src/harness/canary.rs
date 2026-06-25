@@ -21,7 +21,7 @@
 use std::fmt;
 use std::path::Path;
 
-use franken_snowflake_core::redact::{contains_secret, redact};
+use franken_snowflake_core::redact::{redact, secret_spans};
 use serde::Serialize;
 
 /// A planted sentinel a test can inject and then assert never leaks. It is not a
@@ -155,15 +155,19 @@ impl CanaryGuard {
             }
         }
         if self.scan_shapes {
-            for (offset, token) in tokens_with_offsets(text) {
-                if contains_secret(token) {
-                    hits.push(CanaryHit {
-                        channel: channel.clone(),
-                        kind: HitKind::SecretShape,
-                        needle: redact(token).into_owned(),
-                        byte_offset: offset,
-                    });
-                }
+            // Reuse the production span-finder over the *whole* channel rather
+            // than a whitespace tokenizer: the PEM private-key needles contain
+            // spaces, so a per-token scan could never match them and a leaked
+            // key would go unflagged. Sharing `secret_spans` keeps the guard and
+            // the redactor from drifting.
+            for (start, end) in secret_spans(text) {
+                let span = text.get(start..end).unwrap_or(text);
+                hits.push(CanaryHit {
+                    channel: channel.clone(),
+                    kind: HitKind::SecretShape,
+                    needle: redact(span).into_owned(),
+                    byte_offset: start,
+                });
             }
         }
         hits
@@ -199,26 +203,6 @@ impl CanaryGuard {
         }
         Ok(CanaryReport { hits })
     }
-}
-
-/// Split `text` into maximal non-whitespace runs, each paired with its byte
-/// offset, so secret-shape hits carry a meaningful location.
-fn tokens_with_offsets(text: &str) -> Vec<(usize, &str)> {
-    let mut tokens = Vec::new();
-    let mut start: Option<usize> = None;
-    for (offset, ch) in text.char_indices() {
-        if ch.is_whitespace() {
-            if let Some(begin) = start.take() {
-                tokens.push((begin, &text[begin..offset]));
-            }
-        } else if start.is_none() {
-            start = Some(offset);
-        }
-    }
-    if let Some(begin) = start {
-        tokens.push((begin, &text[begin..]));
-    }
-    tokens
 }
 
 /// The combined result of a scan across channels.
@@ -342,6 +326,27 @@ mod tests {
         assert_eq!(shape.len(), 1);
         // The raw secret is never retained; only the redacted form is.
         assert!(!shape[0].needle.contains("ghp_0123456789"));
+        assert!(shape[0].needle.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn leaked_pem_private_key_is_flagged_as_a_secret_shape() {
+        // The PEM private-key needles contain spaces, so the old whitespace
+        // tokenizer could never match them and a leaked key went unflagged.
+        // The whole-text span scan must catch it.
+        let guard = CanaryGuard::new();
+        let key_body = "MIIBVgIBADANBgkqhkiG9w0BAQEFAASCAT8leakedKeyMaterial";
+        let leaked = format!(
+            "stderr: -----BEGIN PRIVATE KEY-----\n{key_body}\n-----END PRIVATE KEY----- done"
+        );
+        let hits = guard.scan_text(Channel::Stderr, &leaked);
+        let shape: Vec<&CanaryHit> = hits
+            .iter()
+            .filter(|hit| hit.kind == HitKind::SecretShape)
+            .collect();
+        assert_eq!(shape.len(), 1, "PEM key must be flagged exactly once");
+        // The raw key body is never retained; only the redacted form is.
+        assert!(!shape[0].needle.contains(key_body));
         assert!(shape[0].needle.contains("[REDACTED]"));
     }
 

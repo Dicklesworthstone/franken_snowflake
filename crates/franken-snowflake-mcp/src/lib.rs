@@ -528,10 +528,12 @@ mod fastmcp_surface {
                 build_mcp_server(runner).run_http(addr.to_string())
             }
             Some(other) => {
+                // Redact the echoed mode: a secret-shaped value mis-passed as the
+                // serve mode must not leak to stderr (mirrors `invalid_params`).
                 eprintln!(
                     "{}: unsupported MCP serve mode `{}`; use --stdio or --http <addr>",
                     SnowflakeErrorCode::UsageError.stable_code(),
-                    other
+                    franken_snowflake_core::redact::redact(other)
                 );
                 std::process::exit(64)
             }

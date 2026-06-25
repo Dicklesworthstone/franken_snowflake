@@ -187,7 +187,7 @@ pub enum DatasetKind {
 
 /// Rights class. Unknown serialized labels deserialize to the most restrictive
 /// class so policy fails closed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RightsClass {
     /// Public/non-sensitive.
@@ -197,13 +197,8 @@ pub enum RightsClass {
     /// Private data.
     Private,
     /// Most restrictive fallback.
+    #[default]
     Restricted,
-}
-
-impl Default for RightsClass {
-    fn default() -> Self {
-        Self::Restricted
-    }
 }
 
 impl<'de> Deserialize<'de> for RightsClass {

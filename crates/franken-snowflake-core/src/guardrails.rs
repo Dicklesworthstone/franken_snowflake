@@ -314,12 +314,12 @@ pub fn enforce_query_safety(
     plan: QueryPlanGuard,
     limits: &QuerySafetyLimits,
 ) -> Result<BoundedQueryPlan, SnowflakeError> {
-    if plan.sql.as_bytes().len() > limits.max_statement_bytes {
+    if plan.sql.len() > limits.max_statement_bytes {
         return Err(SnowflakeError::new(
             SnowflakeErrorCode::SafetyLimitExceeded,
             format!(
                 "statement is {} bytes; max_statement_bytes is {}",
-                plan.sql.as_bytes().len(),
+                plan.sql.len(),
                 limits.max_statement_bytes
             ),
         ));
@@ -433,11 +433,10 @@ pub fn cost_budget_breach_log(cost: &CostVector, quota_micros: u64) -> Option<Gu
 pub fn scan_canary_outputs(outputs: &[(OutputChannel, &str)]) -> Vec<CanaryLeakFinding> {
     outputs
         .iter()
-        .filter_map(|(channel, output)| {
-            contains_secret(output).then(|| CanaryLeakFinding {
-                channel: *channel,
-                message: "secret-shaped canary found in output channel".to_string(),
-            })
+        .filter(|(_, output)| contains_secret(output))
+        .map(|(channel, _)| CanaryLeakFinding {
+            channel: *channel,
+            message: "secret-shaped canary found in output channel".to_string(),
         })
         .collect()
 }
@@ -448,8 +447,9 @@ pub fn classify_sql_operation(sql: &str) -> SqlOperationClass {
     let first = first_sql_keyword(sql);
     match first.as_deref() {
         Some(
-            "alter" | "call" | "copy" | "create" | "delete" | "drop" | "grant" | "insert" | "merge"
-            | "put" | "remove" | "revoke" | "truncate" | "update" | "use",
+            "alter" | "call" | "copy" | "create" | "delete" | "drop" | "execute" | "grant"
+            | "insert" | "merge" | "put" | "remove" | "revoke" | "truncate" | "undrop" | "update"
+            | "use",
         ) => SqlOperationClass::Mutating,
         _ => SqlOperationClass::Read,
     }
@@ -460,22 +460,14 @@ fn first_sql_keyword(sql: &str) -> Option<String> {
     loop {
         index = skip_sql_ws(sql, index);
         if sql[index..].starts_with("--") {
-            match sql[index..].find('\n') {
-                Some(line_end) => {
-                    index += line_end + 1;
-                    continue;
-                }
-                None => return None,
-            }
+            let line_end = sql[index..].find('\n')?;
+            index += line_end + 1;
+            continue;
         }
         if sql[index..].starts_with("/*") {
-            match sql[index + 2..].find("*/") {
-                Some(block_end) => {
-                    index += block_end + 4;
-                    continue;
-                }
-                None => return None,
-            }
+            let block_end = sql[index + 2..].find("*/")?;
+            index += block_end + 4;
+            continue;
         }
         break;
     }
@@ -599,6 +591,29 @@ mod tests {
         assert_eq!(error.code, SnowflakeErrorCode::MutationRefused);
         assert_eq!(
             classify_sql_operation("/* read hint */ select * from table_x"),
+            SqlOperationClass::Read
+        );
+    }
+
+    #[test]
+    fn execute_and_undrop_are_classified_mutating() {
+        // `EXECUTE IMMEDIATE '<arbitrary DML>'` and `UNDROP` are single-keyword
+        // mutations; the read-only-by-default classifier must not treat them as
+        // reads just because they are not the canonical DML verbs.
+        for sql in [
+            "execute immediate 'delete from secrets'",
+            "EXECUTE TASK my_task",
+            "undrop table dropped_t",
+        ] {
+            assert_eq!(
+                classify_sql_operation(sql),
+                SqlOperationClass::Mutating,
+                "{sql} must classify as mutating"
+            );
+        }
+        // A plain SELECT stays a read.
+        assert_eq!(
+            classify_sql_operation("select 1"),
             SqlOperationClass::Read
         );
     }

@@ -96,7 +96,6 @@ impl SnowflakeHttpClient {
     }
 
     /// Build a submit request plan without performing network I/O.
-    #[must_use]
     pub fn submit_plan(&self, request: &SubmitHttpRequest) -> Result<WireRequest, TransportError> {
         self.wire_request(
             Method::Post,
@@ -108,7 +107,6 @@ impl SnowflakeHttpClient {
     }
 
     /// Build a poll request plan without performing network I/O.
-    #[must_use]
     pub fn poll_plan(&self, request: &PollHttpRequest) -> Result<WireRequest, TransportError> {
         let route = TransportRoute::Poll {
             handle: request.statement_handle.clone(),
@@ -117,7 +115,6 @@ impl SnowflakeHttpClient {
     }
 
     /// Build a partition request plan without performing network I/O.
-    #[must_use]
     pub fn partition_plan(
         &self,
         request: &PartitionHttpRequest,
@@ -130,7 +127,6 @@ impl SnowflakeHttpClient {
     }
 
     /// Build a cancel request plan without performing network I/O.
-    #[must_use]
     pub fn cancel_plan(&self, request: &CancelHttpRequest) -> Result<WireRequest, TransportError> {
         let route = TransportRoute::Cancel {
             handle: request.statement_handle.clone(),
@@ -831,9 +827,19 @@ impl RetryPolicy {
             .max_attempts
             .saturating_sub(attempt.saturating_sub(1))
             .max(1);
+        // `.with_priority(0)`: `meet`/`combine` takes the *max* priority, and a
+        // bare `Budget::new()` defaults priority to 128. Without this, the
+        // poll-quota constraint would silently raise every retry's scheduling
+        // priority to 128, discarding the configured ambient/route priority.
+        // Priority 0 is the identity element for the max-combine, so this budget
+        // constrains poll-quota only.
         ambient
             .meet(route_budget)
-            .meet(Budget::new().with_poll_quota(remaining_attempts))
+            .meet(
+                Budget::new()
+                    .with_poll_quota(remaining_attempts)
+                    .with_priority(0),
+            )
     }
 }
 
@@ -1615,11 +1621,9 @@ fn unix_seconds_utc(
         return None;
     }
     let second = second.min(59);
-    Some(
-        days_from_civil(year, month, day)
-            .checked_mul(86_400)?
-            .checked_add(i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))?,
-    )
+    days_from_civil(year, month, day)
+        .checked_mul(86_400)?
+        .checked_add(i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))
 }
 
 fn days_in_month(year: i32, month: u32) -> u32 {
@@ -2566,7 +2570,9 @@ mod tests {
         };
 
         let effective = policy.attempt_budget(parent, child, 2);
-        let expected = parent.meet(child).meet(Budget::new().with_poll_quota(3));
+        let expected = parent
+            .meet(child)
+            .meet(Budget::new().with_poll_quota(3).with_priority(0));
 
         assert_eq!(effective, expected);
         assert_eq!(effective.deadline, Some(Time::from_secs(20)));

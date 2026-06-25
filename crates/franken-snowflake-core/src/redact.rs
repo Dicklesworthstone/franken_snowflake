@@ -76,7 +76,14 @@ fn continues_token_left(c: char) -> bool {
 }
 
 /// Byte spans `[start, end)` of secret-shaped tokens, in order.
-fn secret_spans(input: &str) -> Vec<(usize, usize)> {
+///
+/// Exposed so the last-mile canary guard can reuse the exact span-finder the
+/// redactor uses — including multi-line PEM private-key blocks — rather than
+/// re-tokenizing on whitespace, which would silently miss the whitespace-bearing
+/// PEM header needles. Sharing this one finder keeps detection and redaction from
+/// drifting.
+#[must_use]
+pub fn secret_spans(input: &str) -> Vec<(usize, usize)> {
     let chars: Vec<(usize, char)> = input.char_indices().collect();
     let mut spans = Vec::new();
     let mut idx = 0;
@@ -184,8 +191,11 @@ fn pem_private_key_end(input: &str, byte_start: usize) -> usize {
         }
         return input.len();
     }
-    rest.find('\n')
-        .map_or(input.len(), |line_end| byte_start + line_end)
+    // No closing `-----END ...-----` marker: the block is malformed or
+    // truncated, so redact through the end of the input. Stopping at the first
+    // newline (the end of the `-----BEGIN ...-----` line) would leave the
+    // base64 key body in cleartext — a fail-open leak.
+    input.len()
 }
 
 /// Whether `field_name` is credential-shaped per [`CREDENTIAL_FIELD_EXACT`] /
@@ -277,6 +287,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn truncated_pem_private_key_without_end_marker_is_fully_redacted() {
+        // A PEM block missing its `-----END ...-----` line must still have the
+        // base64 key body redacted, not just the `-----BEGIN ...-----` line.
+        // Stopping at the first newline left the key material in cleartext.
+        let input = "loaded -----BEGIN PRIVATE KEY-----\nMIIBODYsecretMaterial0123456789";
+        let out = redact(input);
+        assert!(out.contains(REDACTION_PLACEHOLDER));
+        assert!(!out.contains("MIIBODYsecretMaterial0123456789"));
+        assert!(!contains_secret(out.as_ref()));
+        // The shared span-finder is reused by the canary guard, so it must agree.
+        assert_eq!(secret_spans(input).len(), 1);
     }
 
     #[test]

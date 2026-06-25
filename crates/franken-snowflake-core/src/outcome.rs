@@ -34,7 +34,7 @@ pub enum OutcomeKind {
 }
 
 /// Provenance of a payload. Omitted from the envelope when [`DataSource::Unspecified`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DataSource {
     /// Produced by a live Snowflake call.
@@ -44,6 +44,7 @@ pub enum DataSource {
     /// A valid but empty result.
     Empty,
     /// Not stamped (serialized as absent).
+    #[default]
     Unspecified,
 }
 
@@ -54,12 +55,6 @@ impl DataSource {
     #[must_use]
     pub const fn is_unspecified(&self) -> bool {
         matches!(self, Self::Unspecified)
-    }
-}
-
-impl Default for DataSource {
-    fn default() -> Self {
-        Self::Unspecified
     }
 }
 

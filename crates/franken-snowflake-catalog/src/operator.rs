@@ -184,7 +184,13 @@ pub fn describe_operator_json_schema(operator: &OperatorCatalogEntry) -> Value {
         "$id": operator.json_schema_contract_id,
         "title": format!("franken_snowflake operator {}", operator.id),
         "type": "object",
-        "additionalProperties": false,
+        // `unevaluatedProperties`, not `additionalProperties`: the `value`
+        // property is contributed by the `allOf` sub-schema, and in JSON Schema
+        // 2020-12 `additionalProperties` ignores `allOf`-evaluated properties —
+        // so `additionalProperties: false` rejected every valid value-bearing
+        // predicate (e.g. `{"column":"x","op":"eq","value":5}`).
+        // `unevaluatedProperties` honors the `allOf` annotations.
+        "unevaluatedProperties": false,
         "properties": {
             "column": { "type": "string", "minLength": 1 },
             "op": { "const": operator.id }
@@ -238,5 +244,27 @@ mod tests {
             scalar_value_schema(),
             json!({ "type": ["string", "number", "boolean"] })
         );
+    }
+
+    #[test]
+    fn value_bearing_operator_schema_admits_the_value_property() {
+        // `value` is contributed by the `allOf` sub-schema. With the old
+        // `additionalProperties: false`, a 2020-12 validator would reject the
+        // canonical `{column, op, value}` instance because `additionalProperties`
+        // does not see `allOf`-evaluated properties. The schema must use
+        // `unevaluatedProperties` so `value` is admitted while stray keys are not.
+        let operator = built_in_operator_catalog()
+            .into_iter()
+            .find(|operator| operator.id == "eq")
+            .expect("eq operator exists");
+        let schema = describe_operator_json_schema(&operator);
+
+        assert_eq!(schema["unevaluatedProperties"], json!(false));
+        assert!(
+            schema.get("additionalProperties").is_none(),
+            "additionalProperties would mask the allOf-contributed `value` property"
+        );
+        // `value` is still constrained by the `allOf` branch (required there).
+        assert_eq!(schema["allOf"][0]["required"], json!(["value"]));
     }
 }

@@ -1071,7 +1071,7 @@ impl CacheBackend for FrankenSqliteCache {
                     receipt_json, receipt_hash, receipt_bytes, created_at_ms \
              FROM query_receipts \
              WHERE plan_id = ?1 AND outcome_kind = 'ok' \
-             ORDER BY created_at_ms DESC LIMIT 1",
+             ORDER BY created_at_ms DESC, receipt_id DESC LIMIT 1",
             &[Value::Text(plan_id.to_owned())],
         )?;
         rows.first().map(row_query_receipt).transpose()
@@ -1088,7 +1088,7 @@ impl CacheBackend for FrankenSqliteCache {
                     receipt_json, receipt_hash, receipt_bytes, created_at_ms \
              FROM query_receipts \
              WHERE profile_id = ?1 AND snowflake_query_id = ?2 \
-             ORDER BY created_at_ms DESC LIMIT 1",
+             ORDER BY created_at_ms DESC, receipt_id DESC LIMIT 1",
             &[
                 Value::Text(profile_id.to_owned()),
                 Value::Text(snowflake_query_id.to_owned()),
@@ -1155,7 +1155,7 @@ impl CacheBackend for FrankenSqliteCache {
         self.query(
             "SELECT export_id, receipt_id, export_kind, target_uri_redacted, content_hash, \
                     byte_len, row_count, created_at_ms \
-             FROM exports WHERE receipt_id = ?1 ORDER BY created_at_ms DESC",
+             FROM exports WHERE receipt_id = ?1 ORDER BY created_at_ms DESC, export_id ASC",
             &[Value::Text(receipt_id.to_owned())],
         )?
         .iter()
@@ -1187,7 +1187,7 @@ impl CacheBackend for FrankenSqliteCache {
         self.query(
             "SELECT history_id, profile_id, plan_id, receipt_id, row_count, compressed_bytes, \
                     uncompressed_bytes, cost_vector_json, created_at_ms \
-             FROM cost_history WHERE profile_id = ?1 ORDER BY created_at_ms DESC",
+             FROM cost_history WHERE profile_id = ?1 ORDER BY created_at_ms DESC, history_id ASC",
             &[Value::Text(profile_id.to_owned())],
         )?
         .iter()
@@ -1330,14 +1330,22 @@ fn reject_secret_shape(field: &'static str, value: &str) -> CacheResult<()> {
         }
     }
 
+    // The prefix scan above is anchored at offset 0; catch a secret embedded
+    // mid-string (e.g. a reference accidentally set to `TOKEN=sk-live-...`) with
+    // the shared span-finder. Its token-boundary detection does not flag ordinary
+    // reference names like `SNOWFLAKE_PAT_ENV`.
+    if franken_snowflake_core::redact::contains_secret(value) {
+        return Err(CacheError::SecretRefused {
+            field,
+            reason: "embedded secret-shaped value",
+        });
+    }
+
     Ok(())
 }
 
 fn usize_to_u64(value: usize) -> u64 {
-    match u64::try_from(value) {
-        Ok(value) => value,
-        Err(_) => u64::MAX,
-    }
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn blake3_hex(payload: &[u8]) -> String {

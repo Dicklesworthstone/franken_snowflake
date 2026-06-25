@@ -1083,12 +1083,15 @@ mod tests {
                 "EVENTS_DAILY",
                 "VALUE"
             )),
+            // `ancestors()` returns deterministic key-sorted order (`walk` collects
+            // into a `BTreeSet<NodeKey>`), so the expected vec must be ordered by
+            // node-key string, not by constructor name.
             vec![
-                database_key("demo", "ANALYTICS"),
                 dataset_key("events_daily"),
-                object_key("demo", "ANALYTICS", "PUBLIC", "EVENTS_DAILY"),
                 profile_key("demo"),
+                database_key("demo", "ANALYTICS"),
                 schema_key("demo", "ANALYTICS", "PUBLIC"),
+                object_key("demo", "ANALYTICS", "PUBLIC", "EVENTS_DAILY"),
             ]
         );
         assert_eq!(graph.cycles(), Vec::<Vec<String>>::new());

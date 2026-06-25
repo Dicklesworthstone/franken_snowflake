@@ -895,7 +895,7 @@ impl RaceServerState {
 
     fn count(&mut self, request: &MockHttpRequest) {
         match (&request.method, request.path.as_str()) {
-            (MockMethod::Post, path) if path == "/api/v2/statements" => {
+            (MockMethod::Post, "/api/v2/statements") => {
                 self.counters.plain_submits = self.counters.plain_submits.saturating_add(1);
             }
             (MockMethod::Post, path) if path.starts_with("/api/v2/statements?") => {
@@ -1093,10 +1093,7 @@ fn socket_addr(port: u16) -> SocketAddr {
 }
 
 fn duration_millis(duration: Duration) -> u64 {
-    match u64::try_from(duration.as_millis()) {
-        Ok(millis) => millis,
-        Err(_) => u64::MAX,
-    }
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn trace_fingerprint(runtime: &LabRuntime) -> u64 {

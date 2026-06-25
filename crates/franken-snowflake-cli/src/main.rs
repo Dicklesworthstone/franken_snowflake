@@ -6,6 +6,13 @@
 //! registry, and `--json`/`--toon` output switch are intentionally implemented
 //! early so downstream panes can target one stable shape.
 
+// The CLI returns its rich `Outcome`/`Envelope` (a full response body) by value
+// as the command-dispatch currency rather than boxing it: `result_large_err`
+// (handlers returning `Result<_, Outcome>`) and `large_enum_variant` (the `Body`
+// enum, constructed/matched at 30+ sites) are size/shape style lints on that
+// deliberate design, not correctness issues.
+#![allow(clippy::result_large_err, clippy::large_enum_variant)]
+
 use franken_snowflake_core::error::SnowflakeErrorCode;
 use franken_snowflake_core::exit::ExitCode as CoreExitCode;
 use franken_snowflake_core::redact::redact;
@@ -1098,6 +1105,7 @@ fn success(
 /// graph` previously surfaced the profile only inside `data` on success, leaving
 /// the top-level field `null` exactly when the command succeeded (while their
 /// refusal paths set it), so an agent keyed on `profile_id` lost it on success.
+#[allow(clippy::too_many_arguments)]
 fn success_with_profile(
     format: OutputFormat,
     command_id: &'static str,
@@ -1213,6 +1221,7 @@ fn live_transport_required_with_data(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn feature_disabled(
     format: OutputFormat,
     command_id: &'static str,
@@ -1260,6 +1269,7 @@ fn toon_feature_disabled(request_id: String) -> Outcome {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn error_outcome(
     format: OutputFormat,
     command_id: &'static str,
@@ -2315,6 +2325,7 @@ fn query_run_outcome(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn refusal(
     format: OutputFormat,
     command_id: &'static str,
@@ -2611,6 +2622,11 @@ fn known_flags() -> Vec<&'static str> {
 }
 
 fn flag_requires_value(flag: &str) -> bool {
+    // `--http` is intentionally excluded: it is exclusive to `mcp serve`, which
+    // owns its own missing-address/conflict diagnostics in `parse_mcp` (with the
+    // `mcp.serve` command id). Treating it as a generic value-flag here made the
+    // global validator emit a less precise `help`-scoped "Missing value for
+    // `--http`" *before* `parse_mcp` could run, shadowing the specific message.
     matches!(
         flag,
         "--as-of"
@@ -2619,7 +2635,6 @@ fn flag_requires_value(flag: &str) -> bool {
             | "--dataset"
             | "--entity"
             | "--from"
-            | "--http"
             | "--limit"
             | "--profile"
             | "--role"
@@ -2775,7 +2790,12 @@ fn skip_sql_ws_and_comments(sql: &str, mut index: usize) -> usize {
 
 fn consume_sql_keyword(sql: &str, index: usize, keyword: &str) -> Option<usize> {
     let rest = sql.get(index..)?;
-    if rest.len() < keyword.len() || !rest[..keyword.len()].eq_ignore_ascii_case(keyword) {
+    // `rest.get(..keyword.len())` yields `None` when `keyword.len()` is past the
+    // end *or* lands inside a multi-byte UTF-8 char, so a non-ASCII statement
+    // (e.g. `query plan --sql "€€"`) can never panic on a non-char-boundary
+    // slice — the prior `rest[..keyword.len()]` did exactly that.
+    let head = rest.get(..keyword.len())?;
+    if !head.eq_ignore_ascii_case(keyword) {
         return None;
     }
     let end = index + keyword.len();
@@ -3317,6 +3337,29 @@ mod tests {
         assert!(!is_select_like(
             "with cte as (select 1) merge into t using cte on t.id = cte.id"
         ));
+    }
+
+    #[test]
+    fn sql_keyword_scan_is_panic_free_on_non_ascii_input() {
+        // `consume_sql_keyword` sliced a fixed byte length; a multi-byte char
+        // straddling that offset panicked (`end byte index N is not a char
+        // boundary`). These must all return cleanly, never abort the process.
+        for sql in [
+            "€€",
+            "x€€ from t",
+            "naïve select",
+            "  /* π */ select 1",
+            "señor",
+            "用户 select",
+        ] {
+            // The point is the absence of a panic; the boolean is incidental.
+            let _ = is_select_like(sql);
+            let _ = has_multiple_statements(sql);
+        }
+        // A leading multi-byte run is not SELECT-like, and a genuine select with
+        // a non-ASCII tail still parses as read.
+        assert!(!is_select_like("€€ select"));
+        assert!(is_select_like("select 'café' as c"));
     }
 
     #[cfg(feature = "toon")]

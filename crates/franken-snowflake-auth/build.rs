@@ -559,7 +559,7 @@ fn impl_body<'a>(source: &'a str, trait_name: &str, type_name: &str) -> Option<&
                 let boundary_ok = source
                     .as_bytes()
                     .get(after)
-                    .map_or(true, |byte| !is_ident_byte(*byte));
+                    .is_none_or(|byte| !is_ident_byte(*byte));
                 if boundary_ok {
                     return Some((start, pattern.len()));
                 }
@@ -589,7 +589,7 @@ fn debug_impl_references_self_field(body: &str, field: &str) -> bool {
     while let Some(offset) = body[search_from..].find(&direct) {
         let index = search_from + offset;
         let after = body.as_bytes().get(index + direct.len()).copied();
-        if after.map_or(true, |byte| !is_ident_byte(byte)) {
+        if after.is_none_or(|byte| !is_ident_byte(byte)) {
             return true;
         }
         search_from = index + direct.len();
@@ -707,8 +707,8 @@ fn binding_referenced_after(body: &str, binding: &str, from: usize) -> bool {
             .checked_sub(1)
             .and_then(|idx| suffix.as_bytes().get(idx));
         let after = suffix.as_bytes().get(index + binding.len());
-        let before_ok = before.map_or(true, |byte| !is_ident_byte(*byte));
-        let after_ok = after.map_or(true, |byte| !is_ident_byte(*byte));
+        let before_ok = before.is_none_or(|byte| !is_ident_byte(*byte));
+        let after_ok = after.is_none_or(|byte| !is_ident_byte(*byte));
         if before_ok && after_ok {
             return true;
         }
@@ -729,8 +729,8 @@ fn find_word(source: &str, word: &str, from: usize) -> Option<usize> {
             .checked_sub(1)
             .and_then(|idx| source.as_bytes().get(idx));
         let after = source.as_bytes().get(index + word.len());
-        let before_ok = before.map_or(true, |byte| !is_ident_byte(*byte));
-        let after_ok = after.map_or(true, |byte| !is_ident_byte(*byte));
+        let before_ok = before.is_none_or(|byte| !is_ident_byte(*byte));
+        let after_ok = after.is_none_or(|byte| !is_ident_byte(*byte));
         if before_ok && after_ok {
             return Some(index);
         }

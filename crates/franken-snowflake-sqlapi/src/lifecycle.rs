@@ -91,6 +91,11 @@ pub struct CompletedStatement {
 }
 
 /// The next step a caller should take after feeding the machine a response.
+// `Complete` carries the assembled `CompletedStatement` (~408 bytes) while the
+// poll/fetch variants are tiny. A `Progress` is produced once per network
+// round-trip, so the hot-stack-copy premise of `large_enum_variant` does not
+// apply; boxing would add indirection to every consumer for no real benefit.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Progress {
     /// Poll this handle again (the statement is still running).
@@ -163,6 +168,10 @@ impl std::fmt::Display for LifecycleError {
 impl std::error::Error for LifecycleError {}
 
 /// Internal phase of the lifecycle.
+// `Assembling` holds the in-flight `ResultSet`; `Pending`/`Done` are unit-like.
+// The machine transitions once per network round-trip, so boxing the result set
+// would add indirection for no real benefit (see `Progress` above).
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 enum Phase {
     /// Before submit, or polling a `202` handle.
@@ -509,8 +518,10 @@ mod tests {
                 .poll_interval,
             MIN_POLL_INTERVAL
         );
-        let mut hand_set = PollPlan::default();
-        hand_set.poll_interval = Duration::ZERO;
+        let hand_set = PollPlan {
+            poll_interval: Duration::ZERO,
+            ..PollPlan::default()
+        };
         assert_eq!(hand_set.effective_poll_interval(), MIN_POLL_INTERVAL);
     }
 

@@ -131,6 +131,7 @@ struct LiveProfile {
 }
 
 impl LiveProfile {
+    #[allow(clippy::result_large_err)]
     fn load() -> Result<Self, LiveGate> {
         if env::var(LIVE_OPT_IN_ENV).as_deref() != Ok("1") {
             return Err(LiveGate::new(
