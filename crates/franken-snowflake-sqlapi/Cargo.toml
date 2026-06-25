@@ -28,5 +28,6 @@ serde_json = "1"
 [dev-dependencies]
 # The shared golden framework (key-sorted canonical JSON, LF discipline) drives
 # the fixture round-trip proofs without a live account.
+asupersync = { workspace = true, features = ["test-internals"] }
 franken-snowflake-auth = { path = "../franken-snowflake-auth" }
 franken-snowflake-testkit = { path = "../franken-snowflake-testkit" }

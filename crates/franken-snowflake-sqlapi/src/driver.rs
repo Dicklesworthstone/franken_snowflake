@@ -14,6 +14,8 @@
 //! cleanup request and single-sources the cancel-policy table. Either way the
 //! local outcome is `Cancelled`.
 
+use std::time::Duration;
+
 use asupersync::Cx;
 use franken_snowflake_core::cancel::CancelReason;
 use franken_snowflake_core::error::{SnowflakeError, SnowflakeErrorCode};
@@ -24,7 +26,9 @@ use franken_snowflake_http::{
     StatusClass, SubmitHttpRequest, TransportRoute,
 };
 
-use crate::lifecycle::{CompletedStatement, PollPlan, Progress, StatementMachine};
+use crate::lifecycle::{
+    CompletedStatement, MIN_POLL_INTERVAL, PollPlan, Progress, StatementMachine,
+};
 use crate::request::{SubmitQueryParams, SubmitStatementRequest};
 use crate::status::ResponseClass;
 
@@ -69,6 +73,9 @@ pub async fn run_statement(
         SnowflakeOutcome::Panicked(payload) => return SnowflakeOutcome::panicked(payload),
     };
 
+    // Captured before the machine takes ownership; `PollPlan` is `Copy`. The 202
+    // poll loop waits this long between GETs (see `wait_poll_interval`).
+    let poll_interval = poll_plan.effective_poll_interval();
     let mut machine = StatementMachine::new(poll_plan);
     let mut progress = match machine.on_submit(
         response_class(submit_response.status),
@@ -97,6 +104,14 @@ pub async fn run_statement(
                 if cx.checkpoint().is_err() {
                     return cancel_locally(cx, client, &auth, &handle, local_cancel_reason(cx))
                         .await;
+                }
+                // Pace the 202 poll loop: a still-running statement returns 202
+                // immediately (the transport only backs off on retryable 429/5xx),
+                // so without this cancel-aware wait the loop would hammer the SQL
+                // API and burn the poll quota in milliseconds. A cancellation
+                // during the wait still fires the remote cancel for the live handle.
+                if let Err(reason) = wait_poll_interval(cx, poll_interval).await {
+                    return cancel_locally(cx, client, &auth, &handle, reason).await;
                 }
                 let poll = client
                     .poll_statement(
@@ -183,6 +198,37 @@ fn local_cancel_reason(cx: &Cx) -> CancelReason {
         .unwrap_or_else(CancelReason::parent_cancelled)
 }
 
+/// Wait `delay` between poll `GET`s, cancel-aware. Returns the cancellation reason
+/// if the ambient `Cx` is cancelled before or during the wait, so the caller can
+/// fire the remote cancel for the live statement handle.
+async fn wait_poll_interval(cx: &Cx, delay: Duration) -> Result<(), CancelReason> {
+    let mut remaining = delay;
+    while !remaining.is_zero() {
+        if cx.checkpoint().is_err() {
+            return Err(local_cancel_reason(cx));
+        }
+
+        let slice = remaining.min(MIN_POLL_INTERVAL);
+        if asupersync::time::budget_sleep(cx, slice, cx.now_for_observability())
+            .await
+            .is_err()
+        {
+            // `budget_sleep` reports elapsed deadlines but does not itself mark
+            // the `Cx` cancelled. Checkpoint once so budget exhaustion is
+            // attributed as Deadline/PollQuota/CostBudget instead of falling
+            // back to ParentCancelled.
+            let _ = cx.checkpoint();
+            return Err(local_cancel_reason(cx));
+        }
+
+        if cx.checkpoint().is_err() {
+            return Err(local_cancel_reason(cx));
+        }
+        remaining = remaining.saturating_sub(slice);
+    }
+    Ok(())
+}
+
 /// Pick the submit route, preserving every typed submit query parameter.
 fn submit_route(params: &SubmitQueryParams) -> TransportRoute {
     let query = params.to_query_pairs();
@@ -212,6 +258,7 @@ const fn response_class(status: StatusClass) -> ResponseClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::{Budget, CancelKind, Time};
 
     #[test]
     fn response_class_maps_each_transport_status() {
@@ -276,5 +323,18 @@ mod tests {
             route.path_and_query(),
             "/api/v2/statements?requestId=req-async-nullable&retry=true&async=true&nullable=false"
         );
+    }
+
+    #[test]
+    fn wait_poll_interval_preserves_deadline_attribution() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::for_testing_with_budget(Budget::new().with_deadline(Time::from_millis(1)));
+
+            let reason = wait_poll_interval(&cx, Duration::from_millis(10))
+                .await
+                .expect_err("deadline should expire during poll wait");
+
+            assert_eq!(reason.kind, CancelKind::Deadline);
+        });
     }
 }

@@ -14,32 +14,66 @@
 //! decompressed by the transport, so the machine always receives **decoded**
 //! partition bytes.
 
+use std::time::Duration;
+
 use franken_snowflake_core::error::{SnowflakeError, SnowflakeErrorCode};
 use franken_snowflake_core::ids::StatementHandle;
 
 use crate::response::{QueryFailureStatus, QueryStatus, ResultSet};
 use crate::status::ResponseClass;
 
-/// How long to poll a `202` handle before giving up.
+/// Lower bound on the inter-poll wait so a `202` poll loop can never degrade into
+/// a tight, API-hammering spin (which would also burn the whole poll quota in
+/// milliseconds and provoke server-side `429` rate limiting).
+pub const MIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How a `202` handle is polled: how many times, and how long to wait between
+/// `GET`s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PollPlan {
     /// Maximum number of poll `GET`s before [`LifecycleErrorCode::PollQuotaExhausted`].
     pub max_polls: u32,
+    /// Wall-clock delay the async driver waits between successive poll `GET`s on a
+    /// still-running (`202`) handle. The pure machine carries this as data only;
+    /// the [`crate::driver`] performs the cancel-aware sleep. The transport only
+    /// backs off on *retryable* statuses (`429`/`5xx`); a `202` returns
+    /// immediately, so without this interval the poll loop would spin with no gap.
+    pub poll_interval: Duration,
 }
 
 impl Default for PollPlan {
     fn default() -> Self {
-        Self { max_polls: 120 }
+        Self {
+            max_polls: 120,
+            poll_interval: Duration::from_millis(1_000),
+        }
     }
 }
 
 impl PollPlan {
-    /// A plan with an explicit poll ceiling (clamped to at least 1).
+    /// A plan with an explicit poll ceiling (clamped to at least 1), keeping the
+    /// default inter-poll interval.
     #[must_use]
     pub fn with_max_polls(max_polls: u32) -> Self {
         Self {
             max_polls: max_polls.max(1),
+            ..Self::default()
         }
+    }
+
+    /// Set the inter-poll wait, clamped to [`MIN_POLL_INTERVAL`] so the `202` poll
+    /// loop can never become a tight spin.
+    #[must_use]
+    pub fn with_poll_interval(mut self, poll_interval: Duration) -> Self {
+        self.poll_interval = poll_interval.max(MIN_POLL_INTERVAL);
+        self
+    }
+
+    /// The effective inter-poll wait, never below [`MIN_POLL_INTERVAL`] even if the
+    /// public field was set directly.
+    #[must_use]
+    pub fn effective_poll_interval(&self) -> Duration {
+        self.poll_interval.max(MIN_POLL_INTERVAL)
     }
 }
 
@@ -318,6 +352,15 @@ impl StatementMachine {
         let rows = result_set.data.clone();
         if total <= 1 {
             self.phase = Phase::Done;
+            // Apply the same row-count integrity check as the multi-partition path:
+            // for a single (inline) partition, `data` must hold exactly `numRows`.
+            let expected = result_set.result_set_meta_data.num_rows;
+            if expected >= 0 && rows.len() as i64 != expected {
+                return Err(LifecycleError::new(
+                    LifecycleErrorCode::PartitionRowMismatch,
+                    format!("assembled {} rows but numRows is {expected}", rows.len()),
+                ));
+            }
             Ok(Progress::Complete(CompletedStatement {
                 statement_handle: handle,
                 result_set,
@@ -374,6 +417,32 @@ pub fn parse_partition_rows(body: &[u8]) -> Result<Vec<Vec<Option<String>>>, Lif
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_plan_interval_is_always_sane() {
+        // The default paces the 202 poll loop (never a tight spin).
+        assert_eq!(
+            PollPlan::default().poll_interval,
+            Duration::from_millis(1_000)
+        );
+        assert!(PollPlan::default().effective_poll_interval() >= MIN_POLL_INTERVAL);
+        // with_max_polls keeps the default interval.
+        assert_eq!(
+            PollPlan::with_max_polls(5).poll_interval,
+            PollPlan::default().poll_interval
+        );
+        // A too-small (or zero) interval is clamped to the floor, both via the
+        // setter and via the effective accessor (guarding a direct field write).
+        assert_eq!(
+            PollPlan::default()
+                .with_poll_interval(Duration::ZERO)
+                .poll_interval,
+            MIN_POLL_INTERVAL
+        );
+        let mut hand_set = PollPlan::default();
+        hand_set.poll_interval = Duration::ZERO;
+        assert_eq!(hand_set.effective_poll_interval(), MIN_POLL_INTERVAL);
+    }
 
     #[test]
     fn partition_total_treats_absent_or_single_info_as_inline() -> Result<(), String> {
@@ -466,7 +535,10 @@ mod tests {
         let mut machine = StatementMachine::new(PollPlan::default());
         let first = machine.on_submit(ResponseClass::Completed, terminal);
         let handle = match first {
-            Ok(Progress::FetchPartition { handle, partition: 1 }) => handle,
+            Ok(Progress::FetchPartition {
+                handle,
+                partition: 1,
+            }) => handle,
             other => return Err(format!("expected FetchPartition 1, got {other:?}")),
         };
         assert_eq!(handle, StatementHandle::new("hp"));
@@ -477,7 +549,10 @@ mod tests {
         match machine.on_partition(ResponseClass::Completed, 2, br#"[["5","e"]]"#) {
             Ok(Progress::Complete(done)) => {
                 assert_eq!(done.rows.len(), 5);
-                assert_eq!(done.rows[4], vec![Some("5".to_owned()), Some("e".to_owned())]);
+                assert_eq!(
+                    done.rows[4],
+                    vec![Some("5".to_owned()), Some("e".to_owned())]
+                );
                 Ok(())
             }
             other => Err(format!("expected Complete, got {other:?}")),
@@ -496,6 +571,24 @@ mod tests {
         let result = machine.on_partition(ResponseClass::Completed, 1, br#"[["y"]]"#);
         assert!(matches!(
             result,
+            Err(LifecycleError {
+                code: LifecycleErrorCode::PartitionRowMismatch,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn single_partition_row_count_mismatch_is_rejected() {
+        // numRows claims 5 but the single inline partition has 1 row: the
+        // integrity check applies to the single-partition path too.
+        let terminal = br#"{"resultSetMetaData":{"numRows":5,"format":"jsonv2",
+            "rowType":[{"name":"A","type":"TEXT","nullable":false}],
+            "partitionInfo":[{"rowCount":5,"compressedSize":1,"uncompressedSize":1}]},
+            "data":[["x"]],"code":"090001","statementHandle":"h"}"#;
+        let mut machine = StatementMachine::new(PollPlan::default());
+        assert!(matches!(
+            machine.on_submit(ResponseClass::Completed, terminal),
             Err(LifecycleError {
                 code: LifecycleErrorCode::PartitionRowMismatch,
                 ..
