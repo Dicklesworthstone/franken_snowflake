@@ -372,7 +372,7 @@ fn execute(raw_args: Vec<String>) -> Outcome {
 }
 
 fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
-    let (output, args) = extract_output_format(raw_args);
+    let (output, explicit_json, args) = extract_output_format(raw_args);
     let args_for_request_id = args.clone();
 
     validate_known_flags(output, &args)?;
@@ -400,7 +400,7 @@ fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
         "doctor" => Command::Doctor,
         "selftest" => Command::Selftest,
         "profile" => parse_profile(&args, output)?,
-        "catalog" => parse_catalog(&args, output)?,
+        "catalog" => parse_catalog(&args, output, explicit_json)?,
         "dataset" => parse_dataset(&args, output)?,
         "query" => parse_query(&args, output)?,
         "receipt" => parse_receipt(&args, output)?,
@@ -505,7 +505,11 @@ fn parse_profile(args: &[String], output: OutputFormat) -> Result<Command, Outco
     }
 }
 
-fn parse_catalog(args: &[String], output: OutputFormat) -> Result<Command, Outcome> {
+fn parse_catalog(
+    args: &[String],
+    output: OutputFormat,
+    explicit_json: bool,
+) -> Result<Command, Outcome> {
     match args.get(1).map(String::as_str) {
         Some("scan") => match args.get(2) {
             Some(profile) => {
@@ -562,7 +566,10 @@ fn parse_catalog(args: &[String], output: OutputFormat) -> Result<Command, Outco
                 let wants_svg = has_flag(args, "--svg");
                 let raw_output_count =
                     (if wants_mermaid { 1 } else { 0 }) + (if wants_svg { 1 } else { 0 });
-                if raw_output_count > 1 || (output == OutputFormat::Toon && raw_output_count > 0) {
+                if raw_output_count > 1
+                    || (explicit_json && raw_output_count > 0)
+                    || (output == OutputFormat::Toon && raw_output_count > 0)
+                {
                     return Err(usage_error(
                         output,
                         "catalog.graph",
@@ -2409,23 +2416,27 @@ fn first_commands() -> Vec<String> {
     ]
 }
 
-fn extract_output_format(raw_args: Vec<String>) -> (OutputFormat, Vec<String>) {
+fn extract_output_format(raw_args: Vec<String>) -> (OutputFormat, bool, Vec<String>) {
     let mut output = OutputFormat::Json;
+    let mut explicit_json = false;
     let mut filtered = Vec::new();
     for arg in raw_args {
         match arg.as_str() {
-            "--json" => output = OutputFormat::Json,
+            "--json" => {
+                explicit_json = true;
+                output = OutputFormat::Json;
+            }
             "--toon" => output = OutputFormat::Toon,
             "--no-color" => {}
             _ => filtered.push(arg),
         }
     }
-    (output, filtered)
+    (output, explicit_json, filtered)
 }
 
 fn validate_known_flags(output: OutputFormat, args: &[String]) -> Result<(), Outcome> {
     let mut skip_next = false;
-    for arg in args {
+    for (index, arg) in args.iter().enumerate() {
         if skip_next {
             skip_next = false;
             continue;
@@ -2440,6 +2451,12 @@ fn validate_known_flags(output: OutputFormat, args: &[String]) -> Result<(), Out
             .map_or(arg.as_str(), |(name, _value)| name);
         if known_flags().iter().any(|known| known == &flag_name) {
             if flag_requires_value(flag_name) && !arg.contains('=') {
+                let Some(next) = args.get(index + 1) else {
+                    return Err(missing_flag_value_outcome(output, flag_name));
+                };
+                if next.starts_with('-') && !flag_allows_flag_like_value(flag_name) {
+                    return Err(missing_flag_value_outcome(output, flag_name));
+                }
                 skip_next = true;
             }
             continue;
@@ -2463,6 +2480,20 @@ fn validate_known_flags(output: OutputFormat, args: &[String]) -> Result<(), Out
     }
 
     Ok(())
+}
+
+fn missing_flag_value_outcome(output: OutputFormat, flag_name: &str) -> Outcome {
+    usage_error(
+        output,
+        "help",
+        "fsnow.help.v1",
+        &format!("Missing value for `{flag_name}`."),
+        vec![
+            "franken-snowflake capabilities --json".to_string(),
+            format!("franken-snowflake <command> {flag_name} <value> --json"),
+        ],
+        vec![],
+    )
 }
 
 fn known_flags() -> Vec<&'static str> {
@@ -2513,6 +2544,10 @@ fn flag_requires_value(flag: &str) -> bool {
             | "--to"
             | "--warehouse"
     )
+}
+
+fn flag_allows_flag_like_value(flag: &str) -> bool {
+    matches!(flag, "--sql")
 }
 
 fn has_any(args: &[String], needles: &[&str]) -> bool {
@@ -3193,6 +3228,22 @@ mod tests {
     }
 
     #[test]
+    fn missing_global_flag_value_cannot_swallow_following_flags() {
+        let outcome = execute(vec![
+            "capabilities".to_string(),
+            "--profile".to_string(),
+            "--bogus".to_string(),
+        ]);
+        assert_eq!(outcome.status.code(), 64);
+        let rendered = match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("Missing value for `--profile`."));
+        assert!(!rendered.contains("\"command_id\":\"capabilities\""));
+    }
+
+    #[test]
     fn parse_errors_keep_requested_toon_format() {
         let outcome = execute(vec![
             "profile".to_string(),
@@ -3223,6 +3274,21 @@ mod tests {
         assert!(rendered.contains("Conflicting catalog graph output formats"));
         assert!(rendered.contains("franken-snowflake catalog graph &lt;profile&gt; --toon")
             || rendered.contains("franken-snowflake catalog graph <profile> --toon"));
+
+        let json_mermaid = execute(vec![
+            "catalog".to_string(),
+            "graph".to_string(),
+            "demo".to_string(),
+            "--json".to_string(),
+            "--mermaid".to_string(),
+        ]);
+        assert_eq!(json_mermaid.status.code(), 64);
+        let rendered = match json_mermaid.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("Conflicting catalog graph output formats"));
+        assert!(!rendered.starts_with("graph TD"));
 
         let toon_mermaid = execute(vec![
             "catalog".to_string(),
@@ -3317,7 +3383,7 @@ mod tests {
             Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
             Body::Raw { data } => data,
         };
-        assert!(rendered.contains("Missing --profile for `query plan`."));
+        assert!(rendered.contains("Missing value for `--profile`."));
         assert!(!rendered.contains("\"profile_id\":\"--sql\""));
     }
 
