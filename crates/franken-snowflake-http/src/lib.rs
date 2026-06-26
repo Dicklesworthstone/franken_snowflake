@@ -376,8 +376,7 @@ impl SnowflakeHttpClient {
 
             match result {
                 Ok(response) => {
-                    let retry_after_ms =
-                        retry_after_ms(response.headers.as_slice(), asupersync::time::wall_now());
+                    let retry_after_ms = retry_after_ms(response.headers.as_slice());
                     let retryable = is_retryable_status(response.status);
                     if retryable {
                         if !route_allows_automatic_retry(&wire.route) {
@@ -1500,23 +1499,38 @@ fn response_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'
         .map(|(_, value)| value.as_str())
 }
 
-fn retry_after_ms(headers: &[(String, String)], now: Time) -> Option<u64> {
+fn retry_after_ms(headers: &[(String, String)]) -> Option<u64> {
     let raw = response_header(headers, "Retry-After")?.trim();
     raw.parse::<u64>()
         .ok()
         .and_then(|seconds| seconds.checked_mul(1_000))
-        .or_else(|| retry_after_http_date_ms(raw, now))
+        .or_else(|| retry_after_http_date_ms(raw))
 }
 
-fn retry_after_http_date_ms(raw: &str, now: Time) -> Option<u64> {
+/// Convert an HTTP-date form `Retry-After` (RFC 7231) into a delay in
+/// milliseconds.
+///
+/// The header names an absolute calendar instant, so the delay is
+/// `target - now` measured on the real wall clock. `asupersync::time::wall_now()`
+/// is **process-relative** (elapsed since process start), not Unix-epoch, so it
+/// must not be used here: subtracting a tiny process uptime from an absolute
+/// Unix instant yields a decades-long bogus delay that exceeds the retry budget
+/// and aborts retries on the first attempt. `std::time::SystemTime` (std — not a
+/// forbidden async-runtime dependency) is the correct absolute clock source.
+fn retry_after_http_date_ms(raw: &str) -> Option<u64> {
     let target_seconds = parse_http_date_unix_seconds(raw)?;
-    if target_seconds <= 0 {
+    let now_unix_seconds = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs(),
+    )
+    .ok()?;
+    let delta_seconds = target_seconds.saturating_sub(now_unix_seconds);
+    if delta_seconds <= 0 {
         return Some(0);
     }
-    let target = Time::from_secs(u64::try_from(target_seconds).ok()?);
-    Some(duration_millis_saturating(Duration::from_nanos(
-        target.duration_since(now),
-    )))
+    Some((delta_seconds as u64).saturating_mul(1_000))
 }
 
 fn parse_http_date_unix_seconds(raw: &str) -> Option<i64> {
@@ -2470,34 +2484,49 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_parses_delta_seconds_and_http_dates() {
-        let now = Time::from_secs(1_445_412_475);
-        assert_eq!(
-            retry_after_ms(&header("Retry-After", "5"), now),
-            Some(5_000)
-        );
-        assert_eq!(
-            retry_after_ms(&header("Retry-After", "Wed, 21 Oct 2015 07:28:00 GMT"), now),
-            Some(5_000)
-        );
-        assert_eq!(
-            retry_after_ms(
-                &header("Retry-After", "Wednesday, 21-Oct-15 07:28:00 GMT"),
-                now
-            ),
-            Some(5_000)
-        );
-        assert_eq!(
-            retry_after_ms(&header("Retry-After", "Wed Oct 21 07:28:00 2015"), now),
-            Some(5_000)
-        );
-        assert_eq!(
-            retry_after_ms(
-                &header("Retry-After", "Wed, 21 Oct 2015 07:28:00 GMT"),
-                Time::from_secs(1_445_412_480)
-            ),
-            Some(0)
-        );
+    fn retry_after_delta_seconds_form_is_clock_independent() {
+        assert_eq!(retry_after_ms(&header("Retry-After", "5")), Some(5_000));
+        assert_eq!(retry_after_ms(&header("Retry-After", "0")), Some(0));
+        assert_eq!(retry_after_ms(&header("Retry-After", "not-a-value")), None);
+    }
+
+    #[test]
+    fn retry_after_http_date_formats_parse_to_unix_seconds() {
+        // All three RFC 7231 date forms denote 2015-10-21T07:28:00Z. Parsing is a
+        // pure function (no clock) and must accept IMF-fixdate, RFC-850, and
+        // asctime forms identically.
+        for raw in [
+            "Wed, 21 Oct 2015 07:28:00 GMT",
+            "Wednesday, 21-Oct-15 07:28:00 GMT",
+            "Wed Oct 21 07:28:00 2015",
+        ] {
+            assert_eq!(parse_http_date_unix_seconds(raw), Some(1_445_412_480));
+        }
+    }
+
+    #[test]
+    fn retry_after_http_date_is_measured_against_absolute_wall_clock() {
+        // Regression: an HTTP-date `Retry-After` must be differenced against
+        // absolute Unix time, not asupersync's process-relative `wall_now()`. A
+        // date already in the past yields a zero delay. Under the old
+        // process-relative clock (≈ seconds since process start) the same past
+        // date produced a ~decades-long bogus delay that blew the retry budget and
+        // aborted retries on the first attempt — so this would have returned a huge
+        // value, not `Some(0)`.
+        for raw in [
+            "Wed, 21 Oct 2015 07:28:00 GMT",
+            "Wednesday, 21-Oct-15 07:28:00 GMT",
+            "Wed Oct 21 07:28:00 2015",
+        ] {
+            assert_eq!(retry_after_ms(&header("Retry-After", raw)), Some(0));
+        }
+
+        // A clearly-future date yields a positive (non-zero) delay rather than the
+        // saturated-to-zero past case, confirming the sign of the difference is
+        // correct.
+        let delay = retry_after_ms(&header("Retry-After", "Fri, 31 Dec 2100 23:59:59 GMT"))
+            .expect("future date delay");
+        assert!(delay > 0, "future date must yield a positive delay, got {delay}");
     }
 
     #[test]
