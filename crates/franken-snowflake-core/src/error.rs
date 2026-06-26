@@ -62,6 +62,9 @@ pub enum SnowflakeErrorCode {
     MetadataError,
     /// An internal invariant was violated.
     Internal,
+    /// A command surface is reserved but its handler is not implemented yet.
+    /// A deliberate refusal (exit 2), not an I/O fault — distinct from `Internal`.
+    SurfaceReserved,
 }
 
 /// One row of the error registry.
@@ -110,6 +113,7 @@ impl SnowflakeErrorCode {
         Self::CacheError,
         Self::MetadataError,
         Self::Internal,
+        Self::SurfaceReserved,
     ];
 
     /// The full registry row for this code.
@@ -355,6 +359,16 @@ impl SnowflakeErrorCode {
                 summary: "Internal invariant violated.",
                 safe_next_commands: &["franken-snowflake doctor --json"],
                 repair_commands: &["franken-snowflake selftest --json"],
+            },
+            Self::SurfaceReserved => ErrorEntry {
+                code: self,
+                stable_code: "FSNOW-9002",
+                exit_code: ExitCode::SafetyRefusal,
+                retryable: false,
+                policy_boundary: true,
+                summary: "Command surface is reserved; its handler is pending lower-level beads.",
+                safe_next_commands: &["franken-snowflake capabilities --json"],
+                repair_commands: &["franken-snowflake doctor --json"],
             },
         }
     }
