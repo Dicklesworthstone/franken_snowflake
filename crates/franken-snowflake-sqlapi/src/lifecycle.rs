@@ -446,6 +446,20 @@ fn parse_failure(body: &[u8]) -> Result<QueryFailureStatus, LifecycleError> {
 /// # Errors
 /// [`LifecycleErrorCode::DecodeFailed`] if the body is not a JSON row array.
 pub fn parse_partition_rows(body: &[u8]) -> Result<Vec<Vec<Option<String>>>, LifecycleError> {
+    // The live SQL API returns a non-inline partition as a JSON **object**
+    // `{"data": [[...]]}` (observed against a real account, 2026-06-25 — a
+    // `GET ...?partition=N` over a 13-partition result yielded `{"data":[...]}`,
+    // gzip-encoded, decoded by the transport). The original bare-top-level-array
+    // assumption (carried by replay/mock fixtures) made every live partition
+    // fetch fail with `invalid type: map, expected a sequence`. Accept the object
+    // form first, then fall back to the bare-array form for fixtures/replays.
+    #[derive(serde::Deserialize)]
+    struct PartitionEnvelope {
+        data: Vec<Vec<Option<String>>>,
+    }
+    if let Ok(envelope) = serde_json::from_slice::<PartitionEnvelope>(body) {
+        return Ok(envelope.data);
+    }
     serde_json::from_slice(body)
         .map_err(|error| LifecycleError::new(LifecycleErrorCode::DecodeFailed, error.to_string()))
 }

@@ -438,6 +438,24 @@ fn run_live_lanes(profile: &LiveProfile, logger: &mut RunLogger) -> Result<(), S
             )
             .map_err(|error| error.to_string())?;
 
+        // Per-run unique request ids: a fixed `requestId` + `retry=true` is the
+        // SQL API idempotency contract, so re-running against the same account
+        // returned the *cached original* statement (e.g. the cancel lane saw a
+        // Completed/Cancelled result instead of a fresh 202). A live proof must be
+        // re-runnable, so each lane gets a UUID-shaped id unique per run (nonce)
+        // and per lane. (Wall clock is fine here — this is the opt-in live lane.)
+        let run_nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or(0);
+        let req_id = |lane: u64| {
+            format!(
+                "{:08x}-0000-4000-8000-{:012x}",
+                (run_nonce & 0xffff_ffff) as u32,
+                ((run_nonce >> 16) ^ lane) & 0xffff_ffff_ffff,
+            )
+        };
+
         let profile_probe = run_query_lane(
             &cx,
             &client,
@@ -445,7 +463,7 @@ fn run_live_lanes(profile: &LiveProfile, logger: &mut RunLogger) -> Result<(), S
             profile,
             "profile_doctor_online",
             &profile.profile_sql,
-            "00000000-0000-4000-8000-000000000101",
+            &req_id(1),
         )
         .await?;
         require_rows(profile, "profile_doctor_online", &profile_probe, 1)?;
@@ -460,7 +478,7 @@ fn run_live_lanes(profile: &LiveProfile, logger: &mut RunLogger) -> Result<(), S
             profile,
             "catalog_scan",
             &profile.catalog_sql,
-            "00000000-0000-4000-8000-000000000102",
+            &req_id(2),
         )
         .await?;
         logger
@@ -481,7 +499,7 @@ fn run_live_lanes(profile: &LiveProfile, logger: &mut RunLogger) -> Result<(), S
             profile,
             "small_select",
             &profile.small_sql,
-            "00000000-0000-4000-8000-000000000103",
+            &req_id(3),
         )
         .await?;
         require_rows(profile, "small_select", &small, 1)?;
@@ -489,7 +507,7 @@ fn run_live_lanes(profile: &LiveProfile, logger: &mut RunLogger) -> Result<(), S
             .pass(COMMAND_ID, "small_select")
             .map_err(|error| error.to_string())?;
 
-        let cancelled = cancel_lane(&cx, &client, auth.clone(), profile).await?;
+        let cancelled = cancel_lane(&cx, &client, auth.clone(), profile, &req_id(4)).await?;
         logger
             .info(
                 COMMAND_ID,
@@ -508,7 +526,7 @@ fn run_live_lanes(profile: &LiveProfile, logger: &mut RunLogger) -> Result<(), S
             profile,
             "partitioned_result",
             &profile.partition_sql,
-            "00000000-0000-4000-8000-000000000105",
+            &req_id(5),
         )
         .await?;
         if partitioned.result_set.partition_count() < 2 {
@@ -574,9 +592,10 @@ async fn cancel_lane(
     client: &SnowflakeHttpClient,
     auth: AuthorizationDescriptor,
     profile: &LiveProfile,
+    request_id: &str,
 ) -> Result<StatementHandle, String> {
     let params = SubmitQueryParams {
-        request_id: Some("00000000-0000-4000-8000-000000000104".to_string()),
+        request_id: Some(request_id.to_string()),
         retry: true,
         asynchronous: true,
         nullable: None,

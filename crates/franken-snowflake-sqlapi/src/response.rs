@@ -132,10 +132,17 @@ pub struct ColumnType {
 pub struct PartitionInfo {
     /// Rows in this partition.
     pub row_count: i64,
-    /// Compressed (gzip) byte size.
-    pub compressed_size: i64,
-    /// Uncompressed byte size.
-    pub uncompressed_size: i64,
+    /// Compressed (gzip) byte size. **Optional**: the live SQL API omits
+    /// `compressedSize` for inline/uncompressed partition 0 (observed against a
+    /// real account, 2026-06-25 — a `SELECT` returns `{"rowCount":N,
+    /// "uncompressedSize":B}` with no `compressedSize`). A required field here
+    /// made every live response fail to decode (`missing field compressedSize`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compressed_size: Option<i64>,
+    /// Uncompressed byte size. Optional for the same reason (Snowflake omits
+    /// either size field depending on partition encoding).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uncompressed_size: Option<i64>,
 }
 
 /// A `202 Accepted` still-running status — the poll-again signal. Re-`GET` the

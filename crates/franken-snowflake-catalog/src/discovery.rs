@@ -1136,8 +1136,8 @@ mod tests {
                 row_type,
                 partition_info: vec![PartitionInfo {
                     row_count: owned_rows.len() as i64,
-                    compressed_size: 0,
-                    uncompressed_size: 0,
+                    compressed_size: Some(0),
+                    uncompressed_size: Some(0),
                 }],
             },
             data: owned_rows.clone(),
