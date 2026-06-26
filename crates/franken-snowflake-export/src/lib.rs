@@ -915,8 +915,15 @@ mod local {
             }
             SnowflakeTypeFamily::Number if is_json_number(value) => Ok(value.to_owned()),
             SnowflakeTypeFamily::SemiStructured => {
-                let parsed: serde_json::Value = serde_json::from_str(value)?;
-                serde_json::to_string(&parsed).map_err(ExportError::from)
+                // Snowflake returns VARIANT/OBJECT/ARRAY cells as already-compact
+                // JSON text. Round-tripping through `serde_json::Value` would
+                // silently corrupt it: without the `arbitrary_precision` feature an
+                // integer beyond u64 (a `NUMBER(38,0)` is routine) collapses to f64
+                // (e.g. `99999999999999999999` -> `1e20`), and without
+                // `preserve_order` object keys are re-sorted. Validate that the cell
+                // is well-formed JSON, then emit the source bytes verbatim.
+                serde_json::from_str::<serde::de::IgnoredAny>(value)?;
+                Ok(value.to_owned())
             }
             _ => serde_json::to_string(value).map_err(ExportError::from),
         }
@@ -1442,6 +1449,34 @@ mod tests {
             .content_address
             .verify(&artifact.bytes)
             .is_ok());
+    }
+
+    #[test]
+    fn jsonl_variant_cells_preserve_key_order_and_large_integers() {
+        // VARIANT/OBJECT/ARRAY cells must be emitted verbatim. Round-tripping
+        // through `serde_json::Value` (no `arbitrary_precision`/`preserve_order`)
+        // would reorder the keys and collapse the `NUMBER(38,0)` `big` value
+        // (> u64) to `1e20`. Emit-raw must keep the source bytes intact.
+        let raw = "{\"z\":1,\"a\":2,\"big\":99999999999999999999,\"dec\":12345678901234567.89}";
+        let input = LocalExportInput::new(
+            vec![ExportColumn::new("v", "VARIANT")],
+            vec![ResultPartition::new(0, vec![vec![Some(raw.to_owned())]])],
+        );
+        let artifact = export_jsonl(&input, "artifacts/variant.jsonl", 1).expect("export");
+        let line = String::from_utf8(artifact.bytes).expect("utf8 export bytes");
+        assert_eq!(line, format!("{{\"v\":{raw}}}\n"));
+    }
+
+    #[test]
+    fn jsonl_variant_cell_rejects_malformed_json() {
+        let input = LocalExportInput::new(
+            vec![ExportColumn::new("v", "VARIANT")],
+            vec![ResultPartition::new(
+                0,
+                vec![vec![Some("{not valid json".to_owned())]],
+            )],
+        );
+        assert!(export_jsonl(&input, "artifacts/bad.jsonl", 1).is_err());
     }
 
     #[test]

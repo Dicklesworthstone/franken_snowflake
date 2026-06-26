@@ -19,7 +19,6 @@ mod frankenpandas {
     use fp_columnar::Column;
     use fp_types::{DType, NullKind, Scalar};
     use serde::{Deserialize, Serialize};
-    use serde_json::Value;
 
     const NANOS_PER_SECOND: i128 = 1_000_000_000;
     const SECONDS_PER_DAY: i128 = 86_400;
@@ -506,9 +505,14 @@ mod frankenpandas {
                 Scalar::Utf8(text.to_owned())
             }
             SnowflakeLogicalType::StructuredJson => {
-                let value = serde_json::from_str::<Value>(text)
+                // Validate the cell is well-formed JSON, but keep the original text.
+                // Re-serializing through `serde_json::Value` (no `arbitrary_precision`
+                // / `preserve_order` features) would coerce large integers — a
+                // `NUMBER(38,0)` inside a VARIANT exceeds u64 — to f64 and re-sort
+                // object keys, silently corrupting the value.
+                serde_json::from_str::<serde::de::IgnoredAny>(text)
                     .map_err(|_| decode_error(source, "semi-structured cell must be JSON"))?;
-                Scalar::Utf8(value.to_string())
+                Scalar::Utf8(text.to_owned())
             }
             SnowflakeLogicalType::Text | SnowflakeLogicalType::UnknownText => {
                 Scalar::Utf8(text.to_owned())
@@ -820,6 +824,29 @@ mod frankenpandas {
             );
 
             Ok(())
+        }
+
+        #[test]
+        fn variant_cells_preserve_key_order_and_large_integers() -> Result<(), String> {
+            // VARIANT cells are stored verbatim. Re-serializing through
+            // `serde_json::Value` (no `arbitrary_precision`/`preserve_order`) would
+            // reorder the keys and collapse the `NUMBER(38,0)` `big` value (> u64)
+            // to `1e20`.
+            let raw = "{\"z\":1,\"a\":2,\"big\":99999999999999999999}";
+            let columns = vec![col("PAYLOAD", "VARIANT")];
+            let partitions = vec![ResultPartition::new(0, vec![vec![Some(raw.to_owned())]])];
+            let frame = materialize_partitions(&columns, partitions).map_err(|e| e.to_string())?;
+            let payload = frame_column(&frame, "PAYLOAD")?;
+            assert_eq!(payload.column.value(0), Some(&Scalar::Utf8(raw.to_owned())));
+            Ok(())
+        }
+
+        #[test]
+        fn variant_cell_rejects_malformed_json() {
+            let columns = vec![col("PAYLOAD", "VARIANT")];
+            let partitions =
+                vec![ResultPartition::new(0, vec![vec![Some("{not json".to_owned())]])];
+            assert!(materialize_partitions(&columns, partitions).is_err());
         }
 
         #[test]
