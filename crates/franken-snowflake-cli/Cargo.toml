@@ -15,6 +15,14 @@ publish.workspace = true
 name = "franken-snowflake"
 path = "src/main.rs"
 
+# `fsnow` is the short agent-ergonomic alias (same entry point + identical
+# contract). Agents type the connector name constantly; the 5-char form cuts
+# keystrokes without changing any behavior. The long name stays canonical for
+# documentation and the `invocation` strings in `capabilities`.
+[[bin]]
+name = "fsnow"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 

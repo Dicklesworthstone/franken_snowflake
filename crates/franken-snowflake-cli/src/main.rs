@@ -1590,6 +1590,7 @@ fn write_stderr(data: &str) -> Result<(), ()> {
 fn capabilities_data() -> Json {
     json_object(vec![
         ("tool_name", json_string("franken-snowflake")),
+        ("binary_aliases", string_array(vec!["fsnow".to_string()])),
         ("crate_name", json_string(env!("CARGO_PKG_NAME"))),
         ("version", json_string(env!("CARGO_PKG_VERSION"))),
         ("contract_version", json_string(CLI_CONTRACT_VERSION)),
@@ -1599,10 +1600,10 @@ fn capabilities_data() -> Json {
         (
             "feature_flags",
             json_object(vec![
-                ("live", Json::Bool(false)),
-                ("testkit", Json::Bool(false)),
+                ("live", Json::Bool(live_transport_available())),
+                ("testkit", Json::Bool(testkit_available())),
                 ("mcp", Json::Bool(mcp_surface_available())),
-                ("tui", Json::Bool(false)),
+                ("tui", Json::Bool(tui_available())),
                 ("toon", Json::Bool(toon_output_available())),
             ]),
         ),
@@ -3372,6 +3373,22 @@ fn mcp_surface_available() -> bool {
     cfg!(feature = "mcp")
 }
 
+// Feature flags must report what is ACTUALLY compiled into this binary, computed
+// from this crate's own `cfg!`. Hardcoding them (the prior `false` literals) made
+// `capabilities.feature_flags.live` lie when built `--features live`, so an agent
+// reading capabilities would never attempt a live command that in fact works.
+fn live_transport_available() -> bool {
+    cfg!(feature = "live")
+}
+
+fn testkit_available() -> bool {
+    cfg!(feature = "testkit")
+}
+
+fn tui_available() -> bool {
+    cfg!(feature = "tui")
+}
+
 fn output_mode_usage() -> &'static str {
     if toon_output_available() {
         "franken-snowflake <command> [--json|--toon]"
@@ -3448,6 +3465,35 @@ mod tests {
         }
         assert!(rendered.contains("\"error_registry\""));
         assert!(rendered.contains("FSNOW-1002"));
+    }
+
+    // Regression for the `feature_flags` accuracy fix: the reported flags must
+    // reflect what is actually compiled into THIS binary (via `cfg!`), never a
+    // hardcoded literal. Previously `live`/`testkit`/`tui` were hardcoded
+    // `false`, so a `--features live` build advertised `live:false` and an agent
+    // would never attempt a live command that in fact works.
+    #[test]
+    fn capabilities_feature_flags_reflect_compiled_features() {
+        let rendered = render_json(&envelope_for(&["capabilities", "--json"]));
+        let expect = |flag: &str, on: bool| {
+            assert!(
+                rendered.contains(&format!("\"{flag}\":{on}")),
+                "feature_flags.{flag} should be {on} for this build"
+            );
+        };
+        expect("live", cfg!(feature = "live"));
+        expect("testkit", cfg!(feature = "testkit"));
+        expect("tui", cfg!(feature = "tui"));
+        expect("mcp", cfg!(feature = "mcp"));
+        expect("toon", cfg!(feature = "toon"));
+    }
+
+    // Regression for the short-alias surface: capabilities advertises the
+    // `fsnow` binary alias so an agent can discover the short form.
+    #[test]
+    fn capabilities_advertises_fsnow_alias() {
+        let rendered = render_json(&envelope_for(&["capabilities", "--json"]));
+        assert!(rendered.contains("\"binary_aliases\":[\"fsnow\"]"));
     }
 
     #[test]
