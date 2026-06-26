@@ -465,8 +465,28 @@ fn first_sql_keyword(sql: &str) -> Option<String> {
             continue;
         }
         if sql[index..].starts_with("/*") {
-            let block_end = sql[index + 2..].find("*/")?;
-            index += block_end + 4;
+            // Snowflake supports *nested* block comments, so a first-match scan for
+            // `*/` would close the outer comment early and leave the real statement
+            // keyword hidden behind a stray `*/`, classifying e.g.
+            // `/* /* */ */ delete ...` as `Read` (a fail-open in the read-only
+            // guard). Track nesting depth so the whole comment is consumed.
+            let mut depth = 1usize;
+            let mut scan = index + 2;
+            while depth > 0 {
+                let rest = &sql[scan..];
+                let close = rest.find("*/")?;
+                match rest.find("/*") {
+                    Some(open) if open < close => {
+                        depth += 1;
+                        scan += open + 2;
+                    }
+                    _ => {
+                        depth -= 1;
+                        scan += close + 2;
+                    }
+                }
+            }
+            index = scan;
             continue;
         }
         break;
@@ -591,6 +611,30 @@ mod tests {
         assert_eq!(error.code, SnowflakeErrorCode::MutationRefused);
         assert_eq!(
             classify_sql_operation("/* read hint */ select * from table_x"),
+            SqlOperationClass::Read
+        );
+    }
+
+    #[test]
+    fn nested_block_comment_hiding_mutation_is_classified_mutating() {
+        // Snowflake nests `/* */`, so `/* /* */ */ delete ...` runs the DELETE. A
+        // first-match `*/` scan would close the outer comment at the inner `*/`,
+        // mis-read the leftover `*/ delete` as having no keyword, and fail OPEN to
+        // `Read`. Depth-aware skipping must surface the real `delete`/`drop`.
+        for sql in [
+            "/* /* */ */ delete from table_x",
+            "/*outer /*inner*/ still outer*/ drop table t",
+            "/* a /* b /* c */ d */ e */ update t set x = 1",
+        ] {
+            assert_eq!(
+                classify_sql_operation(sql),
+                SqlOperationClass::Mutating,
+                "nested-comment-wrapped mutation must classify as mutating: {sql}"
+            );
+        }
+        // A nested comment in front of a genuine read stays a read.
+        assert_eq!(
+            classify_sql_operation("/* /* hint */ */ select 1"),
             SqlOperationClass::Read
         );
     }
