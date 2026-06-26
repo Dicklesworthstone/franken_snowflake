@@ -726,6 +726,85 @@ mod tests {
     }
 
     #[test]
+    fn parse_partition_rows_accepts_live_object_data_form() -> Result<(), String> {
+        // Live-decode regression (bug #2): a real `GET ...?partition=N` returns the
+        // rows wrapped in `{"data":[[...]]}`, not a bare top-level array. The
+        // bare-array assumption made every live partition fetch fail with
+        // `invalid type: map, expected a sequence`.
+        let rows = parse_partition_rows(br#"{"data":[["3","c"],["4","d"]]}"#)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("3".to_owned()), Some("c".to_owned())],
+                vec![Some("4".to_owned()), Some("d".to_owned())],
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_partition_rows_still_accepts_bare_array_form() -> Result<(), String> {
+        // Backward-compat: replay/mock fixtures emit the bare array form, which the
+        // object-form fix must not regress.
+        let rows = parse_partition_rows(br#"[["5","e"]]"#).map_err(|error| error.to_string())?;
+        assert_eq!(rows, vec![vec![Some("5".to_owned()), Some("e".to_owned())]]);
+        Ok(())
+    }
+
+    #[test]
+    fn partition_info_decodes_when_compressed_size_is_omitted() -> Result<(), String> {
+        // Live-decode regression (bug #1): the real API omits `compressedSize` for
+        // the inline, uncompressed partition 0. A required field made every live
+        // response fail with `missing field compressedSize`; the field is now
+        // optional and absent decodes to `None`.
+        let body = br#"{"resultSetMetaData":{"numRows":2,"format":"jsonv2",
+            "rowType":[{"name":"A","type":"TEXT","nullable":false}],
+            "partitionInfo":[{"rowCount":2,"uncompressedSize":64}]},
+            "data":[["x"],["y"]],"code":"090001","statementHandle":"h"}"#;
+        let result_set = parse_result_set(body).map_err(|error| error.to_string())?;
+        let info = result_set
+            .result_set_meta_data
+            .partition_info
+            .first()
+            .ok_or("expected partition_info[0]")?;
+        assert_eq!(info.row_count, 2);
+        assert_eq!(info.compressed_size, None);
+        assert_eq!(info.uncompressed_size, Some(64));
+        Ok(())
+    }
+
+    #[test]
+    fn live_shaped_multi_partition_flow_decodes_end_to_end() -> Result<(), String> {
+        // Both live-discovered decode bugs together, exercised through the real
+        // StatementMachine path (mirrors what the live proof did end-to-end):
+        // (1) partition 0's info omits `compressedSize`, and
+        // (2) the fetched partition body uses the `{"data":[...]}` object form.
+        let terminal = br#"{"resultSetMetaData":{"numRows":3,"format":"jsonv2",
+            "rowType":[{"name":"ID","type":"FIXED","nullable":false}],
+            "partitionInfo":[{"rowCount":2,"uncompressedSize":16},
+                             {"rowCount":1,"compressedSize":8,"uncompressedSize":16}]},
+            "data":[["1"],["2"]],"code":"090001","statementHandle":"hp"}"#;
+        let mut machine = StatementMachine::new(PollPlan::default());
+        let handle = match machine.on_submit(ResponseClass::Completed, terminal) {
+            Ok(Progress::FetchPartition {
+                handle,
+                partition: 1,
+            }) => handle,
+            other => return Err(format!("expected FetchPartition 1, got {other:?}")),
+        };
+        assert_eq!(handle, StatementHandle::new("hp"));
+        match machine.on_partition(ResponseClass::Completed, 1, br#"{"data":[["3"]]}"#) {
+            Ok(Progress::Complete(done)) => {
+                assert_eq!(done.rows.len(), 3);
+                assert_eq!(done.rows[2], vec![Some("3".to_owned())]);
+                Ok(())
+            }
+            other => Err(format!("expected Complete, got {other:?}")),
+        }
+    }
+
+    #[test]
     fn row_count_mismatch_is_rejected() {
         let terminal = br#"{"resultSetMetaData":{"numRows":99,"format":"jsonv2",
             "rowType":[{"name":"A","type":"TEXT","nullable":false}],
