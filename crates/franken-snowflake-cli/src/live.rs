@@ -158,6 +158,296 @@ pub fn run_catalog_scan_outcome(
     }
 }
 
+/// Live build: render the catalog lineage graph (profile -> database -> schema ->
+/// object) from a real `INFORMATION_SCHEMA.TABLES` scan. Mirrors `catalog scan`'s
+/// scoping and safety: requires `--database`, validates identifiers, never
+/// substitutes fixture data. Mermaid/SVG return raw text; JSON/TOON carry
+/// nodes + edges + the Mermaid rendering in a `data_source: live` envelope.
+pub fn run_catalog_graph_outcome(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    database: Option<String>,
+    schema: Option<String>,
+    graph_output: crate::GraphOutput,
+) -> crate::Outcome {
+    let Some(database) = database else {
+        return failure_outcome(
+            format,
+            "catalog.graph",
+            "fsnow.catalog.graph.v1",
+            request_id,
+            profile,
+            &SnowflakeError::new(
+                SnowflakeErrorCode::UsageError,
+                "catalog graph requires --database (and optionally --schema) to scope the live scan",
+            ),
+        );
+    };
+    if !is_safe_sql_identifier(&database) {
+        return failure_outcome(
+            format,
+            "catalog.graph",
+            "fsnow.catalog.graph.v1",
+            request_id,
+            profile,
+            &SnowflakeError::new(
+                SnowflakeErrorCode::UsageError,
+                "--database must be a plain SQL identifier (letters, digits, _ or $)",
+            ),
+        );
+    }
+    if let Some(schema_name) = &schema {
+        if !is_safe_sql_identifier(schema_name) {
+            return failure_outcome(
+                format,
+                "catalog.graph",
+                "fsnow.catalog.graph.v1",
+                request_id,
+                profile,
+                &SnowflakeError::new(
+                    SnowflakeErrorCode::UsageError,
+                    "--schema must be a plain SQL identifier (letters, digits, _ or $)",
+                ),
+            );
+        }
+    }
+
+    let where_clause = match &schema {
+        Some(schema_name) => format!("WHERE TABLE_SCHEMA = '{schema_name}' "),
+        None => String::new(),
+    };
+    let sql = format!(
+        "SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE \
+         FROM {database}.INFORMATION_SCHEMA.TABLES \
+         {where_clause}\
+         ORDER BY TABLE_SCHEMA, TABLE_NAME \
+         LIMIT {CATALOG_SCAN_LIMIT}"
+    );
+    let rows = match execute(&profile, &sql, Some(&database), schema.as_deref()) {
+        Ok(rows) => rows,
+        Err(error) => {
+            return failure_outcome(
+                format,
+                "catalog.graph",
+                "fsnow.catalog.graph.v1",
+                request_id,
+                profile,
+                &error,
+            );
+        }
+    };
+
+    let graph = CatalogHierarchy::from_rows(&profile, &rows);
+
+    match graph_output {
+        crate::GraphOutput::Mermaid => crate::Outcome {
+            status: CoreExitCode::Success,
+            body: Body::Raw {
+                data: graph.to_mermaid(),
+            },
+        },
+        crate::GraphOutput::Svg => crate::Outcome {
+            status: CoreExitCode::Success,
+            body: Body::Raw {
+                data: graph.to_svg(),
+            },
+        },
+        crate::GraphOutput::Json | crate::GraphOutput::Toon => {
+            let out_format = if matches!(graph_output, crate::GraphOutput::Toon) {
+                OutputFormat::Toon
+            } else {
+                format
+            };
+            let mut envelope = base_envelope(
+                true,
+                "success",
+                "catalog.graph",
+                "fsnow.catalog.graph.v1",
+                request_id,
+                json_object(vec![
+                    ("profile_id", json_string(profile.clone())),
+                    ("database", json_string(database)),
+                    (
+                        "schema",
+                        schema.map_or(Json::Null, json_string),
+                    ),
+                    ("nodes", graph.nodes_json()),
+                    ("edges", graph.edges_json()),
+                    ("node_count", Json::Number(graph.nodes.len() as i64)),
+                    ("edge_count", Json::Number(graph.edges.len() as i64)),
+                    ("mermaid", json_string(graph.to_mermaid())),
+                ]),
+            );
+            envelope.data_source = "live";
+            envelope.profile_id = Some(profile);
+            envelope.safe_next_commands = vec![
+                "franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json"
+                    .to_string(),
+            ];
+            crate::Outcome {
+                status: CoreExitCode::Success,
+                body: Body::Envelope {
+                    envelope,
+                    format: out_format,
+                },
+            }
+        }
+    }
+}
+
+/// A deterministic profile -> database -> schema -> object containment graph built
+/// directly from `INFORMATION_SCHEMA.TABLES` rows. Index-based node ids keep the
+/// Mermaid/SVG output collision-free and safe regardless of object names.
+#[derive(Default)]
+struct CatalogHierarchy {
+    ids: BTreeMap<String, usize>,
+    /// `(kind, label)` indexed by node id.
+    nodes: Vec<(&'static str, String)>,
+    edge_set: std::collections::BTreeSet<(usize, usize)>,
+    edges: Vec<(usize, usize)>,
+}
+
+impl CatalogHierarchy {
+    fn from_rows(profile: &str, rows: &LiveRows) -> Self {
+        let mut h = Self::default();
+        let profile_node = h.ensure(format!("P|{profile}"), "profile", format!("profile: {profile}"));
+        for row in &rows.rows {
+            let cell = |i: usize| row.get(i).and_then(Clone::clone).unwrap_or_default();
+            let database = cell(0);
+            let schema = cell(1);
+            let table = cell(2);
+            if database.is_empty() || schema.is_empty() || table.is_empty() {
+                continue;
+            }
+            let db = h.ensure(format!("D|{database}"), "database", database.clone());
+            let sc = h.ensure(format!("S|{database}.{schema}"), "schema", schema.clone());
+            let ob = h.ensure(
+                format!("O|{database}.{schema}.{table}"),
+                "object",
+                table.clone(),
+            );
+            h.edge(profile_node, db);
+            h.edge(db, sc);
+            h.edge(sc, ob);
+        }
+        h
+    }
+
+    fn ensure(&mut self, key: String, kind: &'static str, label: String) -> usize {
+        if let Some(&idx) = self.ids.get(&key) {
+            return idx;
+        }
+        let idx = self.nodes.len();
+        self.ids.insert(key, idx);
+        self.nodes.push((kind, label));
+        idx
+    }
+
+    fn edge(&mut self, source: usize, target: usize) {
+        if self.edge_set.insert((source, target)) {
+            self.edges.push((source, target));
+        }
+    }
+
+    fn to_mermaid(&self) -> String {
+        let mut out = String::from("graph TD\n");
+        if self.nodes.is_empty() {
+            out.push_str("  EMPTY[\"no objects found for this scope\"]\n");
+            return out;
+        }
+        for (idx, (_kind, label)) in self.nodes.iter().enumerate() {
+            out.push_str(&format!("  n{idx}[\"{}\"]\n", escape_mermaid_label(label)));
+        }
+        for (source, target) in &self.edges {
+            out.push_str(&format!("  n{source} --> n{target}\n"));
+        }
+        out
+    }
+
+    fn to_svg(&self) -> String {
+        let line_height = 18;
+        let height = (self.nodes.len().max(1) * line_height) + 20;
+        let mut out = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" role=\"img\" aria-label=\"catalog graph\" \
+             width=\"480\" height=\"{height}\">\n"
+        );
+        for (idx, (kind, label)) in self.nodes.iter().enumerate() {
+            let y = 20 + idx * line_height;
+            out.push_str(&format!(
+                "  <text x=\"10\" y=\"{y}\">{}: {}</text>\n",
+                escape_xml(kind),
+                escape_xml(label)
+            ));
+        }
+        out.push_str("</svg>\n");
+        out
+    }
+
+    fn nodes_json(&self) -> Json {
+        json_array(
+            self.nodes
+                .iter()
+                .enumerate()
+                .map(|(idx, (kind, label))| {
+                    json_object(vec![
+                        ("id", json_string(format!("n{idx}"))),
+                        ("kind", json_string(*kind)),
+                        ("label", json_string(label.clone())),
+                    ])
+                })
+                .collect(),
+        )
+    }
+
+    fn edges_json(&self) -> Json {
+        json_array(
+            self.edges
+                .iter()
+                .map(|(source, target)| {
+                    json_object(vec![
+                        ("source", json_string(format!("n{source}"))),
+                        ("target", json_string(format!("n{target}"))),
+                        ("kind", json_string("contains")),
+                    ])
+                })
+                .collect(),
+        )
+    }
+}
+
+/// HTML-entity-encode a Mermaid node label so object names can never inject graph
+/// structure (the `xgr` finding: backslash/quote escaping must be effective).
+fn escape_mermaid_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    for ch in label.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\n' | '\r' => out.push(' '),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn escape_xml(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Attempt a real credential/connectivity probe for `profile doctor --online`:
 /// run a minimal `SELECT CURRENT_VERSION()` and report whether it succeeded,
 /// without ever reading or emitting a secret value. A missing credential handle

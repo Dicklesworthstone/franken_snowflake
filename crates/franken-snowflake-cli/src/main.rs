@@ -67,6 +67,8 @@ enum Command {
     },
     CatalogGraph {
         profile: String,
+        database: Option<String>,
+        schema: Option<String>,
         graph_output: GraphOutput,
     },
     DatasetInspect {
@@ -619,6 +621,8 @@ fn parse_catalog(
                 };
                 Ok(Command::CatalogGraph {
                     profile: profile.clone(),
+                    database: value_after(args, "--database"),
+                    schema: value_after(args, "--schema"),
                     graph_output,
                 })
             }
@@ -953,8 +957,17 @@ fn dispatch(invocation: Invocation) -> Outcome {
         } => catalog_scan_dispatch(invocation.output, request_id, profile, database, schema),
         Command::CatalogGraph {
             profile,
+            database,
+            schema,
             graph_output,
-        } => catalog_graph_outcome(invocation.output, request_id, profile, graph_output),
+        } => catalog_graph_outcome(
+            invocation.output,
+            request_id,
+            profile,
+            database,
+            schema,
+            graph_output,
+        ),
         Command::DatasetInspect { dataset_id } => not_implemented_with_data(
             invocation.output,
             "dataset.inspect",
@@ -2651,42 +2664,60 @@ fn catalog_graph_outcome(
     format: OutputFormat,
     request_id: String,
     profile: String,
+    database: Option<String>,
+    schema: Option<String>,
     graph_output: GraphOutput,
 ) -> Outcome {
-    match graph_output {
-        GraphOutput::Mermaid => Outcome {
-            status: CoreExitCode::Success,
-            body: Body::Raw {
-                data: "graph TD\n  EMPTY[\"catalog graph requires catalog scan fixtures\"]".to_string(),
-            },
-        },
-        GraphOutput::Svg => Outcome {
-            status: CoreExitCode::Success,
-            body: Body::Raw {
-                data: "<svg xmlns=\"http://www.w3.org/2000/svg\" role=\"img\" aria-label=\"empty catalog graph\"></svg>"
-                    .to_string(),
-            },
-        },
-        GraphOutput::Json | GraphOutput::Toon => success_with_profile(
-            if graph_output == GraphOutput::Toon {
-                OutputFormat::Toon
-            } else {
-                format
-            },
-            "catalog.graph",
-            "fsnow.catalog.graph.v1",
-            request_id,
-            Some(profile.clone()),
-            json_object(vec![
-                ("profile_id", json_string(profile)),
-                ("nodes", json_array(vec![])),
-                ("edges", json_array(vec![])),
-                ("mermaid", json_string("graph TD\n  EMPTY[\"catalog graph requires catalog scan fixtures\"]")),
-            ]),
-            vec![],
-            vec!["franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json".to_string()],
-        ),
-    }
+    catalog_graph_dispatch(format, request_id, profile, database, schema, graph_output)
+}
+
+/// Live build: render the real catalog lineage graph from a live scan.
+#[cfg(feature = "live")]
+fn catalog_graph_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    database: Option<String>,
+    schema: Option<String>,
+    graph_output: GraphOutput,
+) -> Outcome {
+    live::run_catalog_graph_outcome(format, request_id, profile, database, schema, graph_output)
+}
+
+/// Default (no-account) build: the lineage graph is derived from a live catalog
+/// scan, so without transport refuse cleanly rather than emit a placeholder an
+/// agent could mistake for a real (empty) graph.
+#[cfg(not(feature = "live"))]
+fn catalog_graph_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    database: Option<String>,
+    schema: Option<String>,
+    _graph_output: GraphOutput,
+) -> Outcome {
+    live_transport_required_with_data(
+        format,
+        "catalog.graph",
+        "fsnow.catalog.graph.v1",
+        request_id,
+        Some(profile),
+        json_object(vec![
+            ("requested_database", option_json(database)),
+            ("requested_schema", option_json(schema)),
+            (
+                "requires",
+                json_array(vec![
+                    json_string("live SQL API transport"),
+                    json_string("a catalog scan over --database/--schema"),
+                ]),
+            ),
+        ]),
+        vec![
+            "franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json"
+                .to_string(),
+        ],
+    )
 }
 
 fn exit_code_json() -> Json {
@@ -3565,23 +3596,18 @@ fn live_transport_available() -> bool {
 }
 
 // Shared by `capabilities` and the `onboard` mega-command so the two surfaces
-// can never drift on what this binary actually has compiled in.
+// can never drift on what this binary actually has compiled in. `live`/`mcp`/
+// `toon` are real CLI-crate features (reported via `cfg!`); `testkit` and `tui`
+// are NOT features of this binary — those surfaces live in sibling crates — so
+// they are definitionally false for any `franken-snowflake`/`fsnow` build.
 fn feature_flags_json() -> Json {
     json_object(vec![
         ("live", Json::Bool(live_transport_available())),
-        ("testkit", Json::Bool(testkit_available())),
+        ("testkit", Json::Bool(false)),
         ("mcp", Json::Bool(mcp_surface_available())),
-        ("tui", Json::Bool(tui_available())),
+        ("tui", Json::Bool(false)),
         ("toon", Json::Bool(toon_output_available())),
     ])
-}
-
-fn testkit_available() -> bool {
-    cfg!(feature = "testkit")
-}
-
-fn tui_available() -> bool {
-    cfg!(feature = "tui")
 }
 
 fn output_mode_usage() -> &'static str {
@@ -3677,8 +3703,9 @@ mod tests {
             );
         };
         expect("live", cfg!(feature = "live"));
-        expect("testkit", cfg!(feature = "testkit"));
-        expect("tui", cfg!(feature = "tui"));
+        // testkit/tui are not features of the CLI binary — always false here.
+        expect("testkit", false);
+        expect("tui", false);
         expect("mcp", cfg!(feature = "mcp"));
         expect("toon", cfg!(feature = "toon"));
     }
@@ -3793,6 +3820,33 @@ mod tests {
             Body::Raw { data } => data,
         };
         assert!(rendered.contains("FSNOW-9002"));
+    }
+
+    // 1p1: the no-account build refuses `catalog graph` cleanly (live transport
+    // required) instead of emitting the old empty-graph stub that an agent could
+    // mistake for a real, empty catalog. Under `live` it renders from a real scan.
+    #[cfg(not(feature = "live"))]
+    #[test]
+    fn catalog_graph_refuses_cleanly_without_live_transport() {
+        let outcome = execute(vec![
+            "catalog".to_string(),
+            "graph".to_string(),
+            "demo".to_string(),
+            "--database".to_string(),
+            "FRANKEN_TEST".to_string(),
+            "--json".to_string(),
+        ]);
+        assert_ne!(outcome.status.code(), 0, "no-account catalog graph must refuse");
+        let rendered = match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("\"command_id\":\"catalog.graph\""));
+        assert!(rendered.contains("live SQL API transport"));
+        assert!(
+            !rendered.contains("requires catalog scan fixtures"),
+            "the misleading empty-graph stub must be gone"
+        );
     }
 
     #[test]
