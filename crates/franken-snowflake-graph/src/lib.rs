@@ -320,6 +320,13 @@ impl CatalogGraph {
                 continue;
             }
             for (next, incoming) in self.neighbors_both(&current) {
+                // The graph is bidirectional, so once BFS expands a direct neighbor
+                // of the seed (at depth >= 2) `neighbors_both` yields the seed back.
+                // "What relates to X" must not list X itself, so skip it (the seen
+                // set only prevents re-queuing, not re-insertion into `related`).
+                if next == node {
+                    continue;
+                }
                 let next_depth = current_depth.saturating_add(1);
                 let entry = related.entry(next.clone()).or_insert(RelatedNode {
                     node: next.clone(),
@@ -1110,6 +1117,20 @@ mod tests {
         assert!(related.iter().any(|node| node.node
             == column_key("demo", "ANALYTICS", "PUBLIC", "EVENTS_DAILY", "VALUE")
             && node.outgoing));
+    }
+
+    #[test]
+    fn bounded_neighborhood_excludes_the_seed_at_depth_two() {
+        // At depth >= 2 BFS re-expands a direct neighbor whose `neighbors_both`
+        // yields the seed back. The seed must never appear in its own
+        // "what relates to X" neighborhood.
+        let graph = CatalogGraph::from_snapshot(&fixture_snapshot());
+        let object = object_key("demo", "ANALYTICS", "PUBLIC", "EVENTS_DAILY");
+        let related = graph.what_relates_to(&object, 2);
+        assert!(
+            related.iter().all(|node| node.node != object),
+            "seed node must be excluded from its own neighborhood"
+        );
     }
 
     #[test]
