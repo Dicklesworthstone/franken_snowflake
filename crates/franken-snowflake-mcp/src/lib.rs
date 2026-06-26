@@ -524,7 +524,10 @@ mod fastmcp_surface {
         match mode.as_deref() {
             None | Some("stdio") => build_mcp_server(runner).run_stdio(),
             Some(value) if value.starts_with("http:") => {
-                let addr = value.trim_start_matches("http:");
+                // Strip exactly one `http:` mode tag. `trim_start_matches` would
+                // peel every leading `http:`, mangling an address that itself
+                // begins with it (e.g. `--http http://host:port` -> `//host:port`).
+                let addr = value.strip_prefix("http:").unwrap_or(value);
                 build_mcp_server(runner).run_http(addr.to_string())
             }
             Some(other) => {
