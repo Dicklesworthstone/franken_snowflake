@@ -47,6 +47,7 @@ enum GraphOutput {
 #[derive(Debug)]
 enum Command {
     Help,
+    Onboard,
     Capabilities,
     RobotDocsGuide,
     AgentHandbook,
@@ -178,6 +179,16 @@ struct CommandSpec {
 }
 
 const COMMAND_SPECS: &[CommandSpec] = &[
+    CommandSpec {
+        id: "onboard",
+        invocation: "franken-snowflake onboard --json",
+        output_contract_id: "fsnow.onboard.v1",
+        description: "Mega-command: capabilities + exit codes + first commands + health in one call.",
+        read_only: true,
+        provider_network: false,
+        mutates_local_state: false,
+        sensitive_output: false,
+    },
     CommandSpec {
         id: "capabilities",
         invocation: "franken-snowflake capabilities --json",
@@ -406,6 +417,7 @@ fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
     }
 
     let command = match args[0].as_str() {
+        "onboard" => Command::Onboard,
         "capabilities" => Command::Capabilities,
         "robot-docs" => parse_robot_docs(&args, output)?,
         "agent-handbook" => Command::AgentHandbook,
@@ -872,6 +884,18 @@ fn dispatch(invocation: Invocation) -> Outcome {
             help_data(),
             vec![],
             vec!["franken-snowflake capabilities --json".to_string()],
+        ),
+        Command::Onboard => success(
+            invocation.output,
+            "onboard",
+            "fsnow.onboard.v1",
+            request_id,
+            onboard_data(),
+            vec![],
+            vec![
+                "franken-snowflake capabilities --json".to_string(),
+                "franken-snowflake profile validate <profile> --json".to_string(),
+            ],
         ),
         Command::Capabilities => success(
             invocation.output,
@@ -1587,6 +1611,59 @@ fn write_stderr(data: &str) -> Result<(), ()> {
     stderr.write_all(data.as_bytes()).map_err(|_err| ())
 }
 
+// `onboard` is the mega-command (Σ): a single call that collapses what would
+// otherwise be four round-trips (capabilities + agent-handbook + doctor + the
+// first-commands list) into one envelope, so a cold agent can orient in one
+// tool-call. It reuses the same data builders the individual surfaces emit, so
+// it can never drift from them.
+fn onboard_data() -> Json {
+    let commands_brief: Vec<Json> = COMMAND_SPECS
+        .iter()
+        .map(|spec| {
+            json_object(vec![
+                ("command_id", json_string(spec.id)),
+                ("invocation", json_string(spec.invocation)),
+                ("read_only", Json::Bool(spec.read_only)),
+            ])
+        })
+        .collect();
+    json_object(vec![
+        ("tool_name", json_string("franken-snowflake")),
+        ("binary_aliases", string_array(vec!["fsnow".to_string()])),
+        ("version", json_string(env!("CARGO_PKG_VERSION"))),
+        ("contract_version", json_string(CLI_CONTRACT_VERSION)),
+        ("schema_version", json_string(ENVELOPE_SCHEMA_VERSION)),
+        ("default_output", json_string("json")),
+        ("alternate_outputs", string_array(alternate_outputs())),
+        ("feature_flags", feature_flags_json()),
+        ("exit_codes", exit_code_json()),
+        ("first_commands", string_array(first_commands())),
+        ("commands", Json::Array(commands_brief)),
+        ("health", doctor_data()),
+        (
+            "getting_started",
+            string_array(vec![
+                "1. franken-snowflake capabilities --json  (full machine-readable contract)"
+                    .to_string(),
+                "2. franken-snowflake profile validate <profile> --json  (check a profile's env handles)"
+                    .to_string(),
+                "3. franken-snowflake query plan --profile <profile> --sql \"select 1\" --json  (dry-run a read)"
+                    .to_string(),
+                "4. franken-snowflake query run --profile <profile> --sql \"...\" --json  (run it; live build only)"
+                    .to_string(),
+            ]),
+        ),
+        (
+            "non_goals",
+            string_array(vec![
+                "no third-party Snowflake Rust driver".to_string(),
+                "no Tokio/reqwest/hyper production dependency".to_string(),
+                "no mutation without the future write-intent ladder".to_string(),
+            ]),
+        ),
+    ])
+}
+
 fn capabilities_data() -> Json {
     json_object(vec![
         ("tool_name", json_string("franken-snowflake")),
@@ -1597,16 +1674,7 @@ fn capabilities_data() -> Json {
         ("schema_version", json_string(ENVELOPE_SCHEMA_VERSION)),
         ("default_output", json_string("json")),
         ("alternate_outputs", string_array(alternate_outputs())),
-        (
-            "feature_flags",
-            json_object(vec![
-                ("live", Json::Bool(live_transport_available())),
-                ("testkit", Json::Bool(testkit_available())),
-                ("mcp", Json::Bool(mcp_surface_available())),
-                ("tui", Json::Bool(tui_available())),
-                ("toon", Json::Bool(toon_output_available())),
-            ]),
-        ),
+        ("feature_flags", feature_flags_json()),
         ("commands", Json::Array(command_registry())),
         ("exit_codes", exit_code_json()),
         ("error_registry", error_registry_json()),
@@ -2604,6 +2672,7 @@ fn envelope_key_json() -> Json {
 
 fn first_commands() -> Vec<String> {
     vec![
+        "franken-snowflake onboard --json".to_string(),
         "franken-snowflake capabilities --json".to_string(),
         "franken-snowflake agent-handbook --json".to_string(),
         "franken-snowflake robot-docs guide".to_string(),
@@ -3381,6 +3450,18 @@ fn live_transport_available() -> bool {
     cfg!(feature = "live")
 }
 
+// Shared by `capabilities` and the `onboard` mega-command so the two surfaces
+// can never drift on what this binary actually has compiled in.
+fn feature_flags_json() -> Json {
+    json_object(vec![
+        ("live", Json::Bool(live_transport_available())),
+        ("testkit", Json::Bool(testkit_available())),
+        ("mcp", Json::Bool(mcp_surface_available())),
+        ("tui", Json::Bool(tui_available())),
+        ("toon", Json::Bool(toon_output_available())),
+    ])
+}
+
 fn testkit_available() -> bool {
     cfg!(feature = "testkit")
 }
@@ -3494,6 +3575,27 @@ mod tests {
     fn capabilities_advertises_fsnow_alias() {
         let rendered = render_json(&envelope_for(&["capabilities", "--json"]));
         assert!(rendered.contains("\"binary_aliases\":[\"fsnow\"]"));
+    }
+
+    // Regression for the `onboard` mega-command: a single call must return every
+    // orientation slice an agent would otherwise fetch across four round-trips
+    // (feature flags, exit codes, first commands, command list, health), with a
+    // success envelope and exit 0.
+    #[test]
+    fn onboard_returns_all_orientation_slices_in_one_call() {
+        let outcome = execute(vec!["onboard".to_string(), "--json".to_string()]);
+        assert_eq!(outcome.status.code(), 0, "onboard is read-only and must exit 0");
+        let rendered = render_json(&envelope_for(&["onboard", "--json"]));
+        assert!(rendered.contains("\"command_id\":\"onboard\""));
+        assert!(rendered.contains("\"feature_flags\""));
+        assert!(rendered.contains("\"exit_codes\""));
+        assert!(rendered.contains("\"first_commands\""));
+        assert!(rendered.contains("\"getting_started\""));
+        assert!(rendered.contains("\"health\""));
+        assert!(rendered.contains("\"binary_aliases\":[\"fsnow\"]"));
+        // It is also discoverable from the registry and listed first.
+        let caps = render_json(&envelope_for(&["capabilities", "--json"]));
+        assert!(caps.contains("\"command_id\":\"onboard\""));
     }
 
     #[test]
