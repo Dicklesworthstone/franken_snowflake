@@ -924,26 +924,20 @@ fn dispatch(invocation: Invocation) -> Outcome {
             vec![],
             vec!["franken-snowflake doctor --json".to_string()],
         ),
-        Command::Doctor => findings(
+        Command::Doctor => readiness_outcome(
             invocation.output,
             "doctor",
             "fsnow.doctor.v1",
             request_id,
             doctor_data(),
-            vec![json_string(
-                "live transport and testkit checks are pending lower-level beads",
-            )],
             vec!["franken-snowflake selftest --json".to_string()],
         ),
-        Command::Selftest => findings(
+        Command::Selftest => readiness_outcome(
             invocation.output,
             "selftest",
             "fsnow.selftest.v1",
             request_id,
             selftest_data(),
-            vec![json_string(
-                "no-account testkit is not linked yet; protocol fixtures are pending",
-            )],
             vec!["franken-snowflake doctor --json".to_string()],
         ),
         Command::ProfileValidate { profile } => {
@@ -1140,6 +1134,76 @@ fn success_with_profile(
     outcome
 }
 
+// True only when a readiness `data.checks[*].status` is an actual problem
+// (`fail`/`warn`). A `not_checked` status (a feature pending lower-level beads)
+// is informational, NOT a failure — so a health gate doesn't trip on it.
+fn data_has_failed_check(data: &Json) -> bool {
+    let Json::Object(entries) = data else {
+        return false;
+    };
+    for (key, value) in entries {
+        if *key != "checks" {
+            continue;
+        }
+        let Json::Array(checks) = value else {
+            continue;
+        };
+        for check in checks {
+            let Json::Object(fields) = check else {
+                continue;
+            };
+            for (field_key, field_value) in fields {
+                if *field_key != "status" {
+                    continue;
+                }
+                if let Json::String(status) = field_value {
+                    if status == "fail" || status == "warn" {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+// `doctor`/`selftest` exit 0 when every local readiness check passed, so an agent
+// can use them as a clean health gate (`fsnow doctor --json && proceed`). Only an
+// actual fail/warn check yields exit 1; `not_checked` (pending features) stays
+// informational in `data.checks`, never an exit-affecting warning.
+fn readiness_outcome(
+    format: OutputFormat,
+    command_id: &'static str,
+    output_contract_id: &'static str,
+    request_id: String,
+    data: Json,
+    safe_next_commands: Vec<String>,
+) -> Outcome {
+    if data_has_failed_check(&data) {
+        findings(
+            format,
+            command_id,
+            output_contract_id,
+            request_id,
+            data,
+            vec![json_string(
+                "one or more local readiness checks reported a problem",
+            )],
+            safe_next_commands,
+        )
+    } else {
+        success(
+            format,
+            command_id,
+            output_contract_id,
+            request_id,
+            data,
+            vec![],
+            safe_next_commands,
+        )
+    }
+}
+
 fn findings(
     format: OutputFormat,
     command_id: &'static str,
@@ -1184,14 +1248,17 @@ fn not_implemented_with_data(
     );
     envelope.profile_id = profile_id;
     envelope.error = Some(error_info(
-        SnowflakeErrorCode::Internal,
+        SnowflakeErrorCode::SurfaceReserved,
         "This command surface is reserved, but its live handler is blocked by lower-level beads.",
         vec![json_string("contract-first CLI skeleton")],
     ));
     envelope.safe_next_commands = safe_next_commands;
     envelope.repair_commands = vec!["franken-snowflake doctor --json".to_string()];
+    // A reserved-but-unimplemented surface is a deliberate refusal (exit 2),
+    // not an I/O fault (74) — the previous `Internal` mapping read as a real
+    // failure to an agent. The error code (FSNOW-9002) and exit code now agree.
     Outcome {
-        status: SnowflakeErrorCode::Internal.exit_code(),
+        status: SnowflakeErrorCode::SurfaceReserved.exit_code(),
         body: Body::Envelope { envelope, format },
     }
 }
@@ -1899,23 +1966,26 @@ fn check_json_owned(name: &'static str, status: &'static str, detail: String) ->
 
 fn profile_validate_outcome(format: OutputFormat, request_id: String, profile: String) -> Outcome {
     let syntax_valid = is_valid_profile_id(&profile);
-    let warnings = if syntax_valid {
-        vec![json_string(
-            "profile registry is not linked yet; only offline profile-id and env-handle contract checks ran",
-        )]
+    // A structurally-valid profile is success (exit 0): the offline contract
+    // checks passed and the "registry not linked yet" scope note lives in the
+    // data (`status: offline_validated`), not as an exit-affecting warning — so an
+    // agent gating on `profile validate` isn't blocked by a clean profile. An
+    // invalid profile id is a real finding (exit 1).
+    let (outcome_kind, exit, status, warnings) = if syntax_valid {
+        ("success", CoreExitCode::Success, "offline_validated", vec![])
     } else {
-        vec![json_string(
-            "profile id contains unsupported characters for stable handles",
-        )]
-    };
-    let status = if syntax_valid {
-        "offline_validated"
-    } else {
-        "findings"
+        (
+            "partial_success",
+            CoreExitCode::Findings,
+            "findings",
+            vec![json_string(
+                "profile id contains unsupported characters for stable handles",
+            )],
+        )
     };
     let mut envelope = base_envelope(
         true,
-        "partial_success",
+        outcome_kind,
         "profile.validate",
         "fsnow.profile.validate.v1",
         request_id,
@@ -1928,7 +1998,7 @@ fn profile_validate_outcome(format: OutputFormat, request_id: String, profile: S
     ]);
     envelope.profile_id = Some(profile);
     Outcome {
-        status: CoreExitCode::Findings,
+        status: exit,
         body: Body::Envelope { envelope, format },
     }
 }
@@ -2298,13 +2368,10 @@ fn query_plan_outcome(
             "query.plan",
             "fsnow.query.plan.v1",
             request_id,
-            profile,
+            profile.clone(),
             SnowflakeErrorCode::MultiStatementRefused,
             "Multiple SQL statements are refused by default.",
-            vec![
-                "franken-snowflake query plan --profile <profile> --sql \"select 1\" --json"
-                    .to_string(),
-            ],
+            vec![plan_example(profile.as_deref())],
         );
     }
 
@@ -2314,13 +2381,10 @@ fn query_plan_outcome(
             "query.plan",
             "fsnow.query.plan.v1",
             request_id,
-            profile,
+            profile.clone(),
             SnowflakeErrorCode::MutationRefused,
             "Only SELECT/WITH/SHOW/DESCRIBE/EXPLAIN-style read statements are accepted in the MVP.",
-            vec![
-                "franken-snowflake query plan --profile <profile> --sql \"select 1\" --json"
-                    .to_string(),
-            ],
+            vec![plan_example(profile.as_deref())],
         );
     }
 
@@ -2351,8 +2415,37 @@ fn query_plan_outcome(
             ),
         ]),
         vec![],
-        vec!["franken-snowflake query run --profile <profile> --sql <sql> --json".to_string()],
+        vec![run_hint(profile.as_deref(), &sql_text)],
     )
+}
+
+// Build a copy-pasteable `query plan` command using the agent's ACTUAL profile
+// and SQL (compacted; the envelope redaction pass scrubs any secret in it),
+// instead of literal `<profile>`/`<sql>` placeholders. `<profile>` is only used
+// as a last resort when no profile is in scope.
+fn plan_hint(profile: Option<&str>, sql: &str) -> String {
+    let profile = profile.unwrap_or("<profile>");
+    format!(
+        "franken-snowflake query plan --profile {profile} --sql \"{}\" --json",
+        compact_sql(sql)
+    )
+}
+
+// `query run` form with the agent's actual profile + SQL — suggested after a
+// successful `query plan` so the next step is one copy-paste away.
+fn run_hint(profile: Option<&str>, sql: &str) -> String {
+    let profile = profile.unwrap_or("<profile>");
+    format!(
+        "franken-snowflake query run --profile {profile} --sql \"{}\" --json",
+        compact_sql(sql)
+    )
+}
+
+// `query plan` form carrying the agent's actual profile but a neutral example
+// SQL — used in refusals where re-suggesting the rejected SQL would be unhelpful.
+fn plan_example(profile: Option<&str>) -> String {
+    let profile = profile.unwrap_or("<profile>");
+    format!("franken-snowflake query plan --profile {profile} --sql \"select 1\" --json")
 }
 
 fn query_run_outcome(
@@ -2383,16 +2476,31 @@ fn query_run_outcome(
         );
     };
 
-    if has_multiple_statements(&sql_text) || !is_select_like(&sql_text) {
+    // a3y: distinguish the two refusal reasons instead of one conflated message.
+    // A multi-statement request and an unrecognized/typo'd SELECT are different
+    // problems and an agent needs to know which one it hit.
+    if has_multiple_statements(&sql_text) {
         return refusal(
             format,
             "query.run",
             "fsnow.query.run.v1",
             request_id,
-            profile,
+            profile.clone(),
+            SnowflakeErrorCode::MultiStatementRefused,
+            "Multiple SQL statements are refused by default; submit exactly one read-only statement.",
+            vec![plan_hint(profile.as_deref(), &sql_text)],
+        );
+    }
+    if !is_select_like(&sql_text) {
+        return refusal(
+            format,
+            "query.run",
+            "fsnow.query.run.v1",
+            request_id,
+            profile.clone(),
             SnowflakeErrorCode::MutationRefused,
-            "The MVP query runner accepts one read-only statement; use `query plan` to inspect refusals.",
-            vec!["franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string()],
+            "Unrecognized read statement: `query run` accepts one read-only SELECT/WITH/SHOW/DESCRIBE/EXPLAIN. If you meant to read, start with `SELECT` (a typo such as `selcet` lands here, not in the multi-statement or mutation paths).",
+            vec![plan_hint(profile.as_deref(), &sql_text)],
         );
     }
 
@@ -2518,6 +2626,11 @@ fn refusal(
         request_id,
         json_object(vec![]),
     );
+    // mfw: name the agent's real profile in the repair command rather than the
+    // literal `<profile>` placeholder (captured before profile_id is moved into
+    // the envelope). `<sql>` stays a placeholder — the refusing SQL is the caller's
+    // to correct, and the safe_next_commands already carry the compacted SQL.
+    let profile_label = profile_id.as_deref().unwrap_or("<profile>").to_string();
     envelope.profile_id = profile_id;
     envelope.error = Some(error_info(
         code,
@@ -2525,8 +2638,9 @@ fn refusal(
         vec![json_string("local SQL safety check")],
     ));
     envelope.safe_next_commands = safe_next_commands;
-    envelope.repair_commands =
-        vec!["franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string()];
+    envelope.repair_commands = vec![format!(
+        "franken-snowflake query plan --profile {profile_label} --sql <sql> --json"
+    )];
     Outcome {
         status: code.exit_code(),
         body: Body::Envelope { envelope, format },
@@ -2579,7 +2693,7 @@ fn exit_code_json() -> Json {
     Json::Array(vec![
         exit_code_entry(0, "success, including empty-but-valid results"),
         exit_code_entry(1, "completed with non-fatal findings or warnings"),
-        exit_code_entry(2, "safety refusal"),
+        exit_code_entry(2, "refusal (safety block or reserved/unimplemented surface)"),
         exit_code_entry(3, "credential or profile error"),
         exit_code_entry(4, "upstream Snowflake error"),
         exit_code_entry(5, "network or retry budget exhausted"),
@@ -3598,6 +3712,89 @@ mod tests {
         assert!(caps.contains("\"command_id\":\"onboard\""));
     }
 
+    // a3y: the safety pre-check runs before any live dispatch, so these hold under
+    // both builds. A typo'd SELECT is "unrecognized", NOT "multiple statements".
+    #[test]
+    fn query_run_distinguishes_multi_statement_from_unrecognized_sql() {
+        let typo = render_json(&envelope_for(&["query", "run", "--profile", "demo", "--sql", "selcet 1"]));
+        assert!(typo.contains("Unrecognized read statement"));
+        assert!(!typo.contains("Multiple SQL statements"));
+        let multi = render_json(&envelope_for(&[
+            "query", "run", "--profile", "demo", "--sql", "select 1; select 2",
+        ]));
+        assert!(multi.contains("Multiple SQL statements are refused"));
+        assert!(!multi.contains("Unrecognized read statement"));
+    }
+
+    // mfw: the refusal's next/repair command names the agent's real profile, not
+    // the literal `<profile>` placeholder.
+    #[test]
+    fn query_refusal_interpolates_actual_profile_into_next_command() {
+        let rendered = render_json(&envelope_for(&[
+            "query", "run", "--profile", "demo", "--sql", "drop table t",
+        ]));
+        assert!(rendered.contains("--profile demo"));
+        assert!(!rendered.contains("--profile <profile>"));
+    }
+
+    // ynp F6: clean local readiness is exit 0 so an agent can `doctor && proceed`.
+    #[test]
+    fn doctor_and_selftest_exit_zero_when_local_checks_pass() {
+        assert_eq!(
+            execute(vec!["doctor".to_string(), "--json".to_string()])
+                .status
+                .code(),
+            0
+        );
+        assert_eq!(
+            execute(vec!["selftest".to_string(), "--json".to_string()])
+                .status
+                .code(),
+            0
+        );
+    }
+
+    // ynp F4: a structurally-valid profile validates at exit 0; an invalid id is a
+    // real finding at exit 1.
+    #[test]
+    fn profile_validate_exit_code_reflects_validity() {
+        assert_eq!(
+            execute(vec![
+                "profile".to_string(),
+                "validate".to_string(),
+                "demo".to_string(),
+                "--json".to_string(),
+            ])
+            .status
+            .code(),
+            0
+        );
+        assert_eq!(
+            execute(vec![
+                "profile".to_string(),
+                "validate".to_string(),
+                "bad!id".to_string(),
+                "--json".to_string(),
+            ])
+            .status
+            .code(),
+            1
+        );
+    }
+
+    // ynp F9: a reserved-but-unimplemented surface is a refusal (exit 2 / FSNOW-9002),
+    // not an I/O fault (74).
+    #[test]
+    fn reserved_surfaces_refuse_with_exit_two_not_io() {
+        let outcome = execute(vec!["export".to_string(), "plan".to_string(), "--json".to_string()]);
+        assert_eq!(outcome.status.code(), 2);
+        let rendered = match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("FSNOW-9002"));
+    }
+
     #[test]
     fn query_plan_refuses_multiple_statements() {
         let outcome = execute(vec![
@@ -3944,6 +4141,10 @@ mod tests {
         }
     }
 
+    // No-account build: `query run` reaches the local-safety-check stub. Under the
+    // `live` feature this same invocation drives the real transport instead, so the
+    // assertion is gated and a `live` companion below covers that lane.
+    #[cfg(not(feature = "live"))]
     #[test]
     fn query_shorthand_maps_to_run_surface() {
         let outcome = execute(vec![
@@ -3959,6 +4160,33 @@ mod tests {
         };
         assert!(rendered.contains("\"command_id\":\"query.run\""));
         assert!(rendered.contains("sql_accepted_by_local_safety_check"));
+    }
+
+    // Live build, credential-less profile: `query` shorthand still maps to the run
+    // surface, but with no creds it must produce a typed refusal/error and NEVER
+    // substitute fixture/empty data (`data_source:live` only appears on a real
+    // success). This runs without network because credential resolution fails first.
+    #[cfg(feature = "live")]
+    #[test]
+    fn query_shorthand_maps_to_run_surface_live() {
+        let outcome = execute(vec![
+            "query".to_string(),
+            "--profile".to_string(),
+            "no_creds_profile".to_string(),
+            "--sql".to_string(),
+            "select 1".to_string(),
+        ]);
+        assert_ne!(outcome.status.code(), 0, "credential-less run must not succeed");
+        let rendered = match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("\"command_id\":\"query.run\""));
+        assert!(
+            !rendered.contains("\"data_source\":\"live\""),
+            "must never claim live data without credentials (no fixture substitution)"
+        );
+        assert!(rendered.contains("\"ok\":false"));
     }
 
     #[test]
@@ -3978,6 +4206,11 @@ mod tests {
         assert!(rendered.contains("franken-snowflake query plan --profile"));
     }
 
+    // No-account build: `catalog scan` reaches the stub that echoes
+    // `requested_database`. Under `live` the same flags drive a real scan, so the
+    // catalog-scan assertions are gated; the `live` companion checks the parser
+    // (the part that is feature-independent) instead.
+    #[cfg(not(feature = "live"))]
     #[test]
     fn equals_style_flags_are_read_by_command_parsers() {
         let rendered = render_json(&envelope_for(&[
@@ -4007,6 +4240,40 @@ mod tests {
         assert!(rendered.contains("\"requested_schema\":\"PUBLIC\""));
         assert!(!rendered.contains("Missing --database"));
         assert!(!rendered.contains("Missing --schema"));
+    }
+
+    // Live build: equals-style flag parsing is feature-independent — `query plan`
+    // (offline under both builds) proves `--profile=`/`--sql=` are read, and
+    // `catalog scan` with credential-less flags is parsed (no "Missing --database")
+    // before refusing cleanly without fixture substitution.
+    #[cfg(feature = "live")]
+    #[test]
+    fn equals_style_flags_are_read_by_command_parsers_live() {
+        let rendered = render_json(&envelope_for(&[
+            "query",
+            "plan",
+            "--profile=demo",
+            "--sql=select 1",
+        ]));
+        assert!(rendered.contains("\"command_id\":\"query.plan\""));
+        assert!(rendered.contains("\"ok\":true"));
+        assert!(rendered.contains("\"normalized_sql_preview\":\"select 1\""));
+
+        let outcome = execute(vec![
+            "catalog".to_string(),
+            "scan".to_string(),
+            "no_creds_profile".to_string(),
+            "--database=ANALYTICS".to_string(),
+            "--schema=PUBLIC".to_string(),
+        ]);
+        let rendered = match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        // Parsed (not a usage error about missing flags) and never fixture-backed.
+        assert!(!rendered.contains("Missing --database"));
+        assert!(!rendered.contains("Missing --schema"));
+        assert!(!rendered.contains("\"data_source\":\"live\""));
     }
 
     #[test]
@@ -4085,7 +4352,9 @@ mod tests {
             "validate".to_string(),
             "demo-prod".to_string(),
         ]);
-        assert_eq!(outcome.status.code(), 1);
+        // ynp F4: a structurally-valid profile validates at exit 0 (the
+        // "registry not linked" scope note is informational, not a finding).
+        assert_eq!(outcome.status.code(), 0);
         let rendered = match outcome.body {
             Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
             Body::Raw { data } => data,
@@ -4096,6 +4365,10 @@ mod tests {
         assert!(rendered.contains("FRANKEN_SNOWFLAKE_DEMO_PROD_PAT"));
     }
 
+    // No-account build: `profile doctor --online` records the request but never
+    // probes. Under `live` the same flag drives a real probe, so this is gated and
+    // a `live` companion below covers the credential-less refusal lane.
+    #[cfg(not(feature = "live"))]
     #[test]
     fn profile_doctor_online_never_attempts_live_probe_in_mvp() {
         let outcome = execute(vec![
@@ -4113,6 +4386,30 @@ mod tests {
         assert!(rendered.contains("\"live_probe_requested\":true"));
         assert!(rendered.contains("\"live_probe_attempted\":false"));
         assert!(rendered.contains("FRANKEN_SNOWFLAKE_DEMO_OAUTH_BEARER"));
+    }
+
+    // Live build, credential-less profile: `profile doctor --online` must refuse
+    // cleanly (typed error, no fixture, no network — credential resolution fails
+    // before any I/O). Robust invariants only, so the test is stable across the
+    // exact error code.
+    #[cfg(feature = "live")]
+    #[test]
+    fn profile_doctor_online_refuses_without_credentials_live() {
+        let outcome = execute(vec![
+            "profile".to_string(),
+            "doctor".to_string(),
+            "no_creds_profile".to_string(),
+            "--online".to_string(),
+        ]);
+        let rendered = match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("\"command_id\":\"profile.doctor\""));
+        assert!(
+            !rendered.contains("\"data_source\":\"live\""),
+            "must not claim live data without credentials"
+        );
     }
 
     #[test]
