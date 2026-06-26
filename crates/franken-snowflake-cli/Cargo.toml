@@ -22,8 +22,23 @@ workspace = true
 default = ["toon"]
 mcp = ["dep:franken-snowflake-mcp", "franken-snowflake-mcp/mcp"]
 toon = ["dep:toon"]
+# Opt-in live SQL API transport for `query run` / `catalog scan` / `profile
+# doctor --online`. Default-off so the agent CLI stays a no-account slice (no
+# transport, no asupersync) until live use is explicitly requested. Runtime-gated
+# in addition: even with the feature, a command refuses cleanly when a profile's
+# credential env handles are absent (never substitutes fixture/empty data).
+live = [
+    "dep:franken-snowflake-sqlapi",
+    "dep:franken-snowflake-http",
+    "dep:franken-snowflake-auth",
+    "dep:asupersync",
+]
 
 [dependencies]
 franken-snowflake-core = { path = "../franken-snowflake-core" }
 franken-snowflake-mcp = { path = "../franken-snowflake-mcp", optional = true }
+franken-snowflake-sqlapi = { path = "../franken-snowflake-sqlapi", optional = true }
+franken-snowflake-http = { path = "../franken-snowflake-http", optional = true }
+franken-snowflake-auth = { path = "../franken-snowflake-auth", optional = true }
+asupersync = { workspace = true, optional = true }
 toon = { package = "tru", version = "0.2.3", default-features = false, optional = true }

@@ -718,7 +718,13 @@ fn parse_dataset(args: &[String], output: OutputFormat) -> Result<Command, Outco
 
 fn parse_query(args: &[String], output: OutputFormat) -> Result<Command, Outcome> {
     match args.get(1).map(String::as_str) {
-        Some(value) if value.starts_with("--") && value_after(args, "--sql").is_some() => {
+        // Guard with `raw_value_after` to match the `raw_value_after` extraction
+        // below: a `--sql` whose value legitimately starts with `-` (e.g. SQL
+        // opening with a `--` line comment) must still route through the shorthand,
+        // exactly as `query run --sql ...` / `query plan --sql ...` already do.
+        // Using `value_after` (which rejects flag-like values) here made such SQL
+        // fall through to the "unknown query subcommand `--sql`" error.
+        Some(value) if value.starts_with("--") && raw_value_after(args, "--sql").is_some() => {
             Ok(Command::QueryRun {
                 profile: value_after(args, "--profile"),
                 sql: raw_value_after(args, "--sql"),
@@ -2304,6 +2310,34 @@ fn query_run_outcome(
         );
     }
 
+    // The two builds diverge only here: with `live` the real transport runs; the
+    // default no-account build refuses cleanly. Split into cfg-gated helpers so the
+    // tail stays a single unambiguous expression (no cfg-block-as-tail, no
+    // needless_return under the `-D warnings` clippy gate).
+    query_run_dispatch(format, request_id, profile, &sql_text)
+}
+
+/// Live build: drive the real SQL API transport. The profile presence was checked
+/// by the caller, so `unwrap_or_default` only ever yields the named profile.
+#[cfg(feature = "live")]
+fn query_run_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    profile: Option<String>,
+    sql_text: &str,
+) -> Outcome {
+    live::run_query_outcome(format, request_id, profile.unwrap_or_default(), sql_text)
+}
+
+/// Default (no-account) build: the transport is intentionally not linked, so
+/// refuse cleanly rather than substitute fixture or empty data.
+#[cfg(not(feature = "live"))]
+fn query_run_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    profile: Option<String>,
+    _sql_text: &str,
+) -> Outcome {
     live_transport_required_with_data(
         format,
         "query.run",
@@ -2697,11 +2731,95 @@ fn value_after_inner(args: &[String], flag: &str, allow_flag_like_value: bool) -
 }
 
 fn has_multiple_statements(sql: &str) -> bool {
-    let trimmed = sql.trim();
-    match trimmed.strip_suffix(';') {
-        Some(without_trailing) => without_trailing.contains(';'),
-        None => trimmed.contains(';'),
+    // A bare `.contains(';')` over-refuses valid single statements whose text
+    // legitimately holds a semicolon inside a string literal (`select ';'`), a
+    // line comment (`select 1 -- a; b`), or a block comment (`/* a; b */ select`).
+    // Scan with the same quote/comment state machine as `skip_balanced_sql_parens`
+    // and only treat a *top-level* `;` as a separator. A single trailing separator
+    // (optionally followed by whitespace/comments) is allowed; a second top-level
+    // `;`, or any real content after one, means multiple statements.
+    let bytes = sql.as_bytes();
+    let mut cursor = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut separator_seen = false;
+
+    while cursor < bytes.len() {
+        if in_line_comment {
+            in_line_comment = bytes[cursor] != b'\n';
+            cursor += 1;
+            continue;
+        }
+        if in_block_comment {
+            if bytes[cursor] == b'*' && bytes.get(cursor + 1) == Some(&b'/') {
+                in_block_comment = false;
+                cursor += 2;
+            } else {
+                cursor += 1;
+            }
+            continue;
+        }
+        if in_single_quote {
+            if bytes[cursor] == b'\'' {
+                if bytes.get(cursor + 1) == Some(&b'\'') {
+                    cursor += 2;
+                } else {
+                    in_single_quote = false;
+                    cursor += 1;
+                }
+            } else {
+                cursor += 1;
+            }
+            continue;
+        }
+        if in_double_quote {
+            if bytes[cursor] == b'"' {
+                if bytes.get(cursor + 1) == Some(&b'"') {
+                    cursor += 2;
+                } else {
+                    in_double_quote = false;
+                    cursor += 1;
+                }
+            } else {
+                cursor += 1;
+            }
+            continue;
+        }
+        match bytes[cursor] {
+            b'\'' => {
+                in_single_quote = true;
+                cursor += 1;
+            }
+            b'"' => {
+                in_double_quote = true;
+                cursor += 1;
+            }
+            b'-' if bytes.get(cursor + 1) == Some(&b'-') => {
+                in_line_comment = true;
+                cursor += 2;
+            }
+            b'/' if bytes.get(cursor + 1) == Some(&b'*') => {
+                in_block_comment = true;
+                cursor += 2;
+            }
+            b';' => {
+                if separator_seen {
+                    return true;
+                }
+                separator_seen = true;
+                cursor += 1;
+            }
+            other => {
+                if separator_seen && !other.is_ascii_whitespace() {
+                    return true;
+                }
+                cursor += 1;
+            }
+        }
     }
+    false
 }
 
 fn is_select_like(sql: &str) -> bool {
@@ -3172,6 +3290,9 @@ mod mcp_surface;
 #[cfg(feature = "mcp")]
 pub use mcp_surface::run_mcp_serve_process;
 
+#[cfg(feature = "live")]
+mod live;
+
 fn toon_output_available() -> bool {
     cfg!(feature = "toon")
 }
@@ -3360,6 +3481,42 @@ mod tests {
         // a non-ASCII tail still parses as read.
         assert!(!is_select_like("€€ select"));
         assert!(is_select_like("select 'café' as c"));
+    }
+
+    #[test]
+    fn has_multiple_statements_ignores_semicolons_in_strings_and_comments() {
+        // A semicolon inside a string literal, a `--` line comment, or a `/* */`
+        // block comment is NOT a statement separator; a single read statement that
+        // happens to contain one must not be refused as multi-statement.
+        for sql in [
+            "select 1",
+            "select 1;",
+            "select 1 ;  ",
+            "select ';'",
+            "where name = 'a;b'",
+            "select 1 -- trailing; comment",
+            "select /* a; b */ 1",
+            "select 1; -- trailing comment only",
+            "select \"weird;col\" from t",
+        ] {
+            assert!(
+                !has_multiple_statements(sql),
+                "single statement wrongly flagged as multiple: {sql:?}"
+            );
+        }
+        // Genuine separators (real content after a top-level `;`, or an empty
+        // statement) must still be detected.
+        for sql in [
+            "select 1; select 2",
+            "select 1;;",
+            "select 1; -- c\nselect 2",
+            "insert into t values (1); select 1",
+        ] {
+            assert!(
+                has_multiple_statements(sql),
+                "multiple statements not detected: {sql:?}"
+            );
+        }
     }
 
     #[cfg(feature = "toon")]

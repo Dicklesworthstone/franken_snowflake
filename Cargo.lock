@@ -1668,8 +1668,12 @@ dependencies = [
 name = "franken-snowflake-cli"
 version = "0.0.0"
 dependencies = [
+ "asupersync",
+ "franken-snowflake-auth",
  "franken-snowflake-core",
+ "franken-snowflake-http",
  "franken-snowflake-mcp",
+ "franken-snowflake-sqlapi",
  "tru",
 ]
 
