@@ -932,28 +932,7 @@ fn dispatch(invocation: Invocation) -> Outcome {
             profile,
             database,
             schema,
-        } => not_implemented_with_data(
-            invocation.output,
-            "catalog.scan",
-            "fsnow.catalog.scan.v1",
-            request_id,
-            Some(profile),
-            json_object(vec![
-                ("requested_database", option_json(database)),
-                ("requested_schema", option_json(schema)),
-                (
-                    "requires",
-                    json_array(vec![
-                        json_string("catalog crate"),
-                        json_string("live SQL API transport"),
-                    ]),
-                ),
-            ]),
-            vec![
-                "franken-snowflake query plan --profile <profile> --sql \"select 1\" --json"
-                    .to_string(),
-            ],
-        ),
+        } => catalog_scan_dispatch(invocation.output, request_id, profile, database, schema),
         Command::CatalogGraph {
             profile,
             graph_output,
@@ -2356,6 +2335,60 @@ fn query_run_dispatch(
             ),
         ]),
         vec!["franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string()],
+    )
+}
+
+/// Live build: run an `INFORMATION_SCHEMA.TABLES` discovery scan. `parse_catalog`
+/// guarantees `database`/`schema` are present, so `unwrap_or_default` only ever
+/// yields the supplied values.
+#[cfg(feature = "live")]
+fn catalog_scan_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    database: Option<String>,
+    schema: Option<String>,
+) -> Outcome {
+    live::run_catalog_scan_outcome(
+        format,
+        request_id,
+        profile,
+        database.unwrap_or_default(),
+        schema.unwrap_or_default(),
+    )
+}
+
+/// Default (no-account) build: catalog discovery needs live transport, so refuse
+/// cleanly rather than substitute fixture or empty data.
+#[cfg(not(feature = "live"))]
+fn catalog_scan_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    database: Option<String>,
+    schema: Option<String>,
+) -> Outcome {
+    not_implemented_with_data(
+        format,
+        "catalog.scan",
+        "fsnow.catalog.scan.v1",
+        request_id,
+        Some(profile),
+        json_object(vec![
+            ("requested_database", option_json(database)),
+            ("requested_schema", option_json(schema)),
+            (
+                "requires",
+                json_array(vec![
+                    json_string("catalog crate"),
+                    json_string("live SQL API transport"),
+                ]),
+            ),
+        ]),
+        vec![
+            "franken-snowflake query plan --profile <profile> --sql \"select 1\" --json"
+                .to_string(),
+        ],
     )
 }
 

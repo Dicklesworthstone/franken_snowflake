@@ -48,6 +48,9 @@ const DEFAULT_MAX_POLLS: u32 = 120;
 /// Maximum rows materialized into a single response envelope. The driver still
 /// assembles the full result; this only bounds the JSON payload an agent sees.
 const ROW_EMIT_CAP: usize = 1000;
+/// Upper bound on tables listed by one `catalog scan` (pushed down as a SQL
+/// `LIMIT`, so an unbounded schema never floods the result).
+const CATALOG_SCAN_LIMIT: usize = 10_000;
 
 /// A column's name/type/nullability, projected from the result-set metadata.
 struct LiveColumn {
@@ -79,6 +82,79 @@ pub fn run_query_outcome(
         Err(error) => {
             failure_outcome(format, "query.run", "fsnow.query.run.v1", request_id, profile, &error)
         }
+    }
+}
+
+/// Run a live `INFORMATION_SCHEMA.TABLES` scan for the given database/schema and
+/// return a `catalog scan` envelope. The caller (`parse_catalog`) guarantees both
+/// `database` and `schema` are present. Both are validated as plain SQL
+/// identifiers before interpolation so the discovery SQL cannot be injected.
+pub fn run_catalog_scan_outcome(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    database: String,
+    schema: String,
+) -> crate::Outcome {
+    if !is_safe_sql_identifier(&database) {
+        return failure_outcome(
+            format,
+            "catalog.scan",
+            "fsnow.catalog.scan.v1",
+            request_id,
+            profile,
+            &SnowflakeError::new(
+                SnowflakeErrorCode::UsageError,
+                "--database must be a plain SQL identifier (letters, digits, _ or $)",
+            ),
+        );
+    }
+    if !is_safe_sql_identifier(&schema) {
+        return failure_outcome(
+            format,
+            "catalog.scan",
+            "fsnow.catalog.scan.v1",
+            request_id,
+            profile,
+            &SnowflakeError::new(
+                SnowflakeErrorCode::UsageError,
+                "--schema must be a plain SQL identifier (letters, digits, _ or $)",
+            ),
+        );
+    }
+
+    let sql = format!(
+        "SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, ROW_COUNT, BYTES \
+         FROM {database}.INFORMATION_SCHEMA.TABLES \
+         WHERE TABLE_SCHEMA = '{schema}' \
+         ORDER BY TABLE_SCHEMA, TABLE_NAME \
+         LIMIT {CATALOG_SCAN_LIMIT}"
+    );
+    match execute(&profile, &sql, Some(&database), Some(&schema)) {
+        Ok(rows) => rows_success(
+            format,
+            request_id,
+            profile,
+            "catalog.scan",
+            "fsnow.catalog.scan.v1",
+            vec![
+                ("database", json_string(database)),
+                ("schema", json_string(schema)),
+            ],
+            &rows,
+            vec![
+                "franken-snowflake catalog graph <profile> --mermaid".to_string(),
+                "franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string(),
+            ],
+        ),
+        Err(error) => failure_outcome(
+            format,
+            "catalog.scan",
+            "fsnow.catalog.scan.v1",
+            request_id,
+            profile,
+            &error,
+        ),
     }
 }
 
@@ -341,6 +417,34 @@ fn query_success(
     profile: String,
     rows: &LiveRows,
 ) -> crate::Outcome {
+    rows_success(
+        format,
+        request_id,
+        profile,
+        "query.run",
+        "fsnow.query.run.v1",
+        Vec::new(),
+        rows,
+        vec!["franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string()],
+    )
+}
+
+/// Build a `data_source = "live"` success envelope carrying assembled rows. The
+/// rows are projected positionally (matching the `columns` order, the jsonv2
+/// shape) and capped at [`ROW_EMIT_CAP`] with an explicit `truncated` flag.
+/// `leading` fields (e.g. catalog `database`/`schema`) are placed before the row
+/// payload in `data`.
+#[allow(clippy::too_many_arguments)]
+fn rows_success(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    command_id: &'static str,
+    output_contract_id: &'static str,
+    mut leading: Vec<(&'static str, Json)>,
+    rows: &LiveRows,
+    safe_next_commands: Vec<String>,
+) -> crate::Outcome {
     let returned = rows.rows.len().min(ROW_EMIT_CAP);
     let truncated = rows.rows.len() > ROW_EMIT_CAP;
 
@@ -372,7 +476,7 @@ fn query_success(
             })
             .collect(),
     );
-    let data = json_object(vec![
+    leading.extend(vec![
         ("columns", columns_json),
         ("rows", rows_json),
         ("row_count", Json::Number(rows.total_rows)),
@@ -382,8 +486,14 @@ fn query_success(
         ("truncated", Json::Bool(truncated)),
     ]);
 
-    let mut envelope =
-        base_envelope(true, "success", "query.run", "fsnow.query.run.v1", request_id, data);
+    let mut envelope = base_envelope(
+        true,
+        "success",
+        command_id,
+        output_contract_id,
+        request_id,
+        json_object(leading),
+    );
     envelope.data_source = "live";
     envelope.profile_id = Some(profile);
     envelope.statement_handle = Some(rows.statement_handle.clone());
@@ -393,8 +503,7 @@ fn query_success(
         ("polls", Json::Number(0)),
         ("rows", Json::Number(rows.total_rows)),
     ]);
-    envelope.safe_next_commands =
-        vec!["franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string()];
+    envelope.safe_next_commands = safe_next_commands;
     if truncated {
         envelope.warnings = vec![json_string(format!(
             "result truncated to {ROW_EMIT_CAP} rows in this envelope; {} total rows were \
@@ -475,6 +584,22 @@ fn deterministic_session_parameters() -> BTreeMap<String, String> {
         ("BINARY_OUTPUT_FORMAT".to_string(), "HEX".to_string()),
         ("USE_CACHED_RESULT".to_string(), "FALSE".to_string()),
     ])
+}
+
+/// A conservative Snowflake unquoted-identifier check: a leading letter or
+/// underscore, then letters/digits/underscore/`$`, bounded length. Used to gate
+/// `database`/`schema` before they are interpolated into the discovery SQL, so a
+/// crafted value cannot inject (it is rejected, never escaped-and-trusted).
+fn is_safe_sql_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    value.len() <= 255
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
 }
 
 fn name(prefix: &str, key: &str) -> String {
