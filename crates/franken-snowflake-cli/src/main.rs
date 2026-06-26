@@ -1870,6 +1870,44 @@ fn profile_doctor_outcome(
     profile: String,
     online: bool,
 ) -> Outcome {
+    profile_doctor_dispatch(format, request_id, profile, online)
+}
+
+/// Live build: an explicit `--online` request runs a real credential probe; the
+/// offline path is shared with the default build so its diagnostics envelope
+/// (and goldens) stay byte-identical.
+#[cfg(feature = "live")]
+fn profile_doctor_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    online: bool,
+) -> Outcome {
+    if online {
+        live::profile_doctor_online_outcome(format, request_id, profile)
+    } else {
+        profile_doctor_offline_outcome(format, request_id, profile, online)
+    }
+}
+
+/// Default (no-account) build: the probe cannot run, so report offline-only
+/// findings (an `--online` request is recorded as requested-but-not-attempted).
+#[cfg(not(feature = "live"))]
+fn profile_doctor_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    online: bool,
+) -> Outcome {
+    profile_doctor_offline_outcome(format, request_id, profile, online)
+}
+
+fn profile_doctor_offline_outcome(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    online: bool,
+) -> Outcome {
     let syntax_valid = is_valid_profile_id(&profile);
     let warning = if online {
         "online profile probe requested but not attempted because live transport is not linked"

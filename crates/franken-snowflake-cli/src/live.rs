@@ -158,6 +158,81 @@ pub fn run_catalog_scan_outcome(
     }
 }
 
+/// Attempt a real credential/connectivity probe for `profile doctor --online`:
+/// run a minimal `SELECT CURRENT_VERSION()` and report whether it succeeded,
+/// without ever reading or emitting a secret value. A missing credential handle
+/// collapses to a typed error (exit 3), never a silent "healthy".
+pub fn profile_doctor_online_outcome(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+) -> crate::Outcome {
+    const PROBE_SQL: &str = "SELECT CURRENT_VERSION() AS SNOWFLAKE_VERSION";
+    match execute(&profile, PROBE_SQL, None, None) {
+        Ok(rows) => {
+            let version = rows
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .and_then(Clone::clone);
+            probe_success(format, request_id, profile, version)
+        }
+        Err(error) => failure_outcome(
+            format,
+            "profile.doctor",
+            "fsnow.profile.doctor.v1",
+            request_id,
+            profile,
+            &error,
+        ),
+    }
+}
+
+fn probe_success(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    version: Option<String>,
+) -> crate::Outcome {
+    let data = json_object(vec![
+        ("profile_id", json_string(profile.clone())),
+        ("live_probe_requested", Json::Bool(true)),
+        ("live_probe_attempted", Json::Bool(true)),
+        ("live_probe_ok", Json::Bool(true)),
+        ("secret_values_read", Json::Bool(false)),
+        (
+            "snowflake_version",
+            match version {
+                Some(value) => json_string(value),
+                None => Json::Null,
+            },
+        ),
+        (
+            "redaction_policy",
+            json_string("env var names only; token/private-key values are never emitted"),
+        ),
+    ]);
+    let mut envelope = base_envelope(
+        true,
+        "success",
+        "profile.doctor",
+        "fsnow.profile.doctor.v1",
+        request_id,
+        data,
+    );
+    envelope.data_source = "live";
+    envelope.profile_id = Some(profile);
+    envelope.safe_next_commands = vec![
+        "franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json"
+            .to_string(),
+        "franken-snowflake query run --profile <profile> --sql <sql> --json".to_string(),
+    ];
+    crate::Outcome {
+        status: CoreExitCode::Success,
+        body: Body::Envelope { envelope, format },
+    }
+}
+
 /// Resolve credentials, drive the statement to completion, and assemble rows.
 fn execute(
     profile: &str,
