@@ -273,7 +273,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "catalog.graph",
-        invocation: "franken-snowflake catalog graph <profile> --mermaid",
+        invocation: "franken-snowflake catalog graph <profile> --database <db> --mermaid",
         output_contract_id: "fsnow.catalog.graph.v1",
         description: "Render catalog lineage as JSON, TOON, Mermaid, or SVG.",
         read_only: true,
@@ -1147,37 +1147,43 @@ fn success_with_profile(
     outcome
 }
 
-// True only when a readiness `data.checks[*].status` is an actual problem
-// (`fail`/`warn`). A `not_checked` status (a feature pending lower-level beads)
-// is informational, NOT a failure — so a health gate doesn't trip on it.
+// True when any check object in `items` reports an actual problem (`fail`/`warn`).
+// A `pass` or `not_checked` status (a feature pending lower-level beads) is not a
+// failure — so a health gate doesn't trip on it.
+fn checks_have_failure(items: &[Json]) -> bool {
+    items.iter().any(|item| {
+        let Json::Object(fields) = item else {
+            return false;
+        };
+        fields.iter().any(|(field_key, field_value)| {
+            *field_key == "status"
+                && matches!(field_value, Json::String(status) if status == "fail" || status == "warn")
+        })
+    })
+}
+
+// True when a readiness payload reports any failing check. Doctor lists checks
+// under `checks`; selftest lists them under `fixtures` — both are inspected so a
+// failure in either is detected (an earlier version only looked at `checks`,
+// silently ignoring selftest fixture failures).
 fn data_has_failed_check(data: &Json) -> bool {
     let Json::Object(entries) = data else {
         return false;
     };
-    for (key, value) in entries {
-        if *key != "checks" {
-            continue;
-        }
-        let Json::Array(checks) = value else {
-            continue;
-        };
-        for check in checks {
-            let Json::Object(fields) = check else {
-                continue;
-            };
-            for (field_key, field_value) in fields {
-                if *field_key != "status" {
-                    continue;
-                }
-                if let Json::String(status) = field_value {
-                    if status == "fail" || status == "warn" {
-                        return true;
-                    }
-                }
-            }
-        }
+    entries.iter().any(|(key, value)| {
+        (*key == "checks" || *key == "fixtures")
+            && matches!(value, Json::Array(items) if checks_have_failure(items))
+    })
+}
+
+// A data-level `status` consistent with the readiness exit: `ok` when every check
+// passed (or is pending), `findings` when one failed.
+fn readiness_status(items: &[Json]) -> &'static str {
+    if checks_have_failure(items) {
+        "findings"
+    } else {
+        "ok"
     }
-    false
 }
 
 // `doctor`/`selftest` exit 0 when every local readiness check passed, so an agent
@@ -1897,67 +1903,67 @@ fn help_data() -> Json {
 }
 
 fn doctor_data() -> Json {
-    json_object(vec![
-        ("status", json_string("findings")),
-        (
-            "checks",
-            Json::Array(vec![
-                check_json(
-                    "cli_contract",
-                    "pass",
-                    "command registry and envelope renderer are linked",
-                ),
-                check_json(
-                    "cli_required_surfaces",
-                    "pass",
-                    "capabilities, robot-docs, agent-handbook, doctor, profile validate, query plan/run/cancel, and mcp serve are registered",
-                ),
-                check_json(
-                    "security_guardrails",
-                    "pass",
-                    "core redaction, rights, and cost guardrails are linked",
-                ),
-                check_json(
-                    "live_transport",
-                    "not_checked",
-                    "blocked until SQL API transport lands",
-                ),
-                check_json(
-                    "testkit",
-                    "not_checked",
-                    "blocked until deterministic no-account testkit lands",
-                ),
-                check_json(
-                    "profile_registry",
-                    "not_checked",
-                    "blocked until profile storage lands",
-                ),
-            ]),
+    // Status is derived from the checks so it can never disagree with the exit
+    // code (`ok` here, since every check passes or is pending; `findings` only if
+    // one fails). A `not_checked` item is a feature pending lower-level beads, not
+    // a failure.
+    let checks = vec![
+        check_json(
+            "cli_contract",
+            "pass",
+            "command registry and envelope renderer are linked",
         ),
+        check_json(
+            "cli_required_surfaces",
+            "pass",
+            "capabilities, robot-docs, agent-handbook, doctor, profile validate, query plan/run/cancel, and mcp serve are registered",
+        ),
+        check_json(
+            "security_guardrails",
+            "pass",
+            "core redaction, rights, and cost guardrails are linked",
+        ),
+        check_json(
+            "live_transport",
+            "not_checked",
+            "blocked until SQL API transport lands",
+        ),
+        check_json(
+            "testkit",
+            "not_checked",
+            "blocked until deterministic no-account testkit lands",
+        ),
+        check_json(
+            "profile_registry",
+            "not_checked",
+            "blocked until profile storage lands",
+        ),
+    ];
+    json_object(vec![
+        ("status", json_string(readiness_status(&checks))),
+        ("checks", Json::Array(checks)),
     ])
 }
 
 fn selftest_data() -> Json {
-    json_object(vec![
-        ("status", json_string("not_available")),
-        ("offline", Json::Bool(true)),
-        (
-            "fixtures",
-            Json::Array(vec![
-                check_json("json_envelope_contract", "pass", "renderer available"),
-                check_json("sqlapi_protocol", "not_checked", "testkit bead pending"),
-                check_json(
-                    "secret_redaction",
-                    "pass",
-                    "core redactor and credential canary needle list are linked",
-                ),
-                check_json(
-                    "credential_debug_gate",
-                    "pass",
-                    "auth credential Debug leak gate is linked through the checked workspace",
-                ),
-            ]),
+    let fixtures = vec![
+        check_json("json_envelope_contract", "pass", "renderer available"),
+        check_json("sqlapi_protocol", "not_checked", "testkit bead pending"),
+        check_json(
+            "secret_redaction",
+            "pass",
+            "core redactor and credential canary needle list are linked",
         ),
+        check_json(
+            "credential_debug_gate",
+            "pass",
+            "auth credential Debug leak gate is linked through the checked workspace",
+        ),
+    ];
+    json_object(vec![
+        ("status", json_string(readiness_status(&fixtures))),
+        ("offline", Json::Bool(true)),
+        ("fixtures", Json::Array(fixtures)),
     ])
 }
 
@@ -2512,7 +2518,7 @@ fn query_run_outcome(
             request_id,
             profile.clone(),
             SnowflakeErrorCode::MutationRefused,
-            "Unrecognized read statement: `query run` accepts one read-only SELECT/WITH/SHOW/DESCRIBE/EXPLAIN. If you meant to read, start with `SELECT` (a typo such as `selcet` lands here, not in the multi-statement or mutation paths).",
+            "Not a recognized read-only statement: `query run` accepts a single SELECT/WITH/SHOW/DESCRIBE/EXPLAIN. Mutations (UPDATE/DELETE/INSERT/MERGE/DDL) are refused here, and a typo'd keyword (e.g. `selcet`) lands here too — if you meant to read, start with `SELECT`.",
             vec![plan_hint(profile.as_deref(), &sql_text)],
         );
     }
@@ -2826,7 +2832,7 @@ fn first_commands() -> Vec<String> {
         "franken-snowflake profile validate <profile> --json".to_string(),
         "franken-snowflake query plan --profile <profile> --sql \"select 1\" --json".to_string(),
         "franken-snowflake dataset describe-operator between --jsonschema".to_string(),
-        "franken-snowflake catalog graph <profile> --mermaid".to_string(),
+        "franken-snowflake catalog graph <profile> --database <db> --mermaid".to_string(),
         "franken-snowflake query cancel <statement-handle> --json".to_string(),
     ]
 }
@@ -3744,13 +3750,13 @@ mod tests {
     #[test]
     fn query_run_distinguishes_multi_statement_from_unrecognized_sql() {
         let typo = render_json(&envelope_for(&["query", "run", "--profile", "demo", "--sql", "selcet 1"]));
-        assert!(typo.contains("Unrecognized read statement"));
+        assert!(typo.contains("Not a recognized read-only statement"));
         assert!(!typo.contains("Multiple SQL statements"));
         let multi = render_json(&envelope_for(&[
             "query", "run", "--profile", "demo", "--sql", "select 1; select 2",
         ]));
         assert!(multi.contains("Multiple SQL statements are refused"));
-        assert!(!multi.contains("Unrecognized read statement"));
+        assert!(!multi.contains("Not a recognized read-only statement"));
     }
 
     // mfw: the refusal's next/repair command names the agent's real profile, not

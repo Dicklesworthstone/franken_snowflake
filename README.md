@@ -91,7 +91,7 @@ franken-snowflake profile validate demo-prod --json
 
 # Discover data
 franken-snowflake catalog scan demo-prod --database ANALYTICS --schema PUBLIC --json
-franken-snowflake catalog graph demo-prod --mermaid
+franken-snowflake catalog graph demo-prod --database ANALYTICS --mermaid
 franken-snowflake dataset describe-operator between --jsonschema
 
 # Plan and run a query (raw SQL or dataset mode)
