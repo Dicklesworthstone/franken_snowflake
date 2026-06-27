@@ -51,6 +51,7 @@ mod fastmcp_surface {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ReadVerb {
         Capabilities,
+        Onboard,
         Doctor,
         AgentHandbook,
         RobotDocsGuide,
@@ -71,6 +72,7 @@ mod fastmcp_surface {
 
     const READ_VERBS: &[ReadVerb] = &[
         ReadVerb::Capabilities,
+        ReadVerb::Onboard,
         ReadVerb::Doctor,
         ReadVerb::AgentHandbook,
         ReadVerb::RobotDocsGuide,
@@ -120,6 +122,14 @@ mod fastmcp_surface {
                 Self::Capabilities => ToolSpec {
                     name: "capabilities",
                     description: "Return the franken-snowflake read-only capability registry as the CLI JSON envelope.",
+                    open_world_hint: "offline",
+                    read_only: true,
+                    params: Vec::new(),
+                    tags: &["discovery", "offline"],
+                },
+                Self::Onboard => ToolSpec {
+                    name: "onboard",
+                    description: "Mega-command: capabilities + exit codes + first commands + local health in one call, via the CLI onboard handler.",
                     open_world_hint: "offline",
                     read_only: true,
                     params: Vec::new(),
@@ -206,14 +216,24 @@ mod fastmcp_surface {
                 },
                 Self::CatalogGraph => ToolSpec {
                     name: "catalog_graph",
-                    description: "Render the catalog graph through the CLI catalog graph handler; format may be json, mermaid, or svg.",
-                    open_world_hint: "offline",
+                    description: "Render the catalog lineage graph through the CLI catalog graph handler from a live scan of the given database; format may be json, mermaid, or svg.",
+                    open_world_hint: "snowflake",
                     read_only: true,
                     params: vec![
                         ParamSpec::string(
                             "profile",
-                            "Profile id whose cached catalog graph should be rendered.",
+                            "Profile id to use for the live catalog scan.",
                             true,
+                        ),
+                        ParamSpec::string(
+                            "database",
+                            "Snowflake database name to scope the graph (required).",
+                            true,
+                        ),
+                        ParamSpec::string(
+                            "schema",
+                            "Optional Snowflake schema name to narrow the graph.",
+                            false,
                         ),
                         ParamSpec::string_enum(
                             "format",
@@ -320,6 +340,7 @@ mod fastmcp_surface {
         fn cli_args(self, arguments: &Value) -> McpResult<Vec<String>> {
             match self {
                 Self::Capabilities => Ok(json_args(&["capabilities"])),
+                Self::Onboard => Ok(json_args(&["onboard"])),
                 Self::Doctor => Ok(json_args(&["doctor"])),
                 Self::AgentHandbook => Ok(json_args(&["agent-handbook"])),
                 Self::RobotDocsGuide => Ok(json_args(&["robot-docs", "guide"])),
@@ -354,7 +375,13 @@ mod fastmcp_surface {
                         "catalog".to_string(),
                         "graph".to_string(),
                         required_string(arguments, "profile")?,
+                        "--database".to_string(),
+                        required_string(arguments, "database")?,
                     ];
+                    if let Some(schema) = optional_string(arguments, "schema")? {
+                        args.push("--schema".to_string());
+                        args.push(schema);
+                    }
                     match optional_string(arguments, "format")?
                         .as_deref()
                         .unwrap_or("json")
@@ -817,8 +844,11 @@ mod fastmcp_surface {
         #[test]
         fn invalid_params_redacts_secret_shaped_argument_values() {
             let raw_secret = "sfpat_mcpBadFormat001";
+            // `database` is now required for catalog_graph and is validated before
+            // `format`; supply it so the unsupported-format (secret-shaped) value is
+            // the failure under test.
             let err = match ReadVerb::CatalogGraph.cli_args(
-                &json!({"profile": "demo", "format": raw_secret}),
+                &json!({"profile": "demo", "database": "DB", "format": raw_secret}),
             ) {
                 Ok(_) => {
                     assert!(

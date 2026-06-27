@@ -163,6 +163,10 @@ enum Body {
         envelope: Envelope,
         format: OutputFormat,
     },
+    // Only constructed by the live `catalog graph` Mermaid/SVG renderers. Without
+    // the `live` feature the no-account build never produces raw output (it
+    // refuses with a JSON envelope), so the variant is legitimately unused there.
+    #[cfg_attr(not(feature = "live"), allow(dead_code))]
     Raw {
         data: String,
     },
@@ -1858,6 +1862,12 @@ fn agent_handbook_data() -> Json {
                         "Run `franken-snowflake doctor --json`; profile registry is not linked yet.",
                     ),
                 ),
+                (
+                    SnowflakeErrorCode::SurfaceReserved.stable_code(),
+                    json_string(
+                        "This surface is reserved/not implemented yet; run `franken-snowflake capabilities --json` for the live surfaces.",
+                    ),
+                ),
             ]),
         ),
         (
@@ -3349,6 +3359,7 @@ fn compact_sql(sql: &str) -> String {
 fn top_level_commands() -> Vec<&'static str> {
     vec![
         "capabilities",
+        "onboard",
         "robot-docs",
         "agent-handbook",
         "doctor",
@@ -4068,6 +4079,19 @@ mod tests {
     fn did_you_mean_catches_near_miss() {
         let suggestions = did_you_mean("capabilties", &["capabilities", "catalog"]);
         assert_eq!(suggestions, vec!["capabilities".to_string()]);
+    }
+
+    // Regression: the new top-level `onboard` verb must be a did_you_mean
+    // candidate, so a typo suggests it like every other command.
+    #[test]
+    fn onboard_typo_suggests_onboard() {
+        let outcome = execute(vec!["onbord".to_string(), "--json".to_string()]);
+        assert_eq!(outcome.status.code(), 64);
+        let rendered = match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("\"did_you_mean\":[\"onboard\"]"));
     }
 
     #[test]

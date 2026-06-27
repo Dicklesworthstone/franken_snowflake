@@ -143,7 +143,7 @@ pub fn run_catalog_scan_outcome(
             ],
             &rows,
             vec![
-                "franken-snowflake catalog graph <profile> --mermaid".to_string(),
+                "franken-snowflake catalog graph <profile> --database <db> --mermaid".to_string(),
                 "franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string(),
             ],
         ),
@@ -416,8 +416,10 @@ impl CatalogHierarchy {
     }
 }
 
-/// HTML-entity-encode a Mermaid node label so object names can never inject graph
-/// structure (the `xgr` finding: backslash/quote escaping must be effective).
+/// HTML-entity-encode a Mermaid node label so an object name can never inject
+/// graph structure. The label sits inside `id["..."]`; encoding `"`/`<`/`>`/`&`
+/// and flattening newlines makes structural breakout impossible (`]` and `\` are
+/// literal inside the quoted span, so they need no escaping).
 fn escape_mermaid_label(label: &str) -> String {
     let mut out = String::with_capacity(label.len());
     for ch in label.chars() {
