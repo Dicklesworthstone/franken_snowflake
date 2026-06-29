@@ -34,9 +34,10 @@ implementation first and the test/hardening pass follows in a later wave. The
 - Package version: `0.0.0` across the workspace; all crates inherit
   `publish = false`.
 - Releases: none yet. No git tag, no GitHub Release, no crates.io publish.
-- Live Snowflake transport is enabled with the `live` feature (default-off, so
-  the default build is a credential-free slice) and is gated at runtime by
-  credential availability.
+- Live Snowflake transport is enabled with the `live` feature (default-off) and
+  is gated at runtime by credential availability. Reads (`query run`,
+  `catalog scan`, `profile doctor --online`) and writes (`query write`) both run
+  through it.
 
 ## Timeline
 
@@ -46,6 +47,7 @@ implementation first and the test/hardening pass follows in a later wave. The
 | 2026-06-25 | Hardening wave: MCP serve adapter, optional TUI, redaction and safety fixes across every crate, write-intent ladder types, cross-platform CI |
 | 2026-06-26 | Live proof lanes, opt-in live transport wired into `query run` / `catalog scan` / `profile doctor --online`, and the agent-ergonomics CLI pass (`onboard`, `fsnow` alias) |
 | 2026-06-29 | Hero illustration and GitHub social preview image |
+| 2026-06-29 | Live writes: the write-intent ladder executor; `query write` / `write` alias |
 
 ---
 
@@ -83,18 +85,18 @@ maps once to a default recovery path), the capability registry, the exit-code
 dictionary, and the id newtypes. It then adopted the Asupersync `Outcome`,
 `Budget`, `CancelReason`, and capability primitives so the connector's
 four-valued result and cost-quota model come straight from the runtime. Security
-and cost guardrails, the redactor, and the deferred write-intent ladder types
-landed here too. Later fixes tightened the read-only guard against block-comment
-evasion, projected policy refusals and statement timeouts as typed outcome
-kinds, and added the `SurfaceReserved` code (`FSNOW-9002`, an exit-2 refusal).
+and cost guardrails, the redactor, and the write-intent ladder types landed here
+too. Later fixes tightened the read guard against block-comment evasion,
+projected policy refusals and statement timeouts as typed outcome kinds, and
+added the `SurfaceReserved` code (`FSNOW-9002`, an exit-2 refusal).
 
 **Representative commits**
 - [`82b1a7e`](https://github.com/Dicklesworthstone/franken_snowflake/commit/82b1a7e) core: shared types, error registry, JSON envelope
 - [`d086813`](https://github.com/Dicklesworthstone/franken_snowflake/commit/d086813) core: adopt Asupersync Outcome/Budget/CancelReason/capabilities
 - [`2b01739`](https://github.com/Dicklesworthstone/franken_snowflake/commit/2b01739) core: add security and cost guardrails
 - [`ac83c11`](https://github.com/Dicklesworthstone/franken_snowflake/commit/ac83c11) core: fix redactor token-boundary so secrets after `=`/`:` are redacted
-- [`f16c117`](https://github.com/Dicklesworthstone/franken_snowflake/commit/f16c117) Add deferred write-intent ladder types
-- [`b137675`](https://github.com/Dicklesworthstone/franken_snowflake/commit/b137675) fix(core): close read-only-guard fail-open on nested block comments
+- [`f16c117`](https://github.com/Dicklesworthstone/franken_snowflake/commit/f16c117) Add write-intent ladder types
+- [`b137675`](https://github.com/Dicklesworthstone/franken_snowflake/commit/b137675) fix(core): close read-guard fail-open on nested block comments
 - [`1a33396`](https://github.com/Dicklesworthstone/franken_snowflake/commit/1a33396) feat(core): add SurfaceReserved error code (FSNOW-9002, exit 2 refusal)
 
 **Notes for agents**: exit codes are coarse and stable (0 success, 2 safety
@@ -148,13 +150,13 @@ retried; idempotency is the SQL API `requestId` plus `retry=true` contract. See
 ### SQL API client: request, response, lifecycle, wire
 
 `franken-snowflake-sqlapi` carries the protocol. The request/response/status
-schemas landed with no-account golden fixtures and round-trip proofs, including a
-fix for the jsonv2 codec decoding negative pre-1970 fractional timestamps. The
-statement lifecycle is a state machine driving submit, poll, partition stream,
-and cancel; later fixes preserved poll cancellation attribution, closed the
-lifecycle machine on terminal failure, preserved terminal-failure projection, and
-hardened partition and cancel integrity (including rejecting invalid partition
-stream seeds).
+schemas landed with golden fixtures and round-trip proofs, including a fix for
+the jsonv2 codec decoding negative pre-1970 fractional timestamps. The statement
+lifecycle is a state machine driving submit, poll, partition stream, and cancel;
+later fixes preserved poll cancellation attribution, closed the lifecycle machine
+on terminal failure, preserved terminal-failure projection, and hardened
+partition and cancel integrity (including rejecting invalid partition stream
+seeds).
 
 **Representative commits**
 - [`d5e08d3`](https://github.com/Dicklesworthstone/franken_snowflake/commit/d5e08d3) sqlapi: SQL API request/response/status protocol schemas (kx6)
@@ -218,7 +220,7 @@ planned and hardened the optional frankensearch lane (`hash`/`lexical` only).
 
 ### Deterministic testkit, mock server, replay, and DPOR race suite
 
-`franken-snowflake-testkit` is the no-account proof substrate. It provides a
+`franken-snowflake-testkit` is the deterministic proof substrate. It provides a
 shared harness (a golden framework, a JSON-line logger, a deterministic clock,
 and a canary guard), determinism and schema-stability self-tests, a deterministic
 Snowflake SQL API mock with replay, a deterministic cancel/retry race suite, and
@@ -234,9 +236,9 @@ recordings, recorded mock request paths, and mock HTTP `Debug` surfaces.
 - [`dcaea80`](https://github.com/Dicklesworthstone/franken_snowflake/commit/dcaea80) test: add deterministic mock e2e harness
 - [`f734ace`](https://github.com/Dicklesworthstone/franken_snowflake/commit/f734ace) fix(testkit): make the DPOR cancel/retry race suite deterministic
 
-**Notes for agents**: the two no-account lanes are a deterministic codec lane
-under the lab runtime (over virtual TCP, with DPOR coverage) and an integration
-lane against the mock server. See `docs/proof_lanes.md`.
+**Notes for agents**: the two test lanes are a deterministic codec lane under the
+lab runtime (over virtual TCP, with DPOR coverage) and an integration lane
+against the mock server. See `docs/proof_lanes.md`.
 
 ### Agent-ergonomic CLI
 
@@ -282,8 +284,9 @@ to make the query-pane keys executable and a combined MCP/TUI review-defect pass
 - [`b2d987e`](https://github.com/Dicklesworthstone/franken_snowflake/commit/b2d987e) feat: add optional FrankenTUI surface
 - [`21beeec`](https://github.com/Dicklesworthstone/franken_snowflake/commit/21beeec) Fix MCP and TUI review defects
 
-**Notes for agents**: `mcp serve` is read-only and stdio-first by design. The
-tool roster mirrors the CLI verbs (capabilities, onboard, doctor,
+**Notes for agents**: `mcp serve` exposes the read and discovery verbs and is
+stdio-first by design; data writes go through the CLI `query write` ladder. The
+tool roster mirrors the CLI read verbs (capabilities, onboard, doctor,
 agent_handbook, robot_docs_guide, selftest, profile_validate, profile_doctor,
 catalog_scan, catalog_graph, dataset_inspect, dataset_profile,
 dataset_describe_operator, query_plan, query_run, query_cancel, receipt_show,
@@ -292,15 +295,14 @@ export_plan).
 ### Auth/redaction and live transport (opt-in)
 
 The opt-in live lane is the `live` feature. Live proof lanes landed first, then
-two rounds of live-protocol decode fixes (each guarded by no-account regression
-goldens so the no-account build still proves the change). The CLI live wiring
-went in as three slices: `query run`, `catalog scan`, and the
-`profile doctor --online` probe. The runtime contract is strict: with the
-feature compiled and credentials present, the command runs and the envelope
-carries `data_source = "live"` and the real statement handle; with the feature
-compiled but a credential handle absent, the command returns a typed credential
-error (exit 3); without the feature, the command refuses cleanly rather than
-substituting fixture or empty data.
+two rounds of live-protocol decode fixes (each guarded by regression goldens so
+the offline build still proves the change). The CLI live wiring went in as three
+slices: `query run`, `catalog scan`, and the `profile doctor --online` probe. The
+runtime contract is strict: with the feature compiled and credentials present,
+the command runs and the envelope carries `data_source = "live"` and the real
+statement handle; with the feature compiled but a credential handle absent, the
+command returns a typed credential error (exit 3); without the feature, the
+command refuses cleanly rather than substituting fixture or empty data.
 
 **Representative commits**
 - [`1e48db8`](https://github.com/Dicklesworthstone/franken_snowflake/commit/1e48db8) Add opt-in Snowflake live proof lanes
@@ -310,10 +312,37 @@ substituting fixture or empty data.
 - [`4a0b791`](https://github.com/Dicklesworthstone/franken_snowflake/commit/4a0b791) feat(cli): wire live transport into `catalog scan` (9o1, slice 2/3)
 - [`99dfb10`](https://github.com/Dicklesworthstone/franken_snowflake/commit/99dfb10) feat(cli): wire live `profile doctor --online` probe (9o1, slice 3/3)
 
-**Notes for agents**: live results are capped into the envelope with a
+**Notes for agents**: live read results are capped into the envelope with a
 `truncated` flag and a warning; full extraction uses a Snowflake-side `LIMIT` or
 `COPY INTO`. Live session parameters are pinned (UTC, fixed date/time formats,
 result cache disabled) for stable output. See `docs/live_proof.md`.
+
+### Live writes: the write-intent ladder executor
+
+This wave turned the write-intent ladder from a set of core types into a live
+executor on the CLI. `query write` runs a mutation in two rungs. A `--dry-run`
+classifies the statement (`statement_kind`, `safety_class`), plans it without
+executing anything, and returns a `required_confirmation_token` (for example
+`confirm:insert:<idempotency-id>`) bound to the (profile, SQL) pair; a re-run
+with `--confirm <token>` authorizes the ladder and submits the statement through
+the live SQL API transport, returning a `data_source = "live"` execution receipt
+with the statement handle and rows affected. Data writes
+(INSERT/MERGE/UPDATE/DELETE/COPY INTO/PUT) execute once a profile sets
+`FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ENABLED=true`; DDL
+(CREATE/ALTER/DROP/TRUNCATE/GRANT/REVOKE) needs the additional
+`FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ALLOW_DDL=true`. The refusals are typed:
+`FSNOW-3007` (writes not enabled), `FSNOW-3008` (confirmation required or
+mismatched), `FSNOW-3009` (DDL not opted in), and `FSNOW-2003` (credential
+missing). `write` is a top-level alias for `query write`. Without the `live`
+feature or without credentials the command refuses cleanly and never fakes an
+execution.
+
+**Representative commits**
+- [`ee54952`](https://github.com/Dicklesworthstone/franken_snowflake/commit/ee54952) Live writes: the write-intent ladder executor (`query write` / `write` alias)
+
+**Notes for agents**: the confirmation token only authorizes a re-run of the same
+statement on the same profile, so a plan cannot be replayed against different
+SQL. `query run` is the read path; route any mutation through `query write`.
 
 ### Hardening, fresh-eyes review, and release readiness
 
@@ -321,7 +350,7 @@ Several waves were dedicated to review rather than new features. The
 open-source-readiness prep, the downstream adapter contract fixtures, and
 repeated fresh-eyes review rounds landed verified bug and chore fixes across the
 workspace (recorded in Beads). Dependency-lane coverage was extended to the graph
-and toon lanes. The most recent commit added the hero illustration and the GitHub
+and toon lanes. A recent commit added the hero illustration and the GitHub
 social preview image.
 
 **Representative commits**
