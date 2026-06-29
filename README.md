@@ -2,6 +2,8 @@
 
 # franken_snowflake
 
+<img src="franken_snowflake_illustration.webp" alt="franken_snowflake - clean-room, Rust-first Snowflake SQL API connector for coding agents">
+
 **A clean-room, Rust-first Snowflake SQL API connector built for coding agents.**
 
 ![License](https://img.shields.io/badge/license-MIT%20%2B%20OpenAI%2FAnthropic%20rider-blue)
