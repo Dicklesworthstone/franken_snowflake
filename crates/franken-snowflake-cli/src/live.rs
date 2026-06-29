@@ -85,6 +85,170 @@ pub fn run_query_outcome(
     }
 }
 
+/// The authorized-write facts the live executor stamps into the execution
+/// receipt. Built by the CLI from a core `WriteIntentDecision::ExecutionAuthorized`
+/// plan; the core authorized the mutation, this struct carries the (non-secret)
+/// identifiers the receipt envelope surfaces. No SQL is submitted until the CLI
+/// has the authorized plan in hand.
+pub struct AuthorizedWrite<'a> {
+    /// The exact mutating statement the ladder authorized.
+    pub sql: &'a str,
+    /// Stable statement-kind token (e.g. `insert`, `copy_into_table`).
+    pub statement_kind: &'a str,
+    /// Coarse safety class token (e.g. `dml`, `external_file`).
+    pub safety_class: &'a str,
+    /// The write-intent ladder receipt / idempotency id (non-secret).
+    pub idempotency_request_id: String,
+    /// Optional session database/schema overrides (else the profile env applies).
+    pub database: Option<String>,
+    /// Optional session schema override.
+    pub schema: Option<String>,
+}
+
+/// Execute an authorized mutating statement live and return an execution-receipt
+/// envelope. The caller guarantees the write-intent ladder already authorized this
+/// statement (dry-run + exact confirmation token) and that the profile is
+/// write-enabled. Reuses the exact submit -> poll -> assemble transport as the read
+/// path; the SQL API does not distinguish read from write. Credential/transport
+/// failures collapse to typed errors and never claim `data_source = "live"`.
+pub fn run_write_outcome(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    write: &AuthorizedWrite<'_>,
+) -> crate::Outcome {
+    match execute(&profile, write.sql, write.database.as_deref(), write.schema.as_deref()) {
+        Ok(rows) => write_success(format, request_id, profile, write, &rows),
+        Err(error) => failure_outcome(
+            format,
+            "query.write",
+            "fsnow.query.write.v1",
+            request_id,
+            profile,
+            &error,
+        ),
+    }
+}
+
+/// Best-effort rows-affected for a DML statement. Snowflake's SQL API returns a
+/// single result row whose numeric columns hold the affected counts (e.g. "number
+/// of rows inserted"); sum the integer-parseable cells of the first row. Returns
+/// `None` when the result is not a count shape (e.g. a stage `PUT`/`COPY` summary).
+fn dml_rows_affected(rows: &LiveRows) -> Option<i64> {
+    let first = rows.rows.first()?;
+    let mut total: i64 = 0;
+    let mut saw_count = false;
+    for value in first.iter().flatten() {
+        if let Ok(parsed) = value.trim().parse::<i64>() {
+            saw_count = true;
+            total = total.saturating_add(parsed);
+        }
+    }
+    saw_count.then_some(total)
+}
+
+/// Build the `data_source = "live"` execution-receipt envelope for an authorized
+/// write: the real statement handle, best-effort rows-affected, the write-intent
+/// receipt id, and a capped preview of any result the SQL API returned.
+fn write_success(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    write: &AuthorizedWrite<'_>,
+    rows: &LiveRows,
+) -> crate::Outcome {
+    let returned = rows.rows.len().min(ROW_EMIT_CAP);
+    let truncated = rows.rows.len() > ROW_EMIT_CAP;
+    let rows_affected = dml_rows_affected(rows);
+
+    let columns_json = json_array(
+        rows.columns
+            .iter()
+            .map(|column| {
+                json_object(vec![
+                    ("name", json_string(column.name.clone())),
+                    ("type", json_string(column.type_name.clone())),
+                    ("nullable", Json::Bool(column.nullable)),
+                ])
+            })
+            .collect(),
+    );
+    let rows_json = json_array(
+        rows.rows
+            .iter()
+            .take(returned)
+            .map(|row| {
+                json_array(
+                    row.iter()
+                        .map(|cell| match cell {
+                            Some(value) => json_string(value.clone()),
+                            None => Json::Null,
+                        })
+                        .collect(),
+                )
+            })
+            .collect(),
+    );
+
+    let mut envelope = base_envelope(
+        true,
+        "success",
+        "query.write",
+        "fsnow.query.write.v1",
+        request_id,
+        json_object(vec![
+            ("profile_id", json_string(profile.clone())),
+            ("execution_enabled", Json::Bool(true)),
+            ("statement_kind", json_string(write.statement_kind.to_string())),
+            ("safety_class", json_string(write.safety_class.to_string())),
+            (
+                "write_intent_receipt_id",
+                json_string(write.idempotency_request_id.clone()),
+            ),
+            (
+                "idempotency_request_id",
+                json_string(write.idempotency_request_id.clone()),
+            ),
+            (
+                "rows_affected",
+                rows_affected.map_or(Json::Null, Json::Number),
+            ),
+            ("columns", columns_json),
+            ("rows", rows_json),
+            ("result_row_count", Json::Number(rows.total_rows)),
+            ("returned_rows", Json::Number(returned as i64)),
+            ("partition_count", Json::Number(rows.partition_count as i64)),
+            ("row_emit_cap", Json::Number(ROW_EMIT_CAP as i64)),
+            ("truncated", Json::Bool(truncated)),
+        ]),
+    );
+    envelope.data_source = "live";
+    envelope.profile_id = Some(profile);
+    envelope.statement_handle = Some(rows.statement_handle.clone());
+    envelope.query_id = Some(rows.statement_handle.clone());
+    envelope.budget_consumed = json_object(vec![
+        ("deadline_ms", Json::Number(0)),
+        ("polls", Json::Number(0)),
+        ("rows", Json::Number(rows.total_rows)),
+    ]);
+    envelope.safe_next_commands = vec![
+        "franken-snowflake query run --profile <profile> --sql <select-to-verify> --json"
+            .to_string(),
+    ];
+    if truncated {
+        envelope.warnings = vec![json_string(format!(
+            "write result truncated to {ROW_EMIT_CAP} rows in this envelope; {} total rows were \
+             returned",
+            rows.total_rows
+        ))];
+    }
+
+    crate::Outcome {
+        status: CoreExitCode::Success,
+        body: Body::Envelope { envelope, format },
+    }
+}
+
 /// Run a live `INFORMATION_SCHEMA.TABLES` scan for the given database/schema and
 /// return a `catalog scan` envelope. The caller (`parse_catalog`) guarantees both
 /// `database` and `schema` are present. Both are validated as plain SQL
@@ -924,7 +1088,10 @@ fn outcome_kind_for(code: SnowflakeErrorCode) -> &'static str {
         | SnowflakeErrorCode::RequireLiveRefused
         | SnowflakeErrorCode::RowCapExceeded
         | SnowflakeErrorCode::SafetyLimitExceeded
-        | SnowflakeErrorCode::WarehouseRefused => "refusal",
+        | SnowflakeErrorCode::WarehouseRefused
+        | SnowflakeErrorCode::WriteDisabled
+        | SnowflakeErrorCode::WriteConfirmationRequired
+        | SnowflakeErrorCode::WriteDdlRefused => "refusal",
         _ => "error",
     }
 }

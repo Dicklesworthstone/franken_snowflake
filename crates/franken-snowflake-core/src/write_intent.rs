@@ -1,9 +1,12 @@
-//! Deferred write-intent ladder types.
+//! Write-intent ladder types.
 //!
-//! This module models the only path that may ever widen from read-only query
-//! planning to mutating Snowflake operations. It intentionally does not submit
-//! SQL or expose an executor. The current implementation can produce dry-run
-//! plans and typed refusals only.
+//! This module models the only path that may widen from read-only query
+//! planning to mutating Snowflake operations. It is transport-free: it
+//! *authorizes* a mutation once every required rung is satisfied, but it never
+//! submits SQL itself. The authorized [`WriteIntentDecision::ExecutionAuthorized`]
+//! plan is handed to the transport layer (the CLI `live` executor) which runs the
+//! statement over the SQL API. The ladder still produces non-executing dry-run
+//! plans and typed refusals for every path that is not fully satisfied.
 
 use serde::{Deserialize, Serialize};
 
@@ -19,8 +22,9 @@ pub const WRITE_INTENT_SCHEMA_VERSION: u16 = 1;
 pub enum WriteIntentMode {
     /// Produce a non-executing dry-run plan.
     PlanDryRun,
-    /// Validate the future execution preflight. This still refuses execution in
-    /// this crate because mutation transport is intentionally absent.
+    /// Run the execution preflight. When every rung is satisfied this authorizes
+    /// execution (returning [`WriteIntentDecision::ExecutionAuthorized`]); the
+    /// core authorizes but does not submit SQL — the transport layer does.
     PrepareExecution,
 }
 
@@ -319,9 +323,10 @@ pub struct WriteIntentReceipt {
     pub request_id: RequestId,
     /// Statement kind this receipt covers.
     pub statement_kind: WriteStatementKind,
-    /// True for this implementation: only dry-run receipts exist.
+    /// True for a dry-run receipt; false on an execution-authorized receipt.
     pub dry_run: bool,
-    /// Always false until an executor bead lands.
+    /// True once the ladder has authorized execution for this receipt; false on a
+    /// dry-run receipt. The transport layer only submits SQL when this is true.
     pub execution_enabled: bool,
 }
 
@@ -342,9 +347,11 @@ pub struct WriteIntentPlan {
     pub receipt: WriteIntentReceipt,
     /// Exact token required by any future execution preflight.
     pub required_confirmation_token: ConfirmationToken,
-    /// Remaining rungs that a future executor must satisfy.
+    /// Remaining rungs the executor must satisfy. A dry-run plan still lists the
+    /// confirmation/receipt/audit rungs; an authorized plan lists only the
+    /// execution-receipt rung the transport layer records.
     pub next_required_stages: Vec<WriteIntentStage>,
-    /// Always false in this crate.
+    /// False on a dry-run plan; true on an execution-authorized plan.
     pub execution_enabled: bool,
 }
 
@@ -368,7 +375,10 @@ pub enum WriteIntentRefusalCode {
     ConfirmationTokenMismatch,
     /// The caller omitted an append-only audit intent.
     MissingAppendOnlyAudit,
-    /// All checks passed but this crate still cannot execute mutations.
+    /// Reserved: every ladder rung passed but the calling surface has no live
+    /// execution transport linked. The ladder itself now authorizes execution
+    /// (see [`WriteIntentDecision::ExecutionAuthorized`]); this code is for a
+    /// transport-less surface to report a clean refusal after authorization.
     ExecutionUnavailable,
 }
 
@@ -409,6 +419,13 @@ pub enum WriteIntentDecision {
     /// Request produced a non-executing dry-run plan.
     DryRunPlanned {
         /// Dry-run plan and receipt.
+        plan: WriteIntentPlan,
+    },
+    /// Every required rung passed: the transport layer is authorized to submit
+    /// this mutation. The core does not submit SQL; it only authorizes. The plan
+    /// and receipt carry `execution_enabled = true`.
+    ExecutionAuthorized {
+        /// Execution-authorized plan and receipt.
         plan: WriteIntentPlan,
     },
 }
@@ -519,15 +536,25 @@ pub fn evaluate_write_intent(
         return refused(
             WriteIntentRefusalCode::MissingAppendOnlyAudit,
             WriteIntentStage::AppendOnlyAudit,
-            "future execution preflight requires an append-only audit intent",
+            "execution preflight requires an append-only audit intent",
         );
     }
 
-    refused(
-        WriteIntentRefusalCode::ExecutionUnavailable,
-        WriteIntentStage::ExecutionReceipt,
-        "mutation execution is intentionally not implemented",
-    )
+    // Every required rung is satisfied. Authorize execution: the core stamps the
+    // receipt/plan as execution-enabled and hands it to the transport layer. The
+    // ladder never submits SQL itself.
+    let receipt = WriteIntentReceipt {
+        dry_run: false,
+        execution_enabled: true,
+        ..plan.receipt.clone()
+    };
+    let authorized = WriteIntentPlan {
+        receipt,
+        next_required_stages: vec![WriteIntentStage::ExecutionReceipt],
+        execution_enabled: true,
+        ..plan
+    };
+    WriteIntentDecision::ExecutionAuthorized { plan: authorized }
 }
 
 /// Classify a SQL preview into a write statement kind.
@@ -749,14 +776,54 @@ mod tests {
         let decision = evaluate_write_intent(&req, &enabled_policy());
         assert!(matches!(
             decision,
-            WriteIntentDecision::Refused {
-                refusal: WriteIntentRefusal {
-                    code: WriteIntentRefusalCode::ExecutionUnavailable,
-                    stage: WriteIntentStage::ExecutionReceipt,
-                    ..
-                }
-            }
+            WriteIntentDecision::ExecutionAuthorized { .. }
         ));
+        if let WriteIntentDecision::ExecutionAuthorized { plan } = decision {
+            assert!(plan.execution_enabled, "authorized plan must enable execution");
+            assert!(plan.receipt.execution_enabled);
+            assert!(!plan.receipt.dry_run, "authorized receipt is no longer dry-run");
+            assert_eq!(plan.statement_kind, WriteStatementKind::Insert);
+            assert_eq!(plan.safety_class, WriteSafetyClass::Dml);
+            assert_eq!(plan.receipt.request_id.as_str(), "req-123");
+            assert_eq!(
+                plan.next_required_stages,
+                vec![WriteIntentStage::ExecutionReceipt]
+            );
+        }
+    }
+
+    #[test]
+    fn fully_satisfied_request_without_append_only_audit_is_authorized() {
+        // The routine data-write path the CLI uses: dry-run + exact confirmation
+        // token, with the append-only audit rung left as an optional policy knob.
+        let mut policy = enabled_policy();
+        policy.require_append_only_audit = false;
+        let mut req = request(
+            WriteIntentMode::PrepareExecution,
+            "insert into t values (1)",
+        );
+        req.confirmation_token = Some(ConfirmationToken::new("confirm:insert:req-123"));
+        let decision = evaluate_write_intent(&req, &policy);
+        assert!(
+            matches!(decision, WriteIntentDecision::ExecutionAuthorized { .. }),
+            "write-enabled profile + dry-run + confirm token must authorize without audit ceremony"
+        );
+    }
+
+    #[test]
+    fn dry_run_plan_is_not_execution_authorized() {
+        let decision = evaluate_write_intent(
+            &request(WriteIntentMode::PlanDryRun, "insert into t values (1)"),
+            &enabled_policy(),
+        );
+        assert!(matches!(
+            decision,
+            WriteIntentDecision::DryRunPlanned { .. }
+        ));
+        if let WriteIntentDecision::DryRunPlanned { plan } = decision {
+            assert!(!plan.execution_enabled, "dry-run plan never enables execution");
+            assert!(plan.receipt.dry_run);
+        }
     }
 
     #[test]

@@ -1,10 +1,12 @@
 //! `franken-snowflake` — the agent-ergonomic CLI binary.
 //!
 //! This crate owns the public command contract described in
-//! `docs/agent_cli_contract.md`. The live Snowflake handlers are still blocked on
-//! lower-level beads, but the CLI surface, deterministic envelope, error-code
-//! registry, and `--json`/`--toon` output switch are intentionally implemented
-//! early so downstream panes can target one stable shape.
+//! `docs/agent_cli_contract.md`. Read commands (`query run`, `catalog scan`,
+//! `profile doctor --online`) drive the real Snowflake SQL API under the `live`
+//! feature; mutations run through the write-intent ladder via `query write`
+//! (dry-run plan + exact confirmation token, then a live execution receipt). The
+//! deterministic envelope, error-code registry, and `--json`/`--toon` output
+//! switch give every surface one stable shape.
 
 // The CLI returns its rich `Outcome`/`Envelope` (a full response body) by value
 // as the command-dispatch currency rather than boxing it: `result_large_err`
@@ -15,7 +17,14 @@
 
 use franken_snowflake_core::error::SnowflakeErrorCode;
 use franken_snowflake_core::exit::ExitCode as CoreExitCode;
+use franken_snowflake_core::ids::RequestId;
 use franken_snowflake_core::redact::redact;
+use franken_snowflake_core::write_intent::{
+    ConfirmationToken, StatementAllowlistEntry, WriteIntentDecision, WriteIntentMode,
+    WriteIntentPlan, WriteIntentPolicy, WriteIntentRefusal, WriteIntentRefusalCode,
+    WriteIntentRequest, WriteSafetyClass, WriteStatementKind, classify_write_statement,
+    evaluate_write_intent,
+};
 
 use std::env;
 use std::io::{self, Write};
@@ -87,6 +96,12 @@ enum Command {
     QueryRun {
         profile: Option<String>,
         sql: Option<String>,
+    },
+    QueryWrite {
+        profile: Option<String>,
+        sql: Option<String>,
+        dry_run: bool,
+        confirm: Option<String>,
     },
     QueryCancel {
         statement_handle: String,
@@ -336,6 +351,16 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         sensitive_output: true,
     },
     CommandSpec {
+        id: "query.write",
+        invocation: "franken-snowflake query write --profile <profile> --sql <sql> --dry-run | --confirm <token>",
+        output_contract_id: "fsnow.query.write.v1",
+        description: "Drive the write-intent ladder: --dry-run plans and emits a confirmation token; --confirm <token> executes the mutation live and returns an execution receipt.",
+        read_only: false,
+        provider_network: true,
+        mutates_local_state: false,
+        sensitive_output: true,
+    },
+    CommandSpec {
         id: "query.cancel",
         invocation: "franken-snowflake query cancel <statement-handle> --json",
         output_contract_id: "fsnow.query.cancel.v1",
@@ -433,6 +458,14 @@ fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
         "catalog" => parse_catalog(&args, output, explicit_json)?,
         "dataset" => parse_dataset(&args, output)?,
         "query" => parse_query(&args, output)?,
+        // Top-level `write` alias for `query write` — same dispatch style as the
+        // `query --sql` shorthand maps to `query run`.
+        "write" => Command::QueryWrite {
+            profile: value_after(&args, "--profile"),
+            sql: raw_value_after(&args, "--sql"),
+            dry_run: has_flag(&args, "--dry-run"),
+            confirm: value_after(&args, "--confirm"),
+        },
         "receipt" => parse_receipt(&args, output)?,
         "export" => Command::ExportPlan,
         "tui" => Command::Tui {
@@ -758,6 +791,12 @@ fn parse_query(args: &[String], output: OutputFormat) -> Result<Command, Outcome
             profile: value_after(args, "--profile"),
             sql: raw_value_after(args, "--sql"),
         }),
+        Some("write") => Ok(Command::QueryWrite {
+            profile: value_after(args, "--profile"),
+            sql: raw_value_after(args, "--sql"),
+            dry_run: has_flag(args, "--dry-run"),
+            confirm: value_after(args, "--confirm"),
+        }),
         Some("cancel") => match args.get(2) {
             Some(statement_handle) => Ok(Command::QueryCancel {
                 statement_handle: statement_handle.clone(),
@@ -779,9 +818,11 @@ fn parse_query(args: &[String], output: OutputFormat) -> Result<Command, Outcome
             vec![
                 "franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string(),
                 "franken-snowflake query run --profile <profile> --sql <sql> --json".to_string(),
+                "franken-snowflake query write --profile <profile> --sql <sql> --dry-run --json"
+                    .to_string(),
                 "franken-snowflake query cancel <statement-handle> --json".to_string(),
             ],
-            did_you_mean(other, &["plan", "run", "cancel"]),
+            did_you_mean(other, &["plan", "run", "write", "cancel"]),
         )),
         None => Err(usage_error(
             output,
@@ -791,6 +832,8 @@ fn parse_query(args: &[String], output: OutputFormat) -> Result<Command, Outcome
             vec![
                 "franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string(),
                 "franken-snowflake query run --profile <profile> --sql <sql> --json".to_string(),
+                "franken-snowflake query write --profile <profile> --sql <sql> --dry-run --json"
+                    .to_string(),
                 "franken-snowflake query cancel <statement-handle> --json".to_string(),
             ],
             vec![],
@@ -1015,6 +1058,12 @@ fn dispatch(invocation: Invocation) -> Outcome {
         Command::QueryRun { profile, sql } => {
             query_run_outcome(invocation.output, request_id, profile, sql)
         }
+        Command::QueryWrite {
+            profile,
+            sql,
+            dry_run,
+            confirm,
+        } => query_write_outcome(invocation.output, request_id, profile, sql, dry_run, confirm),
         Command::QueryCancel { statement_handle } => live_transport_required_with_data(
             invocation.output,
             "query.cancel",
@@ -1741,6 +1790,8 @@ fn onboard_data() -> Json {
                     .to_string(),
                 "4. franken-snowflake query run --profile <profile> --sql \"...\" --json  (run it; live build only)"
                     .to_string(),
+                "5. franken-snowflake query write --profile <profile> --sql \"insert ...\" --dry-run --json  (plan a write; then --confirm <token>)"
+                    .to_string(),
             ]),
         ),
         (
@@ -1748,7 +1799,8 @@ fn onboard_data() -> Json {
             string_array(vec![
                 "no third-party Snowflake Rust driver".to_string(),
                 "no Tokio/reqwest/hyper production dependency".to_string(),
-                "no mutation without the future write-intent ladder".to_string(),
+                "no mutation outside the write-intent ladder (dry-run + confirmation token)"
+                    .to_string(),
             ]),
         ),
     ])
@@ -1774,8 +1826,11 @@ fn capabilities_data() -> Json {
             string_array(vec![
                 "no third-party Snowflake Rust driver".to_string(),
                 "no Tokio/reqwest/hyper production dependency".to_string(),
-                "no mutation without the future write-intent ladder".to_string(),
-                "no live credential access in this skeleton".to_string(),
+                "no mutation outside the write-intent ladder (dry-run + confirmation token)"
+                    .to_string(),
+                "no DDL without the explicit per-profile WRITE_ALLOW_DDL opt-in".to_string(),
+                "no live transport without the `live` feature and a profile's credential handles"
+                    .to_string(),
             ]),
         ),
     ])
@@ -1868,6 +1923,24 @@ fn agent_handbook_data() -> Json {
                         "This surface is reserved/not implemented yet; run `franken-snowflake capabilities --json` for the live surfaces.",
                     ),
                 ),
+                (
+                    SnowflakeErrorCode::WriteDisabled.stable_code(),
+                    json_string(
+                        "Writes are disabled for this profile; set FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ENABLED=true, then use `query write --dry-run`.",
+                    ),
+                ),
+                (
+                    SnowflakeErrorCode::WriteConfirmationRequired.stable_code(),
+                    json_string(
+                        "Run `query write --dry-run` to get the confirmation token, then re-run with `--confirm <token>`.",
+                    ),
+                ),
+                (
+                    SnowflakeErrorCode::WriteDdlRefused.stable_code(),
+                    json_string(
+                        "DDL is opt-in; set FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ALLOW_DDL=true to allow CREATE/ALTER/DROP/TRUNCATE/GRANT/REVOKE.",
+                    ),
+                ),
             ]),
         ),
         (
@@ -1875,7 +1948,8 @@ fn agent_handbook_data() -> Json {
             string_array(vec![
                 "do not store raw secrets in profiles".to_string(),
                 "do not silently use fixtures when live data is required".to_string(),
-                "do not run DDL/DML without a future write-intent ladder".to_string(),
+                "do not mutate outside the write-intent ladder; DDL stays behind an explicit opt-in"
+                    .to_string(),
             ]),
         ),
     ])
@@ -2412,8 +2486,11 @@ fn query_plan_outcome(
             request_id,
             profile.clone(),
             SnowflakeErrorCode::MutationRefused,
-            "Only SELECT/WITH/SHOW/DESCRIBE/EXPLAIN-style read statements are accepted in the MVP.",
-            vec![plan_example(profile.as_deref())],
+            "`query plan` validates read statements (SELECT/WITH/SHOW/DESCRIBE/EXPLAIN). To plan and execute a mutation, use `query write` (dry-run -> confirm token).",
+            vec![
+                plan_example(profile.as_deref()),
+                write_dry_run_example(profile.as_deref()),
+            ],
         );
     }
 
@@ -2528,8 +2605,11 @@ fn query_run_outcome(
             request_id,
             profile.clone(),
             SnowflakeErrorCode::MutationRefused,
-            "Not a recognized read-only statement: `query run` accepts a single SELECT/WITH/SHOW/DESCRIBE/EXPLAIN. Mutations (UPDATE/DELETE/INSERT/MERGE/DDL) are refused here, and a typo'd keyword (e.g. `selcet`) lands here too — if you meant to read, start with `SELECT`.",
-            vec![plan_hint(profile.as_deref(), &sql_text)],
+            "`query run` is the read path: it accepts a single SELECT/WITH/SHOW/DESCRIBE/EXPLAIN. To MUTATE data (INSERT/UPDATE/DELETE/MERGE/COPY INTO/PUT/DDL) use `query write` — start with --dry-run to get a confirmation token, then re-run with --confirm <token>. (A typo'd keyword like `selcet` also lands here — if you meant to read, start with SELECT.)",
+            vec![
+                plan_hint(profile.as_deref(), &sql_text),
+                write_hint(profile.as_deref(), &sql_text),
+            ],
         );
     }
 
@@ -2575,6 +2655,365 @@ fn query_run_dispatch(
                     json_string("live SQL API transport"),
                     json_string("profile credential handles"),
                     json_string("statement lifecycle submit/poll/partition handler"),
+                ]),
+            ),
+        ]),
+        vec!["franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string()],
+    )
+}
+
+/// Drive the write-intent ladder for `query write`.
+///
+/// Flow: `--dry-run` produces a non-executing [`WriteIntentPlan`] (statement kind,
+/// safety class, the exact confirmation token, and the remaining ladder rungs);
+/// `--confirm <token>` re-derives the same idempotency id from the (profile, SQL)
+/// pair, and — when the profile is write-enabled and the token matches — drives the
+/// ladder to authorization and EXECUTES the mutation live. The connector authorizes
+/// here; the SQL is submitted only by the `live` transport executor.
+fn query_write_outcome(
+    format: OutputFormat,
+    request_id: String,
+    profile: Option<String>,
+    sql: Option<String>,
+    dry_run: bool,
+    confirm: Option<String>,
+) -> Outcome {
+    let Some(profile) = profile else {
+        return usage_error(
+            format,
+            "query.write",
+            "fsnow.query.write.v1",
+            "Missing --profile for `query write`.",
+            vec![write_dry_run_example(None)],
+            vec![],
+        );
+    };
+    let Some(sql_text) = sql else {
+        return usage_error(
+            format,
+            "query.write",
+            "fsnow.query.write.v1",
+            "Missing --sql for `query write`.",
+            vec![write_dry_run_example(Some(&profile))],
+            vec![],
+        );
+    };
+
+    if has_multiple_statements(&sql_text) {
+        return refusal(
+            format,
+            "query.write",
+            "fsnow.query.write.v1",
+            request_id,
+            Some(profile.clone()),
+            SnowflakeErrorCode::MultiStatementRefused,
+            "Multiple SQL statements are refused by default; submit exactly one mutating statement.",
+            vec![write_hint(Some(&profile), &sql_text)],
+        );
+    }
+
+    // Mode selection from the two safety flags. `--dry-run` plans; `--confirm`
+    // executes. Requiring exactly one keeps the dry-run -> confirm discipline.
+    if dry_run && confirm.is_some() {
+        return usage_error(
+            format,
+            "query.write",
+            "fsnow.query.write.v1",
+            "Choose either --dry-run (to plan) or --confirm <token> (to execute), not both.",
+            vec![write_dry_run_example(Some(&profile))],
+            vec![],
+        );
+    }
+    let mode = if confirm.is_some() {
+        WriteIntentMode::PrepareExecution
+    } else if dry_run {
+        WriteIntentMode::PlanDryRun
+    } else {
+        return usage_error(
+            format,
+            "query.write",
+            "fsnow.query.write.v1",
+            "Start with --dry-run to get a confirmation token, then re-run with --confirm <token>.",
+            vec![write_dry_run_example(Some(&profile))],
+            vec![],
+        );
+    };
+
+    // Reject read/unrecognized statements up front with a read-path pointer.
+    let statement_kind = classify_write_statement(&sql_text);
+    if statement_kind == WriteStatementKind::Unknown {
+        return usage_error(
+            format,
+            "query.write",
+            "fsnow.query.write.v1",
+            "`query write` expects a mutating statement (INSERT/UPDATE/DELETE/MERGE/COPY INTO/PUT/...). For reads use `query run`.",
+            vec![run_hint(Some(&profile), &sql_text)],
+            vec![],
+        );
+    }
+
+    let policy = write_policy_for_profile(&profile, statement_kind);
+    let allowlist_id = cli_allowlist_id(statement_kind);
+
+    // Deterministic idempotency id bound to (profile, compacted SQL): the dry-run
+    // confirmation token only validates a re-run of the *same* statement.
+    let ladder_request_id =
+        stable_request_id(&format!("write\u{1f}{profile}\u{1f}{}", compact_sql(&sql_text)));
+
+    let mut intent = WriteIntentRequest::new(mode, &sql_text);
+    intent.dry_run = true;
+    intent.allowlist_id = Some(allowlist_id);
+    intent.request_id = Some(RequestId::new(ladder_request_id));
+    if let Some(token) = &confirm {
+        intent.confirmation_token = Some(ConfirmationToken::new(token.clone()));
+    }
+
+    match evaluate_write_intent(&intent, &policy) {
+        WriteIntentDecision::Refused { refusal: detail } => {
+            write_refusal_outcome(format, request_id, profile, &sql_text, &detail)
+        }
+        WriteIntentDecision::DryRunPlanned { plan } => {
+            write_plan_outcome(format, request_id, profile, &plan)
+        }
+        WriteIntentDecision::ExecutionAuthorized { plan } => {
+            query_write_execute_dispatch(format, request_id, profile, &sql_text, &plan)
+        }
+    }
+}
+
+/// Build the per-profile write-intent policy from env handles. The default usable
+/// path keeps the dry-run -> confirmation-token rung but does NOT force append-only
+/// audit or a hand-maintained per-statement allowlist on routine data writes; those
+/// stay available as policy knobs the core already models. DDL stays behind an
+/// explicit `<PREFIX>_WRITE_ALLOW_DDL` opt-in.
+fn write_policy_for_profile(profile: &str, statement_kind: WriteStatementKind) -> WriteIntentPolicy {
+    WriteIntentPolicy {
+        enabled: profile_env_flag(profile, "WRITE_ENABLED"),
+        allow_ddl: profile_env_flag(profile, "WRITE_ALLOW_DDL"),
+        require_dry_run: true,
+        require_exact_confirmation: true,
+        require_idempotency_request_id: true,
+        require_append_only_audit: false,
+        statement_allowlist: vec![StatementAllowlistEntry::new(
+            cli_allowlist_id(statement_kind),
+            statement_kind,
+        )],
+    }
+}
+
+/// The auto allowlist id the CLI binds for a classified statement kind, so routine
+/// writes do not require the operator to hand-maintain an allowlist.
+fn cli_allowlist_id(statement_kind: WriteStatementKind) -> String {
+    format!("cli_auto_{}", statement_kind.as_token())
+}
+
+/// Read a boolean profile env handle (`<PREFIX>_<KEY> == "true"`, case-insensitive).
+fn profile_env_flag(profile: &str, key: &str) -> bool {
+    let prefix = profile_env_prefix(profile);
+    env::var(format!("{prefix}_{key}"))
+        .ok()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+}
+
+/// A non-executing dry-run write plan envelope: statement kind, safety class, the
+/// exact confirmation token, the remaining ladder rungs, and the ready-to-run
+/// `--confirm` command. `execution_enabled`/`will_submit` are false; nothing runs.
+fn write_plan_outcome(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    plan: &WriteIntentPlan,
+) -> Outcome {
+    let token = plan.required_confirmation_token.as_str().to_string();
+    let confirm_command = format!(
+        "franken-snowflake query write --profile {profile} --sql \"{}\" --confirm {token} --json",
+        compact_sql(&plan.redacted_sql_preview)
+    );
+    let next_stages = string_array(
+        plan.next_required_stages
+            .iter()
+            .map(|stage| format!("{stage:?}"))
+            .collect(),
+    );
+    success_with_profile(
+        format,
+        "query.write",
+        "fsnow.query.write.v1",
+        request_id,
+        Some(profile),
+        json_object(vec![
+            ("mode", json_string("dry_run")),
+            ("execution_enabled", Json::Bool(false)),
+            ("will_submit", Json::Bool(false)),
+            ("statement_kind", json_string(plan.statement_kind.as_token())),
+            (
+                "safety_class",
+                json_string(safety_class_token(plan.safety_class)),
+            ),
+            (
+                "redacted_sql_preview",
+                json_string(plan.redacted_sql_preview.clone()),
+            ),
+            (
+                "idempotency_request_id",
+                json_string(plan.receipt.request_id.as_str().to_string()),
+            ),
+            ("required_confirmation_token", json_string(token)),
+            ("next_required_stages", next_stages),
+            ("confirm_command", json_string(confirm_command.clone())),
+        ]),
+        vec![],
+        vec![confirm_command],
+    )
+}
+
+/// A typed write-intent refusal envelope, mapping the core `WriteIntentRefusalCode`
+/// to a stable `FSNOW-*` code with an actionable repair hint.
+fn write_refusal_outcome(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    sql: &str,
+    detail: &WriteIntentRefusal,
+) -> Outcome {
+    let code = write_refusal_code(detail.code);
+    let mut envelope = base_envelope(
+        false,
+        "refusal",
+        "query.write",
+        "fsnow.query.write.v1",
+        request_id,
+        json_object(vec![
+            (
+                "write_intent_stage",
+                json_string(format!("{:?}", detail.stage)),
+            ),
+            ("execution_enabled", Json::Bool(false)),
+        ]),
+    );
+    envelope.profile_id = Some(profile.clone());
+    envelope.error = Some(error_info(
+        code,
+        detail.message.clone(),
+        vec![json_string("write-intent ladder")],
+    ));
+    envelope.safe_next_commands = vec![write_hint(Some(&profile), sql)];
+    envelope.repair_commands = write_refusal_repair(detail.code, &profile);
+    Outcome {
+        status: code.exit_code(),
+        body: Body::Envelope { envelope, format },
+    }
+}
+
+/// Map a core write-intent refusal code to the CLI's stable error code.
+fn write_refusal_code(code: WriteIntentRefusalCode) -> SnowflakeErrorCode {
+    match code {
+        WriteIntentRefusalCode::MutationsDisabled => SnowflakeErrorCode::WriteDisabled,
+        WriteIntentRefusalCode::DdlRefused => SnowflakeErrorCode::WriteDdlRefused,
+        WriteIntentRefusalCode::MissingDryRun
+        | WriteIntentRefusalCode::MissingConfirmationToken
+        | WriteIntentRefusalCode::ConfirmationTokenMismatch => {
+            SnowflakeErrorCode::WriteConfirmationRequired
+        }
+        WriteIntentRefusalCode::StatementNotAllowlisted
+        | WriteIntentRefusalCode::MissingIdempotencyRequestId
+        | WriteIntentRefusalCode::MissingAppendOnlyAudit
+        | WriteIntentRefusalCode::ExecutionUnavailable => SnowflakeErrorCode::MutationRefused,
+    }
+}
+
+/// The most actionable repair command for a write-intent refusal.
+fn write_refusal_repair(code: WriteIntentRefusalCode, profile: &str) -> Vec<String> {
+    let prefix = profile_env_prefix(profile);
+    match code {
+        WriteIntentRefusalCode::MutationsDisabled => {
+            vec![format!("export {prefix}_WRITE_ENABLED=true")]
+        }
+        WriteIntentRefusalCode::DdlRefused => {
+            vec![format!("export {prefix}_WRITE_ALLOW_DDL=true")]
+        }
+        _ => vec![write_dry_run_example(Some(profile))],
+    }
+}
+
+/// Stable lowercase token for a write safety class (matches the core serde naming).
+fn safety_class_token(class: WriteSafetyClass) -> &'static str {
+    match class {
+        WriteSafetyClass::Dml => "dml",
+        WriteSafetyClass::Ddl => "ddl",
+        WriteSafetyClass::Procedure => "procedure",
+        WriteSafetyClass::ExternalFile => "external_file",
+        WriteSafetyClass::SessionState => "session_state",
+        WriteSafetyClass::Unknown => "unknown",
+    }
+}
+
+/// `query write --dry-run` form carrying the agent's actual profile + SQL.
+fn write_hint(profile: Option<&str>, sql: &str) -> String {
+    let profile = profile.unwrap_or("<profile>");
+    format!(
+        "franken-snowflake query write --profile {profile} --sql \"{}\" --dry-run --json",
+        compact_sql(sql)
+    )
+}
+
+/// `query write --dry-run` form with a neutral example, for usage errors.
+fn write_dry_run_example(profile: Option<&str>) -> String {
+    let profile = profile.unwrap_or("<profile>");
+    format!(
+        "franken-snowflake query write --profile {profile} --sql \"insert into t values (1)\" --dry-run --json"
+    )
+}
+
+/// Live build: hand the authorized write to the SQL API transport executor.
+#[cfg(feature = "live")]
+fn query_write_execute_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    sql: &str,
+    plan: &WriteIntentPlan,
+) -> Outcome {
+    let write = live::AuthorizedWrite {
+        sql,
+        statement_kind: plan.statement_kind.as_token(),
+        safety_class: safety_class_token(plan.safety_class),
+        idempotency_request_id: plan.receipt.request_id.as_str().to_string(),
+        database: None,
+        schema: None,
+    };
+    live::run_write_outcome(format, request_id, profile, &write)
+}
+
+/// Default (no-account) build: the write was authorized by the ladder, but no live
+/// transport is linked, so refuse cleanly rather than pretend it executed.
+#[cfg(not(feature = "live"))]
+fn query_write_execute_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    _sql: &str,
+    plan: &WriteIntentPlan,
+) -> Outcome {
+    live_transport_required_with_data(
+        format,
+        "query.write",
+        "fsnow.query.write.v1",
+        request_id,
+        Some(profile),
+        json_object(vec![
+            ("write_intent_authorized", Json::Bool(true)),
+            ("execution_enabled", Json::Bool(false)),
+            ("statement_kind", json_string(plan.statement_kind.as_token())),
+            (
+                "idempotency_request_id",
+                json_string(plan.receipt.request_id.as_str().to_string()),
+            ),
+            (
+                "requires",
+                json_array(vec![
+                    json_string("live SQL API transport (build with --features live)"),
+                    json_string("profile credential handles"),
                 ]),
             ),
         ]),
@@ -3368,6 +3807,7 @@ fn top_level_commands() -> Vec<&'static str> {
         "catalog",
         "dataset",
         "query",
+        "write",
         "receipt",
         "export",
         "tui",
@@ -3761,13 +4201,14 @@ mod tests {
     #[test]
     fn query_run_distinguishes_multi_statement_from_unrecognized_sql() {
         let typo = render_json(&envelope_for(&["query", "run", "--profile", "demo", "--sql", "selcet 1"]));
-        assert!(typo.contains("Not a recognized read-only statement"));
+        assert!(typo.contains("is the read path"));
+        assert!(typo.contains("query write"));
         assert!(!typo.contains("Multiple SQL statements"));
         let multi = render_json(&envelope_for(&[
             "query", "run", "--profile", "demo", "--sql", "select 1; select 2",
         ]));
         assert!(multi.contains("Multiple SQL statements are refused"));
-        assert!(!multi.contains("Not a recognized read-only statement"));
+        assert!(!multi.contains("is the read path"));
     }
 
     // mfw: the refusal's next/repair command names the agent's real profile, not
@@ -4578,6 +5019,261 @@ mod tests {
             assert!(
                 SnowflakeErrorCode::from_stable_code(&code).is_some(),
                 "{code} from CLI registry did not resolve against core registry"
+            );
+        }
+    }
+
+    fn render_outcome(outcome: Outcome) -> String {
+        match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        }
+    }
+
+    fn enabled_write_policy(
+        kind: WriteStatementKind,
+        require_confirmation: bool,
+    ) -> WriteIntentPolicy {
+        WriteIntentPolicy {
+            enabled: true,
+            allow_ddl: false,
+            require_dry_run: true,
+            require_exact_confirmation: require_confirmation,
+            require_idempotency_request_id: true,
+            require_append_only_audit: false,
+            statement_allowlist: vec![StatementAllowlistEntry::new(cli_allowlist_id(kind), kind)],
+        }
+    }
+
+    fn dry_run_insert_plan() -> WriteIntentPlan {
+        let policy = enabled_write_policy(WriteStatementKind::Insert, true);
+        let mut req =
+            WriteIntentRequest::new(WriteIntentMode::PlanDryRun, "insert into t values (1)");
+        req.dry_run = true;
+        req.allowlist_id = Some(cli_allowlist_id(WriteStatementKind::Insert));
+        req.request_id = Some(RequestId::new("plan-req"));
+        match evaluate_write_intent(&req, &policy) {
+            WriteIntentDecision::DryRunPlanned { plan } => plan,
+            other => panic!("expected a dry-run plan, got {other:?}"),
+        }
+    }
+
+    fn authorized_insert_plan() -> WriteIntentPlan {
+        let policy = enabled_write_policy(WriteStatementKind::Insert, false);
+        let mut req =
+            WriteIntentRequest::new(WriteIntentMode::PrepareExecution, "insert into t values (1)");
+        req.dry_run = true;
+        req.allowlist_id = Some(cli_allowlist_id(WriteStatementKind::Insert));
+        req.request_id = Some(RequestId::new("exec-req"));
+        match evaluate_write_intent(&req, &policy) {
+            WriteIntentDecision::ExecutionAuthorized { plan } => plan,
+            other => panic!("expected execution authorization, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_write_requires_profile_and_sql() {
+        let missing_profile = execute(vec![
+            "query".to_string(),
+            "write".to_string(),
+            "--sql".to_string(),
+            "insert into t values (1)".to_string(),
+            "--dry-run".to_string(),
+        ]);
+        assert_eq!(missing_profile.status.code(), 64);
+        assert!(render_outcome(missing_profile).contains("Missing --profile for `query write`."));
+
+        let missing_sql = execute(vec![
+            "query".to_string(),
+            "write".to_string(),
+            "--profile".to_string(),
+            "demo".to_string(),
+            "--dry-run".to_string(),
+        ]);
+        assert_eq!(missing_sql.status.code(), 64);
+        assert!(render_outcome(missing_sql).contains("Missing --sql for `query write`."));
+    }
+
+    #[test]
+    fn query_write_requires_exactly_one_mode_flag() {
+        let neither = execute(vec![
+            "query".to_string(),
+            "write".to_string(),
+            "--profile".to_string(),
+            "demo".to_string(),
+            "--sql".to_string(),
+            "insert into t values (1)".to_string(),
+        ]);
+        assert_eq!(neither.status.code(), 64);
+        assert!(render_outcome(neither).contains("Start with --dry-run"));
+
+        let both = execute(vec![
+            "query".to_string(),
+            "write".to_string(),
+            "--profile".to_string(),
+            "demo".to_string(),
+            "--sql".to_string(),
+            "insert into t values (1)".to_string(),
+            "--dry-run".to_string(),
+            "--confirm".to_string(),
+            "confirm:insert:abc".to_string(),
+        ]);
+        assert_eq!(both.status.code(), 64);
+        assert!(render_outcome(both).contains("not both"));
+    }
+
+    #[test]
+    fn query_write_points_reads_to_query_run() {
+        let outcome = execute(vec![
+            "query".to_string(),
+            "write".to_string(),
+            "--profile".to_string(),
+            "demo".to_string(),
+            "--sql".to_string(),
+            "select 1".to_string(),
+            "--dry-run".to_string(),
+        ]);
+        assert_eq!(outcome.status.code(), 64);
+        let rendered = render_outcome(outcome);
+        assert!(rendered.contains("expects a mutating statement"));
+        assert!(rendered.contains("franken-snowflake query run"));
+    }
+
+    #[test]
+    fn query_write_refuses_multi_statement() {
+        let outcome = execute(vec![
+            "query".to_string(),
+            "write".to_string(),
+            "--profile".to_string(),
+            "demo".to_string(),
+            "--sql".to_string(),
+            "insert into t values (1); insert into t values (2)".to_string(),
+            "--dry-run".to_string(),
+        ]);
+        assert_eq!(outcome.status.code(), 2);
+        assert!(render_outcome(outcome).contains("FSNOW-3002"));
+    }
+
+    // A profile with no WRITE_ENABLED handle (the default) cannot even plan a
+    // write: the ladder refuses with the typed WriteDisabled code. The profile id
+    // is distinctive so the test never collides with a real env handle.
+    #[test]
+    fn query_write_refuses_when_profile_not_write_enabled() {
+        let outcome = execute(vec![
+            "query".to_string(),
+            "write".to_string(),
+            "--profile".to_string(),
+            "wcap_off_xyz".to_string(),
+            "--sql".to_string(),
+            "insert into t values (1)".to_string(),
+            "--dry-run".to_string(),
+        ]);
+        assert_eq!(outcome.status.code(), 2);
+        let rendered = render_outcome(outcome);
+        assert!(rendered.contains("FSNOW-3007"));
+        assert!(rendered.contains("\"command_id\":\"query.write\""));
+        assert!(rendered.contains("WRITE_ENABLED"));
+        assert!(
+            !rendered.contains("\"data_source\":\"live\""),
+            "a disabled-write refusal must never claim live data"
+        );
+    }
+
+    #[test]
+    fn write_plan_outcome_emits_confirmation_token_and_executes_nothing() {
+        let plan = dry_run_insert_plan();
+        let token = plan.required_confirmation_token.as_str().to_string();
+        let outcome = write_plan_outcome(
+            OutputFormat::Json,
+            "req-test".to_string(),
+            "demo".to_string(),
+            &plan,
+        );
+        assert_eq!(outcome.status.code(), 0);
+        let rendered = render_outcome(outcome);
+        assert!(rendered.contains("\"command_id\":\"query.write\""));
+        assert!(rendered.contains("\"ok\":true"));
+        assert!(rendered.contains("\"execution_enabled\":false"));
+        assert!(rendered.contains("\"will_submit\":false"));
+        assert!(rendered.contains("\"statement_kind\":\"insert\""));
+        assert!(rendered.contains("\"required_confirmation_token\""));
+        assert!(rendered.contains(&token));
+        assert!(rendered.contains("--confirm"));
+    }
+
+    // No-account build: an authorized write has nothing to run it, so it refuses
+    // cleanly with the typed live-transport-required code instead of pretending to
+    // execute or emitting fixture data.
+    #[cfg(not(feature = "live"))]
+    #[test]
+    fn authorized_write_without_live_transport_refuses_cleanly() {
+        let plan = authorized_insert_plan();
+        let outcome = query_write_execute_dispatch(
+            OutputFormat::Json,
+            "req-test".to_string(),
+            "demo".to_string(),
+            "insert into t values (1)",
+            &plan,
+        );
+        assert_ne!(outcome.status.code(), 0, "no-transport build must refuse");
+        let rendered = render_outcome(outcome);
+        assert!(rendered.contains("\"command_id\":\"query.write\""));
+        assert!(rendered.contains("FSNOW-3003"));
+        assert!(rendered.contains("live SQL API transport"));
+        assert!(rendered.contains("\"write_intent_authorized\":true"));
+        assert!(!rendered.contains("\"data_source\":\"live\""));
+    }
+
+    // Live build, credential-less profile: the executor IS reachable behind the
+    // `live` cfg, but with no credentials it must produce a typed error and never
+    // claim live data. Credential resolution fails before any network I/O.
+    #[cfg(feature = "live")]
+    #[test]
+    fn authorized_write_without_credentials_refuses_cleanly_live() {
+        let plan = authorized_insert_plan();
+        let outcome = query_write_execute_dispatch(
+            OutputFormat::Json,
+            "req-test".to_string(),
+            "no_creds_profile".to_string(),
+            "insert into t values (1)",
+            &plan,
+        );
+        assert_ne!(outcome.status.code(), 0, "credential-less write must not succeed");
+        let rendered = render_outcome(outcome);
+        assert!(rendered.contains("\"command_id\":\"query.write\""));
+        assert!(rendered.contains("\"ok\":false"));
+        assert!(
+            !rendered.contains("\"data_source\":\"live\""),
+            "must never claim live data without credentials"
+        );
+    }
+
+    #[test]
+    fn capabilities_lists_query_write_and_typed_write_codes() {
+        let rendered = render_json(&envelope_for(&["capabilities", "--json"]));
+        assert!(rendered.contains("\"command_id\":\"query.write\""));
+        assert!(rendered.contains("FSNOW-3007"));
+        assert!(rendered.contains("FSNOW-3008"));
+        assert!(rendered.contains("FSNOW-3009"));
+    }
+
+    #[test]
+    fn write_refusal_codes_resolve_against_core_registry() {
+        for refusal_code in [
+            WriteIntentRefusalCode::MutationsDisabled,
+            WriteIntentRefusalCode::MissingDryRun,
+            WriteIntentRefusalCode::DdlRefused,
+            WriteIntentRefusalCode::StatementNotAllowlisted,
+            WriteIntentRefusalCode::MissingIdempotencyRequestId,
+            WriteIntentRefusalCode::MissingConfirmationToken,
+            WriteIntentRefusalCode::ConfirmationTokenMismatch,
+            WriteIntentRefusalCode::MissingAppendOnlyAudit,
+            WriteIntentRefusalCode::ExecutionUnavailable,
+        ] {
+            let code = write_refusal_code(refusal_code);
+            assert!(
+                SnowflakeErrorCode::from_stable_code(code.stable_code()).is_some(),
+                "{refusal_code:?} mapped to an unregistered code"
             );
         }
     }

@@ -42,6 +42,13 @@ pub enum SnowflakeErrorCode {
     SafetyLimitExceeded,
     /// Warehouse policy refused the requested warehouse.
     WarehouseRefused,
+    /// A write was attempted against a profile that is not write-enabled.
+    WriteDisabled,
+    /// A write needs the dry-run/confirmation-token rung of the write-intent
+    /// ladder satisfied (missing/mismatched confirmation token, or no dry-run).
+    WriteConfirmationRequired,
+    /// A DDL statement was refused; DDL stays behind an explicit opt-in.
+    WriteDdlRefused,
     /// An upstream Snowflake SQL API error.
     UpstreamError,
     /// A statement failed upstream (422 / SQL error).
@@ -103,6 +110,9 @@ impl SnowflakeErrorCode {
         Self::RowCapExceeded,
         Self::SafetyLimitExceeded,
         Self::WarehouseRefused,
+        Self::WriteDisabled,
+        Self::WriteConfirmationRequired,
+        Self::WriteDdlRefused,
         Self::UpstreamError,
         Self::StatementFailed,
         Self::StatementTimeout,
@@ -249,6 +259,48 @@ impl SnowflakeErrorCode {
                 summary: "Warehouse guardrail refused the requested warehouse.",
                 safe_next_commands: &["franken-snowflake profile validate <profile> --json"],
                 repair_commands: &["franken-snowflake profile doctor <profile> --json"],
+            },
+            Self::WriteDisabled => ErrorEntry {
+                code: self,
+                stable_code: "FSNOW-3007",
+                exit_code: ExitCode::SafetyRefusal,
+                retryable: false,
+                policy_boundary: true,
+                summary: "Writes are disabled for this profile; set its WRITE_ENABLED handle.",
+                safe_next_commands: &[
+                    "franken-snowflake query write --profile <profile> --sql <sql> --dry-run --json",
+                ],
+                repair_commands: &[
+                    "export FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ENABLED=true",
+                ],
+            },
+            Self::WriteConfirmationRequired => ErrorEntry {
+                code: self,
+                stable_code: "FSNOW-3008",
+                exit_code: ExitCode::SafetyRefusal,
+                retryable: false,
+                policy_boundary: true,
+                summary: "Write needs a dry-run confirmation token; run --dry-run, then --confirm.",
+                safe_next_commands: &[
+                    "franken-snowflake query write --profile <profile> --sql <sql> --dry-run --json",
+                ],
+                repair_commands: &[
+                    "franken-snowflake query write --profile <profile> --sql <sql> --confirm <token> --json",
+                ],
+            },
+            Self::WriteDdlRefused => ErrorEntry {
+                code: self,
+                stable_code: "FSNOW-3009",
+                exit_code: ExitCode::SafetyRefusal,
+                retryable: false,
+                policy_boundary: true,
+                summary: "DDL is refused; it stays behind an explicit WRITE_ALLOW_DDL opt-in.",
+                safe_next_commands: &[
+                    "franken-snowflake query plan --profile <profile> --sql <sql> --json",
+                ],
+                repair_commands: &[
+                    "export FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ALLOW_DDL=true",
+                ],
             },
             Self::UpstreamError => ErrorEntry {
                 code: self,
