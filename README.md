@@ -70,7 +70,7 @@ warehouse before any live credential exists.
 | Callable as a tool | Optional `mcp serve` exposing the same handlers and envelope contract over stdio or HTTP |
 | Deterministic tests | A mock SQL API server and a codec lane under a lab runtime exercise the contracts with no warehouse |
 | Never a fixture posing as live data | `data_source` provenance on every envelope; the live path refuses cleanly when credentials are absent |
-| Safe writes | `query write` runs DML, COPY INTO, and PUT through a dry-run to confirm write-intent ladder; a confirmation token binds to (profile, SQL), and DDL needs a separate opt-in |
+| Safe writes | `query write` runs DML, COPY INTO, and PUT directly once a profile sets `WRITE_ENABLED`; `--dry-run` previews and binds a (profile, SQL) confirmation token, `WRITE_REQUIRE_CONFIRM` re-arms that ceremony, and DDL needs a separate opt-in |
 | Secrets stay secret | No secret in config, `Debug`, JSON, or panic text; a compile-time leak gate enforces it |
 | Auditable after the fact | Content-addressed query receipts and an append-only audit log |
 
@@ -114,13 +114,13 @@ exported, the same binary reads from and writes to the live account:
 # Read: run a single statement against the live account.
 fsnow query run --profile demo-prod --sql "select current_version()" --json
 
-# Write, step 1: plan the mutation. This executes nothing and returns a
-# confirmation token bound to (profile, SQL).
-fsnow query write --profile demo-prod --sql "insert into events (id) select 1" --dry-run --json
+# Write: once the profile sets WRITE_ENABLED, a bare `query write` executes the
+# mutation directly and returns the live execution receipt.
+fsnow query write --profile demo-prod --sql "insert into events (id) select 1" --json
 
-# Write, step 2: execute it live with the token from the dry-run plan.
-fsnow query write --profile demo-prod --sql "insert into events (id) select 1" \
-  --confirm confirm:insert:<id> --json
+# Optional preview: --dry-run executes nothing and returns the plan plus a
+# confirmation token, without running the statement.
+fsnow query write --profile demo-prod --sql "insert into events (id) select 1" --dry-run --json
 ```
 
 `fsnow` is the short alias for the canonical `franken-snowflake` binary. Both
@@ -167,8 +167,10 @@ and the policy is verified to actually fail a build or clippy run.
 **Safe writes, redaction, guardrails, and budgets.** Secrets never appear in
 config, `Debug`, JSON output, or panic text; a compile-time gate fails the build
 if a credential-shaped field derives `Debug`. Reads run with read-only
-capabilities, while writes go through the dry-run to confirm write-intent ladder
-with a confirmation token bound to the exact statement. Cost and safety
+capabilities, while writes are gated behind a per-profile `WRITE_ENABLED` opt-in
+and execute directly once enabled; `--dry-run` previews and binds a confirmation
+token to the exact statement, and `WRITE_REQUIRE_CONFIRM` makes that ceremony
+mandatory for cautious profiles. Cost and safety
 guardrails bound work before it is dispatched, and result rows are capped into a
 response envelope with an explicit `truncated` flag so an agent never receives
 an unbounded payload by surprise.
@@ -191,7 +193,7 @@ for fast CI. The table below sets it against the alternatives.
 | Hidden Tokio/reqwest graph | None, by policy | n/a | Usually | n/a |
 | Agent JSON contract plus MCP | First-class | No | No | No |
 | Deterministic tests, no warehouse | Yes | Varies | Rare | No |
-| Safe-write ladder (dry-run to confirm) | Built-in | No | No | No |
+| Safe writes (`WRITE_ENABLED` gate, optional confirm) | Built-in | No | No | No |
 | Secret-leak compile gate | Yes | No | No | No |
 | Live read and write against a Snowflake account | Yes (`--features live`) | Yes | Varies | Yes |
 
@@ -308,21 +310,21 @@ Asupersync dependency set; the pinned toolchain lives in `rust-toolchain.toml`.
      --sql "select current_version()" --json
    ```
 
-6. **Write data with the safety ladder.** Enable writes for the profile, plan
-   the mutation to get a confirmation token, then re-run with the token to
-   execute it live.
+6. **Write data.** Enable writes for the profile, then run the mutation. Once
+   `WRITE_ENABLED` is set, a bare `query write` executes the statement directly
+   and returns the live execution receipt. `--dry-run` stays available as an
+   optional preview.
 
    ```bash
    export FRANKEN_SNOWFLAKE_DEMO_PROD_WRITE_ENABLED=true
 
-   # Plan only; this executes nothing and returns a bound confirmation token.
+   # Execute the mutation directly and return the live receipt.
+   ./target/release/fsnow query write --profile demo-prod \
+     --sql "insert into events (id) select 1" --json
+
+   # Optional: preview without executing (returns the plan plus a token).
    ./target/release/fsnow query write --profile demo-prod \
      --sql "insert into events (id) select 1" --dry-run --json
-
-   # Execute live with the token from the dry-run plan.
-   ./target/release/fsnow query write --profile demo-prod \
-     --sql "insert into events (id) select 1" \
-     --confirm confirm:insert:<id> --json
    ```
 
 ---
@@ -416,7 +418,7 @@ fsnow dataset profile events_daily --json
 |---|---|
 | `fsnow query plan --profile <profile> --sql <sql> --json` | Validate and explain a read plan without submitting it |
 | `fsnow query run --profile <profile> --sql <sql> --json` | Submit a single read statement (SELECT / WITH / SHOW / DESCRIBE / EXPLAIN) |
-| `fsnow query write --profile <profile> --sql <sql> --dry-run \| --confirm <token> --json` | Drive the write-intent ladder for a mutation (see [Writes](#writes)) |
+| `fsnow query write --profile <profile> --sql <sql> [--dry-run \| --confirm <token>] --json` | Execute a mutation; direct once `WRITE_ENABLED` is set, with `--dry-run` as an optional preview (see [Writes](#writes)) |
 | `fsnow query --sql <sql> --profile <profile> --json` | Shorthand that maps to `query run` |
 | `fsnow query cancel <statement-handle> --json` | Cancel a remote SQL API statement handle |
 
@@ -440,8 +442,9 @@ fsnow query cancel 01b2c3d4-0000-abcd-0000-000000000001 --json
 ### Writes
 
 `query write` executes INSERT, MERGE, UPDATE, DELETE, COPY INTO, and PUT against
-the live account through a dry-run to confirm write-intent ladder. `write` is a
-top-level alias for `query write`.
+the live account. Data writes are frictionless by default: once a profile sets
+`WRITE_ENABLED`, a bare `query write` executes the statement and returns the live
+execution receipt. `write` is a top-level alias for `query write`.
 
 1. **Enable writes for the profile.** Data writes are off until you opt in per
    profile:
@@ -450,49 +453,60 @@ top-level alias for `query write`.
    export FRANKEN_SNOWFLAKE_DEMO_PROD_WRITE_ENABLED=true
    ```
 
-2. **Dry-run to get a confirmation token.** This plans the statement and
-   executes nothing (exit 0). The envelope reports `statement_kind`,
-   `safety_class`, and a `required_confirmation_token` such as
-   `confirm:insert:<idempotency-id>`. The token is bound to (profile, SQL), so it
-   only authorizes a re-run of the same statement on the same profile.
+2. **Run the mutation.** With the `live` feature and credentials present, the
+   connector submits the statement directly and returns a `data_source = "live"`
+   execution receipt with the statement handle and rows affected. No dry-run or
+   confirmation token is required.
+
+   ```bash
+   fsnow query write --profile demo-prod \
+     --sql "insert into events (id) select 1" --json
+   ```
+
+3. **Preview first (optional).** `--dry-run` plans the statement and executes
+   nothing (exit 0). The envelope reports `statement_kind`, `safety_class`, and a
+   `required_confirmation_token` such as `confirm:insert:<idempotency-id>`. The
+   token is bound to (profile, SQL), so re-running with `--confirm <token>`
+   executes only the same statement on the same profile.
 
    ```bash
    fsnow query write --profile demo-prod \
      --sql "insert into events (id) select 1" --dry-run --json
-   ```
 
-3. **Confirm to execute live.** Re-run with the token. With the `live` feature
-   and credentials present, the connector submits the statement and returns a
-   `data_source = "live"` execution receipt with the statement handle and rows
-   affected.
-
-   ```bash
    fsnow query write --profile demo-prod \
      --sql "insert into events (id) select 1" \
      --confirm confirm:insert:<id> --json
    ```
 
-Data writes (DML, COPY INTO, PUT) run frictionlessly through this flow once
-`WRITE_ENABLED` is set. DDL (CREATE / ALTER / DROP / TRUNCATE / GRANT / REVOKE)
-needs a second opt-in on top of `WRITE_ENABLED`:
+**Cautious mode (opt-in).** A profile can require the dry-run to confirm ceremony
+on every write by setting `WRITE_REQUIRE_CONFIRM=true`. A bare `query write` then
+refuses and tells you to `--dry-run` first, and execution requires the exact
+`--confirm <token>`:
+
+```bash
+export FRANKEN_SNOWFLAKE_DEMO_PROD_WRITE_REQUIRE_CONFIRM=true
+```
+
+DDL (CREATE / ALTER / DROP / TRUNCATE / GRANT / REVOKE) needs a second opt-in on
+top of `WRITE_ENABLED`; once set, DDL also executes directly (subject to
+`WRITE_REQUIRE_CONFIRM` like everything else):
 
 ```bash
 export FRANKEN_SNOWFLAKE_DEMO_PROD_WRITE_ALLOW_DDL=true
 ```
 
-Typed refusals keep the ladder honest:
+Typed refusals keep the write path honest:
 
 | Code | Meaning |
 |---|---|
 | `FSNOW-3007` | Writes are not enabled for the profile; set `<PREFIX>_WRITE_ENABLED=true` |
-| `FSNOW-3008` | A dry-run confirmation token is required, or the supplied token does not match; run `--dry-run`, then `--confirm <token>` |
+| `FSNOW-3008` | This profile sets `WRITE_REQUIRE_CONFIRM=true` and no matching confirmation token was supplied; run `--dry-run`, then `--confirm <token>` |
 | `FSNOW-3009` | The statement is DDL and DDL is not opted in; set `<PREFIX>_WRITE_ALLOW_DDL=true` |
 | `FSNOW-2003` | A required credential handle is missing |
 
 Without the `live` feature or without credentials, `query write` refuses cleanly
-with a typed envelope (the dry-run plan still authorizes, but the execution rung
-reports that live transport and credentials are required); it never fakes an
-execution.
+with a typed envelope (the write is authorized, but the execution rung reports
+that live transport and credentials are required); it never fakes an execution.
 
 ### Receipts and export
 
@@ -554,7 +568,8 @@ normalized to `_`, then prefixed with `FRANKEN_SNOWFLAKE_`. The profile
 | `<PREFIX>_SCHEMA` | Optional default schema (overridden by `--schema`) |
 | `<PREFIX>_ROLE` | Optional role |
 | `<PREFIX>_MAX_POLLS` | Optional poll budget (default 120) |
-| `<PREFIX>_WRITE_ENABLED` | Set to `true` to enable data writes (DML, COPY INTO, PUT) for the profile through `query write` |
+| `<PREFIX>_WRITE_ENABLED` | Set to `true` to enable data writes (DML, COPY INTO, PUT) for the profile; a bare `query write` then executes directly |
+| `<PREFIX>_WRITE_REQUIRE_CONFIRM` | Set to `true` to require the dry-run to confirm ceremony on every write (cautious opt-in); a bare `query write` refuses until you `--dry-run`, then `--confirm <token>` |
 | `<PREFIX>_WRITE_ALLOW_DDL` | Set to `true` to additionally allow DDL (CREATE/ALTER/DROP/TRUNCATE/GRANT/REVOKE) through `query write` |
 
 ### Secret handles by auth lane
@@ -582,7 +597,7 @@ export FRANKEN_SNOWFLAKE_DEMO_PROD_AUTH="pat"
 export FRANKEN_SNOWFLAKE_DEMO_PROD_WAREHOUSE="COMPUTE_WH"
 export FRANKEN_SNOWFLAKE_DEMO_PROD_PAT="..."   # resolved at request time, never logged
 
-# Allow data writes (DML/COPY INTO/PUT) through the dry-run to confirm ladder:
+# Allow data writes (DML/COPY INTO/PUT); a bare `query write` then executes directly:
 export FRANKEN_SNOWFLAKE_DEMO_PROD_WRITE_ENABLED=true
 
 # Confirm the handles are present (no network, no secret read):
@@ -596,7 +611,7 @@ fsnow profile doctor demo-prod --online --json
 
 The default build links no live transport. Discovery, self-description, profile
 validation, offline `query plan`, `dataset describe-operator`, and `query write`
-dry-run planning (once a profile sets `WRITE_ENABLED`) all work with no
+previews (`--dry-run`, once a profile sets `WRITE_ENABLED`) all work with no
 credentials. The live data-plane verbs (`catalog scan`, `catalog graph` live
 source, `query run`, `query write` execution, `profile doctor --online`) require
 the `live` feature at build time and the profile's credential handles at run
@@ -695,8 +710,8 @@ fsnow mcp serve --stdio
 | Credential error (exit 3) on a live command | A required `<PREFIX>_*` handle is missing | Run `fsnow profile validate <profile> --json` to see the expected handle set, then export the missing ones |
 | `--toon` rejected | The `toon` feature is not compiled in | Use `--json`, or rebuild with the default features (which include `toon`) |
 | Safety refusal (exit 2) on `query run` / `query plan` | The SQL is a mutation, DDL, or multiple statements | `query run` and `query plan` take a single read statement (SELECT / WITH / SHOW / DESCRIBE / EXPLAIN); to change data, use `query write` |
-| `query write` refuses with `FSNOW-3007` | Writes are not enabled for the profile | `export FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ENABLED=true`, then run `query write --dry-run` |
-| `query write` refuses with `FSNOW-3008` | No confirmation token, or it does not match the statement | Run `query write --dry-run` to get the token, then re-run with `--confirm <token>` |
+| `query write` refuses with `FSNOW-3007` | Writes are not enabled for the profile | `export FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ENABLED=true`, then run `query write` directly |
+| `query write` refuses with `FSNOW-3008` | The profile sets `WRITE_REQUIRE_CONFIRM=true` and no matching token was supplied | Run `query write --dry-run` to get the token, then re-run with `--confirm <token>` (or unset the handle for direct writes) |
 | `query write` refuses with `FSNOW-3009` | The statement is DDL and DDL is not opted in | `export FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ALLOW_DDL=true` |
 | `query write` returns a "live transport required" envelope | The binary was built without the `live` feature | Rebuild with `--features live`, then export the profile's credential handles |
 | `mcp serve` reports the feature is unavailable | The binary was built without the `mcp` feature | Rebuild with `--features mcp` |
@@ -723,9 +738,10 @@ confirmation required, `FSNOW-3009` DDL not opted in) with an exact next command
   or with `cargo install`. Prebuilt-binary releases arrive with the first tag.
 - `query run` accepts exactly one read statement, and `query write` accepts
   exactly one mutating statement; multiple-statement requests are refused.
-- Data writes (DML, COPY INTO, PUT) run once a profile sets `WRITE_ENABLED`, and
-  DDL needs the additional `WRITE_ALLOW_DDL` opt-in; every write goes through the
-  dry-run to confirm ladder.
+- Data writes (DML, COPY INTO, PUT) execute directly once a profile sets
+  `WRITE_ENABLED`; DDL needs the additional `WRITE_ALLOW_DDL` opt-in, and
+  `WRITE_REQUIRE_CONFIRM` re-arms the dry-run to confirm ceremony for cautious
+  profiles.
 - `dataset inspect` and `dataset profile` currently return typed "planned" or
   "requires model" envelopes while the dataset-manifest model is finalized.
 - Local Arrow/Parquet export is not implemented yet; local export covers
@@ -745,13 +761,15 @@ loads data through `query write`. The default credential-free build covers
 offline contract work, deterministic fixtures, and CI.
 
 **How do I load or write data?** Enable writes for the profile with `export
-FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ENABLED=true`, then drive `query write`: a
-`--dry-run` plans the statement and returns a confirmation token bound to
-(profile, SQL), and `--confirm <token>` executes it live (with the `live`
-feature and credentials present) and returns a `data_source = "live"` receipt
-with the statement handle and rows affected. DDL additionally needs `export
+FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ENABLED=true`, then run `query write`: with the
+`live` feature and credentials present, a bare write executes the statement
+directly and returns a `data_source = "live"` receipt with the statement handle
+and rows affected. `--dry-run` is an optional preview that returns a confirmation
+token bound to (profile, SQL), and `--confirm <token>` then executes that exact
+statement. Set `FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_REQUIRE_CONFIRM=true` to require
+that ceremony on every write. DDL additionally needs `export
 FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ALLOW_DDL=true`. INSERT, MERGE, UPDATE, DELETE,
-COPY INTO, and PUT all run through this flow.
+COPY INTO, and PUT all run through this path.
 
 **Why not just use an official driver?** Snowflake publishes none for Rust, and
 the goal here is a Rust-first, Tokio-free, agent-ergonomic client, a niche the

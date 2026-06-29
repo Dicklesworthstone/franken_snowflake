@@ -793,6 +793,36 @@ mod tests {
     }
 
     #[test]
+    fn direct_prepare_execution_without_confirm_is_authorized_when_not_required() {
+        // The frictionless-by-default write path: a write-enabled profile with the
+        // dry-run and exact-confirmation rungs disabled authorizes a PrepareExecution
+        // request that carries NO confirmation token. The auto-populated allowlist +
+        // idempotency request id are enough to reach ExecutionAuthorized.
+        // Mirror the CLI's default write-enabled policy: dry-run, exact-confirmation,
+        // and append-only-audit rungs all off, leaving only the auto allowlist +
+        // idempotency request id.
+        let mut policy = enabled_policy();
+        policy.require_dry_run = false;
+        policy.require_exact_confirmation = false;
+        policy.require_append_only_audit = false;
+        let req = request(WriteIntentMode::PrepareExecution, "insert into t values (1)");
+        assert!(
+            req.confirmation_token.is_none(),
+            "no confirmation token is supplied"
+        );
+        let decision = evaluate_write_intent(&req, &policy);
+        assert!(
+            matches!(decision, WriteIntentDecision::ExecutionAuthorized { .. }),
+            "default write-enabled policy must authorize a token-less direct write, got {decision:?}"
+        );
+        if let WriteIntentDecision::ExecutionAuthorized { plan } = decision {
+            assert!(plan.execution_enabled);
+            assert!(plan.receipt.execution_enabled);
+            assert!(!plan.receipt.dry_run);
+        }
+    }
+
+    #[test]
     fn fully_satisfied_request_without_append_only_audit_is_authorized() {
         // The routine data-write path the CLI uses: dry-run + exact confirmation
         // token, with the append-only audit rung left as an optional policy knob.

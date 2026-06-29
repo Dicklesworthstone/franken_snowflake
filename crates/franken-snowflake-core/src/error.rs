@@ -266,9 +266,9 @@ impl SnowflakeErrorCode {
                 exit_code: ExitCode::SafetyRefusal,
                 retryable: false,
                 policy_boundary: true,
-                summary: "Writes are disabled for this profile; set its WRITE_ENABLED handle.",
+                summary: "Writes are disabled for this profile; set its WRITE_ENABLED handle, then writes execute directly.",
                 safe_next_commands: &[
-                    "franken-snowflake query write --profile <profile> --sql <sql> --dry-run --json",
+                    "franken-snowflake query write --profile <profile> --sql <sql> --json",
                 ],
                 repair_commands: &[
                     "export FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ENABLED=true",

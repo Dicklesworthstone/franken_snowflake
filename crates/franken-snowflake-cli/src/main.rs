@@ -3,8 +3,10 @@
 //! This crate owns the public command contract described in
 //! `docs/agent_cli_contract.md`. Read commands (`query run`, `catalog scan`,
 //! `profile doctor --online`) drive the real Snowflake SQL API under the `live`
-//! feature; mutations run through the write-intent ladder via `query write`
-//! (dry-run plan + exact confirmation token, then a live execution receipt). The
+//! feature; mutations run through `query write`, which executes directly once a
+//! profile sets `WRITE_ENABLED` (`--dry-run` stays available as an optional
+//! preview, and the dry-run/confirm ceremony becomes mandatory only when a
+//! profile opts in with `WRITE_REQUIRE_CONFIRM`). The
 //! deterministic envelope, error-code registry, and `--json`/`--toon` output
 //! switch give every surface one stable shape.
 
@@ -352,9 +354,9 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "query.write",
-        invocation: "franken-snowflake query write --profile <profile> --sql <sql> --dry-run | --confirm <token>",
+        invocation: "franken-snowflake query write --profile <profile> --sql <sql> [--dry-run | --confirm <token>] --json",
         output_contract_id: "fsnow.query.write.v1",
-        description: "Drive the write-intent ladder: --dry-run plans and emits a confirmation token; --confirm <token> executes the mutation live and returns an execution receipt.",
+        description: "Execute a mutation. Once the profile sets WRITE_ENABLED, a bare `query write` runs DML/COPY INTO/PUT directly and returns the live receipt; --dry-run previews and emits a confirmation token; --confirm <token> executes a previewed write. Set WRITE_REQUIRE_CONFIRM=true to require the dry-run/confirm ceremony; DDL needs WRITE_ALLOW_DDL.",
         read_only: false,
         provider_network: true,
         mutates_local_state: false,
@@ -818,7 +820,7 @@ fn parse_query(args: &[String], output: OutputFormat) -> Result<Command, Outcome
             vec![
                 "franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string(),
                 "franken-snowflake query run --profile <profile> --sql <sql> --json".to_string(),
-                "franken-snowflake query write --profile <profile> --sql <sql> --dry-run --json"
+                "franken-snowflake query write --profile <profile> --sql <sql> --json"
                     .to_string(),
                 "franken-snowflake query cancel <statement-handle> --json".to_string(),
             ],
@@ -832,7 +834,7 @@ fn parse_query(args: &[String], output: OutputFormat) -> Result<Command, Outcome
             vec![
                 "franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string(),
                 "franken-snowflake query run --profile <profile> --sql <sql> --json".to_string(),
-                "franken-snowflake query write --profile <profile> --sql <sql> --dry-run --json"
+                "franken-snowflake query write --profile <profile> --sql <sql> --json"
                     .to_string(),
                 "franken-snowflake query cancel <statement-handle> --json".to_string(),
             ],
@@ -1790,7 +1792,7 @@ fn onboard_data() -> Json {
                     .to_string(),
                 "4. franken-snowflake query run --profile <profile> --sql \"...\" --json  (run it; live build only)"
                     .to_string(),
-                "5. franken-snowflake query write --profile <profile> --sql \"insert ...\" --dry-run --json  (plan a write; then --confirm <token>)"
+                "5. franken-snowflake query write --profile <profile> --sql \"insert ...\" --json  (writes directly once WRITE_ENABLED; add --dry-run only to preview)"
                     .to_string(),
             ]),
         ),
@@ -1799,7 +1801,7 @@ fn onboard_data() -> Json {
             string_array(vec![
                 "no third-party Snowflake Rust driver".to_string(),
                 "no Tokio/reqwest/hyper production dependency".to_string(),
-                "no mutation outside the write-intent ladder (dry-run + confirmation token)"
+                "no mutation unless the profile sets WRITE_ENABLED (DDL needs WRITE_ALLOW_DDL)"
                     .to_string(),
             ]),
         ),
@@ -1826,7 +1828,7 @@ fn capabilities_data() -> Json {
             string_array(vec![
                 "no third-party Snowflake Rust driver".to_string(),
                 "no Tokio/reqwest/hyper production dependency".to_string(),
-                "no mutation outside the write-intent ladder (dry-run + confirmation token)"
+                "no mutation unless the profile sets WRITE_ENABLED (writes execute directly; WRITE_REQUIRE_CONFIRM re-arms the dry-run/confirm ceremony)"
                     .to_string(),
                 "no DDL without the explicit per-profile WRITE_ALLOW_DDL opt-in".to_string(),
                 "no live transport without the `live` feature and a profile's credential handles"
@@ -1926,13 +1928,13 @@ fn agent_handbook_data() -> Json {
                 (
                     SnowflakeErrorCode::WriteDisabled.stable_code(),
                     json_string(
-                        "Writes are disabled for this profile; set FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ENABLED=true, then use `query write --dry-run`.",
+                        "Writes are disabled for this profile; set FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ENABLED=true, then run `query write` directly (it executes once write-enabled; add --dry-run only to preview).",
                     ),
                 ),
                 (
                     SnowflakeErrorCode::WriteConfirmationRequired.stable_code(),
                     json_string(
-                        "Run `query write --dry-run` to get the confirmation token, then re-run with `--confirm <token>`.",
+                        "This profile opted into the confirm ceremony (WRITE_REQUIRE_CONFIRM=true): run `query write --dry-run` to get the confirmation token, then re-run with `--confirm <token>`.",
                     ),
                 ),
                 (
@@ -1948,7 +1950,7 @@ fn agent_handbook_data() -> Json {
             string_array(vec![
                 "do not store raw secrets in profiles".to_string(),
                 "do not silently use fixtures when live data is required".to_string(),
-                "do not mutate outside the write-intent ladder; DDL stays behind an explicit opt-in"
+                "do not mutate unless the profile sets WRITE_ENABLED; DDL stays behind an explicit WRITE_ALLOW_DDL opt-in"
                     .to_string(),
             ]),
         ),
@@ -2486,10 +2488,10 @@ fn query_plan_outcome(
             request_id,
             profile.clone(),
             SnowflakeErrorCode::MutationRefused,
-            "`query plan` validates read statements (SELECT/WITH/SHOW/DESCRIBE/EXPLAIN). To plan and execute a mutation, use `query write` (dry-run -> confirm token).",
+            "`query plan` validates read statements (SELECT/WITH/SHOW/DESCRIBE/EXPLAIN). To execute a mutation, use `query write` (direct once the profile sets WRITE_ENABLED).",
             vec![
                 plan_example(profile.as_deref()),
-                write_dry_run_example(profile.as_deref()),
+                write_example(profile.as_deref()),
             ],
         );
     }
@@ -2605,7 +2607,7 @@ fn query_run_outcome(
             request_id,
             profile.clone(),
             SnowflakeErrorCode::MutationRefused,
-            "`query run` is the read path: it accepts a single SELECT/WITH/SHOW/DESCRIBE/EXPLAIN. To MUTATE data (INSERT/UPDATE/DELETE/MERGE/COPY INTO/PUT/DDL) use `query write` — start with --dry-run to get a confirmation token, then re-run with --confirm <token>. (A typo'd keyword like `selcet` also lands here — if you meant to read, start with SELECT.)",
+            "`query run` is the read path: it accepts a single SELECT/WITH/SHOW/DESCRIBE/EXPLAIN. To MUTATE data (INSERT/UPDATE/DELETE/MERGE/COPY INTO/PUT/DDL) use `query write`, which executes directly once the profile sets WRITE_ENABLED. (A typo'd keyword like `selcet` also lands here; if you meant to read, start with SELECT.)",
             vec![
                 plan_hint(profile.as_deref(), &sql_text),
                 write_hint(profile.as_deref(), &sql_text),
@@ -2662,14 +2664,21 @@ fn query_run_dispatch(
     )
 }
 
-/// Drive the write-intent ladder for `query write`.
+/// Drive the write path for `query write`.
 ///
-/// Flow: `--dry-run` produces a non-executing [`WriteIntentPlan`] (statement kind,
-/// safety class, the exact confirmation token, and the remaining ladder rungs);
-/// `--confirm <token>` re-derives the same idempotency id from the (profile, SQL)
-/// pair, and — when the profile is write-enabled and the token matches — drives the
-/// ladder to authorization and EXECUTES the mutation live. The connector authorizes
-/// here; the SQL is submitted only by the `live` transport executor.
+/// Default flow once a profile sets `WRITE_ENABLED`: a bare `query write` (no
+/// `--dry-run`, no `--confirm`) goes straight to `PrepareExecution`, the ladder
+/// authorizes the mutation, and the `live` transport EXECUTES it — frictionless by
+/// default. `--dry-run` stays available as an optional non-executing preview that
+/// returns a [`WriteIntentPlan`] (statement kind, safety class, confirmation token,
+/// remaining rungs). `--confirm <token>` re-derives the same idempotency id from the
+/// (profile, SQL) pair and executes a previously previewed write.
+///
+/// A cautious profile can re-arm the ceremony with `WRITE_REQUIRE_CONFIRM=true`:
+/// then a bare `query write` refuses and tells the caller to `--dry-run` first, and
+/// execution requires the exact `--confirm <token>`. Without `WRITE_ENABLED` the
+/// ladder emits the typed `WriteDisabled` refusal. The connector authorizes here;
+/// the SQL is submitted only by the `live` transport executor.
 fn query_write_outcome(
     format: OutputFormat,
     request_id: String,
@@ -2684,7 +2693,7 @@ fn query_write_outcome(
             "query.write",
             "fsnow.query.write.v1",
             "Missing --profile for `query write`.",
-            vec![write_dry_run_example(None)],
+            vec![write_example(None)],
             vec![],
         );
     };
@@ -2694,7 +2703,7 @@ fn query_write_outcome(
             "query.write",
             "fsnow.query.write.v1",
             "Missing --sql for `query write`.",
-            vec![write_dry_run_example(Some(&profile))],
+            vec![write_example(Some(&profile))],
             vec![],
         );
     };
@@ -2712,34 +2721,21 @@ fn query_write_outcome(
         );
     }
 
-    // Mode selection from the two safety flags. `--dry-run` plans; `--confirm`
-    // executes. Requiring exactly one keeps the dry-run -> confirm discipline.
+    // The two safety flags are mutually exclusive. `--dry-run` previews; `--confirm`
+    // executes a previewed write. Supplying both is ambiguous.
     if dry_run && confirm.is_some() {
         return usage_error(
             format,
             "query.write",
             "fsnow.query.write.v1",
-            "Choose either --dry-run (to plan) or --confirm <token> (to execute), not both.",
+            "Choose either --dry-run (to preview) or --confirm <token> (to execute a previewed write), not both.",
             vec![write_dry_run_example(Some(&profile))],
             vec![],
         );
     }
-    let mode = if confirm.is_some() {
-        WriteIntentMode::PrepareExecution
-    } else if dry_run {
-        WriteIntentMode::PlanDryRun
-    } else {
-        return usage_error(
-            format,
-            "query.write",
-            "fsnow.query.write.v1",
-            "Start with --dry-run to get a confirmation token, then re-run with --confirm <token>.",
-            vec![write_dry_run_example(Some(&profile))],
-            vec![],
-        );
-    };
 
-    // Reject read/unrecognized statements up front with a read-path pointer.
+    // Reject read/unrecognized statements up front with a read-path pointer, before
+    // any execution decision.
     let statement_kind = classify_write_statement(&sql_text);
     if statement_kind == WriteStatementKind::Unknown {
         return usage_error(
@@ -2751,6 +2747,34 @@ fn query_write_outcome(
             vec![],
         );
     }
+
+    // Mode selection. `--confirm` executes a previewed write; `--dry-run` previews
+    // without executing. With neither flag the write is frictionless BY DEFAULT once
+    // the profile is write-enabled: route straight to PrepareExecution so the ladder
+    // authorizes and the transport executes. A cautious profile that opted into
+    // `WRITE_REQUIRE_CONFIRM` instead refuses a bare write and asks the caller to
+    // dry-run first. A profile without `WRITE_ENABLED` still falls through to
+    // PrepareExecution, where the ladder emits the typed `WriteDisabled` refusal.
+    let mode = if confirm.is_some() {
+        WriteIntentMode::PrepareExecution
+    } else if dry_run {
+        WriteIntentMode::PlanDryRun
+    } else if profile_env_flag(&profile, "WRITE_ENABLED")
+        && profile_env_flag(&profile, "WRITE_REQUIRE_CONFIRM")
+    {
+        return refusal(
+            format,
+            "query.write",
+            "fsnow.query.write.v1",
+            request_id,
+            Some(profile.clone()),
+            SnowflakeErrorCode::WriteConfirmationRequired,
+            "This profile sets WRITE_REQUIRE_CONFIRM=true: run `query write --dry-run` first to get a confirmation token, then re-run with --confirm <token>.",
+            vec![write_hint(Some(&profile), &sql_text)],
+        );
+    } else {
+        WriteIntentMode::PrepareExecution
+    };
 
     let policy = write_policy_for_profile(&profile, statement_kind);
     let allowlist_id = cli_allowlist_id(statement_kind);
@@ -2781,17 +2805,37 @@ fn query_write_outcome(
     }
 }
 
-/// Build the per-profile write-intent policy from env handles. The default usable
-/// path keeps the dry-run -> confirmation-token rung but does NOT force append-only
-/// audit or a hand-maintained per-statement allowlist on routine data writes; those
-/// stay available as policy knobs the core already models. DDL stays behind an
-/// explicit `<PREFIX>_WRITE_ALLOW_DDL` opt-in.
+/// Build the per-profile write-intent policy from env handles. By default a
+/// write-enabled profile authorizes data writes DIRECTLY: the dry-run and exact
+/// confirmation rungs are off (`require_dry_run`/`require_exact_confirmation` are
+/// false), so a bare `query write` reaches `ExecutionAuthorized`. A profile can
+/// re-arm the cautious dry-run -> confirm ceremony with `<PREFIX>_WRITE_REQUIRE_CONFIRM`.
+/// The append-only-audit and hand-maintained allowlist knobs the core models stay
+/// off by default. DDL stays behind an explicit `<PREFIX>_WRITE_ALLOW_DDL` opt-in.
 fn write_policy_for_profile(profile: &str, statement_kind: WriteStatementKind) -> WriteIntentPolicy {
+    write_policy_from_flags(
+        profile_env_flag(profile, "WRITE_ENABLED"),
+        profile_env_flag(profile, "WRITE_ALLOW_DDL"),
+        profile_env_flag(profile, "WRITE_REQUIRE_CONFIRM"),
+        statement_kind,
+    )
+}
+
+/// Pure write-intent policy assembly from the resolved boolean flags (env-free, so
+/// it is unit-testable). `require_confirm` drives BOTH the `require_dry_run` and
+/// `require_exact_confirmation` rungs: false (the default) makes writes frictionless;
+/// true restores the dry-run -> confirmation-token ceremony.
+fn write_policy_from_flags(
+    enabled: bool,
+    allow_ddl: bool,
+    require_confirm: bool,
+    statement_kind: WriteStatementKind,
+) -> WriteIntentPolicy {
     WriteIntentPolicy {
-        enabled: profile_env_flag(profile, "WRITE_ENABLED"),
-        allow_ddl: profile_env_flag(profile, "WRITE_ALLOW_DDL"),
-        require_dry_run: true,
-        require_exact_confirmation: true,
+        enabled,
+        allow_ddl,
+        require_dry_run: require_confirm,
+        require_exact_confirmation: require_confirm,
         require_idempotency_request_id: true,
         require_append_only_audit: false,
         statement_allowlist: vec![StatementAllowlistEntry::new(
@@ -2957,11 +3001,19 @@ fn write_hint(profile: Option<&str>, sql: &str) -> String {
     )
 }
 
-/// `query write --dry-run` form with a neutral example, for usage errors.
+/// `query write --dry-run` form with a neutral example, for preview/ceremony hints.
 fn write_dry_run_example(profile: Option<&str>) -> String {
     let profile = profile.unwrap_or("<profile>");
     format!(
         "franken-snowflake query write --profile {profile} --sql \"insert into t values (1)\" --dry-run --json"
+    )
+}
+
+/// Direct `query write` form (the default once WRITE_ENABLED), for usage errors.
+fn write_example(profile: Option<&str>) -> String {
+    let profile = profile.unwrap_or("<profile>");
+    format!(
+        "franken-snowflake query write --profile {profile} --sql \"insert into t values (1)\" --json"
     )
 }
 
@@ -5094,19 +5146,28 @@ mod tests {
         assert!(render_outcome(missing_sql).contains("Missing --sql for `query write`."));
     }
 
+    // A bare `query write` (no --dry-run, no --confirm) is no longer a usage error:
+    // it routes straight into the write-intent ladder. For a profile with no
+    // WRITE_ENABLED handle (the distinctive id avoids colliding with a real env
+    // var) the ladder emits the typed WriteDisabled refusal, never a fake execution.
     #[test]
-    fn query_write_requires_exactly_one_mode_flag() {
-        let neither = execute(vec![
+    fn query_write_bare_invocation_routes_into_ladder() {
+        let bare = execute(vec![
             "query".to_string(),
             "write".to_string(),
             "--profile".to_string(),
-            "demo".to_string(),
+            "wmode_off_xyz".to_string(),
             "--sql".to_string(),
             "insert into t values (1)".to_string(),
         ]);
-        assert_eq!(neither.status.code(), 64);
-        assert!(render_outcome(neither).contains("Start with --dry-run"));
+        assert_eq!(bare.status.code(), 2, "bare write routes to the ladder, not a usage error");
+        let rendered = render_outcome(bare);
+        assert!(rendered.contains("FSNOW-3007"), "disabled profile -> WriteDisabled");
+        assert!(!rendered.contains("\"data_source\":\"live\""));
+    }
 
+    #[test]
+    fn query_write_rejects_both_mode_flags() {
         let both = execute(vec![
             "query".to_string(),
             "write".to_string(),
@@ -5177,6 +5238,83 @@ mod tests {
             !rendered.contains("\"data_source\":\"live\""),
             "a disabled-write refusal must never claim live data"
         );
+    }
+
+    // The default once WRITE_ENABLED=true (no WRITE_REQUIRE_CONFIRM): a direct
+    // PrepareExecution write with no dry-run and no confirmation token reaches
+    // ExecutionAuthorized. This is the frictionless-by-default path.
+    #[test]
+    fn write_policy_default_authorizes_direct_execution() {
+        let policy = write_policy_from_flags(true, false, false, WriteStatementKind::Insert);
+        assert!(!policy.require_dry_run);
+        assert!(!policy.require_exact_confirmation);
+        let mut req =
+            WriteIntentRequest::new(WriteIntentMode::PrepareExecution, "insert into t values (1)");
+        req.dry_run = true;
+        req.allowlist_id = Some(cli_allowlist_id(WriteStatementKind::Insert));
+        req.request_id = Some(RequestId::new("direct-req"));
+        // No confirmation token supplied — the default path needs none.
+        let decision = evaluate_write_intent(&req, &policy);
+        assert!(
+            matches!(decision, WriteIntentDecision::ExecutionAuthorized { .. }),
+            "write-enabled default profile must authorize a direct write, got {decision:?}"
+        );
+    }
+
+    // WRITE_REQUIRE_CONFIRM=true restores the dry-run -> confirm ceremony: a direct
+    // PrepareExecution write with no token is refused (MissingConfirmationToken), and
+    // only the exact token authorizes execution.
+    #[test]
+    fn write_policy_require_confirm_restores_confirmation_requirement() {
+        let policy = write_policy_from_flags(true, false, true, WriteStatementKind::Insert);
+        assert!(policy.require_dry_run);
+        assert!(policy.require_exact_confirmation);
+        let mut req =
+            WriteIntentRequest::new(WriteIntentMode::PrepareExecution, "insert into t values (1)");
+        req.dry_run = true;
+        req.allowlist_id = Some(cli_allowlist_id(WriteStatementKind::Insert));
+        req.request_id = Some(RequestId::new("confirm-req"));
+
+        let refused = evaluate_write_intent(&req, &policy);
+        assert!(
+            matches!(
+                refused,
+                WriteIntentDecision::Refused {
+                    refusal: WriteIntentRefusal {
+                        code: WriteIntentRefusalCode::MissingConfirmationToken,
+                        ..
+                    }
+                }
+            ),
+            "require-confirm profile must refuse a token-less direct write, got {refused:?}"
+        );
+
+        req.confirmation_token = Some(ConfirmationToken::for_request(
+            &RequestId::new("confirm-req"),
+            WriteStatementKind::Insert,
+        ));
+        let authorized = evaluate_write_intent(&req, &policy);
+        assert!(
+            matches!(authorized, WriteIntentDecision::ExecutionAuthorized { .. }),
+            "the exact confirmation token must authorize execution, got {authorized:?}"
+        );
+    }
+
+    #[test]
+    fn write_policy_from_flags_maps_handles() {
+        let off = write_policy_from_flags(false, false, false, WriteStatementKind::Insert);
+        assert!(!off.enabled);
+        assert!(!off.allow_ddl);
+        assert!(!off.require_dry_run);
+        assert!(!off.require_exact_confirmation);
+        assert!(!off.require_append_only_audit);
+
+        let strict = write_policy_from_flags(true, true, true, WriteStatementKind::Create);
+        assert!(strict.enabled);
+        assert!(strict.allow_ddl);
+        assert!(strict.require_dry_run);
+        assert!(strict.require_exact_confirmation);
+        assert!(!strict.require_append_only_audit);
     }
 
     #[test]
