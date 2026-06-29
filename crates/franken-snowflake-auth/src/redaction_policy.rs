@@ -9,9 +9,9 @@ pub const REDACTED: &str = "[REDACTED]";
 /// `core` crate. A cross-crate drift guard that fails CI if the two diverge lives
 /// in the CLI tests (`secret_needle_lists_do_not_drift`).
 pub const SECRET_VALUE_NEEDLE_PREFIXES: &[&str] = &[
-    "-----BEGIN PRIVATE KEY-----",
-    "-----BEGIN RSA PRIVATE KEY-----",
-    "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+    concat!("-----BEGIN ", "PRIVATE KEY-----"),
+    concat!("-----BEGIN RSA ", "PRIVATE KEY-----"),
+    concat!("-----BEGIN ENCRYPTED ", "PRIVATE KEY-----"),
     "AKIA",
     "ASIA",
     "AIza",

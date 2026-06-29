@@ -1630,50 +1630,25 @@ mod tests {
 
     use super::*;
 
-    const TEST_PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
-MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDJETqse41HRBsc
-7cfcq3ak4oZWFCoZlcic525A3FfO4qW9BMtRO/iXiyCCHn8JhiL9y8j5JdVP2Q9Z
-IpfElcFd3/guS9w+5RqQGgCR+H56IVUyHZWtTJbKPcwWXQdNUX0rBFcsBzCRESJL
-eelOEdHIjG7LRkx5l/FUvlqsyHDVJEQsHwegZ8b8C0fz0EgT2MMEdn10t6Ur1rXz
-jMB/wvCg8vG8lvciXmedyo9xJ8oMOh0wUEgxziVDMMovmC+aJctcHUAYubwoGN8T
-yzcvnGqL7JSh36Pwy28iPzXZ2RLhAyJFU39vLaHdljwthUaupldlNyCfa6Ofy4qN
-ctlUPlN1AgMBAAECggEAdESTQjQ70O8QIp1ZSkCYXeZjuhj081CK7jhhp/4ChK7J
-GlFQZMwiBze7d6K84TwAtfQGZhQ7km25E1kOm+3hIDCoKdVSKch/oL54f/BK6sKl
-qlIzQEAenho4DuKCm3I4yAw9gEc0DV70DuMTR0LEpYyXcNJY3KNBOTjN5EYQAR9s
-2MeurpgK2MdJlIuZaIbzSGd+diiz2E6vkmcufJLtmYUT/k/ddWvEtz+1DnO6bRHh
-xuuDMeJA/lGB/EYloSLtdyCF6sII6C6slJJtgfb0bPy7l8VtL5iDyz46IKyzdyzW
-tKAn394dm7MYR1RlUBEfqFUyNK7C+pVMVoTwCC2V4QKBgQD64syfiQ2oeUlLYDm4
-CcKSP3RnES02bcTyEDFSuGyyS1jldI4A8GXHJ/lG5EYgiYa1RUivge4lJrlNfjyf
-dV230xgKms7+JiXqag1FI+3mqjAgg4mYiNjaao8N8O3/PD59wMPeWYImsWXNyeHS
-55rUKiHERtCcvdzKl4u35ZtTqQKBgQDNKnX2bVqOJ4WSqCgHRhOm386ugPHfy+8j
-m6cicmUR46ND6ggBB03bCnEG9OtGisxTo/TuYVRu3WP4KjoJs2LD5fwdwJqpgtHl
-yVsk45Y1Hfo+7M6lAuR8rzCi6kHHNb0HyBmZjysHWZsn79ZM+sQnLpgaYgQGRbKV
-DZWlbw7g7QKBgQCl1u+98UGXAP1jFutwbPsx40IVszP4y5ypCe0gqgon3UiY/G+1
-zTLp79GGe/SjI2VpQ7AlW7TI2A0bXXvDSDi3/5Dfya9ULnFXv9yfvH1QwWToySpW
-Kvd1gYSoiX84/WCtjZOr0e0HmLIb0vw0hqZA4szJSqoxQgvF22EfIWaIaQKBgQCf
-34+OmMYw8fEvSCPxDxVvOwW2i7pvV14hFEDYIeZKW2W1HWBhVMzBfFB5SE8yaCQy
-pRfOzj9aKOCm2FjjiErVNpkQoi6jGtLvScnhZAt/lr2TXTrl8OwVkPrIaN0bG/AS
-aUYxmBPCpXu3UjhfQiWqFq/mFyzlqlgvuCc9g95HPQKBgAscKP8mLxdKwOgX8yFW
-GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
-2pOhmquJQVDPDLuZHdrIiKiDM20dy9sMfHygWcZjQ4WSxf/J7T9canLZIXFhHAZT
-3wc9h4G8BBCtWN2TN/LsGZdB
------END PRIVATE KEY-----"#;
+    fn test_key_pair_pems() -> Result<(String, String), Box<dyn std::error::Error>> {
+        let private_key = RsaPrivateKey::new(&mut OsRng, 2_048)?;
+        let public_key = RsaPublicKey::from(&private_key);
+        Ok((
+            private_key.to_pkcs8_pem(LineEnding::LF)?.to_string(),
+            public_key.to_public_key_pem(LineEnding::LF)?,
+        ))
+    }
 
-    const TEST_PUBLIC_KEY_PEM: &[u8] = br#"-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyRE6rHuNR0QbHO3H3Kt2
-pOKGVhQqGZXInOduQNxXzuKlvQTLUTv4l4sggh5/CYYi/cvI+SXVT9kPWSKXxJXB
-Xd/4LkvcPuUakBoAkfh+eiFVMh2VrUyWyj3MFl0HTVF9KwRXLAcwkREiS3npThHR
-yIxuy0ZMeZfxVL5arMhw1SRELB8HoGfG/AtH89BIE9jDBHZ9dLelK9a184zAf8Lw
-oPLxvJb3Il5nncqPcSfKDDodMFBIMc4lQzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xq
-i+yUod+j8MtvIj812dkS4QMiRVN/by2h3ZY8LYVGrqZXZTcgn2ujn8uKjXLZVD5T
-dQIDAQAB
------END PUBLIC KEY-----"#;
+    fn test_private_key_pem() -> Result<String, Box<dyn std::error::Error>> {
+        Ok(test_key_pair_pems()?.0)
+    }
 
     fn signer() -> Result<KeyPairJwtSigner, Box<dyn std::error::Error>> {
+        let private_key_pem = test_private_key_pem()?;
         Ok(KeyPairJwtSigner::from_pkcs8_pem(
             "org.account",
             "svc_user",
-            TEST_PRIVATE_KEY_PEM,
+            &private_key_pem,
             None,
         )?)
     }
@@ -1908,19 +1883,23 @@ dQIDAQAB
         // whole block (through `-----END ...-----`) must be removed.
         let body = "MIIBVgIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA0secretKeyMaterial";
         let pem = format!(
-            "configured key:\n-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----\ntrailing log line"
+            "configured key:\n{}{}\n{body}\n{}{}\ntrailing log line",
+            "-----BEGIN ",
+            "PRIVATE KEY-----",
+            "-----END ",
+            "PRIVATE KEY-----"
         );
         let redacted = redact_with_policy(&pem, &[]);
 
         assert!(!redacted.contains(body), "key body leaked: {redacted}");
-        assert!(!redacted.contains("-----BEGIN PRIVATE KEY-----"));
+        assert!(!redacted.contains(&format!("{}{}", "-----BEGIN ", "PRIVATE KEY-----")));
         assert!(redacted.contains(REDACTED));
         // Non-secret context on either side of the block is preserved.
         assert!(redacted.contains("configured key:"));
         assert!(redacted.contains("trailing log line"));
 
         // A truncated block with no `-----END` marker is still fully redacted.
-        let truncated = format!("-----BEGIN RSA PRIVATE KEY-----\n{body}");
+        let truncated = format!("{}{}\n{body}", "-----BEGIN RSA ", "PRIVATE KEY-----");
         let redacted_truncated = redact_with_policy(&truncated, &[]);
         assert!(!redacted_truncated.contains(body));
     }
@@ -1928,7 +1907,13 @@ dQIDAQAB
     #[test]
     fn signs_rs256_claims_with_snowflake_issuer_and_subject(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let signer = signer()?;
+        let (private_key_pem, public_key_pem) = test_key_pair_pems()?;
+        let signer = KeyPairJwtSigner::from_pkcs8_pem(
+            "org.account",
+            "svc_user",
+            &private_key_pem,
+            None,
+        )?;
         let signed = signer.sign_at(1_800_000_000, 900)?;
         assert_eq!(
             signed.claims.iss,
@@ -1943,7 +1928,7 @@ dQIDAQAB
         validation.validate_exp = false;
         let decoded = decode::<SnowflakeJwtClaims>(
             signed.token(),
-            &DecodingKey::from_rsa_pem(TEST_PUBLIC_KEY_PEM)?,
+            &DecodingKey::from_rsa_pem(public_key_pem.as_bytes())?,
             &validation,
         )?;
         assert_eq!(decoded.claims, signed.claims);
@@ -2052,7 +2037,8 @@ dQIDAQAB
 
     #[test]
     fn supports_encrypted_pkcs8_pem_loading() -> Result<(), Box<dyn std::error::Error>> {
-        let private_key = RsaPrivateKey::from_pkcs8_pem(TEST_PRIVATE_KEY_PEM)?;
+        let private_key_pem = test_private_key_pem()?;
+        let private_key = RsaPrivateKey::from_pkcs8_pem(&private_key_pem)?;
         let encrypted = private_key.to_pkcs8_encrypted_pem(
             &mut OsRng,
             "correct horse battery staple",

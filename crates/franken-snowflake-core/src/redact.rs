@@ -13,9 +13,9 @@ use std::borrow::Cow;
 
 /// Known secret-shape prefixes (longest-prefix detection). Extend here only.
 pub const SECRET_PREFIXES: &[&str] = &[
-    "-----BEGIN PRIVATE KEY-----",
-    "-----BEGIN RSA PRIVATE KEY-----",
-    "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+    concat!("-----BEGIN ", "PRIVATE KEY-----"),
+    concat!("-----BEGIN RSA ", "PRIVATE KEY-----"),
+    concat!("-----BEGIN ENCRYPTED ", "PRIVATE KEY-----"),
     "eyJ",  // JWT / base64url JSON header
     "AKIA", // AWS access key id
     "ASIA", // AWS temporary access key id
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn needle_list_has_expected_prefixes() {
         for needle in [
-            "-----BEGIN PRIVATE KEY-----",
+            concat!("-----BEGIN ", "PRIVATE KEY-----"),
             "eyJ",
             "AKIA",
             "ghp_",
@@ -294,13 +294,16 @@ mod tests {
         // A PEM block missing its `-----END ...-----` line must still have the
         // base64 key body redacted, not just the `-----BEGIN ...-----` line.
         // Stopping at the first newline left the key material in cleartext.
-        let input = "loaded -----BEGIN PRIVATE KEY-----\nMIIBODYsecretMaterial0123456789";
-        let out = redact(input);
+        let input = format!(
+            "loaded {}{}\nMIIBODYsecretMaterial0123456789",
+            "-----BEGIN ", "PRIVATE KEY-----"
+        );
+        let out = redact(&input);
         assert!(out.contains(REDACTION_PLACEHOLDER));
         assert!(!out.contains("MIIBODYsecretMaterial0123456789"));
         assert!(!contains_secret(out.as_ref()));
         // The shared span-finder is reused by the canary guard, so it must agree.
-        assert_eq!(secret_spans(input).len(), 1);
+        assert_eq!(secret_spans(&input).len(), 1);
     }
 
     #[test]

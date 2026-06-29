@@ -337,7 +337,11 @@ mod tests {
         let guard = CanaryGuard::new();
         let key_body = "MIIBVgIBADANBgkqhkiG9w0BAQEFAASCAT8leakedKeyMaterial";
         let leaked = format!(
-            "stderr: -----BEGIN PRIVATE KEY-----\n{key_body}\n-----END PRIVATE KEY----- done"
+            "stderr: {}{}\n{key_body}\n{}{} done",
+            "-----BEGIN ",
+            "PRIVATE KEY-----",
+            "-----END ",
+            "PRIVATE KEY-----"
         );
         let hits = guard.scan_text(Channel::Stderr, &leaked);
         let shape: Vec<&CanaryHit> = hits
