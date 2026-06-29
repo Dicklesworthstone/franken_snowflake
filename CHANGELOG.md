@@ -7,10 +7,10 @@ tagged release.
 
 ## Scope and method
 
-This is the pre-release development history of a no-account MVP. As of this
+This is the development history of `franken_snowflake` to date. As of this
 writing the repository holds **166 non-merge commits from 2026-06-24 to
 2026-06-29**, with **no git tags and no GitHub Releases**. There is no published
-crate and no installer release, so there is no version timeline to reconstruct;
+crate and no tagged release yet, so there is no version timeline to reconstruct;
 everything below sits under a single `Unreleased` heading.
 
 The record is organized by landed capability wave rather than raw commit order,
@@ -31,11 +31,12 @@ implementation first and the test/hardening pass follows in a later wave. The
 
 ## Version state
 
-- Package version: `0.0.0` (workspace pre-release; all crates inherit
-  `publish = false`).
-- Releases: none. No git tag, no GitHub Release, no crates.io publish.
-- Status: no-account MVP. Live Snowflake transport is opt-in (the `live`
-  feature) and pre-release.
+- Package version: `0.0.0` across the workspace; all crates inherit
+  `publish = false`.
+- Releases: none yet. No git tag, no GitHub Release, no crates.io publish.
+- Live Snowflake transport is enabled with the `live` feature (default-off, so
+  the default build is a credential-free slice) and is gated at runtime by
+  credential availability.
 
 ## Timeline
 
@@ -241,8 +242,8 @@ lane against the mock server. See `docs/proof_lanes.md`.
 
 `franken-snowflake-cli` owns the public command contract and produces both the
 canonical `franken-snowflake` binary and the short `fsnow` alias. The draft
-command surface, the MVP required-argument enforcement, offline profile
-diagnostics, and the MVP command contracts landed first, with live query
+command surface, required-argument enforcement, offline profile
+diagnostics, and the initial command contracts landed first, with live query
 surfaces mapped to clean safety refusals. The agent-ergonomics pass added the
 `onboard` mega-command, the `fsnow` alias with accurate compiled `feature_flags`,
 exit-code precision, query-error pedagogy, and a `catalog graph` rendered from a
@@ -331,8 +332,8 @@ social preview image.
 - [`8bacec5`](https://github.com/Dicklesworthstone/franken_snowflake/commit/8bacec5) docs: add hero illustration to README + GitHub social preview image
 
 **Notes for agents**: the gate that decides whether the tree is releasable is
-`RELEASE.md`. Until a SemVer version is chosen and `publish = false` is flipped
-deliberately, treat the project as pre-release.
+`RELEASE.md`. A SemVer version and the first tagged release come once `RELEASE.md` is
+satisfied and `publish = false` is flipped deliberately.
 
 ---
 
@@ -344,7 +345,7 @@ deliberately, treat the project as pre-release.
   [`COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md`](COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md)
   and the Asupersync leverage contract in
   [`docs/asupersync_leverage.md`](docs/asupersync_leverage.md).
-- Live Snowflake use remains pre-release and opt-in. Do not treat local fixtures
+- Live Snowflake use is enabled with the `live` feature. Do not treat local fixtures
   as live data; every live lane either provides explicit credential evidence or
   emits a typed skip/refusal.
 - Once the first public release is tagged, this file gains a dated, versioned

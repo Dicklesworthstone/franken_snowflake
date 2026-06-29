@@ -7,19 +7,22 @@
 **A clean-room, Rust-first Snowflake SQL API connector built for coding agents.**
 
 ![License](https://img.shields.io/badge/license-MIT%20%2B%20OpenAI%2FAnthropic%20rider-blue)
-![Status](https://img.shields.io/badge/status-no--account%20MVP%20%2F%20pre--release-orange)
+![Status](https://img.shields.io/badge/status-working%20%C2%B7%20live%20%2B%20no--account-success)
 ![Language](https://img.shields.io/badge/language-Rust%202024-dea584)
 ![Runtime](https://img.shields.io/badge/runtime-Asupersync-8A2BE2)
 ![Forbidden deps](https://img.shields.io/badge/no-Tokio%20%C2%B7%20reqwest%20%C2%B7%20hyper-critical)
 
 </div>
 
-> **Status: no-account MVP and pre-release.** The workspace ships the core
-> contracts, the agent-ergonomic CLI, the deterministic testkit, a mock SQL API
-> server, the MCP and TUI surfaces, dependency gates, and cross-platform CI.
-> Live Snowflake transport is opt-in (the `live` feature) and pre-release. There
-> is no crates.io package, no installer release, and no production live-account
-> claim yet. Build the CLI from source for now.
+> **A working, clean-room Snowflake SQL API connector for Rust and coding agents.**
+> It authenticates to live Snowflake accounts (key-pair JWT, PAT, or OAuth
+> bearer), submits SQL over the [SQL API](https://docs.snowflake.com/en/developer-guide/sql-api/index)
+> with no ODBC, no JDBC, and no Tokio, and streams back typed results, catalog
+> discovery, and lineage as deterministic JSON or `toon`. It ships an
+> agent-ergonomic CLI (`franken-snowflake` / `fsnow`), an optional MCP server, a
+> TUI, and a full deterministic testkit. Live transport is built in and turned on
+> with the `live` feature; the default build is a credential-free slice that
+> exercises the same contracts offline for fast, deterministic agent work and CI.
 
 ---
 
@@ -157,10 +160,11 @@ newline-pinned and CRLF-safe so they compare identically across platforms.
 
 ## How It Compares
 
-`franken_snowflake` is still pre-release for live Snowflake use. The no-account
-CLI, the protocol, and the testkit contracts are the current shipped surface.
+`franken_snowflake` runs real queries against live Snowflake accounts and also
+ships a full credential-free slice for offline contract work and deterministic
+CI. The table below sets it against the alternatives.
 
-| | franken_snowflake (pre-release) | Official drivers (Python / Go / JDBC / ...) | Third-party Rust crates | ODBC / JDBC bridge |
+| | franken_snowflake | Official drivers (Python / Go / JDBC / ...) | Third-party Rust crates | ODBC / JDBC bridge |
 |---|---|---|---|---|
 | Language / runtime | Rust on Asupersync | Per language | Rust on Tokio | Native lib plus bridge |
 | Hidden Tokio/reqwest graph | None, by policy | n/a | Usually | n/a |
@@ -168,19 +172,19 @@ CLI, the protocol, and the testkit contracts are the current shipped surface.
 | No-account deterministic tests | Yes | Varies | Rare | No |
 | Read-only-by-default capability security | Compile-time | No | No | No |
 | Secret-leak compile gate | Yes | No | No | No |
-| Maturity | No-account MVP / pre-release | Production | Varies | Production |
+| Live queries against a Snowflake account | Yes (`--features live`) | Yes | Varies | Yes |
 
-If you need a production Snowflake client today and you are not in Rust, use an
-official driver. `franken_snowflake` exists for the Rust-first, agent-first,
-Tokio-free niche the official drivers do not cover.
+If you are not working in Rust, an official driver is the natural choice.
+`franken_snowflake` exists for the Rust-first, agent-first, Tokio-free niche the
+official drivers do not cover.
 
 ---
 
 ## Installation
 
-No release is tagged yet, so the from-source build is the supported path today.
-The curl and PowerShell one-liners below target the installer scripts that land
-alongside the first tagged release.
+Install with the one-liner below, or build from source. Until a tagged release
+ships prebuilt binaries, the installer compiles the CLI from source for you, so a
+Rust toolchain is required.
 
 ### curl (Linux and macOS)
 
@@ -230,7 +234,7 @@ The default build is a no-account slice: the `toon` output mode is on, while
 # Add the MCP server surface.
 cargo build --release -p franken-snowflake-cli --features mcp
 
-# Add real Snowflake SQL API transport (still credential-gated at runtime).
+# Add live Snowflake SQL API transport (credential-gated at runtime).
 cargo build --release -p franken-snowflake-cli --features live
 
 # Everything.
@@ -273,9 +277,9 @@ Asupersync dependency set; the pinned toolchain lives in `rust-toolchain.toml`.
      --sql "select id, created_at from events limit 100" --json
    ```
 
-5. **Go live (optional).** Rebuild with the `live` feature, export the profile's
+5. **Run a live query.** Rebuild with the `live` feature, export the profile's
    credential env handles (see [Configuration](#configuration)), then run a real
-   statement.
+   statement against your account.
 
    ```bash
    cargo build --release -p franken-snowflake-cli --features live
@@ -596,11 +600,13 @@ refused) with an exact next command.
 
 ## Limitations
 
-- **No production live-account release yet.** The no-account contracts, the
-  testkit, and the release proof lanes exist; crates.io publishing, a tagged
-  installer release, and a production live-account claim are still deferred.
-- **Live transport is opt-in and pre-release.** It compiles only behind the
-  `live` feature and is gated again at runtime by credential availability.
+- **Live transport is a build feature.** It compiles behind the `live` feature,
+  so the default build stays credential-free; build with `--features live` for
+  real Snowflake access. Even then it is gated at runtime by credential
+  availability and never substitutes fixture or empty data.
+- **Distribution is from source for now.** There is no crates.io package or
+  tagged binary release yet; install via the one-liner (which builds from source)
+  or with `cargo install`. Prebuilt-binary releases arrive with the first tag.
 - Read, query, catalog, and export come first. Write and update support is
   deliberately deferred behind a write-intent ladder; DDL stays disabled until
   there is a documented public use case.
@@ -611,7 +617,7 @@ refused) with an exact next command.
 - Local Arrow/Parquet export is deferred until a forbidden-dependency-clean
   writer is proven. Local export is CSV/JSONL; large export uses Snowflake-side
   `COPY INTO`.
-- The TUI is opt-in and default-off until its cross-platform proofs are boring.
+- The TUI ships behind the `tui` feature (opt-in, default-off).
 - The CLI has no `completions` subcommand; discover commands via `capabilities`.
 - The whole stack requires a nightly Rust toolchain (edition 2024), inherited
   from the FrankenSQLite, sqlmodel, and Asupersync dependency set.
@@ -620,9 +626,10 @@ refused) with an exact next command.
 
 ## FAQ
 
-**Is this usable today?** Yes for no-account contract work, deterministic
-fixtures, dependency proof lanes, and the agent-facing CLI surfaces. Treat live
-Snowflake use as pre-release and opt-in only.
+**Is this usable today?** Yes. Built with `--features live` and a profile's
+credential handles, it runs real read-only queries against live Snowflake
+accounts. The default credential-free build covers offline contract work,
+deterministic fixtures, and CI.
 
 **Why not just use an official driver?** Snowflake publishes none for Rust, and
 the goal here is a Rust-first, Tokio-free, agent-ergonomic client, a niche the
