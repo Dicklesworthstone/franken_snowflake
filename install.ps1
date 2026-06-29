@@ -22,9 +22,9 @@
         producing BOTH target\release\franken-snowflake.exe and
         target\release\fsnow.exe. The DEFAULT build is the no-account slice (no
         live Snowflake transport). For real Snowflake use you need the opt-in
-        'live' feature, built separately:
+        'live' feature; pass -Live to have the installer build it:
             cargo build --release -p franken-snowflake-cli --features live
-        This installer never enables 'live' for you.
+        Without -Live the installer never enables 'live'.
 
     The installed binary can also serve Model Context Protocol:
         franken-snowflake mcp serve --stdio
@@ -46,6 +46,10 @@
 
 .PARAMETER FromSource
     Build from source with cargo instead of downloading a prebuilt binary.
+
+.PARAMETER Live
+    Build the CLI with the 'live' feature (real Snowflake SQL API transport).
+    Applies to every from-source build path. Default builds without 'live'.
 
 .PARAMETER Offline
     Install from a local artifact archive (.zip/.tar.*) instead of downloading.
@@ -79,6 +83,18 @@
 .EXAMPLE
     ./install.ps1 -FromSource
     Build franken-snowflake.exe + fsnow.exe from source with cargo.
+
+.EXAMPLE
+    ./install.ps1 -Live
+    Build the live-capable CLI (cargo build --release -p franken-snowflake-cli --features live).
+
+.NOTES
+    Passing parameters through the one-liner: the `irm ... | iex` form cannot take
+    arguments directly. Download first, then invoke with the switch, e.g.:
+        irm https://raw.githubusercontent.com/Dicklesworthstone/franken_snowflake/main/install.ps1 -OutFile install.ps1
+        ./install.ps1 -Live
+    Or wrap it inline:
+        & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Dicklesworthstone/franken_snowflake/main/install.ps1))) -Live
 #>
 
 [CmdletBinding()]
@@ -89,6 +105,7 @@ param(
     [switch]$EasyMode,
     [switch]$Verify,
     [switch]$FromSource,
+    [switch]$Live,
     [string]$Offline = "",
     [string]$ArtifactUrl = "",
     [string]$Checksum = "",
@@ -443,7 +460,16 @@ function Build-FromSource {
         if ($LASTEXITCODE -ne 0) { throw 'git clone failed' }
     }
 
-    Write-Info "Compiling $CliPackage (cargo build --release, default no-account features)"
+    # Default build is the no-account slice; -Live opts into the real Snowflake
+    # SQL API transport via the 'live' cargo feature.
+    $cargoArgs = @('build', '--release', '-p', $CliPackage)
+    $featureLabel = 'default no-account features'
+    if ($Live) {
+        $cargoArgs += @('--features', 'live')
+        $featureLabel = '--features live (real Snowflake transport)'
+    }
+
+    Write-Info "Compiling $CliPackage (cargo build --release, $featureLabel)"
     Write-Info 'This downloads crates and can take several minutes on first build...'
     Push-Location $src
     $code = 1
@@ -452,7 +478,7 @@ function Build-FromSource {
         Remove-Item Env:\CARGO_TARGET_DIR       -ErrorAction SilentlyContinue
         Remove-Item Env:\CARGO_BUILD_TARGET     -ErrorAction SilentlyContinue
         Remove-Item Env:\CARGO_BUILD_TARGET_DIR -ErrorAction SilentlyContinue
-        & cargo build --release -p $CliPackage
+        & cargo @cargoArgs
         $code = $LASTEXITCODE
     } finally {
         Pop-Location
@@ -551,7 +577,7 @@ function Write-Summary {
     Write-Host '    fsnow doctor --json                      # environment diagnostics'
     Write-Host '    franken-snowflake mcp serve --stdio      # serve over MCP'
     Write-Host ''
-    Write-Host '  Live Snowflake use needs the opt-in ''live'' feature:' -ForegroundColor Yellow
+    Write-Host '  Live Snowflake use needs the opt-in ''live'' feature (re-run the installer with -Live):' -ForegroundColor Yellow
     Write-Host '    cargo build --release -p franken-snowflake-cli --features live'
     Write-Host ''
     Write-Host "  Uninstall: Remove-Item '$Dest\$BinaryName.exe','$Dest\$AliasName.exe'"

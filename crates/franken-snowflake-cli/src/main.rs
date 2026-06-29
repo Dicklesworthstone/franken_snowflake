@@ -463,7 +463,7 @@ fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
         // Top-level `write` alias for `query write` — same dispatch style as the
         // `query --sql` shorthand maps to `query run`.
         "write" => Command::QueryWrite {
-            profile: value_after(&args, "--profile"),
+            profile: resolve_profile(value_after(&args, "--profile")),
             sql: raw_value_after(&args, "--sql"),
             dry_run: has_flag(&args, "--dry-run"),
             confirm: value_after(&args, "--confirm"),
@@ -518,29 +518,27 @@ fn parse_robot_docs(args: &[String], output: OutputFormat) -> Result<Command, Ou
 
 fn parse_profile(args: &[String], output: OutputFormat) -> Result<Command, Outcome> {
     match args.get(1).map(String::as_str) {
-        Some("validate") => match args.get(2) {
-            Some(profile) => Ok(Command::ProfileValidate {
-                profile: profile.clone(),
-            }),
+        Some("validate") => match resolve_profile(positional_profile(args)) {
+            Some(profile) => Ok(Command::ProfileValidate { profile }),
             None => Err(usage_error(
                 output,
                 "profile.validate",
                 "fsnow.profile.validate.v1",
-                "Missing profile name for `profile validate`.",
+                "Missing profile for `profile validate`. Pass <profile> or set FRANKEN_SNOWFLAKE_DEFAULT_PROFILE.",
                 vec!["franken-snowflake profile validate <profile> --json".to_string()],
                 vec![],
             )),
         },
-        Some("doctor") => match args.get(2) {
+        Some("doctor") => match resolve_profile(positional_profile(args)) {
             Some(profile) => Ok(Command::ProfileDoctor {
-                profile: profile.clone(),
+                profile,
                 online: has_flag(args, "--online"),
             }),
             None => Err(usage_error(
                 output,
                 "profile.doctor",
                 "fsnow.profile.doctor.v1",
-                "Missing profile name for `profile doctor`.",
+                "Missing profile for `profile doctor`. Pass <profile> or set FRANKEN_SNOWFLAKE_DEFAULT_PROFILE.",
                 vec!["franken-snowflake profile doctor <profile> --json".to_string()],
                 vec![],
             )),
@@ -576,7 +574,7 @@ fn parse_catalog(
     explicit_json: bool,
 ) -> Result<Command, Outcome> {
     match args.get(1).map(String::as_str) {
-        Some("scan") => match args.get(2) {
+        Some("scan") => match resolve_profile(positional_profile(args)) {
             Some(profile) => {
                 let database = value_after(args, "--database");
                 let schema = value_after(args, "--schema");
@@ -608,7 +606,7 @@ fn parse_catalog(
                 }
 
                 Ok(Command::CatalogScan {
-                    profile: profile.clone(),
+                    profile,
                     database,
                     schema,
                 })
@@ -617,7 +615,7 @@ fn parse_catalog(
                 output,
                 "catalog.scan",
                 "fsnow.catalog.scan.v1",
-                "Missing profile for `catalog scan`.",
+                "Missing profile for `catalog scan`. Pass <profile> or set FRANKEN_SNOWFLAKE_DEFAULT_PROFILE.",
                 vec![
                     "franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json"
                         .to_string(),
@@ -625,7 +623,7 @@ fn parse_catalog(
                 vec![],
             )),
         },
-        Some("graph") => match args.get(2) {
+        Some("graph") => match resolve_profile(positional_profile(args)) {
             Some(profile) => {
                 let wants_mermaid = has_flag(args, "--mermaid");
                 let wants_svg = has_flag(args, "--svg");
@@ -659,7 +657,7 @@ fn parse_catalog(
                     GraphOutput::Json
                 };
                 Ok(Command::CatalogGraph {
-                    profile: profile.clone(),
+                    profile,
                     database: value_after(args, "--database"),
                     schema: value_after(args, "--schema"),
                     graph_output,
@@ -669,7 +667,7 @@ fn parse_catalog(
                 output,
                 "catalog.graph",
                 "fsnow.catalog.graph.v1",
-                "Missing profile for `catalog graph`.",
+                "Missing profile for `catalog graph`. Pass <profile> or set FRANKEN_SNOWFLAKE_DEFAULT_PROFILE.",
                 vec!["franken-snowflake catalog graph <profile> --mermaid".to_string()],
                 vec![],
             )),
@@ -781,20 +779,20 @@ fn parse_query(args: &[String], output: OutputFormat) -> Result<Command, Outcome
         // fall through to the "unknown query subcommand `--sql`" error.
         Some(value) if value.starts_with("--") && raw_value_after(args, "--sql").is_some() => {
             Ok(Command::QueryRun {
-                profile: value_after(args, "--profile"),
+                profile: resolve_profile(value_after(args, "--profile")),
                 sql: raw_value_after(args, "--sql"),
             })
         }
         Some("plan") => Ok(Command::QueryPlan {
-            profile: value_after(args, "--profile"),
+            profile: resolve_profile(value_after(args, "--profile")),
             sql: raw_value_after(args, "--sql"),
         }),
         Some("run") => Ok(Command::QueryRun {
-            profile: value_after(args, "--profile"),
+            profile: resolve_profile(value_after(args, "--profile")),
             sql: raw_value_after(args, "--sql"),
         }),
         Some("write") => Ok(Command::QueryWrite {
-            profile: value_after(args, "--profile"),
+            profile: resolve_profile(value_after(args, "--profile")),
             sql: raw_value_after(args, "--sql"),
             dry_run: has_flag(args, "--dry-run"),
             confirm: value_after(args, "--confirm"),
@@ -1780,10 +1778,13 @@ fn onboard_data() -> Json {
         ("exit_codes", exit_code_json()),
         ("first_commands", string_array(first_commands())),
         ("commands", Json::Array(commands_brief)),
+        ("environment", environment_docs()),
         ("health", doctor_data()),
         (
             "getting_started",
             string_array(vec![
+                "0. export FRANKEN_SNOWFLAKE_DEFAULT_PROFILE=<profile>  (optional; makes --profile optional on every command)"
+                    .to_string(),
                 "1. franken-snowflake capabilities --json  (full machine-readable contract)"
                     .to_string(),
                 "2. franken-snowflake profile validate <profile> --json  (check a profile's env handles)"
@@ -1808,6 +1809,33 @@ fn onboard_data() -> Json {
     ])
 }
 
+/// Documented environment variables that influence command resolution. Shared by
+/// `capabilities`, `onboard`, `agent-handbook`, and `--help` so every discovery
+/// surface advertises `FRANKEN_SNOWFLAKE_DEFAULT_PROFILE` identically.
+fn environment_docs() -> Json {
+    json_array(vec![json_object(vec![
+        ("name", json_string("FRANKEN_SNOWFLAKE_DEFAULT_PROFILE")),
+        (
+            "description",
+            json_string(
+                "Default profile used when --profile (or the positional <profile>) is omitted; an explicit profile always wins. Set it to make --profile optional.",
+            ),
+        ),
+        (
+            "applies_to",
+            string_array(vec![
+                "query plan".to_string(),
+                "query run".to_string(),
+                "query write".to_string(),
+                "catalog scan".to_string(),
+                "catalog graph".to_string(),
+                "profile validate".to_string(),
+                "profile doctor".to_string(),
+            ]),
+        ),
+    ])])
+}
+
 fn capabilities_data() -> Json {
     json_object(vec![
         ("tool_name", json_string("franken-snowflake")),
@@ -1823,6 +1851,7 @@ fn capabilities_data() -> Json {
         ("exit_codes", exit_code_json()),
         ("error_registry", error_registry_json()),
         ("envelope_keys", envelope_key_json()),
+        ("environment", environment_docs()),
         (
             "non_goals",
             string_array(vec![
@@ -1898,13 +1927,14 @@ fn agent_handbook_data() -> Json {
         ("exit_codes", exit_code_json()),
         ("envelope_keys", envelope_key_json()),
         ("error_registry", error_registry_json()),
+        ("environment", environment_docs()),
         (
             "error_recovery",
             json_object(vec![
                 (
                     SnowflakeErrorCode::UsageError.stable_code(),
                     json_string(
-                        "Run `franken-snowflake capabilities --json` and retry with the shown invocation.",
+                        "Run `franken-snowflake capabilities --json` and retry with the shown invocation. For a Missing-profile usage error, pass --profile <profile> or set FRANKEN_SNOWFLAKE_DEFAULT_PROFILE.",
                     ),
                 ),
                 (
@@ -1985,6 +2015,7 @@ fn help_data() -> Json {
                     .collect(),
             ),
         ),
+        ("environment", environment_docs()),
     ])
 }
 
@@ -2450,7 +2481,7 @@ fn query_plan_outcome(
             format,
             "query.plan",
             "fsnow.query.plan.v1",
-            "Missing --profile for `query plan`.",
+            "Missing --profile for `query plan`. Pass --profile <profile> or set FRANKEN_SNOWFLAKE_DEFAULT_PROFILE.",
             vec!["franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string()],
             vec![],
         );
@@ -2567,7 +2598,7 @@ fn query_run_outcome(
             format,
             "query.run",
             "fsnow.query.run.v1",
-            "Missing --profile for `query run`.",
+            "Missing --profile for `query run`. Pass --profile <profile> or set FRANKEN_SNOWFLAKE_DEFAULT_PROFILE.",
             vec!["franken-snowflake query run --profile <profile> --sql <sql> --json".to_string()],
             vec![],
         );
@@ -2692,7 +2723,7 @@ fn query_write_outcome(
             format,
             "query.write",
             "fsnow.query.write.v1",
-            "Missing --profile for `query write`.",
+            "Missing --profile for `query write`. Pass --profile <profile> or set FRANKEN_SNOWFLAKE_DEFAULT_PROFILE.",
             vec![write_example(None)],
             vec![],
         );
@@ -3521,6 +3552,47 @@ fn value_after_inner(args: &[String], flag: &str, allow_flag_like_value: bool) -
     }
 
     None
+}
+
+/// Environment variable that supplies a default profile when `--profile` (or the
+/// positional profile argument) is omitted. This is intentionally distinct from
+/// the internal `FRANKEN_SNOWFLAKE_PROFILE` env-prefix fallback used by credential
+/// lookup (see [`profile_env_prefix`]); reusing that name would conflate the two.
+const DEFAULT_PROFILE_ENV: &str = "FRANKEN_SNOWFLAKE_DEFAULT_PROFILE";
+
+/// Read `FRANKEN_SNOWFLAKE_DEFAULT_PROFILE`, treating an unset OR empty value as
+/// absent. Centralizing the env read behind one indirection keeps the resolution
+/// policy unit-testable as the pure [`resolve_profile_with`] (the workspace forbids
+/// `env::set_var` in tests under edition 2024, so the policy is tested directly).
+fn default_profile_env() -> Option<String> {
+    std::env::var(DEFAULT_PROFILE_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+/// Resolve the active profile for any command that needs one: an explicit
+/// `--profile <p>` (or positional `<profile>`) wins; otherwise fall back to
+/// `FRANKEN_SNOWFLAKE_DEFAULT_PROFILE`. Returns `None` only when neither source
+/// provides one, which routes into the typed Missing-profile usage error.
+fn resolve_profile(explicit: Option<String>) -> Option<String> {
+    resolve_profile_with(explicit, default_profile_env())
+}
+
+/// Pure resolution policy behind [`resolve_profile`]: the explicit value wins,
+/// else the supplied env value. Kept side-effect free so the precedence is
+/// directly unit-testable without touching process environment.
+fn resolve_profile_with(explicit: Option<String>, env_value: Option<String>) -> Option<String> {
+    explicit.or(env_value)
+}
+
+/// The positional profile argument (`args[2]`) for the positional-profile commands
+/// (`profile validate|doctor`, `catalog scan|graph`). A flag-like token (starting
+/// with `-`) is treated as "no positional profile" so the slot can fall back to
+/// `FRANKEN_SNOWFLAKE_DEFAULT_PROFILE` rather than being mistaken for the profile.
+fn positional_profile(args: &[String]) -> Option<String> {
+    args.get(2)
+        .filter(|value| !value.starts_with('-'))
+        .cloned()
 }
 
 fn has_multiple_statements(sql: &str) -> bool {
@@ -4781,6 +4853,49 @@ mod tests {
         };
         assert!(rendered.contains("Missing --profile for `query plan`."));
         assert!(rendered.contains("franken-snowflake query plan --profile"));
+        // The recovery hint now also points at the env-var fallback.
+        assert!(rendered.contains("FRANKEN_SNOWFLAKE_DEFAULT_PROFILE"));
+    }
+
+    // FRANKEN_SNOWFLAKE_DEFAULT_PROFILE resolution policy. The env read is behind
+    // `default_profile_env`; the precedence itself is tested here as the pure
+    // `resolve_profile_with` (edition 2024 forbids `env::set_var` in tests, so we
+    // never mutate the process environment).
+    #[test]
+    fn resolve_profile_prefers_explicit_over_env() {
+        assert_eq!(
+            resolve_profile_with(Some("explicit".to_string()), Some("env".to_string())),
+            Some("explicit".to_string()),
+            "an explicit --profile/positional value always wins over the env default"
+        );
+        assert_eq!(
+            resolve_profile_with(Some("explicit".to_string()), None),
+            Some("explicit".to_string())
+        );
+        // `resolve_profile` itself returns the explicit value without consulting
+        // the environment at all.
+        assert_eq!(
+            resolve_profile(Some("explicit".to_string())),
+            Some("explicit".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_profile_falls_back_to_env_when_explicit_absent() {
+        assert_eq!(
+            resolve_profile_with(None, Some("env-default".to_string())),
+            Some("env-default".to_string()),
+            "FRANKEN_SNOWFLAKE_DEFAULT_PROFILE is used when --profile is omitted"
+        );
+    }
+
+    #[test]
+    fn resolve_profile_returns_none_when_both_absent() {
+        assert_eq!(
+            resolve_profile_with(None, None),
+            None,
+            "no explicit profile and no env default routes into the typed Missing-profile error"
+        );
     }
 
     // No-account build: `catalog scan` reaches the stub that echoes

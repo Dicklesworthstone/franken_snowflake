@@ -231,11 +231,26 @@ The installer accepts these flags (pass after `bash -s --` for the curl form):
 | `--easy-mode` | Guided, prompt-friendly install for newcomers |
 | `--verify` | Verify checksums and signatures of the downloaded artifact |
 | `--from-source` | Build from source instead of downloading a prebuilt binary |
+| `--live` | Build the CLI with the `live` feature so it can talk to a real Snowflake account |
 | `--quiet` | Suppress non-error output |
 | `--no-gum` | Plain output with no styled prompts |
 | `--force` | Overwrite an existing install |
 
 Until a release exists, the installer falls back to `--from-source`.
+
+To build the live-capable binary in one shot, pass `--live` through the pipe:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_snowflake/main/install.sh | bash -s -- --live
+```
+
+On Windows the `irm ... | iex` one-liner cannot forward arguments, so download
+the script first and invoke it with the matching `-Live` switch:
+
+```powershell
+irm https://raw.githubusercontent.com/Dicklesworthstone/franken_snowflake/main/install.ps1 -OutFile install.ps1
+./install.ps1 -Live
+```
 
 ### From source
 
@@ -336,6 +351,11 @@ Read commands default to `--json`. Pass `--toon` for the token-efficient
 encoding (available when the default `toon` feature is compiled in). `--no-color`
 is accepted and ignored. There is no `--version` flag; the compiled version and
 feature set are reported inside the `capabilities` and `onboard` envelopes.
+
+Every command that takes `--profile` (or a positional `<profile>`) also reads
+`FRANKEN_SNOWFLAKE_DEFAULT_PROFILE`: set that variable once and `--profile`
+becomes optional, while an explicit value still wins. See
+[Configuration](#configuration).
 
 ### Discovery and self-description
 
@@ -571,6 +591,20 @@ normalized to `_`, then prefixed with `FRANKEN_SNOWFLAKE_`. The profile
 | `<PREFIX>_WRITE_ENABLED` | Set to `true` to enable data writes (DML, COPY INTO, PUT) for the profile; a bare `query write` then executes directly |
 | `<PREFIX>_WRITE_REQUIRE_CONFIRM` | Set to `true` to require the dry-run to confirm ceremony on every write (cautious opt-in); a bare `query write` refuses until you `--dry-run`, then `--confirm <token>` |
 | `<PREFIX>_WRITE_ALLOW_DDL` | Set to `true` to additionally allow DDL (CREATE/ALTER/DROP/TRUNCATE/GRANT/REVOKE) through `query write` |
+
+### Global environment variables
+
+These apply across profiles rather than to a single profile prefix.
+
+| Variable | Purpose |
+|---|---|
+| `FRANKEN_SNOWFLAKE_DEFAULT_PROFILE` | Default profile used when `--profile` (or the positional `<profile>`) is omitted. Set it once to make `--profile` optional on every command; an explicit profile always wins. |
+
+```bash
+# Make --profile optional for the rest of the session.
+export FRANKEN_SNOWFLAKE_DEFAULT_PROFILE=demo-prod
+fsnow query plan --sql "select 1" --json   # resolves to demo-prod
+```
 
 ### Secret handles by auth lane
 

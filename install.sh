@@ -18,6 +18,8 @@
 #   --easy-mode        Auto-update PATH in shell rc files (and auto-install Rust if needed)
 #   --verify           Run a post-install self-test (selftest + capabilities)
 #   --from-source      Build from source with cargo instead of downloading a binary
+#   --live             Build the CLI with the `live` feature (real Snowflake SQL API
+#                      transport). Applies to every from-source build path.
 #   --offline TARBALL  Install from a local artifact tarball (airgapped, no network)
 #   --artifact-url URL Download the artifact from an explicit URL
 #   --checksum HEX     Expected SHA256 of the artifact (overrides remote SHA256SUMS)
@@ -35,9 +37,10 @@
 #       cargo build --release -p franken-snowflake-cli
 #   producing BOTH target/release/franken-snowflake and target/release/fsnow.
 #   The DEFAULT build is the no-account slice (no live Snowflake transport). For
-#   real Snowflake use you need the opt-in `live` feature, built separately:
+#   real Snowflake use you need the opt-in `live` feature; pass --live to have the
+#   installer build it for you:
 #       cargo build --release -p franken-snowflake-cli --features live
-#   This installer never enables `live` for you.
+#   Without --live the installer never enables `live`.
 #
 # Optional MCP surface:
 #   The installed binary can also serve Model Context Protocol so every read
@@ -62,6 +65,7 @@ EASY=0
 QUIET=0
 VERIFY=0
 FROM_SOURCE=0
+LIVE=0
 NO_GUM=0
 FORCE_INSTALL=0
 NO_VERIFY=0
@@ -203,6 +207,7 @@ Options:
   --easy-mode        Auto-update PATH in shell rc files (auto-install Rust if needed)
   --verify           Run a post-install self-test (selftest + capabilities)
   --from-source      Build from source with cargo instead of downloading a binary
+  --live             Build the CLI with the 'live' feature (real Snowflake transport)
   --offline TARBALL  Install from a local artifact tarball (airgapped)
   --artifact-url URL Download the artifact from an explicit URL
   --checksum HEX     Expected SHA256 of the artifact
@@ -218,7 +223,7 @@ Notes:
         cargo build --release -p ${CLI_PACKAGE}
     which produces BOTH ${BINARY_NAME} and ${ALIAS_NAME}.
   * The default build is the no-account slice. Real Snowflake use needs the
-    opt-in 'live' feature:
+    opt-in 'live' feature; pass --live to build it:
         cargo build --release -p ${CLI_PACKAGE} --features live
   * MCP server:   ${BINARY_NAME} mcp serve --stdio
 EOFU
@@ -233,6 +238,7 @@ while [ $# -gt 0 ]; do
     --easy-mode)    EASY=1; shift ;;
     --verify)       VERIFY=1; shift ;;
     --from-source)  FROM_SOURCE=1; shift ;;
+    --live)         LIVE=1; shift ;;
     --offline)      OFFLINE_TARBALL="${2:?--offline needs a TARBALL path}"; shift 2 ;;
     --artifact-url) ARTIFACT_URL="${2:?--artifact-url needs a value}"; shift 2 ;;
     --checksum)     CHECKSUM="${2:?--checksum needs a value}"; shift 2 ;;
@@ -584,13 +590,23 @@ build_from_source() {
     fi
   fi
 
-  info "Compiling ${CLI_PACKAGE} (cargo build --release, default no-account features)"
+  # Default build is the no-account slice; --live opts into the real Snowflake
+  # SQL API transport via `--features live`. The guarded array expansion keeps an
+  # empty feature list safe under `set -u` on every bash version.
+  local feature_args=()
+  local feature_label="default no-account features"
+  if [ "$LIVE" -eq 1 ]; then
+    feature_args=(--features live)
+    feature_label="--features live (real Snowflake transport)"
+  fi
+
+  info "Compiling ${CLI_PACKAGE} (cargo build --release, ${feature_label})"
   info "This downloads crates and can take several minutes on first build..."
   # Unset target redirection so binaries land where we expect.
   (
     cd "$src" \
       && unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_BUILD_TARGET \
-      && cargo build --release -p "$CLI_PACKAGE"
+      && cargo build --release -p "$CLI_PACKAGE" ${feature_args[@]+"${feature_args[@]}"}
   ) || {
     err "cargo build failed."
     if [ "$NO_RELEASE" -eq 1 ] && [ -z "$LOCAL_CHECKOUT" ]; then
@@ -768,7 +784,7 @@ print_summary() {
       "$(gum style --foreground 245 '  fsnow doctor --json                      # environment diagnostics')" \
       "$(gum style --foreground 245 '  franken-snowflake mcp serve --stdio      # serve over MCP')" \
       "" \
-      "$(gum style --foreground 214 'Live Snowflake use needs the opt-in `live` feature:')" \
+      "$(gum style --foreground 214 'Live Snowflake use needs the opt-in `live` feature (re-run the installer with --live):')" \
       "$(gum style --foreground 245 '  cargo build --release -p franken-snowflake-cli --features live')" \
       "" \
       "$(gum style --foreground 245 "Uninstall:  rm -f $DEST/$BINARY_NAME $DEST/$ALIAS_NAME")"
@@ -788,7 +804,7 @@ print_summary() {
       "  fsnow doctor --json" \
       "  franken-snowflake mcp serve --stdio" \
       "" \
-      "${C_YELLOW}Live Snowflake use needs the opt-in 'live' feature:${RESET}" \
+      "${C_YELLOW}Live Snowflake use needs the opt-in 'live' feature (re-run the installer with --live):${RESET}" \
       "  cargo build --release -p franken-snowflake-cli --features live" \
       "" \
       "Uninstall: rm -f ${DEST}/${BINARY_NAME} ${DEST}/${ALIAS_NAME}"
