@@ -47,7 +47,7 @@ implementation first and the test/hardening pass follows in a later wave. The
 | 2026-06-25 | Hardening wave: MCP serve adapter, optional TUI, redaction and safety fixes across every crate, write-intent ladder types, cross-platform CI |
 | 2026-06-26 | Live proof lanes, opt-in live transport wired into `query run` / `catalog scan` / `profile doctor --online`, and the agent-ergonomics CLI pass (`onboard`, `fsnow` alias) |
 | 2026-06-29 | Hero illustration and GitHub social preview image |
-| 2026-06-29 | Live writes: the write-intent ladder executor; `query write` / `write` alias |
+| 2026-06-29 | Live writes: write-intent ladder executor (frictionless-by-default), `query write`/`write`, default-profile env + installer `--live` |
 
 ---
 
@@ -337,8 +337,17 @@ missing). `write` is a top-level alias for `query write`. Without the `live`
 feature or without credentials the command refuses cleanly and never fakes an
 execution.
 
+A follow-up made writes frictionless by default: once a profile sets
+`WRITE_ENABLED`, a bare `query write` (no `--dry-run`, no `--confirm`) executes
+directly, and the dry-run to confirm ceremony is now opt-in per profile via
+`WRITE_REQUIRE_CONFIRM=true`. A further change added a
+`FRANKEN_SNOWFLAKE_DEFAULT_PROFILE` fallback (so `--profile` is optional) and an
+installer `--live` / `-Live` flag that builds the live-capable binary.
+
 **Representative commits**
 - [`ee54952`](https://github.com/Dicklesworthstone/franken_snowflake/commit/ee54952) Live writes: the write-intent ladder executor (`query write` / `write` alias)
+- [`8c4a860`](https://github.com/Dicklesworthstone/franken_snowflake/commit/8c4a860) Execute writes directly by default once `WRITE_ENABLED`; `WRITE_REQUIRE_CONFIRM` opt-in restores the dry-run to confirm gate
+- [`34f5440`](https://github.com/Dicklesworthstone/franken_snowflake/commit/34f5440) Add `FRANKEN_SNOWFLAKE_DEFAULT_PROFILE` fallback and the installer `--live` flag
 
 **Notes for agents**: the confirmation token only authorizes a re-run of the same
 statement on the same profile, so a plan cannot be replayed against different
