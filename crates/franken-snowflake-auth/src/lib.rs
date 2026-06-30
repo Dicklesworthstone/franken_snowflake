@@ -1939,10 +1939,15 @@ mod tests {
     fn computes_snowflake_public_key_fingerprint() -> Result<(), Box<dyn std::error::Error>> {
         let signer = signer()?;
         let fingerprint = public_key_fingerprint_from_der(signer.public_key_der());
+        let encoded = fingerprint
+            .strip_prefix("SHA256:")
+            .ok_or("fingerprint missing SHA256 prefix")?;
+        let decoded = BASE64_STANDARD.decode(encoded)?;
         assert_eq!(fingerprint, signer.public_key_fingerprint());
+        assert_eq!(decoded.len(), 32);
         assert_eq!(
-            fingerprint,
-            "SHA256:Foko4xUtBlPwCwPWms3QTmlxlZ4/mnroZslhbUJTinM="
+            encoded,
+            BASE64_STANDARD.encode(Sha256::digest(signer.public_key_der()))
         );
         Ok(())
     }

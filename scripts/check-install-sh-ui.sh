@@ -3,15 +3,17 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALLER="$ROOT/install.sh"
+PS_INSTALLER="$ROOT/install.ps1"
 
 bash -n "$INSTALLER"
 
-python3 - "$INSTALLER" <<'PY'
+python3 - "$INSTALLER" "$PS_INSTALLER" <<'PY'
 import sys
 import re
 from pathlib import Path
 
 path = Path(sys.argv[1])
+ps_path = Path(sys.argv[2])
 terminator = re.compile(r"(^|[\s\\])--($|[\s\\])")
 commands = []
 buf = []
@@ -39,6 +41,52 @@ if missing:
     print("gum style calls must pass -- before text arguments:", file=sys.stderr)
     for line in missing:
         print(f"  {line}", file=sys.stderr)
+    sys.exit(1)
+
+shell_text = path.read_text(encoding="utf-8")
+ps_text = ps_path.read_text(encoding="utf-8")
+
+forbidden = [
+    "falls back to BUILD-FROM-SOURCE",
+    "falling back to build-from-source",
+    "All artifact downloads failed",
+    "Versionless artifact failed",
+    "trying latest/download",
+    "No releases yet",
+]
+violations = []
+for needle in forbidden:
+    if needle in shell_text:
+        violations.append(f"install.sh contains forbidden automatic fallback text: {needle}")
+    if needle in ps_text:
+        violations.append(f"install.ps1 contains forbidden automatic fallback text: {needle}")
+
+required_shell = [
+    'TAR="${BINARY_NAME}-v${VERSION_BARE}-${TARGET}.${EXT}"',
+    'TARGET="x86_64-unknown-linux-gnu"',
+    'TARGET="aarch64-unknown-linux-gnu"',
+    'This installer will not build from source automatically.',
+]
+for needle in required_shell:
+    if needle not in shell_text:
+        violations.append(f"install.sh missing required release-binary policy text: {needle}")
+
+required_ps = [
+    '$tar = "$BinaryName-v$($script:VersionBare)-$target.$ext"',
+    'This installer will not build from source automatically.',
+    '$script:FromSourceEffective = [bool]$FromSource',
+]
+for needle in required_ps:
+    if needle not in ps_text:
+        violations.append(f"install.ps1 missing required release-binary policy text: {needle}")
+
+if re.search(r"NO_RELEASE[^\\n]*&&[^\\n]*FROM_SOURCE=1|FROM_SOURCE=1[^\\n]*NO_RELEASE", shell_text):
+    violations.append("install.sh appears to convert missing releases into source builds")
+
+if violations:
+    print("installer release-binary policy checks failed:", file=sys.stderr)
+    for violation in violations:
+        print(f"  {violation}", file=sys.stderr)
     sys.exit(1)
 PY
 
@@ -99,7 +147,7 @@ NO_GUM=0
 QUIET=0
 info "Resolving latest version..."
 ok "Installed alias /tmp/fsnow"
-warn "Primary artifact failed; trying versionless name"
+err "Release artifact not found or download failed: franken-snowflake-v0.0.0-x86_64-unknown-linux-gnu.tar.gz"
 err "cargo build failed."
 
 gum style \
@@ -130,9 +178,8 @@ gum style \
   "$(gum style --foreground 245 -- '  fsnow doctor --json                      # environment diagnostics')" \
   "$(gum style --foreground 245 -- '  franken-snowflake mcp serve --stdio      # serve over MCP')" \
   "" \
-  "$(gum style --foreground 214 -- "Live Snowflake use needs the opt-in \`live\` feature (re-run the installer with --live):")" \
-  "$(gum style --foreground 245 -- '  cargo build --release -p franken-snowflake-cli --features live')" \
-  "" \
+      "$(gum style --foreground 214 -- 'Release binaries include the published live/MCP feature set; credentials are still runtime-gated.')" \
+      "" \
   "$(gum style --foreground 245 -- "Uninstall:  rm -f $DEST/$BINARY_NAME $DEST/$ALIAS_NAME")" \
   >/dev/null
 

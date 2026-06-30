@@ -205,9 +205,9 @@ official drivers do not cover.
 
 ## Installation
 
-Install with the one-liner below, or build from source. Until a tagged release
-ships prebuilt binaries, the installer compiles the CLI from source for you, so a
-Rust toolchain is required.
+Install with the one-liner below, or build from source explicitly. The
+installers download prepared GitHub release binaries by default; they do not
+fall back to cargo builds when a release asset is missing.
 
 ### curl (Linux and macOS)
 
@@ -229,27 +229,30 @@ The installer accepts these flags (pass after `bash -s --` for the curl form):
 | `--dest <dir>` | Install into a chosen directory |
 | `--system` | Install system-wide rather than per-user |
 | `--easy-mode` | Guided, prompt-friendly install for newcomers |
-| `--verify` | Verify checksums and signatures of the downloaded artifact |
-| `--from-source` | Build from source instead of downloading a prebuilt binary |
-| `--live` | Build the CLI with the `live` feature so it can talk to a real Snowflake account |
+| `--verify` | Run a post-install self-test after checksum/signature verification |
+| `--from-source` | Developer-only: build from source instead of downloading a prepared release binary |
+| `--live` | Source-build option: compile the `live` feature when combined with `--from-source` |
 | `--quiet` | Suppress non-error output |
 | `--no-gum` | Plain output with no styled prompts |
 | `--force` | Overwrite an existing install |
 
-Until a release exists, the installer falls back to `--from-source`.
+Release binaries are built with the published live/MCP feature set. Credentials
+are still runtime-gated; the binary refuses live operations cleanly when the
+selected profile or environment does not provide credential handles.
 
-To build the live-capable binary in one shot, pass `--live` through the pipe:
+To build the live-capable binary from source in one shot, pass both
+`--from-source` and `--live` through the pipe:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_snowflake/main/install.sh | bash -s -- --live
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_snowflake/main/install.sh | bash -s -- --from-source --live
 ```
 
 On Windows the `irm ... | iex` one-liner cannot forward arguments, so download
-the script first and invoke it with the matching `-Live` switch:
+the script first and invoke it with the matching source-build switches:
 
 ```powershell
 irm https://raw.githubusercontent.com/Dicklesworthstone/franken_snowflake/main/install.ps1 -OutFile install.ps1
-./install.ps1 -Live
+./install.ps1 -FromSource -Live
 ```
 
 ### From source
@@ -767,9 +770,9 @@ confirmation required, `FSNOW-3009` DDL not opted in) with an exact next command
   build with `--features live` for real Snowflake access. Even then it is gated
   at runtime by credential availability and never substitutes fixture or empty
   data.
-- **Distribution is from source for now.** There is no crates.io package or
-  tagged binary release yet; install via the one-liner (which builds from source)
-  or with `cargo install`. Prebuilt-binary releases arrive with the first tag.
+- **Distribution is binary-first.** The public installers require prepared
+  GitHub release archives for each supported platform. Source builds remain
+  available for developers through `--from-source` or `cargo install`.
 - `query run` accepts exactly one read statement, and `query write` accepts
   exactly one mutating statement; multiple-statement requests are refused.
 - Data writes (DML, COPY INTO, PUT) execute directly once a profile sets

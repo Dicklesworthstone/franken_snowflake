@@ -15,9 +15,10 @@
 #   --version vX.Y.Z   Install a specific released version (default: latest)
 #   --dest DIR         Install into DIR (default: ~/.local/bin)
 #   --system           Install into /usr/local/bin (uses sudo)
-#   --easy-mode        Auto-update PATH in shell rc files (and auto-install Rust if needed)
+#   --easy-mode        Auto-update PATH in shell rc files
 #   --verify           Run a post-install self-test (selftest + capabilities)
-#   --from-source      Build from source with cargo instead of downloading a binary
+#   --from-source      Developer-only: build from source with cargo instead of
+#                      downloading a prepared release binary
 #   --live             Build the CLI with the `live` feature (real Snowflake SQL API
 #                      transport). Applies to every from-source build path.
 #   --offline TARBALL  Install from a local artifact tarball (airgapped, no network)
@@ -30,17 +31,12 @@
 #   --force            Reinstall even if the same version is already present
 #   -h, --help         Show help and exit
 #
-# IMPORTANT — pre-release reality:
-#   There are no tagged GitHub releases yet, so the binary-download tiers below
-#   will 404 today and the installer falls back to BUILD-FROM-SOURCE, which is
-#   the reliable path right now. Build-from-source runs:
-#       cargo build --release -p franken-snowflake-cli
-#   producing BOTH target/release/franken-snowflake and target/release/fsnow.
-#   The DEFAULT build is the no-account slice (no live Snowflake transport). For
-#   real Snowflake use you need the opt-in `live` feature; pass --live to have the
-#   installer build it for you:
-#       cargo build --release -p franken-snowflake-cli --features live
-#   Without --live the installer never enables `live`.
+# Release binaries:
+#   The normal installer path downloads prepared GitHub release archives named:
+#       franken-snowflake-vX.Y.Z-<target-triple>.tar.gz
+#   This installer never builds from source automatically. If no release or no
+#   matching platform archive exists, it fails with the exact missing asset.
+#   --from-source is an explicit developer escape hatch only.
 #
 # Optional MCP surface:
 #   The installed binary can also serve Model Context Protocol so every read
@@ -76,7 +72,7 @@ CHECKSUM_URL="${CHECKSUM_URL:-}"
 LOCK_FILE="/tmp/franken-snowflake-install.lock"
 
 # Filled in later.
-OS=""; ARCH=""; TARGET=""; EXT="tar.xz"
+OS=""; ARCH=""; TARGET=""; EXT="tar.gz"
 VERSION_BARE=""; TAR=""; URL=""
 NO_RELEASE=0            # set when no real release tag could be resolved
 LOCAL_CHECKOUT=""       # set when run inside a franken_snowflake source tree
@@ -204,9 +200,10 @@ Options:
   --version vX.Y.Z   Install a specific released version (default: latest)
   --dest DIR         Install into DIR (default: ~/.local/bin)
   --system           Install into /usr/local/bin (uses sudo)
-  --easy-mode        Auto-update PATH in shell rc files (auto-install Rust if needed)
+  --easy-mode        Auto-update PATH in shell rc files
   --verify           Run a post-install self-test (selftest + capabilities)
-  --from-source      Build from source with cargo instead of downloading a binary
+  --from-source      Developer-only: build from source with cargo instead of
+                     downloading a prepared release binary
   --live             Build the CLI with the 'live' feature (real Snowflake transport)
   --offline TARBALL  Install from a local artifact tarball (airgapped)
   --artifact-url URL Download the artifact from an explicit URL
@@ -219,12 +216,11 @@ Options:
   -h, --help         Show this help and exit
 
 Notes:
-  * No tagged releases exist yet, so the default path builds from source:
-        cargo build --release -p ${CLI_PACKAGE}
-    which produces BOTH ${BINARY_NAME} and ${ALIAS_NAME}.
-  * The default build is the no-account slice. Real Snowflake use needs the
-    opt-in 'live' feature; pass --live to build it:
-        cargo build --release -p ${CLI_PACKAGE} --features live
+  * The default path requires a prepared GitHub release binary and never falls
+    back to cargo. Missing releases or assets are installer errors.
+  * --from-source is explicit developer mode. Without --from-source, --live is
+    ignored because release binaries are already built with the published
+    feature set.
   * MCP server:   ${BINARY_NAME} mcp serve --stdio
 EOFU
 }
@@ -280,16 +276,32 @@ detect_platform() {
   case "$ARCH" in
     x86_64|amd64)  ARCH="x86_64" ;;
     arm64|aarch64) ARCH="aarch64" ;;
-    *) warn "Unknown architecture '$ARCH'; will build from source" ;;
+    *)
+      if [ "$FROM_SOURCE" -eq 1 ] || [ -n "$ARTIFACT_URL" ] || [ -n "$OFFLINE_TARBALL" ]; then
+        warn "Unknown architecture '$ARCH'; continuing because an explicit source/artifact path was requested"
+      else
+        err "Unsupported architecture '$ARCH'. This installer requires a prepared release binary."
+        err "Use --from-source only for an explicit developer build."
+        exit 1
+      fi
+      ;;
   esac
 
   TARGET=""
   case "${OS}-${ARCH}" in
-    linux-x86_64)   TARGET="x86_64-unknown-linux-musl" ;;
-    linux-aarch64)  TARGET="aarch64-unknown-linux-musl" ;;
+    linux-x86_64)   TARGET="x86_64-unknown-linux-gnu" ;;
+    linux-aarch64)  TARGET="aarch64-unknown-linux-gnu" ;;
     darwin-x86_64)  TARGET="x86_64-apple-darwin" ;;
     darwin-aarch64) TARGET="aarch64-apple-darwin" ;;
-    *) warn "No prebuilt target for ${OS}/${ARCH}; will build from source"; FROM_SOURCE=1 ;;
+    *)
+      if [ "$FROM_SOURCE" -eq 1 ] || [ -n "$ARTIFACT_URL" ] || [ -n "$OFFLINE_TARBALL" ]; then
+        warn "No prepared release target for ${OS}/${ARCH}; continuing because an explicit source/artifact path was requested"
+      else
+        err "No prepared release target for ${OS}/${ARCH}."
+        err "Use install.ps1 on Windows, or --from-source only for an explicit developer build."
+        exit 1
+      fi
+      ;;
   esac
 
   if [ "$OS" = "linux" ] && grep -qi microsoft /proc/version 2>/dev/null; then
@@ -297,10 +309,11 @@ detect_platform() {
   fi
 }
 
-# ── Version resolution (GitHub API -> redirect -> raw Cargo.toml -> 0.0.0) ───
+# ── Version resolution (GitHub API -> redirect; source builds may use Cargo.toml) ─
 resolve_version() {
   if [ -n "$VERSION" ]; then
     VERSION_BARE="${VERSION#v}"
+    VERSION="v${VERSION_BARE}"
     return 0
   fi
 
@@ -329,17 +342,24 @@ resolve_version() {
     return 0
   fi
 
-  # No release tag. Read the workspace version from main (cosmetic only) and
-  # steer to build-from-source.
+  # No release tag. Only explicit developer source builds may continue.
   local cb raw cv
   cb=$(date +%s)
   raw="https://raw.githubusercontent.com/${OWNER}/${REPO}/main/Cargo.toml?${cb}"
   cv=$(curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 15 --max-time 45 "$raw" 2>/dev/null \
         | sed -nE 's/^version = "([0-9][^"]*)".*/\1/p' | head -n1 || true)
-  VERSION="${cv:-0.0.0}"
-  VERSION_BARE="${VERSION#v}"
-  NO_RELEASE=1
-  warn "No tagged release found upstream (pre-release). Building from source."
+  if [ "$FROM_SOURCE" -eq 1 ] || [ -n "$ARTIFACT_URL" ] || [ -n "$OFFLINE_TARBALL" ]; then
+    VERSION="${cv:-0.0.0}"
+    VERSION_BARE="${VERSION#v}"
+    NO_RELEASE=1
+    warn "No tagged release found upstream; continuing with explicit source/artifact input."
+    return 0
+  fi
+
+  err "No tagged GitHub release found for ${OWNER}/${REPO}."
+  err "This installer requires prepared release binaries and will not build from source automatically."
+  err "Use --version vX.Y.Z for a specific release, --artifact-url, --offline, or explicit --from-source for developer builds."
+  exit 1
 }
 
 # ── Local checkout detection (build in place when possible) ─────────────────
@@ -579,6 +599,29 @@ extract_archive() {
 }
 
 # ── Build from source ───────────────────────────────────────────────────────
+# Preflight: this pre-release tree path-depends on ~10 sibling FrankenSuite repos
+# by absolute path (none on crates.io yet), so cargo cannot even resolve a fresh
+# external clone. Detect that up front and explain it, rather than letting cargo
+# fail with a cryptic "can't read /dp/asupersync/Cargo.toml" after a delay.
+preflight_frankensuite_deps() {
+  local src="$1" r missing=()
+  local roots
+  roots=$(grep -oE '(/dp|/data/projects)/[A-Za-z0-9_]+' "$src/Cargo.toml" 2>/dev/null | sort -u)
+  for r in $roots; do
+    [ -d "$r" ] || missing+=("$r")
+  done
+  [ "${#missing[@]}" -eq 0 ] && return 0
+  err "franken_snowflake is not yet standalone-buildable."
+  err "Its workspace path-depends on sibling FrankenSuite crates that are not present"
+  err "(this looks like a standalone clone). Missing sibling roots:"
+  for r in "${missing[@]}"; do err "    $r"; done
+  err ""
+  err "Until the FrankenSuite is published to crates.io, build only inside a full"
+  err "FrankenSuite checkout where these siblings exist at their expected paths."
+  err "Sources: https://github.com/Dicklesworthstone/{asupersync,frankensqlite,fastmcp_rust,sqlmodel_rust,toon_rust}"
+  return 1
+}
+
 build_from_source() {
   ensure_cargo
 
@@ -599,11 +642,15 @@ build_from_source() {
     fi
   fi
 
-  # Default build is the no-account slice; --live opts into the real Snowflake
+  # Fail fast and clearly on a standalone external clone, before cargo emits a
+  # cryptic "can't read /dp/asupersync/Cargo.toml" after a delay.
+  preflight_frankensuite_deps "$src" || exit 2
+
+  # Default build omits the live transport; --live opts into the real Snowflake
   # SQL API transport via `--features live`. The guarded array expansion keeps an
   # empty feature list safe under `set -u` on every bash version.
   local feature_args=()
-  local feature_label="default no-account features"
+  local feature_label="default features (no live transport)"
   if [ "$LIVE" -eq 1 ]; then
     feature_args=(--features live)
     feature_label="--features live (real Snowflake transport)"
@@ -675,36 +722,25 @@ install_from_artifact() {
 }
 
 acquire_artifact() {
-  # Decide the artifact name/URL, download with fallbacks, then install.
+  # Decide the artifact name/URL, download it, then install. Missing artifacts
+  # are release errors; the installer never falls back to source builds.
   VERSION_BARE="${VERSION#v}"
   if [ -n "$ARTIFACT_URL" ]; then
     TAR=$(basename "$ARTIFACT_URL"); URL="$ARTIFACT_URL"
   elif [ -n "$TARGET" ]; then
-    TAR="${BINARY_NAME}-${VERSION_BARE}-${TARGET}.${EXT}"
+    TAR="${BINARY_NAME}-v${VERSION_BARE}-${TARGET}.${EXT}"
     URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${TAR}"
   else
-    warn "No prebuilt target; building from source"; FROM_SOURCE=1; return 0
+    err "No prepared release target for ${OS}/${ARCH}."
+    err "Use --from-source only for an explicit developer build."
+    exit 1
   fi
 
   if ! download_with_progress "$URL" "$TMP/$TAR" "Downloading ${BINARY_NAME} ${VERSION}"; then
-    # Tier 2: versionless artifact name.
-    local t2="${BINARY_NAME}-${TARGET}.${EXT}"
-    local u2="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${t2}"
-    warn "Primary artifact failed; trying versionless name"
-    if download_with_progress "$u2" "$TMP/$t2" "Downloading fallback artifact"; then
-      TAR="$t2"; URL="$u2"
-    else
-      # Tier 3: latest/download simple naming.
-      local t3="${BINARY_NAME}-${OS}-${ARCH}.${EXT}"
-      local u3="https://github.com/${OWNER}/${REPO}/releases/latest/download/${t3}"
-      warn "Versionless artifact failed; trying latest/download"
-      if download_with_progress "$u3" "$TMP/$t3" "Downloading latest artifact"; then
-        TAR="$t3"; URL="$u3"
-      else
-        warn "All artifact downloads failed; falling back to build-from-source"
-        FROM_SOURCE=1; return 0
-      fi
-    fi
+    err "Release artifact not found or download failed: ${TAR}"
+    err "Expected URL: ${URL}"
+    err "This installer will not build from source automatically."
+    exit 1
   fi
   install_from_artifact "$TMP/$TAR" "$TAR"
 }
@@ -800,8 +836,7 @@ print_summary() {
       "$(gum style --foreground 245 -- '  fsnow doctor --json                      # environment diagnostics')" \
       "$(gum style --foreground 245 -- '  franken-snowflake mcp serve --stdio      # serve over MCP')" \
       "" \
-      "$(gum style --foreground 214 -- "Live Snowflake use needs the opt-in \`live\` feature (re-run the installer with --live):")" \
-      "$(gum style --foreground 245 -- '  cargo build --release -p franken-snowflake-cli --features live')" \
+      "$(gum style --foreground 214 -- 'Release binaries include the published live/MCP feature set; credentials are still runtime-gated.')" \
       "" \
       "$(gum style --foreground 245 -- "Uninstall:  rm -f $DEST/$BINARY_NAME $DEST/$ALIAS_NAME")"
     echo ""
@@ -820,8 +855,7 @@ print_summary() {
       "  fsnow doctor --json" \
       "  franken-snowflake mcp serve --stdio" \
       "" \
-      "${C_YELLOW}Live Snowflake use needs the opt-in 'live' feature (re-run the installer with --live):${RESET}" \
-      "  cargo build --release -p franken-snowflake-cli --features live" \
+      "${C_YELLOW}Release binaries include the published live/MCP feature set; credentials are still runtime-gated.${RESET}" \
       "" \
       "Uninstall: rm -f ${DEST}/${BINARY_NAME} ${DEST}/${ALIAS_NAME}"
     echo ""
@@ -833,11 +867,6 @@ main() {
   detect_platform
   detect_local_checkout || true
   resolve_version
-
-  # No releases yet (or explicit request) => build from source.
-  if [ "$NO_RELEASE" -eq 1 ] && [ -z "$ARTIFACT_URL" ] && [ -z "$OFFLINE_TARBALL" ]; then
-    FROM_SOURCE=1
-  fi
 
   acquire_lock
   TMP=$(mktemp -d)
@@ -861,8 +890,6 @@ main() {
     build_from_source
   else
     acquire_artifact
-    # acquire_artifact may flip FROM_SOURCE on total download failure.
-    [ "$FROM_SOURCE" -eq 1 ] && build_from_source
   fi
 
   maybe_add_path

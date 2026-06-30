@@ -14,17 +14,12 @@
         irm https://raw.githubusercontent.com/Dicklesworthstone/franken_snowflake/main/install.ps1 -OutFile install.ps1
         ./install.ps1 -EasyMode -Verify
 
-    PRE-RELEASE REALITY:
-        There are no tagged GitHub releases yet, so the prebuilt-binary download
-        tiers will 404 today and the installer falls back to BUILD-FROM-SOURCE,
-        which is the reliable path right now. Build-from-source runs:
-            cargo build --release -p franken-snowflake-cli
-        producing BOTH target\release\franken-snowflake.exe and
-        target\release\fsnow.exe. The DEFAULT build is the no-account slice (no
-        live Snowflake transport). For real Snowflake use you need the opt-in
-        'live' feature; pass -Live to have the installer build it:
-            cargo build --release -p franken-snowflake-cli --features live
-        Without -Live the installer never enables 'live'.
+    Release binaries:
+        The normal installer path downloads prepared GitHub release archives
+        named franken-snowflake-vX.Y.Z-<target-triple>.zip. This installer never
+        builds from source automatically. If no release or no matching platform
+        archive exists, it fails with the exact missing asset. -FromSource is an
+        explicit developer escape hatch only.
 
     The installed binary can also serve Model Context Protocol:
         franken-snowflake mcp serve --stdio
@@ -45,11 +40,13 @@
     Run a post-install self-test (selftest + capabilities) after installing.
 
 .PARAMETER FromSource
-    Build from source with cargo instead of downloading a prebuilt binary.
+    Developer-only: build from source with cargo instead of downloading a
+    prepared release binary.
 
 .PARAMETER Live
     Build the CLI with the 'live' feature (real Snowflake SQL API transport).
-    Applies to every from-source build path. Default builds without 'live'.
+    Applies only to -FromSource. Release binaries already include the published
+    feature set.
 
 .PARAMETER Offline
     Install from a local artifact archive (.zip/.tar.*) instead of downloading.
@@ -85,16 +82,16 @@
     Build franken-snowflake.exe + fsnow.exe from source with cargo.
 
 .EXAMPLE
-    ./install.ps1 -Live
-    Build the live-capable CLI (cargo build --release -p franken-snowflake-cli --features live).
+    ./install.ps1 -FromSource -Live
+    Build the live-capable CLI from source with cargo.
 
 .NOTES
     Passing parameters through the one-liner: the `irm ... | iex` form cannot take
     arguments directly. Download first, then invoke with the switch, e.g.:
         irm https://raw.githubusercontent.com/Dicklesworthstone/franken_snowflake/main/install.ps1 -OutFile install.ps1
-        ./install.ps1 -Live
+        ./install.ps1 -FromSource -Live
     Or wrap it inline:
-        & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Dicklesworthstone/franken_snowflake/main/install.ps1))) -Live
+        & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Dicklesworthstone/franken_snowflake/main/install.ps1))) -FromSource -Live
 #>
 
 [CmdletBinding()]
@@ -187,6 +184,8 @@ function Get-Target {
 function Resolve-Version {
     if ($Version) {
         $script:VersionBare = $Version -replace '^v', ''
+        $script:Version = "v$($script:VersionBare)"
+        $Version = $script:Version
         return
     }
     Write-Info 'Resolving latest version...'
@@ -206,7 +205,7 @@ function Resolve-Version {
         return
     }
 
-    # No release tag: read the workspace version from main (cosmetic) and build from source.
+    # No release tag: only explicit developer source builds may continue.
     $cv = $null
     try {
         $cb = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
@@ -215,12 +214,20 @@ function Resolve-Version {
         $m = [regex]::Match($body.Content, '(?m)^version = "([0-9][^"]*)"')
         if ($m.Success) { $cv = $m.Groups[1].Value }
     } catch { $cv = $null }
-    if (-not $cv) { $cv = '0.0.0' }
-    $script:Version = $cv
-    $Version = $cv
-    $script:VersionBare = $cv -replace '^v', ''
-    $script:NoRelease = $true
-    Write-Warn 'No tagged release found upstream (pre-release). Building from source.'
+    if ($FromSource -or $ArtifactUrl -or $Offline) {
+        if (-not $cv) { $cv = '0.0.0' }
+        $script:Version = $cv
+        $Version = $cv
+        $script:VersionBare = $cv -replace '^v', ''
+        $script:NoRelease = $true
+        Write-Warn 'No tagged release found upstream; continuing with explicit source/artifact input.'
+        return
+    }
+
+    Write-Err "No tagged GitHub release found for $Owner/$Repo."
+    Write-Err 'This installer requires prepared release binaries and will not build from source automatically.'
+    Write-Err 'Use -Version vX.Y.Z for a specific release, -ArtifactUrl, -Offline, or explicit -FromSource for developer builds.'
+    throw 'release not found'
 }
 
 # ── Local checkout detection (build in place when possible) ─────────────────
@@ -408,7 +415,7 @@ function Get-Artifact {
         $tar = Split-Path -Leaf $ArtifactUrl
         $url = $ArtifactUrl
     } else {
-        $tar = "$BinaryName-$($script:VersionBare)-$target.$ext"
+        $tar = "$BinaryName-v$($script:VersionBare)-$target.$ext"
         $url = "https://github.com/$Owner/$Repo/releases/download/$Version/$tar"
     }
 
@@ -416,30 +423,15 @@ function Get-Artifact {
     try {
         Invoke-Download -Url $url -OutFile $out -Label "Downloading $BinaryName $Version"
     } catch {
-        Write-Warn 'Primary artifact failed; trying versionless name'
-        $tar = "$BinaryName-$target.$ext"
-        $url = "https://github.com/$Owner/$Repo/releases/download/$Version/$tar"
-        $out = Join-Path $script:Tmp $tar
-        try {
-            Invoke-Download -Url $url -OutFile $out -Label 'Downloading fallback artifact'
-        } catch {
-            Write-Warn 'Versionless artifact failed; trying latest/download'
-            $tar = "$BinaryName-windows-$target.$ext"
-            $url = "https://github.com/$Owner/$Repo/releases/latest/download/$tar"
-            $out = Join-Path $script:Tmp $tar
-            try {
-                Invoke-Download -Url $url -OutFile $out -Label 'Downloading latest artifact'
-            } catch {
-                Write-Warn 'All artifact downloads failed; falling back to build-from-source'
-                return $false
-            }
-        }
+        Write-Err "Release artifact not found or download failed: $tar"
+        Write-Err "Expected URL: $url"
+        Write-Err 'This installer will not build from source automatically.'
+        throw 'release artifact missing'
     }
     Install-FromArtifact -Archive $out -TarName $tar
     return $true
 }
 
-# ── Build from source ───────────────────────────────────────────────────────
 function Build-FromSource {
     Ensure-Cargo
 
@@ -577,8 +569,7 @@ function Write-Summary {
     Write-Host '    fsnow doctor --json                      # environment diagnostics'
     Write-Host '    franken-snowflake mcp serve --stdio      # serve over MCP'
     Write-Host ''
-    Write-Host '  Live Snowflake use needs the opt-in ''live'' feature (re-run the installer with -Live):' -ForegroundColor Yellow
-    Write-Host '    cargo build --release -p franken-snowflake-cli --features live'
+    Write-Host '  Release binaries include the published live/MCP feature set; credentials are still runtime-gated.' -ForegroundColor Yellow
     Write-Host ''
     Write-Host "  Uninstall: Remove-Item '$Dest\$BinaryName.exe','$Dest\$AliasName.exe'"
     Write-Host ''
@@ -589,11 +580,7 @@ function Invoke-Main {
     Write-Header
     Resolve-Version
 
-    if ($script:NoRelease -and -not $ArtifactUrl -and -not $Offline) {
-        $script:FromSourceEffective = $true
-    } else {
-        $script:FromSourceEffective = [bool]$FromSource
-    }
+    $script:FromSourceEffective = [bool]$FromSource
 
     $script:Tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("fsnow-install-" + [System.Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $script:Tmp -Force | Out-Null
@@ -617,10 +604,7 @@ function Invoke-Main {
             $mode = 'source build'
             Build-FromSource
         } else {
-            if (-not (Get-Artifact)) {
-                $mode = 'source build'
-                Build-FromSource
-            }
+            Get-Artifact | Out-Null
         }
 
         Update-Path
