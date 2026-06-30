@@ -432,6 +432,25 @@ function Get-Artifact {
     return $true
 }
 
+function Test-FrankenSuiteDeps {
+    param([string]$Src)
+    # This pre-release tree path-depends on ~10 sibling FrankenSuite repos by
+    # absolute path (none on crates.io yet); cargo cannot resolve a standalone clone.
+    $cargoToml = Join-Path $Src 'Cargo.toml'
+    $missing = @()
+    if (Test-Path $cargoToml) {
+        $roots = (Select-String -Path $cargoToml -Pattern '(/dp|/data/projects)/[A-Za-z0-9_]+' -AllMatches).Matches.Value | Sort-Object -Unique
+        foreach ($r in $roots) { if (-not (Test-Path $r)) { $missing += $r } }
+    }
+    if ($missing.Count -eq 0) { return $true }
+    Write-Err 'franken_snowflake is not yet standalone-buildable.'
+    Write-Err 'Its workspace path-depends on sibling FrankenSuite crates that are not present (standalone clone). Missing sibling roots:'
+    foreach ($r in $missing) { Write-Err "    $r" }
+    Write-Err 'Until the FrankenSuite is published to crates.io, build only inside a full FrankenSuite checkout where these siblings exist at their expected paths.'
+    Write-Err 'Sources: https://github.com/Dicklesworthstone/{asupersync,frankensqlite,fastmcp_rust,sqlmodel_rust,toon_rust}'
+    return $false
+}
+
 function Build-FromSource {
     Ensure-Cargo
 
@@ -452,10 +471,14 @@ function Build-FromSource {
         if ($LASTEXITCODE -ne 0) { throw 'git clone failed' }
     }
 
-    # Default build is the no-account slice; -Live opts into the real Snowflake
+    # Fail fast and clearly on a standalone external clone, before cargo emits a
+    # cryptic Cargo.toml path error.
+    if (-not (Test-FrankenSuiteDeps $src)) { exit 2 }
+
+    # Default build omits the live transport; -Live opts into the real Snowflake
     # SQL API transport via the 'live' cargo feature.
     $cargoArgs = @('build', '--release', '-p', $CliPackage)
-    $featureLabel = 'default no-account features'
+    $featureLabel = 'default features (no live transport)'
     if ($Live) {
         $cargoArgs += @('--features', 'live')
         $featureLabel = '--features live (real Snowflake transport)'
