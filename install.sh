@@ -599,29 +599,6 @@ extract_archive() {
 }
 
 # ── Build from source ───────────────────────────────────────────────────────
-# Preflight: this pre-release tree path-depends on ~10 sibling FrankenSuite repos
-# by absolute path (none on crates.io yet), so cargo cannot even resolve a fresh
-# external clone. Detect that up front and explain it, rather than letting cargo
-# fail with a cryptic "can't read /dp/asupersync/Cargo.toml" after a delay.
-preflight_frankensuite_deps() {
-  local src="$1" r missing=()
-  local roots
-  roots=$(grep -oE '(/dp|/data/projects)/[A-Za-z0-9_]+' "$src/Cargo.toml" 2>/dev/null | sort -u)
-  for r in $roots; do
-    [ -d "$r" ] || missing+=("$r")
-  done
-  [ "${#missing[@]}" -eq 0 ] && return 0
-  err "franken_snowflake is not yet standalone-buildable."
-  err "Its workspace path-depends on sibling FrankenSuite crates that are not present"
-  err "(this looks like a standalone clone). Missing sibling roots:"
-  for r in "${missing[@]}"; do err "    $r"; done
-  err ""
-  err "Until the FrankenSuite is published to crates.io, build only inside a full"
-  err "FrankenSuite checkout where these siblings exist at their expected paths."
-  err "Sources: https://github.com/Dicklesworthstone/{asupersync,frankensqlite,fastmcp_rust,sqlmodel_rust,toon_rust}"
-  return 1
-}
-
 build_from_source() {
   ensure_cargo
 
@@ -641,10 +618,6 @@ build_from_source() {
       git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$src"
     fi
   fi
-
-  # Fail fast and clearly on a standalone external clone, before cargo emits a
-  # cryptic "can't read /dp/asupersync/Cargo.toml" after a delay.
-  preflight_frankensuite_deps "$src" || exit 2
 
   # Default build omits the live transport; --live opts into the real Snowflake
   # SQL API transport via `--features live`. The guarded array expansion keeps an

@@ -247,14 +247,8 @@ To build the live-capable binary from source in one shot, pass both
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_snowflake/main/install.sh | bash -s -- --from-source --live
 ```
 
-> **No tagged release exists yet,** so the default one-liner reports that no
-> release is available; it never silently falls back to a cargo build.
-> `--from-source` currently builds only inside a full FrankenSuite checkout: the
-> workspace path-depends on sibling crates (asupersync, frankensqlite,
-> fastmcp_rust, and others) at fixed local paths, so a standalone external clone
-> cannot build until the FrankenSuite is published to crates.io. The installer
-> detects a standalone clone and explains this instead of failing on a cryptic
-> cargo error.
+> `--from-source` builds from a fresh standalone clone: the FrankenSuite
+> dependencies resolve from crates.io, so no local sibling checkout is required.
 
 On Windows the `irm ... | iex` one-liner cannot forward arguments, so download
 the script first and invoke it with the matching source-build switches:
@@ -779,15 +773,11 @@ confirmation required, `FSNOW-3009` DDL not opted in) with an exact next command
   build with `--features live` for real Snowflake access. Even then it is gated
   at runtime by credential availability and never substitutes fixture or empty
   data.
-- **Distribution is binary-first, and no release is tagged yet.** The public
-  installers download prepared GitHub release archives and never auto-fall-back
-  to a cargo build; until the first release is tagged, the default install
-  reports that no release is available. A `--from-source` build currently
-  requires a full FrankenSuite checkout, because the workspace path-depends on
-  sibling crates (asupersync, frankensqlite, fastmcp_rust, and others) at fixed
-  local paths; a standalone external clone cannot build until the FrankenSuite is
-  published to crates.io. The installer detects that case and explains it rather
-  than failing cryptically.
+- **Distribution is binary-first; source builds resolve from crates.io.** The
+  public installers download prepared GitHub release archives by default. A
+  `--from-source` build works from a fresh standalone clone: the FrankenSuite
+  dependencies (asupersync, frankensqlite, fastmcp_rust, sqlmodel, and others)
+  resolve from crates.io, so no local sibling checkout is required.
 - `query run` accepts exactly one read statement, and `query write` accepts
   exactly one mutating statement; multiple-statement requests are refused.
 - Data writes (DML, COPY INTO, PUT) execute directly once a profile sets
