@@ -104,7 +104,7 @@ log() { [ "$QUIET" -eq 1 ] && return 0; echo -e "$@"; }
 info() {
   [ "$QUIET" -eq 1 ] && return 0
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 39 "-> $*"
+    gum style --foreground 39 -- "-> $*"
   else
     echo -e "${C_BLUE}->${RESET} $*"
   fi
@@ -113,7 +113,7 @@ info() {
 ok() {
   [ "$QUIET" -eq 1 ] && return 0
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 42 "OK $*"
+    gum style --foreground 42 -- "OK $*"
   else
     echo -e "${C_GREEN}OK${RESET} $*"
   fi
@@ -121,7 +121,7 @@ ok() {
 
 warn() {
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 214 "!  $*"
+    gum style --foreground 214 -- "!  $*"
   else
     echo -e "${C_YELLOW}!${RESET}  $*"
   fi
@@ -129,7 +129,7 @@ warn() {
 
 err() {
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 196 "x  $*"
+    gum style --foreground 196 -- "x  $*"
   else
     echo -e "${C_RED}x${RESET}  $*"
   fi
@@ -260,8 +260,9 @@ if [ "$QUIET" -eq 0 ]; then
     gum style \
       --border rounded --border-foreground 39 \
       --padding "0 2" --margin "1 0" \
-      "$(gum style --foreground 42 --bold 'franken-snowflake installer')" \
-      "$(gum style --foreground 245 'Clean-room, Asupersync-native Snowflake SQL API CLI for agents')"
+      -- \
+      "$(gum style --foreground 42 --bold -- 'franken-snowflake installer')" \
+      "$(gum style --foreground 245 -- 'Clean-room, Asupersync-native Snowflake SQL API CLI for agents')"
   else
     echo ""
     draw_box "$C_CYAN" \
@@ -527,11 +528,19 @@ verify_checksum() {
   fi
 
   if command -v sha256sum >/dev/null 2>&1; then
-    echo "${CHECKSUM}  ${file}" | sha256sum -c - >/dev/null 2>&1 \
-      && { ok "Checksum verified"; return 0; } || { err "Checksum mismatch for ${tarname}"; exit 1; }
+    if echo "${CHECKSUM}  ${file}" | sha256sum -c - >/dev/null 2>&1; then
+      ok "Checksum verified"
+      return 0
+    fi
+    err "Checksum mismatch for ${tarname}"
+    exit 1
   elif command -v shasum >/dev/null 2>&1; then
-    echo "${CHECKSUM}  ${file}" | shasum -a 256 -c - >/dev/null 2>&1 \
-      && { ok "Checksum verified"; return 0; } || { err "Checksum mismatch for ${tarname}"; exit 1; }
+    if echo "${CHECKSUM}  ${file}" | shasum -a 256 -c - >/dev/null 2>&1; then
+      ok "Checksum verified"
+      return 0
+    fi
+    err "Checksum mismatch for ${tarname}"
+    exit 1
   else
     warn "Neither sha256sum nor shasum found; skipping checksum verification"
   fi
@@ -623,7 +632,10 @@ build_from_source() {
   if [ ! -x "$bin" ]; then
     bin=$(find "$src/target" -maxdepth 4 -type f -name "$BINARY_NAME" -perm -111 2>/dev/null | head -n1 || true)
   fi
-  [ -n "$bin" ] && [ -x "$bin" ] || { err "Build succeeded but ${BINARY_NAME} not found under $rel"; exit 1; }
+  if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+    err "Build succeeded but ${BINARY_NAME} not found under $rel"
+    exit 1
+  fi
 
   install_file "$bin" "$BINARY_NAME"
   ok "Installed ${DEST}/${BINARY_NAME} (source build)"
@@ -652,7 +664,10 @@ install_from_artifact() {
   if [ ! -x "$bin" ]; then
     bin=$(find "$TMP" -maxdepth 4 -type f -name "$BINARY_NAME" -perm -111 2>/dev/null | head -n1 || true)
   fi
-  [ -n "$bin" ] && [ -x "$bin" ] || { err "Binary ${BINARY_NAME} not found in archive"; exit 1; }
+  if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+    err "Binary ${BINARY_NAME} not found in archive"
+    exit 1
+  fi
 
   install_file "$bin" "$BINARY_NAME"
   ok "Installed ${DEST}/${BINARY_NAME}"
@@ -772,22 +787,23 @@ print_summary() {
     echo ""
     gum style \
       --border rounded --border-foreground 42 --padding "0 2" --margin "0" \
-      "$(gum style --foreground 42 --bold 'Installation complete')" \
+      -- \
+      "$(gum style --foreground 42 --bold -- 'Installation complete')" \
       "" \
-      "$(gum style --foreground 245 "Binary:  $(gum style --bold "$DEST/$BINARY_NAME")")" \
-      "$(gum style --foreground 245 "Alias:   $(gum style --bold "$DEST/$ALIAS_NAME")")" \
-      "$(gum style --foreground 245 "Version: $(gum style --bold "$VERSION") ($mode)")" \
+      "$(gum style --foreground 245 -- "Binary:  $(gum style --bold -- "$DEST/$BINARY_NAME")")" \
+      "$(gum style --foreground 245 -- "Alias:   $(gum style --bold -- "$DEST/$ALIAS_NAME")")" \
+      "$(gum style --foreground 245 -- "Version: $(gum style --bold -- "$VERSION") ($mode)")" \
       "" \
-      "$(gum style --foreground 39 --bold 'Quick start:')" \
-      "$(gum style --foreground 245 '  franken-snowflake capabilities --json    # self-describing capability list')" \
-      "$(gum style --foreground 245 '  franken-snowflake agent-handbook         # embedded handbook')" \
-      "$(gum style --foreground 245 '  fsnow doctor --json                      # environment diagnostics')" \
-      "$(gum style --foreground 245 '  franken-snowflake mcp serve --stdio      # serve over MCP')" \
+      "$(gum style --foreground 39 --bold -- 'Quick start:')" \
+      "$(gum style --foreground 245 -- '  franken-snowflake capabilities --json    # self-describing capability list')" \
+      "$(gum style --foreground 245 -- '  franken-snowflake agent-handbook         # embedded handbook')" \
+      "$(gum style --foreground 245 -- '  fsnow doctor --json                      # environment diagnostics')" \
+      "$(gum style --foreground 245 -- '  franken-snowflake mcp serve --stdio      # serve over MCP')" \
       "" \
-      "$(gum style --foreground 214 'Live Snowflake use needs the opt-in `live` feature (re-run the installer with --live):')" \
-      "$(gum style --foreground 245 '  cargo build --release -p franken-snowflake-cli --features live')" \
+      "$(gum style --foreground 214 -- "Live Snowflake use needs the opt-in \`live\` feature (re-run the installer with --live):")" \
+      "$(gum style --foreground 245 -- '  cargo build --release -p franken-snowflake-cli --features live')" \
       "" \
-      "$(gum style --foreground 245 "Uninstall:  rm -f $DEST/$BINARY_NAME $DEST/$ALIAS_NAME")"
+      "$(gum style --foreground 245 -- "Uninstall:  rm -f $DEST/$BINARY_NAME $DEST/$ALIAS_NAME")"
     echo ""
   else
     echo ""

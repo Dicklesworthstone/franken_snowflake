@@ -58,6 +58,10 @@ jobs:
       - name: Assert LF-only golden fixtures
         run: python scripts/check-golden-lf.py
 
+      - name: Assert installer shell UI safety
+        if: runner.os != 'Windows'
+        run: bash scripts/check-install-sh-ui.sh
+
       - name: Run deterministic mock e2e harness
         run: cargo test --locked -p franken-snowflake-testkit --test e2e_harness
 
