@@ -195,4 +195,4 @@ fnx-views = { path = "/dp/franken_networkx/crates/fnx-views" }
 
 # The TOON implementation's package is `tru`; it exposes the `toon` library and
 # binary names used by the public CLI contract.
-tru = { path = "/data/projects/toon_rust" }
+tru = { path = "/dp/toon_rust" }
