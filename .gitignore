@@ -49,6 +49,12 @@ perf.data.old
 # Snapshots from the fixing-beads-problems skill (kept locally, never committed):
 .beads/recovery*/
 
+# Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
+/beads_compliance_audit/
+
+# Agent-ergonomics audit workspace (local; gitignored to avoid polluting the live swarm)
+/agent_ergonomics_audit/
+
 # ── Editor / IDE ──────────────────────────────────────────────────────
 .idea/
 .vscode/
