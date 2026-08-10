@@ -98,6 +98,8 @@ enum Command {
     QueryRun {
         profile: Option<String>,
         sql: Option<String>,
+        bindings_env: Option<String>,
+        query_tag: Option<String>,
     },
     QueryWrite {
         profile: Option<String>,
@@ -344,7 +346,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "query.run",
-        invocation: "franken-snowflake query [run] --profile <profile> --sql <sql> --json",
+        invocation: "franken-snowflake query [run] --profile <profile> --sql <sql> [--bindings-env <env-var>] [--query-tag <tag>] --json",
         output_contract_id: "fsnow.query.run.v1",
         description: "Submit a SQL API statement; `query --sql` shorthand maps to this surface.",
         read_only: true,
@@ -781,6 +783,8 @@ fn parse_query(args: &[String], output: OutputFormat) -> Result<Command, Outcome
             Ok(Command::QueryRun {
                 profile: resolve_profile(value_after(args, "--profile")),
                 sql: raw_value_after(args, "--sql"),
+                bindings_env: value_after(args, "--bindings-env"),
+                query_tag: value_after(args, "--query-tag"),
             })
         }
         Some("plan") => Ok(Command::QueryPlan {
@@ -790,6 +794,8 @@ fn parse_query(args: &[String], output: OutputFormat) -> Result<Command, Outcome
         Some("run") => Ok(Command::QueryRun {
             profile: resolve_profile(value_after(args, "--profile")),
             sql: raw_value_after(args, "--sql"),
+            bindings_env: value_after(args, "--bindings-env"),
+            query_tag: value_after(args, "--query-tag"),
         }),
         Some("write") => Ok(Command::QueryWrite {
             profile: resolve_profile(value_after(args, "--profile")),
@@ -1055,9 +1061,19 @@ fn dispatch(invocation: Invocation) -> Outcome {
         Command::QueryPlan { profile, sql } => {
             query_plan_outcome(invocation.output, request_id, profile, sql)
         }
-        Command::QueryRun { profile, sql } => {
-            query_run_outcome(invocation.output, request_id, profile, sql)
-        }
+        Command::QueryRun {
+            profile,
+            sql,
+            bindings_env,
+            query_tag,
+        } => query_run_outcome(
+            invocation.output,
+            request_id,
+            profile,
+            sql,
+            bindings_env,
+            query_tag,
+        ),
         Command::QueryWrite {
             profile,
             sql,
@@ -2592,6 +2608,8 @@ fn query_run_outcome(
     request_id: String,
     profile: Option<String>,
     sql: Option<String>,
+    bindings_env: Option<String>,
+    query_tag: Option<String>,
 ) -> Outcome {
     if profile.is_none() {
         return usage_error(
@@ -2650,7 +2668,14 @@ fn query_run_outcome(
     // default no-account build refuses cleanly. Split into cfg-gated helpers so the
     // tail stays a single unambiguous expression (no cfg-block-as-tail, no
     // needless_return under the `-D warnings` clippy gate).
-    query_run_dispatch(format, request_id, profile, &sql_text)
+    query_run_dispatch(
+        format,
+        request_id,
+        profile,
+        &sql_text,
+        bindings_env.as_deref(),
+        query_tag.as_deref(),
+    )
 }
 
 /// Live build: drive the real SQL API transport. The profile presence was checked
@@ -2661,8 +2686,17 @@ fn query_run_dispatch(
     request_id: String,
     profile: Option<String>,
     sql_text: &str,
+    bindings_env: Option<&str>,
+    query_tag: Option<&str>,
 ) -> Outcome {
-    live::run_query_outcome(format, request_id, profile.unwrap_or_default(), sql_text)
+    live::run_query_outcome(
+        format,
+        request_id,
+        profile.unwrap_or_default(),
+        sql_text,
+        bindings_env,
+        query_tag,
+    )
 }
 
 /// Default (no-account) build: the transport is intentionally not linked, so
@@ -2673,6 +2707,8 @@ fn query_run_dispatch(
     request_id: String,
     profile: Option<String>,
     _sql_text: &str,
+    _bindings_env: Option<&str>,
+    _query_tag: Option<&str>,
 ) -> Outcome {
     live_transport_required_with_data(
         format,
@@ -3452,6 +3488,7 @@ fn missing_flag_value_outcome(output: OutputFormat, flag_name: &str) -> Outcome 
 fn known_flags() -> Vec<&'static str> {
     vec![
         "--as-of",
+        "--bindings-env",
         "--confirm",
         "--database",
         "--dataset",
@@ -3467,6 +3504,7 @@ fn known_flags() -> Vec<&'static str> {
         "--no-color",
         "--online",
         "--profile",
+        "--query-tag",
         "--role",
         "--schema",
         "--sql",
@@ -3488,6 +3526,7 @@ fn flag_requires_value(flag: &str) -> bool {
     matches!(
         flag,
         "--as-of"
+            | "--bindings-env"
             | "--confirm"
             | "--database"
             | "--dataset"
@@ -3495,6 +3534,7 @@ fn flag_requires_value(flag: &str) -> bool {
             | "--from"
             | "--limit"
             | "--profile"
+            | "--query-tag"
             | "--role"
             | "--schema"
             | "--sql"
@@ -4809,6 +4849,35 @@ mod tests {
         };
         assert!(rendered.contains("\"command_id\":\"query.run\""));
         assert!(rendered.contains("sql_accepted_by_local_safety_check"));
+    }
+
+    #[test]
+    fn query_run_parses_binding_env_and_query_tag_without_exposing_values() {
+        let invocation = parse_invocation(vec![
+            "query".to_owned(),
+            "run".to_owned(),
+            "--profile".to_owned(),
+            "integration".to_owned(),
+            "--sql".to_owned(),
+            "select ?".to_owned(),
+            "--bindings-env".to_owned(),
+            "HFDT_TYPED_BINDINGS_JSON".to_owned(),
+            "--query-tag".to_owned(),
+            "hfdt.trace.123".to_owned(),
+        ])
+        .expect("query run flags should parse");
+
+        match invocation.command {
+            Command::QueryRun {
+                bindings_env,
+                query_tag,
+                ..
+            } => {
+                assert_eq!(bindings_env.as_deref(), Some("HFDT_TYPED_BINDINGS_JSON"));
+                assert_eq!(query_tag.as_deref(), Some("hfdt.trace.123"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     // Live build, credential-less profile: `query` shorthand still maps to the run

@@ -40,6 +40,7 @@ live = [
     "dep:franken-snowflake-http",
     "dep:franken-snowflake-auth",
     "dep:asupersync",
+    "dep:serde_json",
 ]
 
 [dependencies]
@@ -49,4 +50,5 @@ franken-snowflake-sqlapi = { path = "../franken-snowflake-sqlapi", optional = tr
 franken-snowflake-http = { path = "../franken-snowflake-http", optional = true }
 franken-snowflake-auth = { path = "../franken-snowflake-auth", optional = true }
 asupersync = { workspace = true, optional = true }
+serde_json = { version = "1", optional = true }
 toon = { package = "tru", version = "0.2.3", default-features = false, optional = true }

@@ -37,7 +37,7 @@ use franken_snowflake_http::{
 };
 use franken_snowflake_sqlapi::driver::run_statement;
 use franken_snowflake_sqlapi::lifecycle::{CompletedStatement, PollPlan};
-use franken_snowflake_sqlapi::request::{SubmitQueryParams, SubmitStatementRequest};
+use franken_snowflake_sqlapi::request::{Binding, SubmitQueryParams, SubmitStatementRequest};
 
 use crate::{Body, Json, OutputFormat, base_envelope, error_info, json_array, json_object, json_string};
 
@@ -51,6 +51,18 @@ const ROW_EMIT_CAP: usize = 1000;
 /// Upper bound on tables listed by one `catalog scan` (pushed down as a SQL
 /// `LIMIT`, so an unbounded schema never floods the result).
 const CATALOG_SCAN_LIMIT: usize = 10_000;
+/// Keep caller-supplied bind payloads bounded before parsing or transport.
+const MAX_BINDINGS_JSON_BYTES: usize = 1_048_576;
+/// The connector materializes at most this many positional binds in one request.
+const MAX_BINDING_COUNT: usize = 1_000;
+/// Snowflake documents QUERY_TAG as a bounded session string.
+const MAX_QUERY_TAG_BYTES: usize = 2_000;
+
+#[derive(Default)]
+struct QueryRequestOptions {
+    bindings: Option<BTreeMap<String, Binding>>,
+    query_tag: Option<String>,
+}
 
 /// A column's name/type/nullability, projected from the result-set metadata.
 struct LiveColumn {
@@ -76,12 +88,32 @@ pub fn run_query_outcome(
     request_id: String,
     profile: String,
     sql: &str,
+    bindings_env: Option<&str>,
+    query_tag: Option<&str>,
 ) -> crate::Outcome {
-    match execute(&profile, sql, None, None) {
-        Ok(rows) => query_success(format, request_id, profile, &rows),
+    let options = match query_request_options(bindings_env, query_tag) {
+        Ok(options) => options,
         Err(error) => {
-            failure_outcome(format, "query.run", "fsnow.query.run.v1", request_id, profile, &error)
+            return failure_outcome(
+                format,
+                "query.run",
+                "fsnow.query.run.v1",
+                request_id,
+                profile,
+                &error,
+            );
         }
+    };
+    match execute(&profile, sql, None, None, options) {
+        Ok(rows) => query_success(format, request_id, profile, &rows),
+        Err(error) => failure_outcome(
+            format,
+            "query.run",
+            "fsnow.query.run.v1",
+            request_id,
+            profile,
+            &error,
+        ),
     }
 }
 
@@ -117,7 +149,13 @@ pub fn run_write_outcome(
     profile: String,
     write: &AuthorizedWrite<'_>,
 ) -> crate::Outcome {
-    match execute(&profile, write.sql, write.database.as_deref(), write.schema.as_deref()) {
+    match execute(
+        &profile,
+        write.sql,
+        write.database.as_deref(),
+        write.schema.as_deref(),
+        QueryRequestOptions::default(),
+    ) {
         Ok(rows) => write_success(format, request_id, profile, write, &rows),
         Err(error) => failure_outcome(
             format,
@@ -294,7 +332,13 @@ pub fn run_catalog_scan_outcome(
          ORDER BY TABLE_SCHEMA, TABLE_NAME \
          LIMIT {CATALOG_SCAN_LIMIT}"
     );
-    match execute(&profile, &sql, Some(&database), Some(&schema)) {
+    match execute(
+        &profile,
+        &sql,
+        Some(&database),
+        Some(&schema),
+        QueryRequestOptions::default(),
+    ) {
         Ok(rows) => rows_success(
             format,
             request_id,
@@ -388,7 +432,13 @@ pub fn run_catalog_graph_outcome(
          ORDER BY TABLE_SCHEMA, TABLE_NAME \
          LIMIT {CATALOG_SCAN_LIMIT}"
     );
-    let rows = match execute(&profile, &sql, Some(&database), schema.as_deref()) {
+    let rows = match execute(
+        &profile,
+        &sql,
+        Some(&database),
+        schema.as_deref(),
+        QueryRequestOptions::default(),
+    ) {
         Ok(rows) => rows,
         Err(error) => {
             return failure_outcome(
@@ -624,7 +674,13 @@ pub fn profile_doctor_online_outcome(
     profile: String,
 ) -> crate::Outcome {
     const PROBE_SQL: &str = "SELECT CURRENT_VERSION() AS SNOWFLAKE_VERSION";
-    match execute(&profile, PROBE_SQL, None, None) {
+    match execute(
+        &profile,
+        PROBE_SQL,
+        None,
+        None,
+        QueryRequestOptions::default(),
+    ) {
         Ok(rows) => {
             let version = rows
                 .rows
@@ -695,6 +751,7 @@ fn execute(
     sql: &str,
     database: Option<&str>,
     schema: Option<&str>,
+    options: QueryRequestOptions,
 ) -> Result<LiveRows, SnowflakeError> {
     let conn = LiveConn::resolve(profile, database, schema)?;
     let runtime = RuntimeBuilder::current_thread().build().map_err(|error| {
@@ -719,7 +776,7 @@ fn execute(
                 SnowflakeError::new(SnowflakeErrorCode::CredentialMissing, error.to_string())
             })?;
         let auth = authorization_descriptor(&mut mechanism)?;
-        let request = build_request(&conn, sql);
+        let request = build_request(&conn, sql, options);
         let params = SubmitQueryParams {
             request_id: Some(unique_request_id()),
             retry: true,
@@ -877,7 +934,11 @@ fn build_auth_profile(prefix: &str, lane: &str) -> Result<AuthProfile, Snowflake
     }
 }
 
-fn build_request(conn: &LiveConn, sql: &str) -> SubmitStatementRequest {
+fn build_request(
+    conn: &LiveConn,
+    sql: &str,
+    options: QueryRequestOptions,
+) -> SubmitStatementRequest {
     let mut request = SubmitStatementRequest::new(sql);
     request.timeout = Some(REQUEST_TIMEOUT_SECONDS);
     request.warehouse = Some(WarehouseName::new(conn.warehouse.clone()));
@@ -885,7 +946,132 @@ fn build_request(conn: &LiveConn, sql: &str) -> SubmitStatementRequest {
     request.schema = conn.schema.clone().map(SchemaName::new);
     request.role = conn.role.clone().map(RoleName::new);
     request.parameters = Some(deterministic_session_parameters());
+    apply_query_request_options(&mut request, options);
     request
+}
+
+fn apply_query_request_options(request: &mut SubmitStatementRequest, options: QueryRequestOptions) {
+    request.bindings = options.bindings;
+    if let Some(query_tag) = options.query_tag {
+        request
+            .parameters
+            .get_or_insert_with(BTreeMap::new)
+            .insert("QUERY_TAG".to_owned(), query_tag);
+    }
+}
+
+fn query_request_options(
+    bindings_env: Option<&str>,
+    query_tag: Option<&str>,
+) -> Result<QueryRequestOptions, SnowflakeError> {
+    let bindings = bindings_env.map(parse_bindings_env).transpose()?;
+    let query_tag = query_tag.map(validate_query_tag).transpose()?;
+    Ok(QueryRequestOptions {
+        bindings,
+        query_tag,
+    })
+}
+
+fn parse_bindings_env(env_name: &str) -> Result<BTreeMap<String, Binding>, SnowflakeError> {
+    if !is_safe_env_name(env_name) {
+        return Err(SnowflakeError::new(
+            SnowflakeErrorCode::UsageError,
+            "--bindings-env must name a 1-128 byte ASCII environment variable",
+        ));
+    }
+    let encoded = std::env::var(env_name).map_err(|_| {
+        SnowflakeError::new(
+            SnowflakeErrorCode::UsageError,
+            format!("bindings environment variable `{env_name}` is unset or unreadable"),
+        )
+    })?;
+    if encoded.len() > MAX_BINDINGS_JSON_BYTES {
+        return Err(SnowflakeError::new(
+            SnowflakeErrorCode::UsageError,
+            format!("bindings payload exceeds {MAX_BINDINGS_JSON_BYTES} bytes"),
+        ));
+    }
+    let bindings =
+        serde_json::from_str::<BTreeMap<String, Binding>>(&encoded).map_err(|error| {
+            SnowflakeError::new(
+                SnowflakeErrorCode::UsageError,
+                format!("bindings payload is not a typed positional binding object: {error}"),
+            )
+        })?;
+    validate_bindings(&bindings)?;
+    Ok(bindings)
+}
+
+fn validate_bindings(bindings: &BTreeMap<String, Binding>) -> Result<(), SnowflakeError> {
+    if bindings.is_empty() || bindings.len() > MAX_BINDING_COUNT {
+        return Err(SnowflakeError::new(
+            SnowflakeErrorCode::UsageError,
+            format!("bindings must contain 1..={MAX_BINDING_COUNT} positional values"),
+        ));
+    }
+    let mut positions = bindings
+        .keys()
+        .map(|key| {
+            key.parse::<usize>().map_err(|_| {
+                SnowflakeError::new(
+                    SnowflakeErrorCode::UsageError,
+                    "binding keys must be 1-based decimal positions",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    positions.sort_unstable();
+    if positions.iter().copied().ne(1..=bindings.len()) {
+        return Err(SnowflakeError::new(
+            SnowflakeErrorCode::UsageError,
+            "binding keys must be contiguous 1-based positions",
+        ));
+    }
+    if bindings
+        .values()
+        .any(|binding| !is_safe_binding_type(&binding.value_type))
+    {
+        return Err(SnowflakeError::new(
+            SnowflakeErrorCode::UsageError,
+            "binding type names must be uppercase Snowflake type tokens",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_query_tag(query_tag: &str) -> Result<String, SnowflakeError> {
+    if query_tag.is_empty()
+        || query_tag.len() > MAX_QUERY_TAG_BYTES
+        || query_tag.chars().any(char::is_control)
+    {
+        return Err(SnowflakeError::new(
+            SnowflakeErrorCode::UsageError,
+            format!(
+                "--query-tag must be 1..={MAX_QUERY_TAG_BYTES} bytes without control characters"
+            ),
+        ));
+    }
+    Ok(query_tag.to_owned())
+}
+
+fn is_safe_env_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    value.len() <= 128
+        && (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn is_safe_binding_type(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    value.len() <= 64
+        && first.is_ascii_uppercase()
+        && chars.all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
 }
 
 fn authorization_descriptor(
@@ -1190,4 +1376,60 @@ fn unique_request_id() -> String {
         (nanos & 0xffff_ffff) as u32,
         (nanos >> 16) & 0xffff_ffff_ffff
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_options_reach_the_sql_api_request() {
+        let bindings = BTreeMap::from([
+            ("1".to_owned(), Binding::new("TEXT", "provider-derived")),
+            ("2".to_owned(), Binding::new("FIXED", "42")),
+        ]);
+        let mut request = SubmitStatementRequest::new("SELECT ? WHERE ? = 42");
+        request.parameters = Some(deterministic_session_parameters());
+
+        apply_query_request_options(
+            &mut request,
+            QueryRequestOptions {
+                bindings: Some(bindings.clone()),
+                query_tag: Some("hfdt.trace.123".to_owned()),
+            },
+        );
+
+        assert_eq!(request.bindings, Some(bindings));
+        assert_eq!(
+            request
+                .parameters
+                .as_ref()
+                .and_then(|parameters| parameters.get("QUERY_TAG"))
+                .map(String::as_str),
+            Some("hfdt.trace.123")
+        );
+    }
+
+    #[test]
+    fn positional_binding_validation_rejects_gaps_and_unsafe_types() {
+        let gap = BTreeMap::from([
+            ("1".to_owned(), Binding::new("TEXT", "one")),
+            ("3".to_owned(), Binding::new("TEXT", "three")),
+        ]);
+        assert!(validate_bindings(&gap).is_err());
+
+        let unsafe_type = BTreeMap::from([(
+            "1".to_owned(),
+            Binding::new("TEXT; DROP TABLE", "must-not-run"),
+        )]);
+        assert!(validate_bindings(&unsafe_type).is_err());
+    }
+
+    #[test]
+    fn query_tag_and_binding_env_names_are_bounded() {
+        assert!(validate_query_tag("hfdt.trace.123").is_ok());
+        assert!(validate_query_tag("hfdt\ntrace").is_err());
+        assert!(is_safe_env_name("HFDT_TYPED_BINDINGS_JSON"));
+        assert!(!is_safe_env_name("HFDT-TYPED-BINDINGS"));
+    }
 }

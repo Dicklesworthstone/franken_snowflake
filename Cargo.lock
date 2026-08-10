@@ -1748,6 +1748,7 @@ dependencies = [
  "franken-snowflake-http",
  "franken-snowflake-mcp",
  "franken-snowflake-sqlapi",
+ "serde_json",
  "tru",
 ]
 
