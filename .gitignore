@@ -69,3 +69,15 @@ perf.data.old
 Thumbs.db
 ehthumbs.db
 Desktop.ini
+
+# === multi-repo ephemeral patterns 2026-08-10 ===
+# Claude Code local session state (nothing tracked here)
+.claude/
+# Eidetic Engine / Wrangler local runtime
+.ee/
+.wrangler/
+.beads/beads.db-fsqlite-ns-*
+.beads/.write.lock.stale-*
+.repo_janitor_workspace/
+.skill-loop-progress.md
+.skill-loop-progress-*.md
