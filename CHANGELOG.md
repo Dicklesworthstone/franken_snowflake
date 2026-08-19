@@ -22,7 +22,7 @@ dates noted in each section. The sources used to build this changelog are:
 - the design documents (`COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md`,
   `docs/asupersync_leverage.md`, and the rest of `docs/`)
 - the executable task graph in `.beads/issues.jsonl`, tracked with Beads (`br`)
-- the release-readiness checklist in `RELEASE.md`
+- the release-readiness checklist in `docs/RELEASE.md`
 
 A note on commit subjects: many early commits are tagged "code-first, batch-test
 pending." That reflects the project's working style, where a swarm lands the
@@ -74,7 +74,7 @@ Linux, macOS, and Windows.
 
 **Notes for agents**: the forbidden list (Tokio, reqwest, hyper, axum, tower,
 sqlx, diesel, sea-orm, third-party Snowflake drivers) is enforced by
-`scripts/check-dependency-admissibility.py`. Run the gates listed in `RELEASE.md`
+`scripts/check-dependency-admissibility.py`. Run the gates listed in `docs/RELEASE.md`
 before assuming a change is admissible.
 
 ### Core contracts: envelope, capabilities, guardrails, budgets
@@ -370,7 +370,7 @@ social preview image.
 - [`8bacec5`](https://github.com/Dicklesworthstone/franken_snowflake/commit/8bacec5) docs: add hero illustration to README + GitHub social preview image
 
 **Notes for agents**: the gate that decides whether the tree is releasable is
-`RELEASE.md`. A SemVer version and the first tagged release come once `RELEASE.md` is
+`docs/RELEASE.md`. A SemVer version and the first tagged release come once `docs/RELEASE.md` is
 satisfied and `publish = false` is flipped deliberately.
 
 ---
@@ -387,7 +387,7 @@ satisfied and `publish = false` is flipped deliberately.
   as live data; every live lane either provides explicit credential evidence or
   emits a typed skip/refusal.
 - Once the first public release is tagged, this file gains a dated, versioned
-  entry with the commit range and the proof evidence from `RELEASE.md`.
+  entry with the commit range and the proof evidence from `docs/RELEASE.md`.
 
 [Unreleased]: https://github.com/Dicklesworthstone/franken_snowflake
 </content>

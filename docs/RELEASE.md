@@ -79,7 +79,7 @@ material, and canary fixtures outside test-only contexts:
 
 ```bash
 rg -n "PRIVATE|SECRET|TOKEN|PASSWORD|BEGIN .*PRIVATE KEY|SNOWFLAKE_ACCOUNT|AKIA|sk-" \
-  README.md AGENTS.md CHANGELOG.md LICENSE RELEASE.md docs crates .beads
+  README.md AGENTS.md CHANGELOG.md LICENSE docs crates .beads
 ```
 
 False positives are allowed only when the surrounding file is a documented
