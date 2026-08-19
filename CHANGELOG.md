@@ -1,17 +1,28 @@
 # Changelog
 
 All notable changes to `franken_snowflake` are recorded here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project will
-adopt [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it ships a
-tagged release.
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
+adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at the
+workspace version (`0.0.1`). Crates still inherit `publish = false`.
 
 ## Scope and method
 
-This is the development history of `franken_snowflake` to date. As of this
-writing the repository holds **166 non-merge commits from 2026-06-24 to
-2026-06-29**, with **no git tags and no GitHub Releases**. There is no published
-crate and no tagged release yet, so there is no version timeline to reconstruct;
-everything below sits under a single `Unreleased` heading.
+Scope window: 2026-06-24 through HEAD
+[`096d726`](https://github.com/Dicklesworthstone/franken_snowflake/commit/096d72644357994f4c5684444fc37409a579e593)
+(2026-08-19). The original synthesis covered 166 non-merge commits from
+2026-06-24 to 2026-06-29. A GitHub Release and a tag-only predecessor landed
+immediately after that window, then 17 more non-merge commits through the
+2026-08-19 janitor docs-reorg.
+
+**Release vs tag:**
+- [`v0.0.0`](https://github.com/Dicklesworthstone/franken_snowflake/tree/v0.0.0)
+  is a **git tag only** (2026-06-29,
+  [`6eb608c`](https://github.com/Dicklesworthstone/franken_snowflake/commit/6eb608c44612feddef8bb19bd09d5a6b4508833e)).
+  There is no GitHub Release at that tag. Do not invent one.
+- [`v0.0.1`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.1)
+  is a **published GitHub Release** (2026-06-30, tag
+  [`fae8bed`](https://github.com/Dicklesworthstone/franken_snowflake/commit/fae8bed20bda3353edf1beb46ea3cedb86885cf4)).
+  It is the only GitHub Release in this repo.
 
 The record is organized by landed capability wave rather than raw commit order,
 with representative commit links so another agent can navigate from a theme to
@@ -19,7 +30,7 @@ the evidence. Chronology is preserved through the timeline table below and the
 dates noted in each section. The sources used to build this changelog are:
 
 - the git history (`git log --reverse --no-merges`)
-- the design documents (`COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md`,
+- the design documents ([`docs/planning/COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md`](docs/planning/COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md),
   `docs/asupersync_leverage.md`, and the rest of `docs/`)
 - the executable task graph in `.beads/issues.jsonl`, tracked with Beads (`br`)
 - the release-readiness checklist in `docs/RELEASE.md`
@@ -31,15 +42,15 @@ implementation first and the test/hardening pass follows in a later wave. The
 
 ## Version state
 
-- Package version: `0.0.0` across the workspace; all crates inherit
-  `publish = false`.
-- Releases: none yet. No git tag, no GitHub Release, no crates.io publish.
+- Package version: `0.0.1` across the workspace; all crates inherit
+  `publish = false`. There is no crates.io publish.
+- Tags: `v0.0.0` (tag only, 2026-06-29) and `v0.0.1` (GitHub Release, 2026-06-30).
 - Live Snowflake transport is enabled with the `live` feature (default-off) and
   is gated at runtime by credential availability. Reads (`query run`,
   `catalog scan`, `profile doctor --online`) and writes (`query write`) both run
   through it.
 
-## Timeline
+## Version Timeline
 
 | Window | Theme |
 |---|---|
@@ -48,10 +59,55 @@ implementation first and the test/hardening pass follows in a later wave. The
 | 2026-06-26 | Live proof lanes, opt-in live transport wired into `query run` / `catalog scan` / `profile doctor --online`, and the agent-ergonomics CLI pass (`onboard`, `fsnow` alias) |
 | 2026-06-29 | Hero illustration and GitHub social preview image |
 | 2026-06-29 | Live writes: write-intent ladder executor (frictionless-by-default), `query write`/`write`, default-profile env + installer `--live` |
+| 2026-06-29 | Tag-only `v0.0.0` ([`6eb608c`](https://github.com/Dicklesworthstone/franken_snowflake/commit/6eb608c44612feddef8bb19bd09d5a6b4508833e)) — installer requires release binaries. Not a GitHub Release. |
+| 2026-06-30 | GitHub Release [`v0.0.1`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.1) ([`fae8bed`](https://github.com/Dicklesworthstone/franken_snowflake/commit/fae8bed20bda3353edf1beb46ea3cedb86885cf4)) |
+| 2026-06-30 → 2026-08-19 | Unreleased since `v0.0.1`: crates.io sibling resolution, typed query options, janitor docs-reorg (`RELEASE.md` → `docs/RELEASE.md`, plan → `docs/planning/`) |
 
 ---
 
-## [Unreleased]
+## [Unreleased] — since v0.0.1
+
+Current window after the [`v0.0.1`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.1)
+GitHub Release (2026-06-30,
+[`fae8bed`](https://github.com/Dicklesworthstone/franken_snowflake/commit/fae8bed20bda3353edf1beb46ea3cedb86885cf4))
+through HEAD
+[`096d726`](https://github.com/Dicklesworthstone/franken_snowflake/commit/096d72644357994f4c5684444fc37409a579e593)
+(2026-08-19): 17 non-merge commits. Cargo is `0.0.1` with `publish = false`.
+
+### Crates.io standalone sibling resolution
+
+External clones no longer need a `/dp` FrankenSuite checkout. Workspace
+dependencies resolve from crates.io; the installer dropped the sibling-tree
+preflight. Typed query options were accepted on the live path
+(`hfdt-snowflake-franken-integration-ejodq.5.9`). Parallel rustc front-end
+threads (`-Z threads=4`) and multi-repo gitignore patterns landed as build
+hygiene.
+
+**Representative commits**
+- [`aa26f37`](https://github.com/Dicklesworthstone/franken_snowflake/commit/aa26f371046f555c7a445d2c65bac9600eda859f) — `deps: resolve FrankenSuite deps from crates.io (standalone buildability)`
+- [`2dc54fc`](https://github.com/Dicklesworthstone/franken_snowflake/commit/2dc54fca945c66a0befbac06883078792a1b493f) — `installer+docs: external builds now work via crates.io; drop preflight`
+- [`8e1d162`](https://github.com/Dicklesworthstone/franken_snowflake/commit/8e1d1626f6b9740d89f71f2ab8463d0862941c26) — `fix(snowflake): accept typed query options (hfdt-snowflake-franken-integration-ejodq.5.9)`
+
+### Janitor docs-reorg (2026-08-19)
+
+The architecture plan moved to
+[`docs/planning/COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md`](docs/planning/COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md)
+(along with the fsnow CC-skill background research). The release-readiness
+checklist moved from the repository root to [`docs/RELEASE.md`](docs/RELEASE.md).
+The unused `franken_snowflake_illustration.png` was dropped; the README hero
+remains `franken_snowflake_illustration.webp`. Skill-loop scratch is untracked.
+
+**Representative commits**
+- [`d04951b`](https://github.com/Dicklesworthstone/franken_snowflake/commit/d04951bfedbdb19f41cf025879245001eb6274b5) — `chore(janitor): untrack skill-loop scratch; move root planning docs into docs/planning/`
+- [`76e5159`](https://github.com/Dicklesworthstone/franken_snowflake/commit/76e5159d7f20c89f0b4b1c9f4969bfc9b8a62cc1) — `chore(janitor): drop agent-identity leaks and root scratch artifacts`
+- [`096d726`](https://github.com/Dicklesworthstone/franken_snowflake/commit/096d72644357994f4c5684444fc37409a579e593) — `chore(janitor): move RELEASE.md into docs/`
+
+---
+
+## Development history through v0.0.1
+
+The waves below are the original Unreleased synthesis (2026-06-24 → 2026-06-29)
+that the `v0.0.1` GitHub Release shipped. They are not a second Release.
 
 ### Workspace scaffold and lint policy
 
@@ -370,8 +426,9 @@ social preview image.
 - [`8bacec5`](https://github.com/Dicklesworthstone/franken_snowflake/commit/8bacec5) docs: add hero illustration to README + GitHub social preview image
 
 **Notes for agents**: the gate that decides whether the tree is releasable is
-`docs/RELEASE.md`. A SemVer version and the first tagged release come once `docs/RELEASE.md` is
-satisfied and `publish = false` is flipped deliberately.
+`docs/RELEASE.md`. `v0.0.1` is already a GitHub Release; crates still have
+`publish = false`. A crates.io publish waits until that checklist is satisfied
+and `publish = false` is flipped deliberately.
 
 ---
 
@@ -380,14 +437,17 @@ satisfied and `publish = false` is flipped deliberately.
 - Start from `br ready --json` for actionable work and `br dep cycles` for graph
   health. Beads is the task source of truth, not GitHub issues.
 - The full rationale lives in
-  [`COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md`](COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md)
+  [`docs/planning/COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md`](docs/planning/COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md)
   and the Asupersync leverage contract in
   [`docs/asupersync_leverage.md`](docs/asupersync_leverage.md).
 - Live Snowflake use is enabled with the `live` feature. Do not treat local fixtures
   as live data; every live lane either provides explicit credential evidence or
   emits a typed skip/refusal.
-- Once the first public release is tagged, this file gains a dated, versioned
-  entry with the commit range and the proof evidence from `docs/RELEASE.md`.
+- [`v0.0.1`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.1)
+  is the first GitHub Release. `v0.0.0` is tag-only. Further crates.io
+  publication still waits on `docs/RELEASE.md` plus flipping `publish = false`.
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_snowflake
+[Unreleased]: https://github.com/Dicklesworthstone/franken_snowflake/compare/v0.0.1...HEAD
+[0.0.1]: https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.1
+[0.0.0]: https://github.com/Dicklesworthstone/franken_snowflake/tree/v0.0.0
 </content>
