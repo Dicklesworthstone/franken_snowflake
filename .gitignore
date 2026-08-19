@@ -70,6 +70,9 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 
+# Source PNG kept out of repo; committed asset is the README WebP
+/franken_snowflake_illustration.png
+
 # === multi-repo ephemeral patterns 2026-08-10 ===
 # Claude Code local session state (nothing tracked here)
 .claude/
