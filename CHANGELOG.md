@@ -74,6 +74,15 @@ through HEAD
 [`096d726`](https://github.com/Dicklesworthstone/franken_snowflake/commit/096d72644357994f4c5684444fc37409a579e593)
 (2026-08-19): 17 non-merge commits. Cargo is `0.0.1` with `publish = false`.
 
+### Delivered capability
+
+- External clones resolve FrankenSuite deps from crates.io (no `/dp` sibling tree).
+- Plan and `RELEASE.md` now live under `docs/planning/` and `docs/RELEASE.md`.
+
+### Closed workstreams
+
+- Tracker: [`.beads/issues.jsonl`](https://github.com/Dicklesworthstone/franken_snowflake/blob/main/.beads/issues.jsonl).
+
 ### Crates.io standalone sibling resolution
 
 External clones no longer need a `/dp` FrankenSuite checkout. Workspace
