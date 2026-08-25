@@ -3,7 +3,7 @@
 All notable changes to `franken_snowflake` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at the
-workspace version (`0.0.1`). Crates still inherit `publish = false`.
+workspace version (`0.0.2`). Crates still inherit `publish = false`.
 
 ## Scope and method
 
@@ -65,7 +65,42 @@ implementation first and the test/hardening pass follows in a later wave. The
 
 ---
 
-## [Unreleased] — since v0.0.1
+## [v0.0.2](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.2) — 2026-08-24
+
+13 commits since [v0.0.1](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.1) (2026-06-30). Patch bump: standalone buildability, one connector fix, repository hygiene, and dependency currency. No API changes. Crates remain `publish = false`; this ships as a GitHub Release only.
+
+### Standalone buildability
+
+- FrankenSuite dependencies now resolve from crates.io rather than local paths, so the workspace builds outside the development fleet ([`aa26f37`](https://github.com/Dicklesworthstone/franken_snowflake/commit/aa26f37)).
+- Installer and docs updated for that path; the build preflight is no longer needed ([`2dc54fc`](https://github.com/Dicklesworthstone/franken_snowflake/commit/2dc54fc)).
+
+### Fixed
+
+- Snowflake connector accepts typed query options ([`8e1d162`](https://github.com/Dicklesworthstone/franken_snowflake/commit/8e1d162)).
+
+### Dependencies
+
+- Refreshed the resolver graph to latest semver-compatible versions.
+- Two pinned families were held uniform on purpose. A bare `cargo update` floats them off-pin:
+  - `asupersync` is pinned `=0.3.5`, but `asupersync-macros` drifts to 0.3.10 — held at 0.3.5.
+  - the `fsqlite` family moved 0.1.13 -> 0.1.16, but `fsqlite-error` drifts to 0.1.19 — held at 0.1.16, so all 20 family members share one version.
+
+### Repository hygiene
+
+- Planning docs moved under `docs/planning/`, `RELEASE.md` moved into `docs/`, skill-loop scratch untracked, agent-identity leaks and root scratch artifacts dropped, and gitignore rules added for multi-repo agent/runtime ephemera.
+
+### Release engineering
+
+- Built through `dsr` (not GitHub Actions). Every artifact was checked with `file(1)` for architecture and, on Linux, with `objdump -T` for its glibc floor before upload.
+
+### Gate
+
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean
+- `cargo test --workspace`: 420 passed, 0 failed across 32 targets
+
+---
+
+## [Unreleased] — since v0.0.2
 
 Current window after the [`v0.0.1`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.1)
 GitHub Release (2026-06-30,

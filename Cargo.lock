@@ -1592,7 +1592,7 @@ dependencies = [
 
 [[package]]
 name = "franken-snowflake-auth"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64",
  "jsonwebtoken",
@@ -1605,7 +1605,7 @@ dependencies = [
 
 [[package]]
 name = "franken-snowflake-cache"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "blake3",
  "franken-snowflake-core",
@@ -1616,7 +1616,7 @@ dependencies = [
 
 [[package]]
 name = "franken-snowflake-catalog"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "franken-snowflake-cache",
  "franken-snowflake-core",
@@ -1628,7 +1628,7 @@ dependencies = [
 
 [[package]]
 name = "franken-snowflake-cli"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "asupersync",
  "franken-snowflake-auth",
@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "franken-snowflake-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "asupersync",
  "serde",
@@ -1651,7 +1651,7 @@ dependencies = [
 
 [[package]]
 name = "franken-snowflake-export"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "blake3",
  "franken-snowflake-core",
@@ -1661,7 +1661,7 @@ dependencies = [
 
 [[package]]
 name = "franken-snowflake-frame"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "fp-columnar",
  "fp-types",
@@ -1671,7 +1671,7 @@ dependencies = [
 
 [[package]]
 name = "franken-snowflake-graph"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "fnx-algorithms",
  "fnx-classes",
@@ -1682,7 +1682,7 @@ dependencies = [
 
 [[package]]
 name = "franken-snowflake-http"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "asupersync",
  "franken-snowflake-core",
@@ -1692,7 +1692,7 @@ dependencies = [
 
 [[package]]
 name = "franken-snowflake-mcp"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "fastmcp-rust",
  "franken-snowflake-core",
@@ -1701,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "franken-snowflake-sqlapi"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "asupersync",
  "franken-snowflake-auth",
@@ -1714,7 +1714,7 @@ dependencies = [
 
 [[package]]
 name = "franken-snowflake-testkit"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "asupersync",
  "franken-snowflake-core",
@@ -1725,7 +1725,7 @@ dependencies = [
 
 [[package]]
 name = "franken-snowflake-text-indexing"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "asupersync",
  "franken-snowflake-core",
@@ -1736,7 +1736,7 @@ dependencies = [
 
 [[package]]
 name = "franken-snowflake-tui"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "franken-snowflake-catalog",
  "franken-snowflake-core",
