@@ -264,8 +264,8 @@ fn hex(bytes: &[u8]) -> String {
 
 fn unhex(hex_text: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(hex_text.len() / 2);
-    let mut chars = hex_text.as_bytes().chunks_exact(2);
-    for pair in &mut chars {
+    let (pairs, _remainder) = hex_text.as_bytes().as_chunks::<2>();
+    for pair in pairs {
         if let (Some(high), Some(low)) = (hex_value(pair[0]), hex_value(pair[1])) {
             out.push((high << 4) | low);
         }
