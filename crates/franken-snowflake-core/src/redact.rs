@@ -205,8 +205,8 @@ pub fn is_credential_field(field_name: &str) -> bool {
     let lowered = field_name.to_ascii_lowercase();
     CREDENTIAL_FIELD_EXACT.contains(&lowered.as_str())
         || CREDENTIAL_FIELD_SUFFIXES
-        .iter()
-        .any(|suffix| lowered.ends_with(suffix))
+            .iter()
+            .any(|suffix| lowered.ends_with(suffix))
 }
 
 #[cfg(test)]

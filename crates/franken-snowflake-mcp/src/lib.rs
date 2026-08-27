@@ -688,11 +688,7 @@ mod fastmcp_surface {
                 payload.insert(key, value);
             }
         }
-        McpError::with_data(
-            McpErrorCode::InvalidParams,
-            message,
-            Value::Object(payload),
-        )
+        McpError::with_data(McpErrorCode::InvalidParams, message, Value::Object(payload))
     }
 
     fn cli_output_to_mcp_result(output: CliContractOutput) -> McpResult<Vec<Content>> {
@@ -847,9 +843,9 @@ mod fastmcp_surface {
             // `database` is now required for catalog_graph and is validated before
             // `format`; supply it so the unsupported-format (secret-shaped) value is
             // the failure under test.
-            let err = match ReadVerb::CatalogGraph.cli_args(
-                &json!({"profile": "demo", "database": "DB", "format": raw_secret}),
-            ) {
+            let err = match ReadVerb::CatalogGraph
+                .cli_args(&json!({"profile": "demo", "database": "DB", "format": raw_secret}))
+            {
                 Ok(_) => {
                     assert!(
                         false,

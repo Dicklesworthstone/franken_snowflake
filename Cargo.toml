@@ -33,7 +33,7 @@ members = [
 [workspace.package]
 version = "0.0.2"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 license-file = "LICENSE"
 authors = ["Jeffrey Emanuel"]
 repository = "https://github.com/Dicklesworthstone/franken_snowflake"

@@ -17,7 +17,7 @@ use franken_snowflake_sqlapi::status::ResponseClass as SqlResponseClass;
 use serde::{Deserialize, Serialize};
 
 use crate::harness::logger::{LogError, RunLogger, RunSummary};
-use crate::harness::paths::{resolve_project_dir, PortableDirKind};
+use crate::harness::paths::{PortableDirKind, resolve_project_dir};
 use crate::mock::http::{MockHttpRequest, MockHttpResponse};
 use crate::mock::scenarios;
 use crate::mock::server::{MockSqlApi, RecordedRequest};

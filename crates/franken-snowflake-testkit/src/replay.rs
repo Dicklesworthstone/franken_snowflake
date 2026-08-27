@@ -286,7 +286,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 mod tests {
     use super::*;
     use crate::harness::golden::{
-        assert_no_cr, check_golden_file, to_canonical_json, GoldenConfig,
+        GoldenConfig, assert_no_cr, check_golden_file, to_canonical_json,
     };
 
     #[test]
@@ -298,11 +298,13 @@ mod tests {
         assert_eq!(replay.steps[0].packet.status, 202);
         assert_eq!(replay.steps[3].packet.status, 200);
         assert_eq!(replay.steps[4].packet.response_class, "completed");
-        assert!(replay.steps[4]
-            .packet
-            .headers
-            .iter()
-            .any(|(name, value)| name == "Content-Encoding" && value == "gzip"));
+        assert!(
+            replay.steps[4]
+                .packet
+                .headers
+                .iter()
+                .any(|(name, value)| name == "Content-Encoding" && value == "gzip")
+        );
     }
 
     #[test]
@@ -340,9 +342,11 @@ mod tests {
         assert!(!wire.contains("sfpat_replay_body_secret_123"));
         assert!(!wire.contains("ghp_replay_header_secret_123"));
         assert!(wire.contains("[REDACTED]"));
-        assert!(packet
-            .headers
-            .iter()
-            .all(|(_, value)| !value.contains("ghp_replay_header_secret_123")));
+        assert!(
+            packet
+                .headers
+                .iter()
+                .all(|(_, value)| !value.contains("ghp_replay_header_secret_123"))
+        );
     }
 }

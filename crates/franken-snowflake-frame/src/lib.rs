@@ -844,8 +844,10 @@ mod frankenpandas {
         #[test]
         fn variant_cell_rejects_malformed_json() {
             let columns = vec![col("PAYLOAD", "VARIANT")];
-            let partitions =
-                vec![ResultPartition::new(0, vec![vec![Some("{not json".to_owned())]])];
+            let partitions = vec![ResultPartition::new(
+                0,
+                vec![vec![Some("{not json".to_owned())]],
+            )];
             assert!(materialize_partitions(&columns, partitions).is_err());
         }
 

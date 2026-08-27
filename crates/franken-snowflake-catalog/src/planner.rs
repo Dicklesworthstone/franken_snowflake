@@ -277,12 +277,11 @@ pub fn plan_dataset_query(
     let projection = resolve_projection(manifest, &dataset_columns, request, &mut refusals);
     validate_axes(manifest, &dataset_columns, request, &mut refusals);
 
-    if let Some(predicate) = &request.filter {
-        if let Err(predicate_refusals) =
+    if let Some(predicate) = &request.filter
+        && let Err(predicate_refusals) =
             validate_predicate(predicate, &dataset_columns_owned, operators)
-        {
-            refusals.extend(predicate_refusals.into_iter().map(PlanRefusal::from));
-        }
+    {
+        refusals.extend(predicate_refusals.into_iter().map(PlanRefusal::from));
     }
 
     let effective_limit = request.limit.unwrap_or(manifest.default_limit);
@@ -333,18 +332,17 @@ pub fn plan_dataset_query(
     );
     let predicate_filters = request.filter.as_ref().map_or(0, count_predicate_leaves);
     let mut pushed_predicate_filters = 0usize;
-    if let Some(predicate) = &request.filter {
-        if let Some(compiled) = compile_predicate(
+    if let Some(predicate) = &request.filter
+        && let Some(compiled) = compile_predicate(
             predicate,
             &dataset_columns,
             &mut bindings,
             &mut next_binding,
         )
         .map_err(|refusal| vec![refusal])?
-        {
-            where_clauses.push(compiled.sql);
-            pushed_predicate_filters = compiled.leaf_count;
-        }
+    {
+        where_clauses.push(compiled.sql);
+        pushed_predicate_filters = compiled.leaf_count;
     }
 
     if !where_clauses.is_empty() {
@@ -417,16 +415,14 @@ pub fn plan_raw_sql_dry_run(request: &RawSqlPlanRequest) -> Result<QueryPlan, Ve
 
     let mut bindings = BTreeMap::new();
     let mut next_binding = 1usize;
-    if !has_sql_limit {
-        if let Some(limit) = pushed_limit {
-            sql.push_str(" LIMIT ");
-            sql.push_str(&push_binding(
-                &mut bindings,
-                &mut next_binding,
-                DtypeClass::Number,
-                limit.to_string(),
-            ));
-        }
+    if !has_sql_limit && let Some(limit) = pushed_limit {
+        sql.push_str(" LIMIT ");
+        sql.push_str(&push_binding(
+            &mut bindings,
+            &mut next_binding,
+            DtypeClass::Number,
+            limit.to_string(),
+        ));
     }
 
     let result_row_cap = pushed_limit.unwrap_or(DEFAULT_MAX_RESULT_ROWS);
@@ -705,35 +701,35 @@ fn add_axis_filters(
     where_clauses: &mut Vec<String>,
 ) -> usize {
     let mut pushed = 0usize;
-    if let Some(entity) = &request.entity {
-        if let Some(column) = axis_column(manifest, columns, FieldRole::EntityKey) {
-            where_clauses.push(format!(
-                "{} = {}",
-                quote_identifier(&column.column),
-                push_binding(bindings, next_binding, column.dtype_class, entity.clone())
-            ));
-            pushed += 1;
-        }
+    if let Some(entity) = &request.entity
+        && let Some(column) = axis_column(manifest, columns, FieldRole::EntityKey)
+    {
+        where_clauses.push(format!(
+            "{} = {}",
+            quote_identifier(&column.column),
+            push_binding(bindings, next_binding, column.dtype_class, entity.clone())
+        ));
+        pushed += 1;
     }
-    if let Some(from) = &request.from {
-        if let Some(column) = axis_column(manifest, columns, FieldRole::TimeIndex) {
-            where_clauses.push(format!(
-                "{} >= {}",
-                quote_identifier(&column.column),
-                push_binding(bindings, next_binding, column.dtype_class, from.clone())
-            ));
-            pushed += 1;
-        }
+    if let Some(from) = &request.from
+        && let Some(column) = axis_column(manifest, columns, FieldRole::TimeIndex)
+    {
+        where_clauses.push(format!(
+            "{} >= {}",
+            quote_identifier(&column.column),
+            push_binding(bindings, next_binding, column.dtype_class, from.clone())
+        ));
+        pushed += 1;
     }
-    if let Some(to) = &request.to {
-        if let Some(column) = axis_column(manifest, columns, FieldRole::TimeIndex) {
-            where_clauses.push(format!(
-                "{} <= {}",
-                quote_identifier(&column.column),
-                push_binding(bindings, next_binding, column.dtype_class, to.clone())
-            ));
-            pushed += 1;
-        }
+    if let Some(to) = &request.to
+        && let Some(column) = axis_column(manifest, columns, FieldRole::TimeIndex)
+    {
+        where_clauses.push(format!(
+            "{} <= {}",
+            quote_identifier(&column.column),
+            push_binding(bindings, next_binding, column.dtype_class, to.clone())
+        ));
+        pushed += 1;
     }
     pushed
 }
@@ -804,11 +800,11 @@ fn compile_compound(
         leaf_count += compiled.leaf_count;
         parts.push(compiled.sql);
     }
-    if let Some(not) = &compound.not {
-        if let Some(compiled) = compile_predicate(not, columns, bindings, next_binding)? {
-            leaf_count += compiled.leaf_count;
-            parts.push(format!("NOT ({})", compiled.sql));
-        }
+    if let Some(not) = &compound.not
+        && let Some(compiled) = compile_predicate(not, columns, bindings, next_binding)?
+    {
+        leaf_count += compiled.leaf_count;
+        parts.push(format!("NOT ({})", compiled.sql));
     }
     if parts.is_empty() {
         Ok(None)

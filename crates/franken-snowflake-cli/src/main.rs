@@ -186,9 +186,7 @@ enum Body {
     // the `live` feature the no-account build never produces raw output (it
     // refuses with a JSON envelope), so the variant is legitimately unused there.
     #[cfg_attr(not(feature = "live"), allow(dead_code))]
-    Raw {
-        data: String,
-    },
+    Raw { data: String },
 }
 
 #[derive(Clone, Copy)]
@@ -824,8 +822,7 @@ fn parse_query(args: &[String], output: OutputFormat) -> Result<Command, Outcome
             vec![
                 "franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string(),
                 "franken-snowflake query run --profile <profile> --sql <sql> --json".to_string(),
-                "franken-snowflake query write --profile <profile> --sql <sql> --json"
-                    .to_string(),
+                "franken-snowflake query write --profile <profile> --sql <sql> --json".to_string(),
                 "franken-snowflake query cancel <statement-handle> --json".to_string(),
             ],
             did_you_mean(other, &["plan", "run", "write", "cancel"]),
@@ -838,8 +835,7 @@ fn parse_query(args: &[String], output: OutputFormat) -> Result<Command, Outcome
             vec![
                 "franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string(),
                 "franken-snowflake query run --profile <profile> --sql <sql> --json".to_string(),
-                "franken-snowflake query write --profile <profile> --sql <sql> --json"
-                    .to_string(),
+                "franken-snowflake query write --profile <profile> --sql <sql> --json".to_string(),
                 "franken-snowflake query cancel <statement-handle> --json".to_string(),
             ],
             vec![],
@@ -1079,7 +1075,14 @@ fn dispatch(invocation: Invocation) -> Outcome {
             sql,
             dry_run,
             confirm,
-        } => query_write_outcome(invocation.output, request_id, profile, sql, dry_run, confirm),
+        } => query_write_outcome(
+            invocation.output,
+            request_id,
+            profile,
+            sql,
+            dry_run,
+            confirm,
+        ),
         Command::QueryCancel { statement_handle } => live_transport_required_with_data(
             invocation.output,
             "query.cancel",
@@ -2124,7 +2127,12 @@ fn profile_validate_outcome(format: OutputFormat, request_id: String, profile: S
     // agent gating on `profile validate` isn't blocked by a clean profile. An
     // invalid profile id is a real finding (exit 1).
     let (outcome_kind, exit, status, warnings) = if syntax_valid {
-        ("success", CoreExitCode::Success, "offline_validated", vec![])
+        (
+            "success",
+            CoreExitCode::Success,
+            "offline_validated",
+            vec![],
+        )
     } else {
         (
             "partial_success",
@@ -2848,8 +2856,10 @@ fn query_write_outcome(
 
     // Deterministic idempotency id bound to (profile, compacted SQL): the dry-run
     // confirmation token only validates a re-run of the *same* statement.
-    let ladder_request_id =
-        stable_request_id(&format!("write\u{1f}{profile}\u{1f}{}", compact_sql(&sql_text)));
+    let ladder_request_id = stable_request_id(&format!(
+        "write\u{1f}{profile}\u{1f}{}",
+        compact_sql(&sql_text)
+    ));
 
     let mut intent = WriteIntentRequest::new(mode, &sql_text);
     intent.dry_run = true;
@@ -2879,7 +2889,10 @@ fn query_write_outcome(
 /// re-arm the cautious dry-run -> confirm ceremony with `<PREFIX>_WRITE_REQUIRE_CONFIRM`.
 /// The append-only-audit and hand-maintained allowlist knobs the core models stay
 /// off by default. DDL stays behind an explicit `<PREFIX>_WRITE_ALLOW_DDL` opt-in.
-fn write_policy_for_profile(profile: &str, statement_kind: WriteStatementKind) -> WriteIntentPolicy {
+fn write_policy_for_profile(
+    profile: &str,
+    statement_kind: WriteStatementKind,
+) -> WriteIntentPolicy {
     write_policy_from_flags(
         profile_env_flag(profile, "WRITE_ENABLED"),
         profile_env_flag(profile, "WRITE_ALLOW_DDL"),
@@ -2956,7 +2969,10 @@ fn write_plan_outcome(
             ("mode", json_string("dry_run")),
             ("execution_enabled", Json::Bool(false)),
             ("will_submit", Json::Bool(false)),
-            ("statement_kind", json_string(plan.statement_kind.as_token())),
+            (
+                "statement_kind",
+                json_string(plan.statement_kind.as_token()),
+            ),
             (
                 "safety_class",
                 json_string(safety_class_token(plan.safety_class)),
@@ -3123,7 +3139,10 @@ fn query_write_execute_dispatch(
         json_object(vec![
             ("write_intent_authorized", Json::Bool(true)),
             ("execution_enabled", Json::Bool(false)),
-            ("statement_kind", json_string(plan.statement_kind.as_token())),
+            (
+                "statement_kind",
+                json_string(plan.statement_kind.as_token()),
+            ),
             (
                 "idempotency_request_id",
                 json_string(plan.receipt.request_id.as_str().to_string()),
@@ -3298,7 +3317,10 @@ fn exit_code_json() -> Json {
     Json::Array(vec![
         exit_code_entry(0, "success, including empty-but-valid results"),
         exit_code_entry(1, "completed with non-fatal findings or warnings"),
-        exit_code_entry(2, "refusal (safety block or reserved/unimplemented surface)"),
+        exit_code_entry(
+            2,
+            "refusal (safety block or reserved/unimplemented surface)",
+        ),
         exit_code_entry(3, "credential or profile error"),
         exit_code_entry(4, "upstream Snowflake error"),
         exit_code_entry(5, "network or retry budget exhausted"),
@@ -3630,9 +3652,7 @@ fn resolve_profile_with(explicit: Option<String>, env_value: Option<String>) -> 
 /// with `-`) is treated as "no positional profile" so the slot can fall back to
 /// `FRANKEN_SNOWFLAKE_DEFAULT_PROFILE` rather than being mistaken for the profile.
 fn positional_profile(args: &[String]) -> Option<String> {
-    args.get(2)
-        .filter(|value| !value.starts_with('-'))
-        .cloned()
+    args.get(2).filter(|value| !value.starts_with('-')).cloned()
 }
 
 fn has_multiple_statements(sql: &str) -> bool {
@@ -4346,7 +4366,11 @@ mod tests {
     #[test]
     fn onboard_returns_all_orientation_slices_in_one_call() {
         let outcome = execute(vec!["onboard".to_string(), "--json".to_string()]);
-        assert_eq!(outcome.status.code(), 0, "onboard is read-only and must exit 0");
+        assert_eq!(
+            outcome.status.code(),
+            0,
+            "onboard is read-only and must exit 0"
+        );
         let rendered = render_json(&envelope_for(&["onboard", "--json"]));
         assert!(rendered.contains("\"command_id\":\"onboard\""));
         assert!(rendered.contains("\"feature_flags\""));
@@ -4364,12 +4388,24 @@ mod tests {
     // both builds. A typo'd SELECT is "unrecognized", NOT "multiple statements".
     #[test]
     fn query_run_distinguishes_multi_statement_from_unrecognized_sql() {
-        let typo = render_json(&envelope_for(&["query", "run", "--profile", "demo", "--sql", "selcet 1"]));
+        let typo = render_json(&envelope_for(&[
+            "query",
+            "run",
+            "--profile",
+            "demo",
+            "--sql",
+            "selcet 1",
+        ]));
         assert!(typo.contains("is the read path"));
         assert!(typo.contains("query write"));
         assert!(!typo.contains("Multiple SQL statements"));
         let multi = render_json(&envelope_for(&[
-            "query", "run", "--profile", "demo", "--sql", "select 1; select 2",
+            "query",
+            "run",
+            "--profile",
+            "demo",
+            "--sql",
+            "select 1; select 2",
         ]));
         assert!(multi.contains("Multiple SQL statements are refused"));
         assert!(!multi.contains("is the read path"));
@@ -4380,7 +4416,12 @@ mod tests {
     #[test]
     fn query_refusal_interpolates_actual_profile_into_next_command() {
         let rendered = render_json(&envelope_for(&[
-            "query", "run", "--profile", "demo", "--sql", "drop table t",
+            "query",
+            "run",
+            "--profile",
+            "demo",
+            "--sql",
+            "drop table t",
         ]));
         assert!(rendered.contains("--profile demo"));
         assert!(!rendered.contains("--profile <profile>"));
@@ -4435,7 +4476,11 @@ mod tests {
     // not an I/O fault (74).
     #[test]
     fn reserved_surfaces_refuse_with_exit_two_not_io() {
-        let outcome = execute(vec!["export".to_string(), "plan".to_string(), "--json".to_string()]);
+        let outcome = execute(vec![
+            "export".to_string(),
+            "plan".to_string(),
+            "--json".to_string(),
+        ]);
         assert_eq!(outcome.status.code(), 2);
         let rendered = match outcome.body {
             Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
@@ -4458,7 +4503,11 @@ mod tests {
             "FRANKEN_TEST".to_string(),
             "--json".to_string(),
         ]);
-        assert_ne!(outcome.status.code(), 0, "no-account catalog graph must refuse");
+        assert_ne!(
+            outcome.status.code(),
+            0,
+            "no-account catalog graph must refuse"
+        );
         let rendered = match outcome.body {
             Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
             Body::Raw { data } => data,
@@ -4894,7 +4943,11 @@ mod tests {
             "--sql".to_string(),
             "select 1".to_string(),
         ]);
-        assert_ne!(outcome.status.code(), 0, "credential-less run must not succeed");
+        assert_ne!(
+            outcome.status.code(),
+            0,
+            "credential-less run must not succeed"
+        );
         let rendered = match outcome.body {
             Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
             Body::Raw { data } => data,
@@ -5296,8 +5349,10 @@ mod tests {
 
     fn authorized_insert_plan() -> WriteIntentPlan {
         let policy = enabled_write_policy(WriteStatementKind::Insert, false);
-        let mut req =
-            WriteIntentRequest::new(WriteIntentMode::PrepareExecution, "insert into t values (1)");
+        let mut req = WriteIntentRequest::new(
+            WriteIntentMode::PrepareExecution,
+            "insert into t values (1)",
+        );
         req.dry_run = true;
         req.allowlist_id = Some(cli_allowlist_id(WriteStatementKind::Insert));
         req.request_id = Some(RequestId::new("exec-req"));
@@ -5344,9 +5399,16 @@ mod tests {
             "--sql".to_string(),
             "insert into t values (1)".to_string(),
         ]);
-        assert_eq!(bare.status.code(), 2, "bare write routes to the ladder, not a usage error");
+        assert_eq!(
+            bare.status.code(),
+            2,
+            "bare write routes to the ladder, not a usage error"
+        );
         let rendered = render_outcome(bare);
-        assert!(rendered.contains("FSNOW-3007"), "disabled profile -> WriteDisabled");
+        assert!(
+            rendered.contains("FSNOW-3007"),
+            "disabled profile -> WriteDisabled"
+        );
         assert!(!rendered.contains("\"data_source\":\"live\""));
     }
 
@@ -5432,8 +5494,10 @@ mod tests {
         let policy = write_policy_from_flags(true, false, false, WriteStatementKind::Insert);
         assert!(!policy.require_dry_run);
         assert!(!policy.require_exact_confirmation);
-        let mut req =
-            WriteIntentRequest::new(WriteIntentMode::PrepareExecution, "insert into t values (1)");
+        let mut req = WriteIntentRequest::new(
+            WriteIntentMode::PrepareExecution,
+            "insert into t values (1)",
+        );
         req.dry_run = true;
         req.allowlist_id = Some(cli_allowlist_id(WriteStatementKind::Insert));
         req.request_id = Some(RequestId::new("direct-req"));
@@ -5453,8 +5517,10 @@ mod tests {
         let policy = write_policy_from_flags(true, false, true, WriteStatementKind::Insert);
         assert!(policy.require_dry_run);
         assert!(policy.require_exact_confirmation);
-        let mut req =
-            WriteIntentRequest::new(WriteIntentMode::PrepareExecution, "insert into t values (1)");
+        let mut req = WriteIntentRequest::new(
+            WriteIntentMode::PrepareExecution,
+            "insert into t values (1)",
+        );
         req.dry_run = true;
         req.allowlist_id = Some(cli_allowlist_id(WriteStatementKind::Insert));
         req.request_id = Some(RequestId::new("confirm-req"));
@@ -5560,7 +5626,11 @@ mod tests {
             "insert into t values (1)",
             &plan,
         );
-        assert_ne!(outcome.status.code(), 0, "credential-less write must not succeed");
+        assert_ne!(
+            outcome.status.code(),
+            0,
+            "credential-less write must not succeed"
+        );
         let rendered = render_outcome(outcome);
         assert!(rendered.contains("\"command_id\":\"query.write\""));
         assert!(rendered.contains("\"ok\":false"));

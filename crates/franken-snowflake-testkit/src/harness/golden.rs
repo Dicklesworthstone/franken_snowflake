@@ -861,12 +861,14 @@ mod tests {
     #[test]
     fn generic_temporal_key_can_be_zeroed_when_fixture_opts_in() {
         let cfg = GoldenConfig::default().with_volatile_key("timestamp");
-        assert!(compare(
-            &json!({ "timestamp": "2026-06-24T00:00:00Z" }),
-            &json!({ "timestamp": "2026-06-25T00:00:00Z" }),
-            &cfg,
-        )
-        .is_ok());
+        assert!(
+            compare(
+                &json!({ "timestamp": "2026-06-24T00:00:00Z" }),
+                &json!({ "timestamp": "2026-06-25T00:00:00Z" }),
+                &cfg,
+            )
+            .is_ok()
+        );
     }
 
     #[test]

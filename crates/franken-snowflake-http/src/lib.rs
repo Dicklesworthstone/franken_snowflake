@@ -435,21 +435,21 @@ impl SnowflakeHttpClient {
                     ));
                 }
                 Err(error) => {
-                    if route_allows_automatic_retry(&wire.route) {
-                        if let Some(retry) = self.config.retry.next_retry(
+                    if route_allows_automatic_retry(&wire.route)
+                        && let Some(retry) = self.config.retry.next_retry(
                             planned.request_id.as_ref(),
                             route_kind,
                             attempt,
                             None,
                             retry_spent_ms,
-                        ) {
-                            if let Err(reason) = wait_retry_delay(cx, retry.delay).await {
-                                return TransportOutcome::cancelled(reason);
-                            }
-                            attempt = attempt.saturating_add(1);
-                            retry_spent_ms = retry.spent_after_ms;
-                            continue;
+                        )
+                    {
+                        if let Err(reason) = wait_retry_delay(cx, retry.delay).await {
+                            return TransportOutcome::cancelled(reason);
                         }
+                        attempt = attempt.saturating_add(1);
+                        retry_spent_ms = retry.spent_after_ms;
+                        continue;
                     }
                     return TransportOutcome::err(
                         TransportError::new(
@@ -832,13 +832,11 @@ impl RetryPolicy {
         // priority to 128, discarding the configured ambient/route priority.
         // Priority 0 is the identity element for the max-combine, so this budget
         // constrains poll-quota only.
-        ambient
-            .meet(route_budget)
-            .meet(
-                Budget::new()
-                    .with_poll_quota(remaining_attempts)
-                    .with_priority(0),
-            )
+        ambient.meet(route_budget).meet(
+            Budget::new()
+                .with_poll_quota(remaining_attempts)
+                .with_priority(0),
+        )
     }
 }
 
@@ -2526,7 +2524,10 @@ mod tests {
         // correct.
         let delay = retry_after_ms(&header("Retry-After", "Fri, 31 Dec 2100 23:59:59 GMT"))
             .expect("future date delay");
-        assert!(delay > 0, "future date must yield a positive delay, got {delay}");
+        assert!(
+            delay > 0,
+            "future date must yield a positive delay, got {delay}"
+        );
     }
 
     #[test]

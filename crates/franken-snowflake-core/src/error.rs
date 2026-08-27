@@ -270,9 +270,7 @@ impl SnowflakeErrorCode {
                 safe_next_commands: &[
                     "franken-snowflake query write --profile <profile> --sql <sql> --json",
                 ],
-                repair_commands: &[
-                    "export FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ENABLED=true",
-                ],
+                repair_commands: &["export FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ENABLED=true"],
             },
             Self::WriteConfirmationRequired => ErrorEntry {
                 code: self,
@@ -298,9 +296,7 @@ impl SnowflakeErrorCode {
                 safe_next_commands: &[
                     "franken-snowflake query plan --profile <profile> --sql <sql> --json",
                 ],
-                repair_commands: &[
-                    "export FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ALLOW_DDL=true",
-                ],
+                repair_commands: &["export FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ALLOW_DDL=true"],
             },
             Self::UpstreamError => ErrorEntry {
                 code: self,

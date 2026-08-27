@@ -216,11 +216,13 @@ fn frac_to_nanos(frac: &str) -> Option<u32> {
 /// non-hex digit.
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
     let bytes = text.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| Some((hex_digit(pair[0])? << 4) | hex_digit(pair[1])?))
         .collect()
 }

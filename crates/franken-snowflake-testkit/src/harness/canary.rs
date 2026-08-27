@@ -338,10 +338,7 @@ mod tests {
         let key_body = "MIIBVgIBADANBgkqhkiG9w0BAQEFAASCAT8leakedKeyMaterial";
         let leaked = format!(
             "stderr: {}{}\n{key_body}\n{}{} done",
-            "-----BEGIN ",
-            "PRIVATE KEY-----",
-            "-----END ",
-            "PRIVATE KEY-----"
+            "-----BEGIN ", "PRIVATE KEY-----", "-----END ", "PRIVATE KEY-----"
         );
         let hits = guard.scan_text(Channel::Stderr, &leaked);
         let shape: Vec<&CanaryHit> = hits

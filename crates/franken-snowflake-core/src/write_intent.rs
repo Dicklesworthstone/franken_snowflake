@@ -779,9 +779,15 @@ mod tests {
             WriteIntentDecision::ExecutionAuthorized { .. }
         ));
         if let WriteIntentDecision::ExecutionAuthorized { plan } = decision {
-            assert!(plan.execution_enabled, "authorized plan must enable execution");
+            assert!(
+                plan.execution_enabled,
+                "authorized plan must enable execution"
+            );
             assert!(plan.receipt.execution_enabled);
-            assert!(!plan.receipt.dry_run, "authorized receipt is no longer dry-run");
+            assert!(
+                !plan.receipt.dry_run,
+                "authorized receipt is no longer dry-run"
+            );
             assert_eq!(plan.statement_kind, WriteStatementKind::Insert);
             assert_eq!(plan.safety_class, WriteSafetyClass::Dml);
             assert_eq!(plan.receipt.request_id.as_str(), "req-123");
@@ -805,7 +811,10 @@ mod tests {
         policy.require_dry_run = false;
         policy.require_exact_confirmation = false;
         policy.require_append_only_audit = false;
-        let req = request(WriteIntentMode::PrepareExecution, "insert into t values (1)");
+        let req = request(
+            WriteIntentMode::PrepareExecution,
+            "insert into t values (1)",
+        );
         assert!(
             req.confirmation_token.is_none(),
             "no confirmation token is supplied"
@@ -851,7 +860,10 @@ mod tests {
             WriteIntentDecision::DryRunPlanned { .. }
         ));
         if let WriteIntentDecision::DryRunPlanned { plan } = decision {
-            assert!(!plan.execution_enabled, "dry-run plan never enables execution");
+            assert!(
+                !plan.execution_enabled,
+                "dry-run plan never enables execution"
+            );
             assert!(plan.receipt.dry_run);
         }
     }

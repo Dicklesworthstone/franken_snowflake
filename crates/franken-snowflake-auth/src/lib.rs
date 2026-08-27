@@ -26,8 +26,8 @@ use std::env;
 use std::error::Error;
 use std::fmt;
 
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use rsa::pkcs1::EncodeRsaPrivateKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePublicKey};
 use rsa::traits::PublicKeyParts;
@@ -1623,10 +1623,10 @@ fn is_secret_delimiter(ch: char) -> bool {
 mod tests {
     use std::cell::Cell;
 
-    use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+    use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
     use rand::rngs::OsRng;
-    use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
     use rsa::RsaPrivateKey;
+    use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 
     use super::*;
 
@@ -1690,10 +1690,10 @@ mod tests {
         fn read_env_secret(&self, name: &str) -> Result<SecretValue, AuthError> {
             self.read_checks
                 .set(self.read_checks.get().saturating_add(1));
-            if name == self.env_name {
-                if let Some(value) = &self.env_value {
-                    return SecretValue::new(value.clone());
-                }
+            if name == self.env_name
+                && let Some(value) = &self.env_value
+            {
+                return SecretValue::new(value.clone());
             }
             Err(AuthError::MissingEnvVar {
                 name: name.to_string(),
@@ -1728,8 +1728,8 @@ mod tests {
     }
 
     #[test]
-    fn pat_auth_constructs_bearer_headers_with_pat_token_type(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn pat_auth_constructs_bearer_headers_with_pat_token_type()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut auth = ProgrammaticAccessTokenAuth::from_bearer_token(
             "pat-secret-value",
             Some(1_800_000_000),
@@ -1750,8 +1750,8 @@ mod tests {
     }
 
     #[test]
-    fn oauth_auth_constructs_bearer_headers_with_oauth_token_type(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn oauth_auth_constructs_bearer_headers_with_oauth_token_type()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut auth = OAuthBearerAuth::from_bearer_token(
             "oauth-secret-value",
             Some(1_800_000_000),
@@ -1767,8 +1767,8 @@ mod tests {
     }
 
     #[test]
-    fn profile_env_source_probes_presence_without_reading_secret(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn profile_env_source_probes_presence_without_reading_secret()
+    -> Result<(), Box<dyn std::error::Error>> {
         let resolver = FakeResolver::with_env("SNOWFLAKE_PAT", "pat-secret-value");
         let source = SecretSource::env_var("SNOWFLAKE_PAT")?;
         let profile = AuthProfile::pat(source);
@@ -1784,8 +1784,8 @@ mod tests {
     }
 
     #[test]
-    fn missing_env_var_teaches_exact_next_command_without_secret(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn missing_env_var_teaches_exact_next_command_without_secret()
+    -> Result<(), Box<dyn std::error::Error>> {
         let resolver = FakeResolver::missing("SNOWFLAKE_PAT");
         let source = SecretSource::env_var("SNOWFLAKE_PAT")?;
         let error = match source.resolve(&resolver) {
@@ -1884,10 +1884,7 @@ mod tests {
         let body = "MIIBVgIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA0secretKeyMaterial";
         let pem = format!(
             "configured key:\n{}{}\n{body}\n{}{}\ntrailing log line",
-            "-----BEGIN ",
-            "PRIVATE KEY-----",
-            "-----END ",
-            "PRIVATE KEY-----"
+            "-----BEGIN ", "PRIVATE KEY-----", "-----END ", "PRIVATE KEY-----"
         );
         let redacted = redact_with_policy(&pem, &[]);
 
@@ -1905,15 +1902,11 @@ mod tests {
     }
 
     #[test]
-    fn signs_rs256_claims_with_snowflake_issuer_and_subject(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn signs_rs256_claims_with_snowflake_issuer_and_subject()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (private_key_pem, public_key_pem) = test_key_pair_pems()?;
-        let signer = KeyPairJwtSigner::from_pkcs8_pem(
-            "org.account",
-            "svc_user",
-            &private_key_pem,
-            None,
-        )?;
+        let signer =
+            KeyPairJwtSigner::from_pkcs8_pem("org.account", "svc_user", &private_key_pem, None)?;
         let signed = signer.sign_at(1_800_000_000, 900)?;
         assert_eq!(
             signed.claims.iss,
@@ -2002,21 +1995,25 @@ mod tests {
         )?;
         let jwt = KeyPairJwtAuth::from_signer(signer()?, MAX_JWT_VALIDITY_SECONDS + 1);
 
-        assert!(pat
-            .lifetime()
-            .doctor_warning_at(1_800_000_000)
-            .map(|warning| warning.message.contains("expires in"))
-            .unwrap_or(false));
-        assert!(oauth
-            .lifetime()
-            .doctor_warning_at(1_800_000_000)
-            .map(|warning| warning.message.contains("refresh"))
-            .unwrap_or(false));
-        assert!(jwt
-            .lifetime()
-            .doctor_warning_at(1_800_000_000)
-            .map(|warning| warning.message.contains("3600s cap"))
-            .unwrap_or(false));
+        assert!(
+            pat.lifetime()
+                .doctor_warning_at(1_800_000_000)
+                .map(|warning| warning.message.contains("expires in"))
+                .unwrap_or(false)
+        );
+        assert!(
+            oauth
+                .lifetime()
+                .doctor_warning_at(1_800_000_000)
+                .map(|warning| warning.message.contains("refresh"))
+                .unwrap_or(false)
+        );
+        assert!(
+            jwt.lifetime()
+                .doctor_warning_at(1_800_000_000)
+                .map(|warning| warning.message.contains("3600s cap"))
+                .unwrap_or(false)
+        );
         Ok(())
     }
 

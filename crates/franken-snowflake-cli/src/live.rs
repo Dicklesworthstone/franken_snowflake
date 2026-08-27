@@ -39,7 +39,9 @@ use franken_snowflake_sqlapi::driver::run_statement;
 use franken_snowflake_sqlapi::lifecycle::{CompletedStatement, PollPlan};
 use franken_snowflake_sqlapi::request::{Binding, SubmitQueryParams, SubmitStatementRequest};
 
-use crate::{Body, Json, OutputFormat, base_envelope, error_info, json_array, json_object, json_string};
+use crate::{
+    Body, Json, OutputFormat, base_envelope, error_info, json_array, json_object, json_string,
+};
 
 /// SQL API statement timeout (seconds) requested per submit.
 const REQUEST_TIMEOUT_SECONDS: u32 = 60;
@@ -237,7 +239,10 @@ fn write_success(
         json_object(vec![
             ("profile_id", json_string(profile.clone())),
             ("execution_enabled", Json::Bool(true)),
-            ("statement_kind", json_string(write.statement_kind.to_string())),
+            (
+                "statement_kind",
+                json_string(write.statement_kind.to_string()),
+            ),
             ("safety_class", json_string(write.safety_class.to_string())),
             (
                 "write_intent_receipt_id",
@@ -482,10 +487,7 @@ pub fn run_catalog_graph_outcome(
                 json_object(vec![
                     ("profile_id", json_string(profile.clone())),
                     ("database", json_string(database)),
-                    (
-                        "schema",
-                        schema.map_or(Json::Null, json_string),
-                    ),
+                    ("schema", schema.map_or(Json::Null, json_string)),
                     ("nodes", graph.nodes_json()),
                     ("edges", graph.edges_json()),
                     ("node_count", Json::Number(graph.nodes.len() as i64)),
@@ -525,7 +527,11 @@ struct CatalogHierarchy {
 impl CatalogHierarchy {
     fn from_rows(profile: &str, rows: &LiveRows) -> Self {
         let mut h = Self::default();
-        let profile_node = h.ensure(format!("P|{profile}"), "profile", format!("profile: {profile}"));
+        let profile_node = h.ensure(
+            format!("P|{profile}"),
+            "profile",
+            format!("profile: {profile}"),
+        );
         for row in &rows.rows {
             let cell = |i: usize| row.get(i).and_then(Clone::clone).unwrap_or_default();
             let database = cell(0);
@@ -767,8 +773,10 @@ fn execute(
                 "async runtime did not install an ambient context",
             )
         })?;
-        let client =
-            SnowflakeHttpClient::default_for_runtime(TransportConfig::new(conn.endpoint.clone()), &cx);
+        let client = SnowflakeHttpClient::default_for_runtime(
+            TransportConfig::new(conn.endpoint.clone()),
+            &cx,
+        );
         let mut mechanism = conn
             .auth_profile
             .resolve(&ProcessSecretResolver, &conn.account, &conn.user)
@@ -797,7 +805,10 @@ fn execute(
             Outcome::Err(error) => Err(error),
             Outcome::Cancelled(reason) => Err(SnowflakeError::new(
                 SnowflakeErrorCode::Internal,
-                format!("statement was cancelled before completion: {:?}", reason.kind),
+                format!(
+                    "statement was cancelled before completion: {:?}",
+                    reason.kind
+                ),
             )),
             Outcome::Panicked(_) => Err(SnowflakeError::new(
                 SnowflakeErrorCode::Internal,
@@ -887,8 +898,12 @@ impl LiveConn {
             account,
             user: user.unwrap_or_default(),
             warehouse: warehouse.unwrap_or_default(),
-            database: database.map(str::to_string).or_else(|| env_value(&name(&prefix, "DATABASE"))),
-            schema: schema.map(str::to_string).or_else(|| env_value(&name(&prefix, "SCHEMA"))),
+            database: database
+                .map(str::to_string)
+                .or_else(|| env_value(&name(&prefix, "DATABASE"))),
+            schema: schema
+                .map(str::to_string)
+                .or_else(|| env_value(&name(&prefix, "SCHEMA"))),
             role: env_value(&name(&prefix, "ROLE")),
             endpoint,
             auth_profile,
@@ -909,10 +924,12 @@ fn secret_env_for_lane(prefix: &str, lane: &str) -> Option<String> {
 }
 
 fn build_auth_profile(prefix: &str, lane: &str) -> Result<AuthProfile, SnowflakeError> {
-    let credential = |detail: String| SnowflakeError::new(SnowflakeErrorCode::CredentialMissing, detail);
+    let credential =
+        |detail: String| SnowflakeError::new(SnowflakeErrorCode::CredentialMissing, detail);
     match lane {
         "pat" | "programmatic_access_token" => Ok(AuthProfile::pat(
-            SecretSource::env_var(name(prefix, "PAT")).map_err(|error| credential(error.to_string()))?,
+            SecretSource::env_var(name(prefix, "PAT"))
+                .map_err(|error| credential(error.to_string()))?,
         )),
         "oauth" | "oauth_bearer" | "oauth_bearer_token" => Ok(AuthProfile::oauth_bearer(
             SecretSource::env_var(name(prefix, "OAUTH_BEARER"))
@@ -1080,12 +1097,15 @@ fn authorization_descriptor(
     let headers = mechanism.headers_at(now_unix_seconds()).map_err(|error| {
         SnowflakeError::new(SnowflakeErrorCode::CredentialMissing, error.to_string())
     })?;
-    let bearer = headers.authorization_value().strip_prefix("Bearer ").ok_or_else(|| {
-        SnowflakeError::new(
-            SnowflakeErrorCode::Internal,
-            "authorization header did not contain a bearer token",
-        )
-    })?;
+    let bearer = headers
+        .authorization_value()
+        .strip_prefix("Bearer ")
+        .ok_or_else(|| {
+            SnowflakeError::new(
+                SnowflakeErrorCode::Internal,
+                "authorization header did not contain a bearer token",
+            )
+        })?;
     let token_type = match headers.token_type_value() {
         PROGRAMMATIC_ACCESS_TOKEN_TYPE => SnowflakeAuthTokenType::ProgrammaticAccessToken,
         KEYPAIR_JWT_TOKEN_TYPE => SnowflakeAuthTokenType::KeypairJwt,
@@ -1100,7 +1120,9 @@ fn authorization_descriptor(
     Ok(AuthorizationDescriptor::bearer(
         token_type,
         bearer,
-        mechanism.credential_handle().unwrap_or("cred_resolved_without_handle"),
+        mechanism
+            .credential_handle()
+            .unwrap_or("cred_resolved_without_handle"),
     ))
 }
 
@@ -1288,7 +1310,10 @@ fn deterministic_session_parameters() -> BTreeMap<String, String> {
     BTreeMap::from([
         ("TIMEZONE".to_string(), "UTC".to_string()),
         ("DATE_OUTPUT_FORMAT".to_string(), "YYYY-MM-DD".to_string()),
-        ("TIME_OUTPUT_FORMAT".to_string(), "HH24:MI:SS.FF9".to_string()),
+        (
+            "TIME_OUTPUT_FORMAT".to_string(),
+            "HH24:MI:SS.FF9".to_string(),
+        ),
         (
             "TIMESTAMP_NTZ_OUTPUT_FORMAT".to_string(),
             "YYYY-MM-DD HH24:MI:SS.FF9".to_string(),
@@ -1318,8 +1343,7 @@ fn is_safe_sql_identifier(value: &str) -> bool {
     if !(first.is_ascii_alphabetic() || first == '_') {
         return false;
     }
-    value.len() <= 255
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
+    value.len() <= 255 && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
 }
 
 fn name(prefix: &str, key: &str) -> String {

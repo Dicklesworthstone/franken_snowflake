@@ -80,13 +80,13 @@ impl ManualClock {
     /// Advance the clock by `delta`.
     pub fn advance(&self, delta: Duration) {
         let delta_nanos = saturating_nanos(delta);
-        // The closure is infallible (always `Some`), so `fetch_update` can never
+        // The closure is infallible (always `Some`), so `try_update` can never
         // return `Err`; discard the `Ok` rather than `.expect()`-ing it, which
         // would trip the workspace `expect_used = "deny"` clippy gate in this
         // non-test path.
         let _ = self
             .nanos
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 Some(current.saturating_add(delta_nanos))
             });
     }

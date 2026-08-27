@@ -656,10 +656,7 @@ mod tests {
             );
         }
         // A plain SELECT stays a read.
-        assert_eq!(
-            classify_sql_operation("select 1"),
-            SqlOperationClass::Read
-        );
+        assert_eq!(classify_sql_operation("select 1"), SqlOperationClass::Read);
     }
 
     #[test]

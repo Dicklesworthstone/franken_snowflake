@@ -639,14 +639,12 @@ fn destructured_bindings(body: &str, field: &str) -> Vec<(String, usize)> {
                     search_from = statement_end;
                     continue;
                 }
-                if let Ok(position) = field.parse::<usize>() {
-                    if let Some(raw) =
+                if let Ok(position) = field.parse::<usize>()
+                    && let Some(raw) =
                         split_top_level_commas(&body[cursor + 1..close]).nth(position)
-                    {
-                        if let Some(binding) = normalize_binding(raw) {
-                            bindings.push((binding, statement_end));
-                        }
-                    }
+                    && let Some(binding) = normalize_binding(raw)
+                {
+                    bindings.push((binding, statement_end));
                 }
                 search_from = statement_end;
             }
