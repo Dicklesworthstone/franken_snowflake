@@ -17,12 +17,13 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   cross-platform:
-    name: ${{ matrix.os }} workspace, gates, e2e
+    name: ${{ matrix.os }} workspace tests, gates, feature lanes
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -30,9 +31,13 @@ jobs:
           - ubuntu-latest
           - macos-latest
           - windows-latest
+    # NOTE: only the `github`/`matrix`/`vars`/`secrets`/`inputs` contexts are
+    # available in job-level `env`. The `runner` context is step-level only; a
+    # job-level `${{ runner.temp }}` here made GitHub reject the whole workflow
+    # before creating any job (every run from 2026-06-25 to 2026-08-27 failed
+    # with "workflow file issue" and zero jobs).
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/franken-snowflake-target
-      FSNOW_ARTIFACTS_DIR: ${{ runner.temp }}/franken-snowflake-artifacts
+      FSNOW_ARTIFACTS_DIR: ${{ github.workspace }}/.fsnow-artifacts
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -43,16 +48,21 @@ jobs:
           rustc --version --verbose
           cargo --version --verbose
 
-      - name: Cargo check
+      - name: Cache cargo registry and build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-workspace
+
+      - name: Cargo check (default features)
         run: cargo check --workspace --locked
 
       - name: Assert dependency admissibility
         run: python scripts/check-dependency-admissibility.py
         env:
-          # Upstream prerequisite for the cache crate on Windows:
-          # fsqlite-vfs/fsqlite-mvcc must re-gate the Unix-only nix dependency
-          # from cfg(not(wasm32)) to cfg(unix). Until then, Windows CI runs the
-          # admissibility gate with only that optional lane explicitly skipped.
+          # Upstream prerequisite for the cache crate's optional `frankensqlite`
+          # lane on Windows: fsqlite-vfs/fsqlite-mvcc gate the Unix-only `nix`
+          # dependency under cfg(not(wasm32)). Until they re-gate to cfg(unix),
+          # Windows runs the admissibility gate with only that lane skipped.
           FSNOW_SKIP_FSQLITE_WINDOWS_PREREQ: ${{ runner.os == 'Windows' && '1' || '0' }}
 
       - name: Assert LF-only golden fixtures
@@ -62,15 +72,41 @@ jobs:
         if: runner.os != 'Windows'
         run: bash scripts/check-install-sh-ui.sh
 
-      - name: Run deterministic mock e2e harness
-        run: cargo test --locked -p franken-snowflake-testkit --test e2e_harness
+      - name: Workspace tests (default features)
+        run: cargo test --workspace --locked
+
+      - name: Feature lane - cli live,mcp
+        run: cargo test --locked -p franken-snowflake-cli --features live,mcp
+
+      - name: Feature lane - core adapter-fixtures
+        run: cargo test --locked -p franken-snowflake-core --features adapter-fixtures
+
+      - name: Feature lane - frame frankenpandas
+        run: cargo test --locked -p franken-snowflake-frame --features frankenpandas
+
+      - name: Feature lane - export
+        run: cargo test --locked -p franken-snowflake-export --features export
+
+      - name: Feature lane - graph
+        run: cargo test --locked -p franken-snowflake-graph --features graph
+
+      - name: Feature lane - text-indexing frankensearch
+        run: cargo test --locked -p franken-snowflake-text-indexing --features frankensearch
+
+      - name: Feature lane - tui
+        run: cargo test --locked -p franken-snowflake-tui --features tui
+
+      - name: Feature lane - cache frankensqlite (Unix only, see admissibility note)
+        if: runner.os != 'Windows'
+        run: cargo test --locked -p franken-snowflake-cache --features frankensqlite
+
+      - name: Live proof lane emits a typed skip without credentials
+        run: cargo test --locked -p franken-snowflake-sqlapi --test live_proof -- --nocapture
 
   linux-lints:
     name: linux lint and single-version gate
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/franken-snowflake-target
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -80,6 +116,11 @@ jobs:
           rustup show
           rustc --version --verbose
           cargo --version --verbose
+
+      - name: Cache cargo registry and build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-lints
 
       - name: Workspace lint policy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
