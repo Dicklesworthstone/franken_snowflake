@@ -663,6 +663,16 @@ fast administrator-managed onboarding, key-pair JWT for long-lived service users
 and rotation, OAuth bearer where an OAuth flow already exists, and workload
 identity federation only after the first three are stable.
 
+The bearer is re-derived before every SQL API request, so a key-pair JWT that
+approaches its validity window during a long poll is re-signed before the next
+`GET` rather than failing. If the API still answers `401`, the JWT lane re-signs
+exactly once and retries the same step; PAT and OAuth cannot re-sign, so a `401`
+becomes a typed `credential_expired` error (with a remote cancel of the orphaned
+statement when a handle exists). Account identifiers in JWT claims follow the
+Snowflake rules: locator forms drop the region/cloud labels
+(`xy12345.us-east-1.aws` becomes `XY12345`) while organization forms keep both
+halves (`myorg.prod2` becomes `MYORG-PROD2`).
+
 ### Example: a live PAT profile with writes enabled
 
 ```bash
@@ -833,10 +843,8 @@ confirmation required, `FSNOW-3009` DDL not opted in) with an exact next command
   the CLI default (the locked fsqlite crates do not build on Windows yet).
 - The TUI crate exists but is not compiled into the binary; `fsnow tui` returns a
   typed refusal.
-- Long-running statements are not re-signed mid-flight for key-pair JWT (a poll
-  past ~1 hour fails typed rather than refreshing), partitions are fetched
-  sequentially, and the `--toon` encoding is byte-size-neutral rather than
-  smaller for row payloads.
+- Partitions are fetched sequentially, and the `--toon` encoding is
+  byte-size-neutral rather than smaller for row payloads.
 - The CLI has no `completions` subcommand; discover commands via `capabilities`.
 - The whole stack requires a nightly Rust toolchain (edition 2024), inherited
   from the FrankenSQLite, sqlmodel, and Asupersync dependency set.

@@ -141,6 +141,16 @@ several commands returned "reserved" stubs. This window closes those gaps:
   every post-handle error path, budget cancellations fire the remote cancel,
   and a `StatementTransport` seam allows scripted fake transports in tests
   ([`cc508e7`](https://github.com/Dicklesworthstone/franken_snowflake/commit/cc508e7)).
+- **JWT re-sign mid-flight and org-account normalization.** The driver now
+  takes an `AuthProvider`: the bearer is re-derived before every submit, poll,
+  and partition fetch (a key-pair JWT near expiry is re-signed before the
+  request), and a `401` triggers exactly one re-sign + retry of the same step
+  for the JWT lane; PAT/OAuth get a typed `credential_expired` error and an
+  orphan cancel. `401` is a distinct `StatusClass::Unauthorized`. The JWT
+  account normalizer no longer truncates organization accounts whose name
+  contains a digit (`myorg.prod2` → `MYORG-PROD2`); locator regions are
+  recognized by hyphenated region labels and the aws/azure/gcp/privatelink
+  keywords.
 - **Dataset mode.** `query plan|run --dataset <id>` compiles pushed-down SQL
   through the catalog planner with positional typed bindings, `--as-of` Time
   Travel, and enforced limits; axis flags without `--dataset` and `--sql`
