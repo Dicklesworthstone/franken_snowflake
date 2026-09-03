@@ -102,6 +102,66 @@ implementation first and the test/hardening pass follows in a later wave. The
 
 ## [Unreleased] — since v0.0.2
 
+### Reality-check remediation (2026-09-02 → 2026-09-03)
+
+An end-to-end reality check against the README found that `v0.0.2` binaries
+shipped without `live`/`mcp`, CI had never produced a job, four crates
+(catalog, cache, graph, export) were built but not wired into the CLI, and
+several commands returned "reserved" stubs. This window closes those gaps:
+
+- **CI actually runs.** The workflow used the `runner` context in job-level
+  `env`, which GitHub rejects at parse time, so no run had ever started. It now
+  runs `cargo test --workspace --locked` plus every optional feature lane on
+  the ubuntu/macos/windows matrix, with clippy `-D warnings` and the
+  single-version gate on Linux
+  ([`2809a3f`](https://github.com/Dicklesworthstone/franken_snowflake/commit/2809a3f)).
+- **Local store.** `franken-snowflake-cache` gained an append-only JSONL
+  `FileCache` backend (first-write-wins, tamper-detected receipts, malformed
+  lines skipped and counted), a platform data-dir resolver
+  (`FRANKEN_SNOWFLAKE_DATA_DIR` override), and receipt/snapshot/dataset lookups
+  on the `CacheBackend` trait
+  ([`791175a`](https://github.com/Dicklesworthstone/franken_snowflake/commit/791175a)).
+- **Catalog, graph, export, receipts wired into the product.** `catalog scan`
+  discovers tables and columns with bound `INFORMATION_SCHEMA` statements and
+  persists manifests; `catalog graph` renders Mermaid/SVG/JSON from the
+  snapshot (or `--refresh`); `dataset inspect` / `dataset profile [--execute]`
+  are real; `export plan` builds content-addressed `COPY INTO` plans and
+  `export run` writes local CSV/JSONL; every live execution writes a BLAKE3
+  receipt, partition evidence, and an audit event, and `receipt show` reads
+  them back; `doctor` and `selftest` execute real checks and fixtures;
+  `--limit/--role/--warehouse/--statement-timeout/--query-tag` are honored or
+  rejected instead of silently ignored; `query cancel` POSTs to the SQL API
+  cancel endpoint
+  ([`d357ce5`](https://github.com/Dicklesworthstone/franken_snowflake/commit/d357ce5)).
+- **Fail-closed fix.** `selftest` caught the read-only guard treating
+  `/* /* nested */ select 1 */ delete from t` as a read; comment skipping is
+  now depth-aware with a regression test.
+- **Cancel correctness.** The driver cancels an orphaned remote statement on
+  every post-handle error path, budget cancellations fire the remote cancel,
+  and a `StatementTransport` seam allows scripted fake transports in tests
+  ([`cc508e7`](https://github.com/Dicklesworthstone/franken_snowflake/commit/cc508e7)).
+- **Dataset mode.** `query plan|run --dataset <id>` compiles pushed-down SQL
+  through the catalog planner with positional typed bindings, `--as-of` Time
+  Travel, and enforced limits; axis flags without `--dataset` and `--sql`
+  with `--dataset` are typed usage errors
+  ([`053a44d`](https://github.com/Dicklesworthstone/franken_snowflake/commit/053a44d)).
+- **Proof lanes.** A binary-spawning CLI e2e test with planted canary secrets
+  and a loopback account, and an MCP stdio handshake/parity test
+  ([`5e55129`](https://github.com/Dicklesworthstone/franken_snowflake/commit/5e55129)).
+- **Docs truth.** README, `docs/RELEASE.md`, the agent CLI contract, and the
+  write-intent ladder now describe what the code does, including that
+  `v0.0.2` binaries lack live/MCP and Windows assets and that `--toon` is
+  byte-size-neutral
+  ([`9acb8bd`](https://github.com/Dicklesworthstone/franken_snowflake/commit/9acb8bd)).
+
+Not verified in this window: every live-account execution path (no
+credentials were available; the live lanes are covered by the fake transport,
+loopback refusals, and fixtures only). Still open: TUI compilation, JWT
+re-signing for statements past the token lifetime, concurrent partition
+fetching, and the empirical jsonv2 golden capture
+(`fsnow-native-snowflake-connector-w0i.13`, reopened because its fixture is
+document-derived).
+
 Current window after the [`v0.0.1`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.1)
 GitHub Release (2026-06-30,
 [`fae8bed`](https://github.com/Dicklesworthstone/franken_snowflake/commit/fae8bed20bda3353edf1beb46ea3cedb86885cf4))
