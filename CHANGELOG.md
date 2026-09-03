@@ -109,17 +109,13 @@ shipped without `live`/`mcp`, CI had never produced a job, four crates
 (catalog, cache, graph, export) were built but not wired into the CLI, and
 several commands returned "reserved" stubs. This window closes those gaps:
 
-- **CI workflow is valid again, but unproven.** The workflow used the `runner`
-  context in job-level `env`, which GitHub rejects at parse time, so none of
-  the 52 earlier runs ever created a job. The rewritten workflow creates jobs
-  for `cargo test --workspace --locked` plus every optional feature lane on
-  the ubuntu/macos/windows matrix, with clippy `-D warnings` and the
-  single-version gate on Linux
-  ([`2809a3f`](https://github.com/Dicklesworthstone/franken_snowflake/commit/2809a3f)).
-  As of 2026-09-03 no job had been assigned a hosted runner: the account's
-  runner concurrency was saturated by sibling repositories and each push
-  cancelled the queued run. No step has executed on any OS yet; treat the
-  matrix as unverified until a completed run URL is recorded here.
+- **GitHub Actions removed; verification is `dsr`-only.** The workflow that
+  existed had never executed a job (52 runs failed at parse because of the
+  `runner` context in job-level `env`; a rewrite in
+  [`2809a3f`](https://github.com/Dicklesworthstone/franken_snowflake/commit/2809a3f)
+  created jobs that were never assigned a hosted runner). Per project policy
+  this repository never uses Actions; `.github/workflows` was deleted and
+  `docs/RELEASE.md` now specifies the `dsr` cross-platform proof instead.
 - **Local store.** `franken-snowflake-cache` gained an append-only JSONL
   `FileCache` backend (first-write-wins, tamper-detected receipts, malformed
   lines skipped and counted), a platform data-dir resolver

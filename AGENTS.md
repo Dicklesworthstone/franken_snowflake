@@ -179,6 +179,10 @@ Core proof lanes should include:
 Live tests require explicit credentials and must be opt-in. A live test that is
 missing credentials should emit a typed skip/refusal, not silently pass.
 
+This repository never uses GitHub Actions. Do not add `.github/workflows`.
+Cross-platform builds, tests, and releases run through `dsr` (see
+`docs/RELEASE.md`); cite `dsr` output, never an Actions run, as proof.
+
 ## External Documentation
 
 When Snowflake behavior is uncertain, check official Snowflake documentation

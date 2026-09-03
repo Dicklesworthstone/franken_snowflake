@@ -52,10 +52,11 @@ The script has a built-in parser self-test that injects the known bad
 `fp-io -> orc-rust -> tokio` path, a third-party Snowflake package, and duplicate
 Franken runtime package versions, then asserts that the gate catches them.
 
-Windows CI has one explicit upstream prerequisite for the non-default cache
-feature: FrankenSQLite must re-gate the Unix-only `nix` dependency in
-`fsqlite-vfs` and `fsqlite-mvcc` from `cfg(not(target_arch = "wasm32"))` to
-`cfg(unix)`, then add its own full-workspace Windows build. Until that lands,
-the CI matrix runs this gate on Windows with only the cache crate's
-`frankensqlite` lane skipped and emits a structured `lane_skipped` event. The
-default cache crate and all other workspace lanes still run on Windows.
+The Windows build host (via `dsr`; this repository never uses GitHub Actions)
+has one explicit upstream prerequisite for the non-default cache feature:
+FrankenSQLite must re-gate the Unix-only `nix` dependency in `fsqlite-vfs` and
+`fsqlite-mvcc` from `cfg(not(target_arch = "wasm32"))` to `cfg(unix)`, then add
+its own full-workspace Windows build. Until that lands, run this gate on
+Windows with `FSNOW_SKIP_FSQLITE_WINDOWS_PREREQ=1` so only the cache crate's
+`frankensqlite` lane is skipped (it emits a structured `lane_skipped` event).
+The default cache crate and all other workspace lanes still run on Windows.

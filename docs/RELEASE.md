@@ -52,22 +52,20 @@ Tokio, reqwest, hyper, hyper-util, axum, tower, tower-http, sqlx, diesel,
 sea-orm, sea-orm-migration, `fp-io`, `orc-rust`, or third-party Snowflake driver
 in a scanned lane blocks release.
 
-## Required CI Proof
+## Required Cross-Platform Proof (dsr, never GitHub Actions)
 
-The GitHub Actions matrix must pass on Linux, macOS, and Windows:
+This repository does not use GitHub Actions. There is no `.github/workflows`
+directory and none may be added. Cross-platform builds, tests, and release
+artifacts run through `dsr` (Doodlestein Self-Releaser) on its Linux, macOS,
+and Windows build hosts. Before tagging, the following must pass on each of
+the three platforms via `dsr`, and the release notes must cite the `dsr`
+run output:
 
 - `cargo check --workspace --locked`
 - `python3 scripts/check-dependency-admissibility.py`
 - `python3 scripts/check-golden-lf.py`
-- `cargo test --workspace --locked` plus every optional feature lane (see
-  `.github/workflows/ci.yml`; the `frankensqlite` lane is Unix-only)
-
-Until 2026-09-02 no CI run had ever produced a job (the workflow used the
-`runner` context in job-level `env`, which GitHub rejects); treat any "CI
-proof" claim older than that as unbacked. After the fix, jobs are created but,
-as of 2026-09-03, none had been assigned a hosted runner (account-wide runner
-saturation plus push-triggered cancellation), so the macOS and Windows lanes
-have still never executed. A release must cite a completed run URL.
+- `cargo test --workspace --locked` plus every optional feature lane listed
+  above (the `frankensqlite` lane is Unix-only)
 
 The Linux lint lane must also pass:
 
@@ -76,8 +74,14 @@ The Linux lint lane must also pass:
 
 The cache crate currently depends on FrankenSQLite candidate crates. On Windows,
 keep the fsqlite `cfg(unix)` prerequisite documented in
-`docs/dependency_admissibility.md` and set the CI skip variable only for that
-known upstream prerequisite, not for forbidden-dependency failures.
+`docs/dependency_admissibility.md` and set `FSNOW_SKIP_FSQLITE_WINDOWS_PREREQ`
+only for that known upstream prerequisite, not for forbidden-dependency
+failures.
+
+History: a GitHub Actions workflow existed until 2026-09-03 and never executed
+a single job (52 runs failed at workflow parse; the 10 after a fix were never
+assigned a runner). It was removed; any "CI proof" wording older than this
+note is unbacked.
 
 ## No-Account Proof Lanes
 
