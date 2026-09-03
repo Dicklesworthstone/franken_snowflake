@@ -151,6 +151,13 @@ several commands returned "reserved" stubs. This window closes those gaps:
   contains a digit (`myorg.prod2` → `MYORG-PROD2`); locator regions are
   recognized by hyphenated region labels and the aws/azure/gcp/privatelink
   keywords.
+- **Scripted CLI outcome lane.** A test-only seam at `execute_request` lets
+  the public live outcome functions run offline against scripted completed
+  statements with real store side effects; six tests cover query run
+  (flag shaping, emit cap, receipt read-back), typed failure, catalog scan →
+  dataset inspect → catalog graph → dataset run → profile execute, export
+  run, and the online profile probe. Documented as Lane 9 in
+  `docs/proof_lanes.md`.
 - **Dataset mode.** `query plan|run --dataset <id>` compiles pushed-down SQL
   through the catalog planner with positional typed bindings, `--as-of` Time
   Travel, and enforced limits; axis flags without `--dataset` and `--sql`

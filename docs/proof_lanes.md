@@ -132,6 +132,34 @@ a typed skip outcome and evidence when credentials are absent — never a silent
 pass. The empirically captured `jsonv2` timestamp-unit golden is pinned here,
 resolving the doc ambiguity Lane 1's codec tests are written against.
 
+## Lane 9 — Scripted Driver And CLI Outcome Lanes (implemented)
+
+Two no-account lanes sit between the protocol goldens and the live opt-in
+lane, and both are labeled for what they prove:
+
+- **Scripted transport under the driver**
+  (`franken-snowflake-sqlapi::driver::tests`, `FakeTransport` +
+  `StatementTransport`): submit → poll → partition → assemble with scripted
+  status classes and bodies. Proves poll pacing/budgets, orphan cancel on
+  every post-handle error, budget cancellations firing the remote cancel, the
+  `AuthProvider` re-sign on `401` (exactly one retry per step), and partition
+  row-count integrity. Every partition body is the live `{"data":[...]}`
+  object form; one explicit bare-array fallback case is kept.
+- **Scripted statements under the CLI outcome layer**
+  (`franken-snowflake-cli::live::test_support`, `--features live`): the
+  public outcome functions (`query run`, `catalog scan`, `dataset inspect`
+  and `catalog graph` from the persisted snapshot, `query run --dataset`,
+  `dataset profile --execute`, `export run`, `profile doctor --online`) run
+  end to end with `execute_request` answered from a per-test script. Proves
+  request shaping (session overrides, typed positional bindings, `QUERY_TAG`,
+  timeout), receipt + audit + snapshot persistence and read-back, envelope
+  shape and `data_source`, and the row emit cap. A profile that is not
+  scripted still resolves through the real env path and fails typed.
+
+What neither lane proves: TLS, the asupersync HTTP client, real gzip
+partition bodies over the wire, or Snowflake's actual responses. Those remain
+Lane 3 (mock server) and Lane 8 (live opt-in).
+
 ## Cross-Cutting Standards
 
 - Unit tests live beside the code; each public behavior has ≥ 1 positive and ≥ 1
