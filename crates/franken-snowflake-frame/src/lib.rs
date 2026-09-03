@@ -633,7 +633,7 @@ mod frankenpandas {
     }
 
     fn is_even_hex(text: &str) -> bool {
-        text.len() % 2 == 0 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+        text.len().is_multiple_of(2) && text.bytes().all(|byte| byte.is_ascii_hexdigit())
     }
 
     #[cfg(test)]

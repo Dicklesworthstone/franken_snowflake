@@ -743,10 +743,7 @@ mod tests {
     fn frankensearch_fixture_docs_build_and_query() {
         use crate::frankensearch_adapter::{build_hash_lexical_index, query_hash_lexical_index};
 
-        let Ok(dir) = tempfile::tempdir() else {
-            assert!(false, "temp dir should be available");
-            return;
-        };
+        let dir = tempfile::tempdir().expect("temp dir should be available");
         let index_path = dir.path().to_path_buf();
         let chunks = vec![
             TextChunk::new(
@@ -783,10 +780,7 @@ mod tests {
     fn frankensearch_builder_refuses_empty_chunks() {
         use crate::frankensearch_adapter::build_hash_lexical_index;
 
-        let Ok(dir) = tempfile::tempdir() else {
-            assert!(false, "temp dir should be available");
-            return;
-        };
+        let dir = tempfile::tempdir().expect("temp dir should be available");
         let index_path = dir.path().to_path_buf();
         let chunks = vec![TextChunk::new(
             query_source(),

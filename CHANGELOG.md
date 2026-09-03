@@ -172,6 +172,20 @@ several commands returned "reserved" stubs. This window closes those gaps:
   assembled: the statement completes early, `CompletedStatement::is_partial`
   is set, and the envelope reports `partitions_fetched` plus a warning. Eight
   new driver tests observe the overlap through the fake transport.
+- **Every feature lane is linted.** `scripts/check-feature-lanes.sh` runs
+  `cargo clippy --all-targets -D warnings` for 18 lanes and fails when any
+  workspace feature is not covered by a lane. Its first run found lints that
+  `cargo test` had been passing for months: a manual `% 2 == 0` in the frame
+  crate and constant `assert!(false)` patterns in the text-indexing and mcp
+  test modules. It is part of the dsr check list and the release proof.
+- **Windows on ARM builds.** `scripts/cross-build-windows-arm64.sh` produces
+  an `aarch64-pc-windows-msvc` executable from Linux (cargo-xwin clang
+  driver; blake3 pure-Rust on that target only; capitalized import-library
+  aliases in the xwin sysroot), and the target is back in the release set,
+  built natively on the Windows host through dsr.
+- **dsr's Windows runner fixed upstream.** Generated PowerShell now travels
+  as `-EncodedCommand` and cmd lines through a base64 cmd.exe wrapper, so
+  hosts with a PowerShell login shell build again (dsr commit `6fad86b`).
 - **MCP surface parity.** The MCP tool registry now covers every wired
   surface: `export_plan` takes its real parameters (it previously accepted
   none and could only return a usage error), `export_run` is new,

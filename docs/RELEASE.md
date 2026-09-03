@@ -40,6 +40,7 @@ cargo test --locked -p franken-snowflake-frame --features frankenpandas
 cargo test --locked -p franken-snowflake-tui --features tui
 cargo test --locked -p franken-snowflake-text-indexing --features frankensearch
 cargo clippy --workspace --all-targets --locked -- -D warnings
+scripts/check-feature-lanes.sh   # clippy -D warnings for every feature lane + coverage check
 ```
 
 `cargo test -p franken-snowflake-cli` includes the binary-spawning e2e lane
@@ -103,13 +104,29 @@ note is unbacked.
 | `x86_64-unknown-linux-gnu` | builds, tests pass | native |
 | `aarch64-unknown-linux-gnu` | builds (ELF aarch64 PIE) **and runs** under `qemu-aarch64`: `capabilities` reports `live=true, mcp=true`, `doctor` ok, `selftest` 7/7 | `cargo zigbuild`, `qemu-aarch64 -L /usr/aarch64-linux-gnu` |
 | `x86_64-pc-windows-msvc` | builds (PE32+ console exe, both binaries) | `cargo xwin build` |
-| `aarch64-pc-windows-msvc` | **does not build** | `cargo xwin` exports clang-cl-style `/imsvc` include flags, but `ring 0.17` compiles its arm64 C sources with plain `clang`, which rejects them; overriding `CFLAGS_aarch64_pc_windows_msvc` is ignored by cargo-xwin. Needs a native Windows-on-ARM host or an upstream fix; the target is out of the release set until then (v0.0.1's arm64 asset came from a hosted Windows runner). |
+| `aarch64-pc-windows-msvc` | builds (PE32+ ARM64 console exe) from Linux via `scripts/cross-build-windows-arm64.sh`; builds natively on the Windows host through dsr (MSVC + VS 2022 clang) | `cargo xwin --cross-compiler clang` plus two workarounds baked into the script: blake3 uses its pure-Rust implementation on this target only (its NEON C path includes MSVC's `arm_neon.h`, which the clang driver cannot compile), and capitalized import-library aliases (`Kernel32.lib`) are added to cargo-xwin's clang sysroot because asupersync links `Kernel32` with a capital K. Linked, not executed: no ARM Windows machine or emulator is available. |
 | `aarch64-apple-darwin` | builds on the dsr macOS host (Mach-O arm64 PIE bundle) | `dsr build` |
 | `x86_64-apple-darwin` | builds on the dsr macOS host once the cross target is installed there (the dsr `build_cmd` now runs `rustup target add` first) | `dsr build` |
 
 The Windows binary above was produced, not executed: no Windows machine or
 emulator was available in this session, so for that row "builds" means the
 linker produced the executable, not that `capabilities` was run on it.
+
+**Windows through dsr.** dsr's native Windows runner could not run on a host
+whose OpenSSH login shell is PowerShell (it sent `powershell -Command "..."`
+and cmd-style lines that the outer PowerShell re-parsed, stripping every
+variable); that was fixed in dsr itself (commit `6fad86b`, `-EncodedCommand`
+for every generated PowerShell script and a base64 `cmd.exe /d /s /c` wrapper
+for cmd lines). With that fix both Windows targets build natively on the
+Windows host (`cross_compile.windows/*` in the dsr registry: `host: wlap`,
+`CARGO_BUILD_TARGET`, a one-line cmd-compatible `build_cmd`), and cargo-xwin
+on the Linux host remains the fallback.
+
+**Executed on the real hosts (2026-09-03).** Both macOS archives were copied
+to the Mac host and run there: `capabilities` reports `live=true, mcp=true`,
+`selftest` 7/7, `doctor` ok, and a typed `FSNOW-2003` refusal without
+credentials, for `aarch64-apple-darwin` natively and `x86_64-apple-darwin`
+under Rosetta.
 
 `dsr build franken_snowflake` (build only, no upload) produced all five
 archives on 2026-09-03 across two runs. The first run built both Linux targets
