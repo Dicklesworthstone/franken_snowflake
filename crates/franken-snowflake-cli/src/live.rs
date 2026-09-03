@@ -212,6 +212,109 @@ pub fn run_query_outcome(
 }
 
 // ---------------------------------------------------------------------------
+// query run --dataset (planned, typed bindings)
+// ---------------------------------------------------------------------------
+
+/// Execute a dataset-mode plan live: the catalog planner's SQL runs with its
+/// positional typed bindings and guardrails (statement timeout, QUERY_TAG),
+/// under the dataset's database/schema and the requested session overrides.
+pub fn run_dataset_query_outcome(
+    format: OutputFormat,
+    request_id: String,
+    spec: crate::dataset_mode::DatasetQuerySpec,
+    options: &QueryRunOptions,
+) -> crate::Outcome {
+    let planned = match crate::dataset_mode::plan_dataset(
+        format,
+        "query.run",
+        "fsnow.query.run.v1",
+        &request_id,
+        &spec,
+    ) {
+        Ok(planned) => planned,
+        Err(outcome) => return outcome,
+    };
+    let profile = planned.profile.clone();
+    let fail = |error: &SnowflakeError| {
+        failure_outcome(
+            format,
+            "query.run",
+            "fsnow.query.run.v1",
+            request_id.clone(),
+            profile.clone(),
+            error,
+        )
+    };
+    let manifest = &planned.dataset.manifest;
+    let mut overrides =
+        match session_overrides(options, Some(&manifest.database), Some(&manifest.schema)) {
+            Ok(overrides) => overrides,
+            Err(error) => return fail(&error),
+        };
+    if overrides.statement_timeout.is_none() {
+        overrides.statement_timeout = Some(planned.plan.guardrails.statement_timeout_seconds);
+    }
+    let conn = match LiveConn::resolve(&profile, &overrides) {
+        Ok(conn) => conn,
+        Err(error) => return fail(&error),
+    };
+    // Every planner binding becomes a positional SQL API binding; values never
+    // enter the SQL text.
+    let bindings: BTreeMap<String, Binding> = planned
+        .plan
+        .bindings
+        .iter()
+        .map(|(position, binding)| {
+            (
+                position.clone(),
+                Binding::new(binding.binding_type.clone(), binding.value.clone()),
+            )
+        })
+        .collect();
+    let request_options = QueryRequestOptions {
+        bindings: (!bindings.is_empty()).then_some(bindings),
+        query_tag: Some(planned.plan.guardrails.query_tag.clone()),
+    };
+    let rows = match execute(&conn, &planned.plan.sql, request_options) {
+        Ok(rows) => rows,
+        Err(error) => return fail(&error),
+    };
+    let (receipt_hash, warnings) = record_receipt(
+        "query.run",
+        &conn,
+        &request_id,
+        &planned.plan.sql,
+        &rows,
+        "statement_executed",
+        serde_json::json!({
+            "mode": "dataset",
+            "dataset_id": manifest.id,
+            "plan_id": planned.plan.plan_id,
+        }),
+    );
+    let emit_cap = match parse_limit(options.limit.as_deref()) {
+        Ok(cap) => cap,
+        Err(error) => return fail(&error),
+    };
+    rows_success(
+        format,
+        request_id,
+        profile,
+        "query.run",
+        "fsnow.query.run.v1",
+        crate::dataset_mode::plan_json(&planned),
+        &rows,
+        emit_cap,
+        receipt_hash,
+        warnings,
+        vec![
+            "franken-snowflake receipt show <receipt-hash> --json".to_string(),
+            format!("franken-snowflake dataset inspect {} --json", manifest.id),
+        ],
+    )
+}
+
+// ---------------------------------------------------------------------------
 // query write
 // ---------------------------------------------------------------------------
 

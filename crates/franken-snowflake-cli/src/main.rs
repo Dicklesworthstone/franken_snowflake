@@ -97,11 +97,13 @@ enum Command {
     QueryPlan {
         profile: Option<String>,
         sql: Option<String>,
+        dataset: Option<dataset_mode::DatasetQuerySpec>,
     },
     QueryRun {
         profile: Option<String>,
         sql: Option<String>,
         options: QueryRunOptions,
+        dataset: Option<dataset_mode::DatasetQuerySpec>,
     },
     QueryWrite {
         profile: Option<String>,
@@ -401,7 +403,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "query.plan",
-        invocation: "franken-snowflake query plan --profile <profile> --sql <sql> --json",
+        invocation: "franken-snowflake query plan --profile <profile> (--sql <sql> | --dataset <id> [--entity <v>] [--from <t>] [--to <t>] [--as-of <t>] [--select a,b] [--filter <json>] [--limit <n>]) --json",
         output_contract_id: "fsnow.query.plan.v1",
         description: "Validate and explain a read-only SQL plan without submitting it.",
         read_only: true,
@@ -411,7 +413,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "query.run",
-        invocation: "franken-snowflake query [run] --profile <profile> --sql <sql> [--limit <rows>] [--role <role>] [--warehouse <wh>] [--statement-timeout <secs>] [--bindings-env <env-var>] [--query-tag <tag>] --json",
+        invocation: "franken-snowflake query [run] --profile <profile> (--sql <sql> | --dataset <id> [--entity <v>] [--from <t>] [--to <t>] [--as-of <t>] [--select a,b] [--filter <json>]) [--limit <rows>] [--role <role>] [--warehouse <wh>] [--statement-timeout <secs>] [--bindings-env <env-var>] [--query-tag <tag>] --json",
         output_contract_id: "fsnow.query.run.v1",
         description: "Submit a SQL API statement; `query --sql` shorthand maps to this surface.",
         read_only: true,
@@ -863,27 +865,34 @@ fn parse_query(args: &[String], output: OutputFormat) -> Result<Command, Outcome
         // exactly as `query run --sql ...` / `query plan --sql ...` already do.
         // Using `value_after` (which rejects flag-like values) here made such SQL
         // fall through to the "unknown query subcommand `--sql`" error.
-        Some(value) if value.starts_with("--") && raw_value_after(args, "--sql").is_some() => {
-            reject_dataset_mode_flags(args, output, "query.run", "fsnow.query.run.v1")?;
+        Some(value)
+            if value.starts_with("--")
+                && (raw_value_after(args, "--sql").is_some()
+                    || value_after(args, "--dataset").is_some()) =>
+        {
+            let dataset = dataset_spec(args, output, "query.run", "fsnow.query.run.v1")?;
             Ok(Command::QueryRun {
                 profile: resolve_profile(value_after(args, "--profile")),
                 sql: raw_value_after(args, "--sql"),
                 options: query_run_options(args),
+                dataset,
             })
         }
         Some("plan") => {
-            reject_dataset_mode_flags(args, output, "query.plan", "fsnow.query.plan.v1")?;
+            let dataset = dataset_spec(args, output, "query.plan", "fsnow.query.plan.v1")?;
             Ok(Command::QueryPlan {
                 profile: resolve_profile(value_after(args, "--profile")),
                 sql: raw_value_after(args, "--sql"),
+                dataset,
             })
         }
         Some("run") => {
-            reject_dataset_mode_flags(args, output, "query.run", "fsnow.query.run.v1")?;
+            let dataset = dataset_spec(args, output, "query.run", "fsnow.query.run.v1")?;
             Ok(Command::QueryRun {
                 profile: resolve_profile(value_after(args, "--profile")),
                 sql: raw_value_after(args, "--sql"),
                 options: query_run_options(args),
+                dataset,
             })
         }
         Some("write") => Ok(Command::QueryWrite {
@@ -965,46 +974,70 @@ fn parse_receipt(args: &[String], output: OutputFormat) -> Result<Command, Outco
     }
 }
 
-/// The dataset-mode flags (`--dataset`, `--entity`, `--from`, `--to`, `--as-of`,
-/// `--select`) are reserved for the dataset planner path. Until that path is
-/// wired, refuse them loudly instead of silently ignoring them (an agent that
-/// passes `--from` expects a date filter, not the full table).
-fn reject_dataset_mode_flags(
+/// Dataset mode is selected by `--dataset <id>`; the axis flags (`--entity`,
+/// `--from`, `--to`, `--as-of`, `--select`, `--filter`) only make sense with
+/// it, and `--sql` is the raw-SQL expert path, so mixing the two is refused
+/// loudly rather than one side being silently ignored.
+fn dataset_spec(
     args: &[String],
     output: OutputFormat,
     command_id: &'static str,
     output_contract_id: &'static str,
-) -> Result<(), Outcome> {
-    const DATASET_FLAGS: [&str; 6] = [
-        "--dataset",
-        "--entity",
-        "--from",
-        "--to",
-        "--as-of",
-        "--select",
+) -> Result<Option<dataset_mode::DatasetQuerySpec>, Outcome> {
+    const AXIS_FLAGS: [&str; 6] = [
+        "--entity", "--from", "--to", "--as-of", "--select", "--filter",
     ];
-    let present: Vec<&str> = DATASET_FLAGS
+    let dataset_id = value_after(args, "--dataset");
+    let axis_present: Vec<&str> = AXIS_FLAGS
         .iter()
         .copied()
         .filter(|flag| flag_present(args, flag))
         .collect();
-    if present.is_empty() {
-        return Ok(());
+    let Some(dataset_id) = dataset_id else {
+        if axis_present.is_empty() {
+            return Ok(None);
+        }
+        return Err(usage_error(
+            output,
+            command_id,
+            output_contract_id,
+            &format!(
+                "Dataset-mode flags ({}) require --dataset <dataset-id> (from `catalog scan` / `dataset inspect`).",
+                axis_present.join(", ")
+            ),
+            vec![
+                "franken-snowflake dataset inspect <dataset-id> --json".to_string(),
+                "franken-snowflake query run --profile <profile> --dataset <dataset-id> --from <date> --to <date> --json"
+                    .to_string(),
+            ],
+            vec![],
+        ));
+    };
+    if raw_value_after(args, "--sql").is_some() {
+        return Err(usage_error(
+            output,
+            command_id,
+            output_contract_id,
+            "Choose either --dataset (planned, typed bindings) or --sql (raw expert path), not both.",
+            vec![
+                "franken-snowflake query run --profile <profile> --dataset <dataset-id> --json"
+                    .to_string(),
+                "franken-snowflake query run --profile <profile> --sql <sql> --json".to_string(),
+            ],
+            vec![],
+        ));
     }
-    Err(usage_error(
-        output,
-        command_id,
-        output_contract_id,
-        &format!(
-            "Dataset-mode flags ({}) are not wired into this build yet; pass the statement with --sql (see `dataset inspect` for the object name and columns).",
-            present.join(", ")
-        ),
-        vec![
-            "franken-snowflake dataset inspect <dataset-id> --json".to_string(),
-            "franken-snowflake query run --profile <profile> --sql <sql> --json".to_string(),
-        ],
-        vec![],
-    ))
+    Ok(Some(dataset_mode::DatasetQuerySpec {
+        dataset_id,
+        profile: resolve_profile(value_after(args, "--profile")),
+        entity: value_after(args, "--entity"),
+        from: value_after(args, "--from"),
+        to: value_after(args, "--to"),
+        as_of: value_after(args, "--as-of"),
+        select: dataset_mode::parse_select(value_after(args, "--select").as_deref()),
+        filter: raw_value_after(args, "--filter"),
+        limit: value_after(args, "--limit"),
+    }))
 }
 
 fn query_run_options(args: &[String]) -> QueryRunOptions {
@@ -1225,14 +1258,23 @@ fn dispatch(invocation: Invocation) -> Outcome {
         Command::DatasetDescribeOperator { operator } => {
             catalog_surface::describe_operator_outcome(invocation.output, request_id, operator)
         }
-        Command::QueryPlan { profile, sql } => {
-            query_plan_outcome(invocation.output, request_id, profile, sql)
-        }
+        Command::QueryPlan {
+            profile,
+            sql,
+            dataset,
+        } => match dataset {
+            Some(spec) => dataset_mode::dataset_plan_outcome(invocation.output, request_id, spec),
+            None => query_plan_outcome(invocation.output, request_id, profile, sql),
+        },
         Command::QueryRun {
             profile,
             sql,
             options,
-        } => query_run_outcome(invocation.output, request_id, profile, sql, options),
+            dataset,
+        } => match dataset {
+            Some(spec) => dataset_run_dispatch(invocation.output, request_id, spec, options),
+            None => query_run_outcome(invocation.output, request_id, profile, sql, options),
+        },
         Command::QueryWrite {
             profile,
             sql,
@@ -2066,7 +2108,6 @@ const OUTPUT_INPUT: InputSpec = input(
 /// without trial and error. Positional arguments are modeled as properties
 /// whose description starts with `positional:`.
 fn command_inputs(command_id: &str) -> Vec<InputSpec> {
-    let sql = input("sql", "string", true, "Exactly one SQL statement (--sql)");
     let database = input(
         "database",
         "string",
@@ -2173,43 +2214,69 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
             ),
             OUTPUT_INPUT,
         ],
-        "query.plan" => vec![PROFILE_INPUT, sql, OUTPUT_INPUT],
-        "query.run" => vec![
-            PROFILE_INPUT,
-            sql,
-            input(
-                "limit",
-                "integer",
-                false,
-                "Rows to emit in the envelope, 1..=100000 (--limit; default 1000)",
-            ),
-            input("role", "string", false, "Session role override (--role)"),
-            input(
-                "warehouse",
-                "string",
-                false,
-                "Session warehouse override (--warehouse)",
-            ),
-            input(
-                "statement_timeout",
-                "integer",
-                false,
-                "SQL API statement timeout in seconds, 1..=86400 (--statement-timeout; default 60)",
-            ),
-            input(
-                "bindings_env",
-                "string",
-                false,
-                "Env var holding a JSON object of positional typed bindings (--bindings-env)",
-            ),
-            input(
-                "query_tag",
-                "string",
-                false,
-                "QUERY_TAG for Snowflake query history (--query-tag)",
-            ),
-            OUTPUT_INPUT,
-        ],
+        "query.plan" => {
+            let mut inputs = vec![
+                PROFILE_INPUT,
+                input(
+                    "sql",
+                    "string",
+                    false,
+                    "Exactly one SQL statement (--sql); exclusive with dataset",
+                ),
+            ];
+            inputs.extend(dataset_mode_inputs());
+            inputs.push(OUTPUT_INPUT);
+            inputs
+        }
+        "query.run" => {
+            let mut inputs = vec![
+                PROFILE_INPUT,
+                input(
+                    "sql",
+                    "string",
+                    false,
+                    "Exactly one SQL statement (--sql); exclusive with dataset",
+                ),
+                input(
+                    "limit",
+                    "integer",
+                    false,
+                    "Rows to emit in the envelope, 1..=100000 (--limit; default 1000; dataset mode: row limit)",
+                ),
+                input("role", "string", false, "Session role override (--role)"),
+                input(
+                    "warehouse",
+                    "string",
+                    false,
+                    "Session warehouse override (--warehouse)",
+                ),
+                input(
+                    "statement_timeout",
+                    "integer",
+                    false,
+                    "SQL API statement timeout in seconds, 1..=86400 (--statement-timeout; default 60)",
+                ),
+                input(
+                    "bindings_env",
+                    "string",
+                    false,
+                    "Env var holding a JSON object of positional typed bindings (--bindings-env)",
+                ),
+                input(
+                    "query_tag",
+                    "string",
+                    false,
+                    "QUERY_TAG for Snowflake query history (--query-tag)",
+                ),
+            ];
+            inputs.extend(
+                dataset_mode_inputs()
+                    .into_iter()
+                    .filter(|spec| spec.name != "limit"),
+            );
+            inputs.push(OUTPUT_INPUT);
+            inputs
+        }
         "query.write" => vec![
             PROFILE_INPUT,
             input(
@@ -2344,6 +2411,59 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
         ],
         _ => vec![OUTPUT_INPUT],
     }
+}
+
+fn dataset_mode_inputs() -> Vec<InputSpec> {
+    vec![
+        input(
+            "dataset",
+            "string",
+            false,
+            "Dataset id from catalog scan; selects dataset mode (--dataset)",
+        ),
+        input(
+            "entity",
+            "string",
+            false,
+            "Dataset mode: entity-key filter value (--entity)",
+        ),
+        input(
+            "from",
+            "string",
+            false,
+            "Dataset mode: inclusive time-index start (--from)",
+        ),
+        input(
+            "to",
+            "string",
+            false,
+            "Dataset mode: inclusive time-index end (--to)",
+        ),
+        input(
+            "as_of",
+            "string",
+            false,
+            "Dataset mode: Time Travel AT(TIMESTAMP => ...) instant (--as-of)",
+        ),
+        input(
+            "select",
+            "string",
+            false,
+            "Dataset mode: comma-separated projection (--select)",
+        ),
+        input(
+            "filter",
+            "string",
+            false,
+            "Dataset mode: predicate AST JSON, see dataset describe-operator (--filter)",
+        ),
+        input(
+            "limit",
+            "integer",
+            false,
+            "Dataset mode: row limit (--limit; manifest default otherwise)",
+        ),
+    ]
 }
 
 /// JSON Schema 2020-12 for a command's inputs.
@@ -3778,6 +3898,54 @@ fn catalog_graph_dispatch(
     )
 }
 
+/// `query run --dataset`: without the live feature, compile the plan and refuse
+/// execution with the compiled SQL in the envelope so nothing is hidden.
+#[cfg(not(feature = "live"))]
+fn dataset_run_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    spec: dataset_mode::DatasetQuerySpec,
+    _options: QueryRunOptions,
+) -> Outcome {
+    let planned = match dataset_mode::plan_dataset(
+        format,
+        "query.run",
+        "fsnow.query.run.v1",
+        &request_id,
+        &spec,
+    ) {
+        Ok(planned) => planned,
+        Err(outcome) => return outcome,
+    };
+    let mut data = dataset_mode::plan_json(&planned);
+    data.push((
+        "requires",
+        json_array(vec![
+            json_string("live SQL API transport (build with --features live)"),
+            json_string("profile credential handles"),
+        ]),
+    ));
+    live_transport_required_with_data(
+        format,
+        "query.run",
+        "fsnow.query.run.v1",
+        request_id,
+        Some(planned.profile.clone()),
+        json_object(data),
+        vec![dataset_mode::run_command_for(&spec, &planned.profile)],
+    )
+}
+
+#[cfg(feature = "live")]
+fn dataset_run_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    spec: dataset_mode::DatasetQuerySpec,
+    options: QueryRunOptions,
+) -> Outcome {
+    live::run_dataset_query_outcome(format, request_id, spec, &options)
+}
+
 /// `dataset profile`: plan-only without the live feature (an `--execute` request
 /// is reported, not silently dropped).
 #[cfg(not(feature = "live"))]
@@ -4051,6 +4219,7 @@ fn known_flags() -> Vec<&'static str> {
         "--dry-run",
         "--entity",
         "--execute",
+        "--filter",
         "--format",
         "--from",
         "--header",
@@ -4100,6 +4269,7 @@ fn flag_requires_value(flag: &str) -> bool {
             | "--database"
             | "--dataset"
             | "--entity"
+            | "--filter"
             | "--format"
             | "--from"
             | "--header"
@@ -4121,7 +4291,7 @@ fn flag_requires_value(flag: &str) -> bool {
 }
 
 fn flag_allows_flag_like_value(flag: &str) -> bool {
-    matches!(flag, "--sql")
+    matches!(flag, "--sql" | "--filter")
 }
 
 fn has_any(args: &[String], needles: &[&str]) -> bool {
@@ -4812,6 +4982,7 @@ pub use mcp_surface::run_mcp_serve_process;
 mod live;
 
 mod catalog_surface;
+mod dataset_mode;
 mod health;
 mod local_store;
 
@@ -4944,6 +5115,232 @@ mod tests {
                 documented_here,
                 "flag {flag} is accepted but undocumented in capabilities"
             );
+        }
+    }
+
+    /// Persist a small fixture snapshot (one dataset, three columns) into the
+    /// per-process test store so dataset-mode commands can resolve it.
+    fn seed_fixture_dataset(dataset_id: &str) {
+        use franken_snowflake_cache::CacheBackend;
+        use franken_snowflake_catalog::model::{
+            CatalogSnapshot, ColumnCatalogEntry, DataSourceClass, DatasetField, DatasetKind,
+            DatasetManifest, DtypeClass, FieldRole, Provenance, ProvenanceSource, RightsClass,
+            RoleConfidence,
+        };
+        use franken_snowflake_catalog::operator::built_in_operator_catalog;
+        let provenance = Provenance {
+            source: ProvenanceSource::Fixture,
+            data_source: DataSourceClass::Fixture,
+            snapshot_id: format!("snap-{dataset_id}"),
+            discovered_at: "2026-01-01T00:00:00Z".to_owned(),
+            profile_fingerprint: "profile:demo".to_owned(),
+            object_fingerprint: "snowflake-object:DB.PUBLIC.EVENTS".to_owned(),
+            command_id: "test".to_owned(),
+            trace_id: "test".to_owned(),
+            redactions_applied: Vec::new(),
+        };
+        let field = |column: &str, role: FieldRole, dtype: DtypeClass| DatasetField {
+            column: column.to_owned(),
+            role,
+            dtype,
+            required: matches!(role, FieldRole::EntityKey | FieldRole::TimeIndex),
+            role_confidence: RoleConfidence::Confirmed,
+        };
+        let manifest = DatasetManifest {
+            id: dataset_id.to_owned(),
+            profile: "demo".to_owned(),
+            database: "DB".to_owned(),
+            schema: "PUBLIC".to_owned(),
+            object: "EVENTS".to_owned(),
+            kind: DatasetKind::Table,
+            rights_class: RightsClass::Restricted,
+            default_limit: 1000,
+            max_rows_without_export: 50_000,
+            approx_row_count: Some(42),
+            bytes: Some(4096),
+            description: None,
+            provenance: provenance.clone(),
+            fields: vec![
+                field("EVENT_DATE", FieldRole::TimeIndex, DtypeClass::Date),
+                field("ENTITY_ID", FieldRole::EntityKey, DtypeClass::String),
+                field("VALUE", FieldRole::Feature, DtypeClass::Number),
+            ],
+        };
+        let column = |name: &str, ordinal: u32, snowflake_type: &str, dtype: DtypeClass| {
+            ColumnCatalogEntry {
+                dataset_id: dataset_id.to_owned(),
+                database: "DB".to_owned(),
+                schema: "PUBLIC".to_owned(),
+                object: "EVENTS".to_owned(),
+                column: name.to_owned(),
+                ordinal,
+                snowflake_type: snowflake_type.to_owned(),
+                dtype_class: dtype,
+                nullable: true,
+                precision: None,
+                scale: None,
+                length: None,
+                aliases: Vec::new(),
+                comment: None,
+                tags: Vec::new(),
+                provenance: Some(provenance.clone()),
+            }
+        };
+        let mut snapshot = CatalogSnapshot::empty(provenance.clone());
+        snapshot.datasets.push(manifest.clone());
+        snapshot.columns = vec![
+            column("EVENT_DATE", 1, "DATE", DtypeClass::Date),
+            column("ENTITY_ID", 2, "TEXT", DtypeClass::String),
+            column("VALUE", 3, "FIXED", DtypeClass::Number),
+        ];
+        snapshot.operators = built_in_operator_catalog();
+        let store = local_store::open_store().expect("test store");
+        let canonical = serde_json::to_string(&snapshot).expect("snapshot json");
+        store
+            .cache
+            .insert_catalog_snapshot(franken_snowflake_cache::CatalogSnapshotRecord {
+                snapshot_id: provenance.snapshot_id.clone(),
+                profile_id: "demo".to_owned(),
+                source_kind: "fixture".to_owned(),
+                database_name: Some("DB".to_owned()),
+                schema_name: Some("PUBLIC".to_owned()),
+                captured_at_ms: 1,
+                payload: franken_snowflake_cache::VerifiedPayload {
+                    address: franken_snowflake_cache::ContentAddress::blake3(canonical.as_bytes()),
+                    canonical,
+                },
+            })
+            .expect("snapshot stored");
+        let manifest_json = serde_json::to_string(&manifest).expect("manifest json");
+        store
+            .cache
+            .upsert_dataset_manifest(franken_snowflake_cache::DatasetManifestRecord {
+                dataset_id: dataset_id.to_owned(),
+                profile_id: "demo".to_owned(),
+                snapshot_id: Some(provenance.snapshot_id.clone()),
+                database_name: "DB".to_owned(),
+                schema_name: "PUBLIC".to_owned(),
+                object_name: "EVENTS".to_owned(),
+                rights_class: "restricted".to_owned(),
+                default_limit: 1000,
+                max_rows_without_export: 50_000,
+                manifest: franken_snowflake_cache::VerifiedPayload {
+                    address: franken_snowflake_cache::ContentAddress::blake3(
+                        manifest_json.as_bytes(),
+                    ),
+                    canonical: manifest_json,
+                },
+                created_at_ms: 1,
+            })
+            .expect("manifest stored");
+    }
+
+    #[test]
+    fn dataset_mode_plans_pushed_down_sql_with_typed_bindings_from_the_store() {
+        let dataset_id = "db_public_events_b3_plantest";
+        seed_fixture_dataset(dataset_id);
+
+        // dataset inspect resolves what catalog scan persisted.
+        let inspect = execute(vec![
+            "dataset".to_string(),
+            "inspect".to_string(),
+            dataset_id.to_string(),
+            "--json".to_string(),
+        ]);
+        assert_eq!(inspect.status.code(), 0);
+        let rendered = match inspect.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("\"data_source\":\"cache\""));
+        assert!(rendered.contains("\"approx_row_count\":42"));
+        assert!(rendered.contains("\"time_index\":[\"EVENT_DATE\"]"));
+
+        // query plan --dataset compiles SQL with bindings, offline.
+        let plan = execute(vec![
+            "query".to_string(),
+            "plan".to_string(),
+            "--dataset".to_string(),
+            dataset_id.to_string(),
+            "--entity".to_string(),
+            "E1".to_string(),
+            "--from".to_string(),
+            "2024-01-01".to_string(),
+            "--to".to_string(),
+            "2024-01-31".to_string(),
+            "--select".to_string(),
+            "EVENT_DATE,VALUE".to_string(),
+            "--filter".to_string(),
+            r#"{"column":"VALUE","op":"gt","value":10}"#.to_string(),
+            "--limit".to_string(),
+            "50".to_string(),
+            "--json".to_string(),
+        ]);
+        assert_eq!(plan.status.code(), 0, "{plan:?}");
+        let rendered = match plan.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("\"mode\":\"dataset\""));
+        assert!(rendered.contains("\"profile_id\":\"demo\""));
+        assert!(
+            rendered.contains("\\\"DB\\\".\\\"PUBLIC\\\".\\\"EVENTS\\\""),
+            "{rendered}"
+        );
+        assert!(rendered.contains("WHERE"), "{rendered}");
+        assert!(rendered.contains("LIMIT ?"), "{rendered}");
+        assert!(
+            !rendered.contains("'E1'"),
+            "values are bound, never interpolated: {rendered}"
+        );
+        assert!(rendered.contains("\"value\":\"E1\""));
+        assert!(rendered.contains("\"value\":\"2024-01-01\""));
+        assert!(rendered.contains("\"will_submit\":false"));
+
+        // Unknown column: usage error with did_you_mean over the real columns.
+        let bad = execute(vec![
+            "query".to_string(),
+            "plan".to_string(),
+            "--dataset".to_string(),
+            dataset_id.to_string(),
+            "--select".to_string(),
+            "EVENT_DAT".to_string(),
+            "--json".to_string(),
+        ]);
+        assert_eq!(bad.status.code(), 64, "{bad:?}");
+        let rendered = match bad.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("FSNOW_COLUMN_UNKNOWN"), "{rendered}");
+        assert!(
+            rendered.contains("EVENT_DATE"),
+            "did_you_mean names the real column: {rendered}"
+        );
+
+        // Mixing --sql and --dataset, or axis flags without --dataset, is refused.
+        for args in [
+            vec![
+                "query",
+                "plan",
+                "--dataset",
+                dataset_id,
+                "--sql",
+                "select 1",
+            ],
+            vec![
+                "query",
+                "run",
+                "--profile",
+                "demo",
+                "--sql",
+                "select 1",
+                "--from",
+                "2024-01-01",
+            ],
+        ] {
+            let outcome = execute(args.iter().map(|a| (*a).to_string()).collect());
+            assert_eq!(outcome.status.code(), 64, "{args:?}");
         }
     }
 

@@ -337,7 +337,7 @@ fn known_dataset_ids(store: &Store) -> Vec<String> {
     store.cache.dataset_ids().unwrap_or_default()
 }
 
-fn dataset_lookup_error_outcome(
+pub fn dataset_lookup_error_outcome(
     format: OutputFormat,
     command_id: &'static str,
     output_contract_id: &'static str,

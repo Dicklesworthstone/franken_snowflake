@@ -132,7 +132,15 @@ fn data_dir_check() -> Json {
 
 fn probe_writable(dir: &Path) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|error| error.to_string())?;
-    let probe = dir.join(format!(".fsnow-doctor-probe-{}", std::process::id()));
+    // Unique per call: two concurrent doctor invocations in one process (the
+    // MCP server, or tests) must not race on the same probe file.
+    static PROBE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let probe = dir.join(format!(
+        ".fsnow-doctor-probe-{}-{}-{}",
+        std::process::id(),
+        local_store::now_unix_ms(),
+        PROBE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     fs::write(&probe, b"probe").map_err(|error| error.to_string())?;
     fs::remove_file(&probe).map_err(|error| error.to_string())
 }

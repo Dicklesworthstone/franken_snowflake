@@ -19,7 +19,7 @@ use crate::catalog_surface::{DATA_SOURCE_CACHE, StoredDataset, load_dataset};
 use crate::local_store;
 use crate::{
     Body, Json, Outcome, OutputFormat, base_envelope, error_info, json_array, json_object,
-    json_object_owned, json_string, option_json, string_array,
+    json_object_owned, json_string, option_json,
 };
 
 /// Parsed dataset-mode flags.
@@ -74,7 +74,9 @@ fn refusals_outcome(
         .map(|refusal| format!("{}: {}", refusal.code, refusal.message))
         .collect::<Vec<_>>()
         .join("; ");
-    let did_you_mean = first.map(|refusal| refusal.did_you_mean.clone()).unwrap_or_default();
+    let did_you_mean = first
+        .map(|refusal| refusal.did_you_mean.clone())
+        .unwrap_or_default();
     let mut envelope = base_envelope(
         false,
         if matches!(code, SnowflakeErrorCode::UsageError) {
@@ -136,9 +138,8 @@ pub fn plan_dataset(
             "franken-snowflake dataset inspect {} --json",
             spec.dataset_id
         )];
-        envelope.repair_commands = vec![
-            "franken-snowflake dataset describe-operator between --jsonschema".to_string(),
-        ];
+        envelope.repair_commands =
+            vec!["franken-snowflake dataset describe-operator between --jsonschema".to_string()];
         Outcome {
             status: CoreExitCode::Usage,
             body: Body::Envelope { envelope, format },
@@ -266,7 +267,10 @@ pub fn plan_json(planned: &PlannedDataset) -> Vec<(&'static str, Json)> {
         .collect();
     vec![
         ("mode", json_string("dataset")),
-        ("dataset_id", json_string(planned.dataset.manifest.id.clone())),
+        (
+            "dataset_id",
+            json_string(planned.dataset.manifest.id.clone()),
+        ),
         ("profile_id", json_string(planned.profile.clone())),
         ("plan_id", json_string(plan.plan_id.clone())),
         ("sql", json_string(plan.sql.clone())),
@@ -395,18 +399,4 @@ pub fn parse_select(raw: Option<&str>) -> Vec<String> {
             .collect()
     })
     .unwrap_or_default()
-}
-
-/// Roles summary for envelope tests and docs.
-pub fn spec_summary_json(spec: &DatasetQuerySpec) -> Json {
-    json_object(vec![
-        ("dataset_id", json_string(spec.dataset_id.clone())),
-        ("entity", option_json(spec.entity.clone())),
-        ("from", option_json(spec.from.clone())),
-        ("to", option_json(spec.to.clone())),
-        ("as_of", option_json(spec.as_of.clone())),
-        ("select", string_array(spec.select.clone())),
-        ("filter", option_json(spec.filter.clone())),
-        ("limit", option_json(spec.limit.clone())),
-    ])
 }
