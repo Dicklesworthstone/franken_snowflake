@@ -28,8 +28,8 @@ use franken_snowflake_core::outcome::SnowflakeOutcome;
 use franken_snowflake_core::redact::redact;
 use franken_snowflake_http::{
     AuthorizationDescriptor, CancelHttpResponse, PartitionBody, PartitionHttpRequest,
-    PollHttpRequest, PollHttpResponse, SnowflakeHttpClient, StatusClass, SubmitHttpRequest,
-    SubmitHttpResponse, TransportOutcome, TransportRoute,
+    PollHttpRequest, PollHttpResponse, RawHttp, SnowflakeHttpClient, StatusClass,
+    SubmitHttpRequest, SubmitHttpResponse, TransportOutcome, TransportRoute,
 };
 
 use crate::lifecycle::{
@@ -81,7 +81,7 @@ pub trait StatementTransport {
     ) -> impl Future<Output = TransportOutcome<CancelHttpResponse>>;
 }
 
-impl StatementTransport for SnowflakeHttpClient {
+impl<H: RawHttp> StatementTransport for SnowflakeHttpClient<H> {
     async fn submit_statement(
         &self,
         cx: &Cx,

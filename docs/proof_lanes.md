@@ -146,6 +146,16 @@ lane, and both are labeled for what they prove:
   row-count integrity, the concurrent partition window (fetch overlap is
   observed through the fake's start/done events), and the row-cap early stop. Every partition body is the live `{"data":[...]}`
   object form; one explicit bare-array fallback case is kept.
+- **Scripted raw HTTP under the transport** (`franken-snowflake-http`
+  tests, `RawHttp` + `ScriptedRaw`): `SnowflakeHttpClient::execute` runs its
+  real retry loop over a scripted exchange. Proves the idempotent resubmit
+  (a `429` is retried with the same `requestId` and `retry=true`, byte-identical
+  body), the bare-submit auto-retry refusal, retry-budget exhaustion after
+  `max_attempts`, network-error retry on poll routes, client deadline to
+  `Deadline` cancel, an in-flight `Cx` cancel surfacing as `User` cancel with
+  the masked cleanup still reaching the cancel endpoint, the short-circuit on
+  an already-cancelled context, and gzip partition decoding with the
+  `Accept-Encoding` request header.
 - **Scripted statements under the CLI outcome layer**
   (`franken-snowflake-cli::live::test_support`, `--features live`): the
   public outcome functions (`query run`, `catalog scan`, `dataset inspect`
@@ -157,9 +167,9 @@ lane, and both are labeled for what they prove:
   shape and `data_source`, and the row emit cap. A profile that is not
   scripted still resolves through the real env path and fails typed.
 
-What neither lane proves: TLS, the asupersync HTTP client, real gzip
-partition bodies over the wire, or Snowflake's actual responses. Those remain
-Lane 3 (mock server) and Lane 8 (live opt-in).
+What none of these lanes proves: TLS, the asupersync HTTP client and its
+connection pool, DNS, or Snowflake's actual responses. Those remain Lane 3
+(mock server) and Lane 8 (live opt-in).
 
 ## Cross-Cutting Standards
 

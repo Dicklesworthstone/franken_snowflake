@@ -59,12 +59,56 @@ pub struct TransportCaps;
 
 /// Asupersync-native Snowflake SQL API HTTP client facade.
 #[derive(Clone)]
-pub struct SnowflakeHttpClient {
+pub struct SnowflakeHttpClient<H = AsupersyncHttpClient> {
     config: TransportConfig,
-    client: AsupersyncHttpClient,
+    client: H,
 }
 
-impl fmt::Debug for SnowflakeHttpClient {
+/// The one network call the transport makes: a single HTTP exchange.
+///
+/// The Asupersync pooled client is the production implementation. Tests
+/// inject a scripted transport so that `execute`'s retry, backoff,
+/// idempotent-resubmit, and cancellation paths are provable without a socket
+/// or an account.
+pub trait RawHttp {
+    /// Send one request; `timeout` is the remaining attempt budget when bounded.
+    fn send(
+        &self,
+        cx: &Cx,
+        method: Method,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        timeout: Option<Duration>,
+    ) -> impl Future<Output = Result<Response, AsupersyncClientError>>;
+}
+
+impl RawHttp for AsupersyncHttpClient {
+    async fn send(
+        &self,
+        cx: &Cx,
+        method: Method,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        timeout: Option<Duration>,
+    ) -> Result<Response, AsupersyncClientError> {
+        let mut builder = self
+            .request_builder(method, url)
+            .headers(
+                headers
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            )
+            .body(body);
+        if let Some(timeout) = timeout {
+            builder = builder.timeout(timeout);
+        }
+        builder.send(cx).await
+    }
+}
+
+impl<H> fmt::Debug for SnowflakeHttpClient<H> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SnowflakeHttpClient")
             .field("config", &self.config)
@@ -74,12 +118,6 @@ impl fmt::Debug for SnowflakeHttpClient {
 }
 
 impl SnowflakeHttpClient {
-    /// Create a client with an explicit Asupersync HTTP client handle.
-    #[must_use]
-    pub fn new(config: TransportConfig, client: AsupersyncHttpClient) -> Self {
-        Self { config, client }
-    }
-
     /// Create a client from the runtime-owned pooled Asupersync HTTP client.
     #[must_use]
     pub fn default_for_runtime(config: TransportConfig, cx: &Cx) -> Self {
@@ -87,6 +125,15 @@ impl SnowflakeHttpClient {
             config,
             client: AsupersyncHttpClient::default_for_runtime(cx),
         }
+    }
+}
+
+impl<H: RawHttp> SnowflakeHttpClient<H> {
+    /// Build a client from an explicit configuration and raw HTTP transport
+    /// (the Asupersync client in production, a scripted transport in tests).
+    #[must_use]
+    pub fn new(config: TransportConfig, client: H) -> Self {
+        Self { config, client }
     }
 
     /// Access the immutable transport configuration.
@@ -351,7 +398,7 @@ fn stream_cancel_cleanup_outcome<T>(
     }
 }
 
-impl SnowflakeHttpClient {
+impl<H: RawHttp> SnowflakeHttpClient<H> {
     async fn execute<R, T>(
         &self,
         cx: &Cx,
@@ -392,19 +439,20 @@ impl SnowflakeHttpClient {
             if let Some(reason) = budget_exhaustion_reason_at(attempt_budget, budget_now) {
                 return TransportOutcome::cancelled(reason);
             }
-            let mut request_builder = self
+            let result = self
                 .client
-                .request_builder(route_kind.method(), wire.url.clone())
-                .headers(
+                .send(
+                    cx,
+                    route_kind.method(),
+                    wire.url.clone(),
                     wire.headers
                         .iter()
-                        .map(|h| (h.name.as_str(), h.value.as_str())),
+                        .map(|h| (h.name.clone(), h.value.clone()))
+                        .collect(),
+                    wire.body.clone(),
+                    budget_timeout_at(attempt_budget, budget_now),
                 )
-                .body(wire.body.clone());
-            if let Some(timeout) = budget_timeout_at(attempt_budget, budget_now) {
-                request_builder = request_builder.timeout(timeout);
-            }
-            let result = request_builder.send(cx).await;
+                .await;
 
             match result {
                 Ok(response) => {
@@ -2233,6 +2281,9 @@ impl std::error::Error for TransportError {}
 mod tests {
     use super::*;
 
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
     fn endpoint() -> SnowflakeEndpoint {
         SnowflakeEndpoint::parse("https://xy12345.us-east-1.snowflakecomputing.com")
             .expect("valid endpoint")
@@ -2860,6 +2911,380 @@ mod tests {
 
         assert_eq!(error.code, TransportErrorCode::BodyLimitExceeded);
         assert!(error.message.contains("compressed partition"));
+    }
+
+    /// A scripted raw transport: answers each `send` from a queue and records
+    /// every request the retry loop actually issued.
+    struct ScriptedRaw {
+        responses: RefCell<VecDeque<Result<Response, AsupersyncClientError>>>,
+        requests: RefCell<Vec<RecordedRequest>>,
+        /// Cancel this context from inside `send` (an in-flight cancellation).
+        cancel_in_flight: Option<Cx>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordedRequest {
+        method: Method,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        timeout: Option<Duration>,
+    }
+
+    impl ScriptedRaw {
+        fn new(responses: Vec<Result<Response, AsupersyncClientError>>) -> Self {
+            Self {
+                responses: RefCell::new(responses.into()),
+                requests: RefCell::new(Vec::new()),
+                cancel_in_flight: None,
+            }
+        }
+
+        fn requests(&self) -> Vec<RecordedRequest> {
+            self.requests.borrow().clone()
+        }
+    }
+
+    impl RawHttp for ScriptedRaw {
+        async fn send(
+            &self,
+            _cx: &Cx,
+            method: Method,
+            url: String,
+            headers: Vec<(String, String)>,
+            body: Vec<u8>,
+            timeout: Option<Duration>,
+        ) -> Result<Response, AsupersyncClientError> {
+            self.requests.borrow_mut().push(RecordedRequest {
+                method,
+                url,
+                headers,
+                body,
+                timeout,
+            });
+            if let Some(cx) = &self.cancel_in_flight {
+                cx.cancel_with(
+                    CancelKind::User,
+                    Some("cancelled while the request was in flight"),
+                );
+            }
+            self.responses.borrow_mut().pop_front().unwrap_or_else(|| {
+                Err(AsupersyncClientError::Io(std::io::Error::other(
+                    "scripted transport exhausted",
+                )))
+            })
+        }
+    }
+
+    fn fast_retry_config(max_attempts: u32) -> TransportConfig {
+        TransportConfig {
+            retry: RetryPolicy {
+                max_attempts,
+                base_delay_ms: 1,
+                max_delay_ms: 1,
+                total_budget_ms: 1_000,
+                respect_retry_after: true,
+                deterministic_jitter: true,
+            },
+            ..TransportConfig::new(endpoint())
+        }
+    }
+
+    fn scripted_client(
+        max_attempts: u32,
+        responses: Vec<Result<Response, AsupersyncClientError>>,
+    ) -> SnowflakeHttpClient<ScriptedRaw> {
+        SnowflakeHttpClient::new(fast_retry_config(max_attempts), ScriptedRaw::new(responses))
+    }
+
+    fn ok_json(status: u16, body: &str) -> Result<Response, AsupersyncClientError> {
+        Ok(Response::new(status, "scripted", body.as_bytes().to_vec())
+            .with_header("content-type", "application/json"))
+    }
+
+    fn network_error() -> Result<Response, AsupersyncClientError> {
+        Err(AsupersyncClientError::Io(std::io::Error::other(
+            "connection reset by peer",
+        )))
+    }
+
+    fn retry_submit(request_id: &str) -> SubmitHttpRequest {
+        SubmitHttpRequest {
+            route: TransportRoute::SubmitRetry {
+                request_id: RequestId::new(request_id),
+            },
+            auth: auth(),
+            body: b"{\"statement\":\"select 1\"}".to_vec(),
+            retry_resubmit: true,
+        }
+    }
+
+    fn poll_request() -> PollHttpRequest {
+        PollHttpRequest {
+            auth: auth(),
+            statement_handle: StatementHandle::new("stmt-poll-1"),
+        }
+    }
+
+    #[test]
+    fn execute_retries_a_429_by_resubmitting_the_same_request_id_with_retry_true() {
+        asupersync::test_utils::run_test(|| async {
+            let client = scripted_client(
+                4,
+                vec![
+                    Ok(Response::new(429, "Too Many Requests", Vec::new())
+                        .with_header("Retry-After", "0")),
+                    ok_json(202, "{\"statementHandle\":\"h1\"}"),
+                ],
+            );
+            let cx = Cx::for_testing();
+            let outcome = client
+                .submit_statement(&cx, retry_submit("req-idem-1"))
+                .await;
+            let TransportOutcome::Ok(response) = outcome else {
+                panic!("expected a submit response, got {outcome:?}");
+            };
+            assert_eq!(response.status, StatusClass::Running);
+            let requests = client.client.requests();
+            assert_eq!(requests.len(), 2, "one 429 then one resubmit");
+            for request in &requests {
+                assert_eq!(request.method, Method::Post);
+                assert!(
+                    request.url.contains("requestId=req-idem-1"),
+                    "{}",
+                    request.url
+                );
+                assert!(request.url.contains("retry=true"), "{}", request.url);
+                assert!(
+                    request.headers.iter().any(
+                        |(name, value)| name == "Authorization" && value.starts_with("Bearer ")
+                    ),
+                    "bearer header present on every attempt"
+                );
+            }
+            // The resubmit is byte-identical to the original: same URL, same body,
+            // and with an unlimited budget neither attempt carries a timeout.
+            assert_eq!(requests[0].url, requests[1].url);
+            assert_eq!(requests[0].body, requests[1].body);
+            assert!(requests.iter().all(|request| request.timeout.is_none()));
+        });
+    }
+
+    #[test]
+    fn execute_refuses_to_auto_retry_a_bare_submit_on_a_retryable_status() {
+        asupersync::test_utils::run_test(|| async {
+            let client = scripted_client(
+                4,
+                vec![Ok(Response::new(503, "Service Unavailable", Vec::new()))],
+            );
+            let cx = Cx::for_testing();
+            let outcome = client
+                .submit_statement(
+                    &cx,
+                    SubmitHttpRequest {
+                        route: TransportRoute::Submit,
+                        auth: auth(),
+                        body: b"{}".to_vec(),
+                        retry_resubmit: false,
+                    },
+                )
+                .await;
+            let TransportOutcome::Err(error) = outcome else {
+                panic!("expected a typed refusal, got {outcome:?}");
+            };
+            assert!(
+                error.message.contains("requestId plus retry=true"),
+                "{}",
+                error.message
+            );
+            assert_eq!(
+                client.client.requests().len(),
+                1,
+                "no second attempt was sent"
+            );
+        });
+    }
+
+    #[test]
+    fn execute_exhausts_the_retry_budget_after_max_attempts() {
+        asupersync::test_utils::run_test(|| async {
+            let client = scripted_client(
+                3,
+                vec![
+                    Ok(Response::new(503, "Service Unavailable", Vec::new())),
+                    Ok(Response::new(503, "Service Unavailable", Vec::new())),
+                    Ok(Response::new(503, "Service Unavailable", Vec::new())),
+                    ok_json(200, "{}"),
+                ],
+            );
+            let cx = Cx::for_testing();
+            let outcome = client.poll_statement(&cx, poll_request()).await;
+            let TransportOutcome::Err(error) = outcome else {
+                panic!("expected retry exhaustion, got {outcome:?}");
+            };
+            assert!(
+                error
+                    .message
+                    .contains("exhausted retry budget after 3 attempts"),
+                "{}",
+                error.message
+            );
+            assert_eq!(client.client.requests().len(), 3);
+        });
+    }
+
+    #[test]
+    fn execute_retries_a_network_error_on_a_poll_route_then_succeeds() {
+        asupersync::test_utils::run_test(|| async {
+            let client = scripted_client(
+                4,
+                vec![
+                    network_error(),
+                    ok_json(202, "{\"statementHandle\":\"h1\"}"),
+                ],
+            );
+            let cx = Cx::for_testing();
+            let outcome = client.poll_statement(&cx, poll_request()).await;
+            let TransportOutcome::Ok(response) = outcome else {
+                panic!("expected a poll response, got {outcome:?}");
+            };
+            assert_eq!(response.status, StatusClass::Running);
+            let requests = client.client.requests();
+            assert_eq!(requests.len(), 2);
+            assert!(
+                requests[1].url.ends_with("/api/v2/statements/stmt-poll-1"),
+                "{}",
+                requests[1].url
+            );
+            assert_eq!(requests[1].method, Method::Get);
+        });
+    }
+
+    #[test]
+    fn execute_maps_a_client_deadline_to_a_deadline_cancel() {
+        asupersync::test_utils::run_test(|| async {
+            let client = scripted_client(4, vec![Err(AsupersyncClientError::DeadlineExceeded)]);
+            let cx = Cx::for_testing();
+            let outcome = client.poll_statement(&cx, poll_request()).await;
+            let TransportOutcome::Cancelled(reason) = outcome else {
+                panic!("expected a deadline cancel, got {outcome:?}");
+            };
+            assert_eq!(reason.kind, CancelKind::Deadline);
+            assert_eq!(client.client.requests().len(), 1);
+        });
+    }
+
+    #[test]
+    fn execute_reports_an_in_flight_user_cancel_and_the_masked_cleanup_still_sends_the_remote_cancel()
+     {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::for_testing();
+            let mut raw = ScriptedRaw::new(vec![
+                Err(AsupersyncClientError::Cancelled),
+                ok_json(200, "{\"status\":\"cancelled\"}"),
+            ]);
+            raw.cancel_in_flight = Some(cx.clone());
+            let client = SnowflakeHttpClient::new(fast_retry_config(4), raw);
+
+            let outcome = client.poll_statement(&cx, poll_request()).await;
+            let TransportOutcome::Cancelled(reason) = outcome else {
+                panic!("expected a cancellation, got {outcome:?}");
+            };
+            assert_eq!(reason.kind, CancelKind::User);
+
+            // The cleanup runs on the same (now cancelled) context and must still
+            // reach the cancel endpoint: that is what the cancellation mask is for.
+            let cleanup = client
+                .cancel_after_local_cancel(&cx, auth(), StatementHandle::new("stmt-poll-1"), reason)
+                .await;
+            // The transport reports the cancel endpoint's own outcome (the driver
+            // is what turns the statement into a local `Cancelled`).
+            assert!(
+                matches!(cleanup, TransportOutcome::Ok(_)),
+                "the masked cleanup must reach the endpoint and be acknowledged: {cleanup:?}"
+            );
+            let requests = client.client.requests();
+            assert_eq!(requests.len(), 2, "poll + remote cancel");
+            assert_eq!(requests[1].method, Method::Post);
+            assert!(
+                requests[1]
+                    .url
+                    .ends_with("/api/v2/statements/stmt-poll-1/cancel"),
+                "{}",
+                requests[1].url
+            );
+        });
+    }
+
+    #[test]
+    fn execute_short_circuits_on_an_already_cancelled_context() {
+        asupersync::test_utils::run_test(|| async {
+            let client = scripted_client(4, vec![ok_json(202, "{}")]);
+            let cx = Cx::for_testing();
+            cx.cancel_with(CancelKind::User, Some("operator hit ctrl-c"));
+            let outcome = client.poll_statement(&cx, poll_request()).await;
+            assert!(
+                matches!(outcome, TransportOutcome::Cancelled(_)),
+                "{outcome:?}"
+            );
+            assert!(
+                client.client.requests().is_empty(),
+                "nothing is sent after a cancel"
+            );
+        });
+    }
+
+    #[test]
+    fn execute_decodes_a_gzip_partition_end_to_end_and_asks_for_gzip() {
+        use asupersync::http::compress::{Compressor, GzipCompressor};
+        asupersync::test_utils::run_test(|| async {
+            let plain = br#"{"data":[["1","alpha"]]}"#;
+            let mut compressed = Vec::new();
+            let mut compressor = GzipCompressor::new();
+            compressor
+                .compress(plain, &mut compressed)
+                .expect("compress");
+            compressor.finish(&mut compressed).expect("finish");
+            let client = scripted_client(
+                4,
+                vec![Ok(Response::new(200, "OK", compressed.clone())
+                    .with_header("content-encoding", "gzip"))],
+            );
+            let cx = Cx::for_testing();
+            let outcome = client
+                .fetch_partition(
+                    &cx,
+                    PartitionHttpRequest {
+                        auth: auth(),
+                        statement_handle: StatementHandle::new("stmt-1"),
+                        partition: 3,
+                    },
+                )
+                .await;
+            let TransportOutcome::Ok(body) = outcome else {
+                panic!("expected a decoded partition, got {outcome:?}");
+            };
+            assert_eq!(body.body, plain);
+            assert_eq!(body.compression.content_encoding, ContentEncoding::Gzip);
+            assert_eq!(body.compression.compressed_bytes, compressed.len() as u64);
+            let requests = client.client.requests();
+            assert_eq!(requests.len(), 1);
+            assert!(
+                requests[0]
+                    .url
+                    .ends_with("/api/v2/statements/stmt-1?partition=3"),
+                "{}",
+                requests[0].url
+            );
+            assert!(
+                requests[0]
+                    .headers
+                    .iter()
+                    .any(|(name, value)| name == HEADER_ACCEPT_ENCODING
+                        && value == PARTITION_ACCEPT_ENCODING),
+                "partition fetches advertise gzip"
+            );
+        });
     }
 
     fn poll_ready<F: Future>(future: F) -> F::Output {

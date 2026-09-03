@@ -172,6 +172,11 @@ several commands returned "reserved" stubs. This window closes those gaps:
   assembled: the statement completes early, `CompletedStatement::is_partial`
   is set, and the envelope reports `partitions_fetched` plus a warning. Eight
   new driver tests observe the overlap through the fake transport.
+- **Raw-transport seam.** `SnowflakeHttpClient` is generic over a `RawHttp`
+  trait (one HTTP exchange; the Asupersync pooled client in production), so
+  the transport's retry/backoff/resubmit/cancel loop is now covered by eight
+  scripted tests, including the idempotent resubmit contract and the masked
+  cleanup that still sends the remote cancel on a cancelled context.
 - **Scripted CLI outcome lane.** A test-only seam at `execute_request` lets
   the public live outcome functions run offline against scripted completed
   statements with real store side effects; six tests cover query run
