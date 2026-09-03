@@ -64,7 +64,10 @@ The GitHub Actions matrix must pass on Linux, macOS, and Windows:
 
 Until 2026-09-02 no CI run had ever produced a job (the workflow used the
 `runner` context in job-level `env`, which GitHub rejects); treat any "CI
-proof" claim older than that as unbacked.
+proof" claim older than that as unbacked. After the fix, jobs are created but,
+as of 2026-09-03, none had been assigned a hosted runner (account-wide runner
+saturation plus push-triggered cancellation), so the macOS and Windows lanes
+have still never executed. A release must cite a completed run URL.
 
 The Linux lint lane must also pass:
 
