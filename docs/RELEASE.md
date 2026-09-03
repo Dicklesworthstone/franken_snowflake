@@ -96,6 +96,20 @@ a single job (52 runs failed at workflow parse; the 10 after a fix were never
 assigned a runner). It was removed; any "CI proof" wording older than this
 note is unbacked.
 
+## Cross-Compile Status (2026-09-03, local, `--features live,mcp --locked`)
+
+| target | result | how |
+|---|---|---|
+| `x86_64-unknown-linux-gnu` | builds, tests pass | native |
+| `aarch64-unknown-linux-gnu` | builds (ELF aarch64 PIE) | `cargo zigbuild` |
+| `x86_64-pc-windows-msvc` | builds (PE32+ console exe, both binaries) | `cargo xwin build` |
+| `aarch64-pc-windows-msvc` | **does not build** | `cargo xwin` exports clang-cl-style `/imsvc` include flags, but `ring 0.17` compiles its arm64 C sources with plain `clang`, which rejects them; overriding `CFLAGS_aarch64_pc_windows_msvc` is ignored by cargo-xwin. Needs a native Windows-on-ARM host or an upstream fix; the target is out of the release set until then (v0.0.1's arm64 asset came from a hosted Windows runner). |
+| `aarch64-apple-darwin`, `x86_64-apple-darwin` | not attempted here (no macOS SDK); built on the dsr macOS host | `dsr build` |
+
+The Windows and aarch64 Linux binaries above were produced, not executed: no
+Windows or ARM machine was available in this session, so "builds" means the
+linker produced the executable, not that `capabilities` was run on it.
+
 ## No-Account Proof Lanes
 
 Before tagging, confirm `docs/proof_lanes.md` has current evidence for:

@@ -65,6 +65,8 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
         r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"capabilities","arguments":{}}}"#,
         r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"dataset_describe_operator","arguments":{"operator":"between"}}}"#,
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"export_plan","arguments":{"profile":"demo","sql":"select * from events","location":"@my_stage/exports/run_001","format":"jsonl"}}}"#,
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"query_plan","arguments":{"dataset_id":"never_scanned_b3_0000","entity":"E1"}}}"#,
     ];
     {
         let stdin = child.stdin.as_mut().expect("stdin");
@@ -77,7 +79,7 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
 
     let mut responses = std::collections::BTreeMap::<u64, serde_json::Value>::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while responses.len() < 4 && std::time::Instant::now() < deadline {
+    while responses.len() < 6 && std::time::Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_secs(5)) {
             Ok(line) => {
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
@@ -96,8 +98,8 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
 
     assert_eq!(
         responses.len(),
-        4,
-        "expected 4 responses, got {responses:?}"
+        6,
+        "expected 6 responses, got {responses:?}"
     );
 
     let init = &responses[&1]["result"];
@@ -111,7 +113,7 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(tools.len(), 18, "{names:?}");
+    assert_eq!(tools.len(), 19, "{names:?}");
     for expected in [
         "capabilities",
         "onboard",
@@ -127,6 +129,9 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
         "query_cancel",
         "receipt_show",
         "export_plan",
+        "export_run",
+        "dataset_profile",
+        "profile_doctor",
     ] {
         assert!(names.contains(&expected), "missing tool {expected}");
     }
@@ -157,4 +162,33 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
     let describe: serde_json::Value = serde_json::from_str(describe).expect("envelope JSON");
     assert_eq!(describe["command_id"], "dataset.describe_operator");
     assert_eq!(describe["data"]["operator"], "between");
+
+    // export_plan carries every flag through to the CLI: a real COPY INTO plan
+    // comes back as the CLI envelope (the old zero-parameter tool could only
+    // produce a usage error).
+    let export = responses[&5]["result"]["content"][0]["text"]
+        .as_str()
+        .expect("export_plan text");
+    let export: serde_json::Value = serde_json::from_str(export).expect("envelope JSON");
+    assert_eq!(export["ok"], true, "{export}");
+    assert_eq!(export["command_id"], "export.plan");
+    assert!(
+        export.to_string().contains("COPY INTO"),
+        "plan should carry the COPY INTO statement: {export}"
+    );
+
+    // Dataset mode reaches the CLI planner: an unknown dataset is the CLI's
+    // typed FSNOW-7002 error, returned verbatim as the tool's envelope text
+    // (only exit-2 refusals become JSON-RPC tool errors).
+    let dataset = responses[&6]["result"]["content"][0]["text"]
+        .as_str()
+        .expect("dataset-mode tool result carries the CLI envelope");
+    let envelope: serde_json::Value = serde_json::from_str(dataset).expect("envelope JSON");
+    assert_eq!(envelope["ok"], false, "{envelope}");
+    assert_eq!(envelope["command_id"], "query.plan", "{envelope}");
+    assert_eq!(envelope["error"]["code"], "FSNOW-7002", "{envelope}");
+    assert!(
+        envelope.to_string().contains("catalog scan"),
+        "the repair command names the scan: {envelope}"
+    );
 }

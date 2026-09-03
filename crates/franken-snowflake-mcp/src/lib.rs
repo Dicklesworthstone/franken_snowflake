@@ -68,6 +68,7 @@ mod fastmcp_surface {
         QueryCancel,
         ReceiptShow,
         ExportPlan,
+        ExportRun,
     }
 
     const READ_VERBS: &[ReadVerb] = &[
@@ -89,6 +90,7 @@ mod fastmcp_surface {
         ReadVerb::QueryCancel,
         ReadVerb::ReceiptShow,
         ReadVerb::ExportPlan,
+        ReadVerb::ExportRun,
     ];
 
     #[derive(Clone, Copy)]
@@ -216,14 +218,19 @@ mod fastmcp_surface {
                 },
                 Self::CatalogGraph => ToolSpec {
                     name: "catalog_graph",
-                    description: "Render the catalog lineage graph through the CLI catalog graph handler from a live scan of the given database; format may be json, mermaid, or svg.",
+                    description: "Render the catalog lineage graph from the local store's latest snapshot for the database (run catalog_scan first); set refresh=true to rescan live before rendering; format may be json, mermaid, or svg.",
                     open_world_hint: "snowflake",
                     read_only: true,
                     params: vec![
                         ParamSpec::string(
                             "profile",
-                            "Profile id to use for the live catalog scan.",
+                            "Profile id whose snapshot (or live rescan) to render.",
                             true,
+                        ),
+                        ParamSpec::boolean(
+                            "refresh",
+                            "Set true to run a live catalog scan before rendering (needs credentials).",
+                            false,
                         ),
                         ParamSpec::string(
                             "database",
@@ -258,14 +265,17 @@ mod fastmcp_surface {
                 },
                 Self::DatasetProfile => ToolSpec {
                     name: "dataset_profile",
-                    description: "Plan pushed-down dataset profiling through the CLI dataset profile handler.",
+                    description: "Build the pushed-down APPROX_COUNT_DISTINCT / null-count / min-max profiling statement for a dataset from the local snapshot; set execute=true to run it live and return the stats.",
                     open_world_hint: "snowflake",
                     read_only: true,
-                    params: vec![ParamSpec::string(
-                        "dataset_id",
-                        "Dataset identifier to profile.",
-                        true,
-                    )],
+                    params: vec![
+                        ParamSpec::string("dataset_id", "Dataset identifier to profile.", true),
+                        ParamSpec::boolean(
+                            "execute",
+                            "Set true to execute the profiling statement live (needs credentials).",
+                            false,
+                        ),
+                    ],
                     tags: &["dataset", "snowflake"],
                 },
                 Self::DatasetDescribeOperator => ToolSpec {
@@ -282,36 +292,37 @@ mod fastmcp_surface {
                 },
                 Self::QueryPlan => ToolSpec {
                     name: "query_plan",
-                    description: "Validate and explain a read-only SQL plan without submitting it.",
+                    description: "Validate and explain a read-only plan without submitting it: raw sql, or dataset mode (dataset_id plus entity/from/to/as_of/select/filter/limit compiled through the catalog planner with typed positional bindings).",
                     open_world_hint: "offline",
                     read_only: true,
-                    params: vec![
-                        ParamSpec::string("profile", "Profile id to plan against.", true),
-                        ParamSpec::string("sql", "Single read-only SQL statement.", true),
-                    ],
+                    params: query_params(false),
                     tags: &["query", "offline"],
                 },
                 Self::QueryRun => ToolSpec {
                     name: "query_run",
-                    description: "Run a read-only SQL query through the CLI query run handler; write tools are not exposed here.",
+                    description: "Run a read-only query through the CLI query run handler (raw sql or dataset mode); every flag is honored or rejected; write tools are not exposed here.",
                     open_world_hint: "snowflake",
                     read_only: true,
-                    params: vec![
-                        ParamSpec::string("profile", "Profile id to query with.", true),
-                        ParamSpec::string("sql", "Single read-only SQL statement.", true),
-                    ],
+                    params: query_params(true),
                     tags: &["query", "snowflake"],
                 },
                 Self::QueryCancel => ToolSpec {
                     name: "query_cancel",
-                    description: "Cancel a Snowflake SQL API statement handle through the CLI query cancel handler.",
+                    description: "POST to the SQL API cancel endpoint for a statement handle with the profile's credentials.",
                     open_world_hint: "snowflake",
                     read_only: false,
-                    params: vec![ParamSpec::string(
-                        "statement_handle",
-                        "Statement handle returned by query run.",
-                        true,
-                    )],
+                    params: vec![
+                        ParamSpec::string(
+                            "statement_handle",
+                            "Statement handle returned by query run.",
+                            true,
+                        ),
+                        ParamSpec::string(
+                            "profile",
+                            "Profile id whose credentials cancel the statement (defaults to FRANKEN_SNOWFLAKE_DEFAULT_PROFILE).",
+                            false,
+                        ),
+                    ],
                     tags: &["query", "snowflake", "cancel"],
                 },
                 Self::ReceiptShow => ToolSpec {
@@ -328,11 +339,19 @@ mod fastmcp_surface {
                 },
                 Self::ExportPlan => ToolSpec {
                     name: "export_plan",
-                    description: "Draft export plans through the CLI export plan handler; execution is not exposed.",
+                    description: "Build a content-addressed COPY INTO <stage> plan (Snowflake-side unload) and the exact `query write` command that executes it; nothing runs.",
                     open_world_hint: "offline",
                     read_only: true,
-                    params: Vec::new(),
+                    params: export_params(true),
                     tags: &["export", "offline"],
+                },
+                Self::ExportRun => ToolSpec {
+                    name: "export_run",
+                    description: "Run a read-only query live and write a content-addressed local CSV or JSONL file at `out`; records an export receipt in the local store.",
+                    open_world_hint: "snowflake",
+                    read_only: false,
+                    params: export_params(false),
+                    tags: &["export", "snowflake"],
                 },
             }
         }
@@ -382,6 +401,9 @@ mod fastmcp_surface {
                         args.push("--schema".to_string());
                         args.push(schema);
                     }
+                    if optional_bool(arguments, "refresh")?.unwrap_or(false) {
+                        args.push("--refresh".to_string());
+                    }
                     match optional_string(arguments, "format")?
                         .as_deref()
                         .unwrap_or("json")
@@ -402,47 +424,291 @@ mod fastmcp_surface {
                     &["dataset", "inspect"],
                     vec![required_string(arguments, "dataset_id")?],
                 )),
-                Self::DatasetProfile => Ok(json_args_with(
-                    &["dataset", "profile"],
-                    vec![required_string(arguments, "dataset_id")?],
-                )),
+                Self::DatasetProfile => {
+                    let mut args = vec![
+                        "dataset".to_string(),
+                        "profile".to_string(),
+                        required_string(arguments, "dataset_id")?,
+                    ];
+                    if optional_bool(arguments, "execute")?.unwrap_or(false) {
+                        args.push("--execute".to_string());
+                    }
+                    args.push("--json".to_string());
+                    Ok(args)
+                }
                 Self::DatasetDescribeOperator => Ok(vec![
                     "dataset".to_string(),
                     "describe-operator".to_string(),
                     required_string(arguments, "operator")?,
                     "--jsonschema".to_string(),
                 ]),
-                Self::QueryPlan => Ok(vec![
-                    "query".to_string(),
-                    "plan".to_string(),
-                    "--profile".to_string(),
-                    required_string(arguments, "profile")?,
-                    "--sql".to_string(),
-                    required_string(arguments, "sql")?,
-                    "--json".to_string(),
-                ]),
-                Self::QueryRun => Ok(vec![
-                    "query".to_string(),
-                    "run".to_string(),
-                    "--profile".to_string(),
-                    required_string(arguments, "profile")?,
-                    "--sql".to_string(),
-                    required_string(arguments, "sql")?,
-                    "--json".to_string(),
-                ]),
-                Self::QueryCancel => Ok(vec![
-                    "query".to_string(),
-                    "cancel".to_string(),
-                    required_string(arguments, "statement_handle")?,
-                    "--json".to_string(),
-                ]),
+                Self::QueryPlan => query_args("plan", arguments),
+                Self::QueryRun => query_args("run", arguments),
+                Self::QueryCancel => {
+                    let mut args = vec![
+                        "query".to_string(),
+                        "cancel".to_string(),
+                        required_string(arguments, "statement_handle")?,
+                    ];
+                    if let Some(profile) = optional_string(arguments, "profile")? {
+                        args.push("--profile".to_string());
+                        args.push(profile);
+                    }
+                    args.push("--json".to_string());
+                    Ok(args)
+                }
                 Self::ReceiptShow => Ok(json_args_with(
                     &["receipt", "show"],
                     vec![required_string(arguments, "receipt_hash")?],
                 )),
-                Self::ExportPlan => Ok(json_args(&["export", "plan"])),
+                Self::ExportPlan => export_args("plan", arguments),
+                Self::ExportRun => export_args("run", arguments),
             }
         }
+    }
+
+    /// Parameters shared by `query_plan` and `query_run`: raw `sql` or dataset
+    /// mode (`dataset_id` plus axis flags); `run` adds the session flags.
+    fn query_params(run: bool) -> Vec<ParamSpec> {
+        let mut params = vec![
+            ParamSpec::string(
+                "profile",
+                "Profile id (defaults to FRANKEN_SNOWFLAKE_DEFAULT_PROFILE; in dataset mode defaults to the profile the dataset was scanned under).",
+                false,
+            ),
+            ParamSpec::string(
+                "sql",
+                "Single read-only SQL statement (raw mode). Mutually exclusive with dataset_id.",
+                false,
+            ),
+            ParamSpec::string(
+                "dataset_id",
+                "Dataset id from catalog_scan / dataset_inspect (dataset mode). Mutually exclusive with sql.",
+                false,
+            ),
+            ParamSpec::string(
+                "entity",
+                "Dataset mode: entity-key value to filter on (bound, never interpolated).",
+                false,
+            ),
+            ParamSpec::string(
+                "from",
+                "Dataset mode: inclusive lower bound on the time index (ISO date/timestamp).",
+                false,
+            ),
+            ParamSpec::string(
+                "to",
+                "Dataset mode: exclusive upper bound on the time index.",
+                false,
+            ),
+            ParamSpec::string(
+                "as_of",
+                "Dataset mode: Time Travel AT(TIMESTAMP => ...) point.",
+                false,
+            ),
+            ParamSpec::string(
+                "select",
+                "Dataset mode: comma-separated column list to project.",
+                false,
+            ),
+            ParamSpec::string(
+                "filter",
+                "Dataset mode: predicate AST as JSON ({\"column\":..,\"op\":..,\"value\":..} or {\"and\":[..]}).",
+                false,
+            ),
+            ParamSpec::string(
+                "limit",
+                "Row limit: dataset mode pushes it down; raw mode caps the rows emitted and fetched (default 1000, max 100000).",
+                false,
+            ),
+        ];
+        if run {
+            params.extend([
+                ParamSpec::string("role", "Session role override.", false),
+                ParamSpec::string("warehouse", "Session warehouse override.", false),
+                ParamSpec::string(
+                    "statement_timeout",
+                    "SQL API statement timeout in seconds.",
+                    false,
+                ),
+                ParamSpec::string(
+                    "query_tag",
+                    "QUERY_TAG session parameter for this run.",
+                    false,
+                ),
+                ParamSpec::string(
+                    "bindings_env",
+                    "Env var name holding positional typed bindings as JSON (raw mode).",
+                    false,
+                ),
+            ]);
+        }
+        params
+    }
+
+    fn query_args(verb: &str, arguments: &Value) -> McpResult<Vec<String>> {
+        let mut args = vec!["query".to_string(), verb.to_string()];
+        if let Some(profile) = optional_string(arguments, "profile")? {
+            args.push("--profile".to_string());
+            args.push(profile);
+        }
+        match (
+            optional_string(arguments, "sql")?,
+            optional_string(arguments, "dataset_id")?,
+        ) {
+            (Some(sql), None) => {
+                args.push("--sql".to_string());
+                args.push(sql);
+            }
+            (None, Some(dataset_id)) => {
+                args.push("--dataset".to_string());
+                args.push(dataset_id);
+            }
+            (Some(_), Some(_)) => {
+                return Err(invalid_params(
+                    "pass either `sql` (raw mode) or `dataset_id` (dataset mode), not both",
+                    None,
+                ));
+            }
+            (None, None) => {
+                return Err(invalid_params(
+                    "one of `sql` (raw mode) or `dataset_id` (dataset mode) is required",
+                    None,
+                ));
+            }
+        }
+        for (key, flag) in [
+            ("entity", "--entity"),
+            ("from", "--from"),
+            ("to", "--to"),
+            ("as_of", "--as-of"),
+            ("select", "--select"),
+            ("filter", "--filter"),
+            ("limit", "--limit"),
+        ] {
+            if let Some(value) = optional_string(arguments, key)? {
+                args.push(flag.to_string());
+                args.push(value);
+            }
+        }
+        if verb == "run" {
+            for (key, flag) in [
+                ("role", "--role"),
+                ("warehouse", "--warehouse"),
+                ("statement_timeout", "--statement-timeout"),
+                ("query_tag", "--query-tag"),
+                ("bindings_env", "--bindings-env"),
+            ] {
+                if let Some(value) = optional_string(arguments, key)? {
+                    args.push(flag.to_string());
+                    args.push(value);
+                }
+            }
+        }
+        args.push("--json".to_string());
+        Ok(args)
+    }
+
+    /// Parameters for `export_plan` (stage unload plan) and `export_run` (local file).
+    fn export_params(plan: bool) -> Vec<ParamSpec> {
+        let mut params = vec![
+            ParamSpec::string("profile", "Profile id the export belongs to.", true),
+            ParamSpec::string(
+                "sql",
+                "Read-only SELECT to export. Mutually exclusive with query_id.",
+                false,
+            ),
+            ParamSpec::string(
+                "query_id",
+                "Snowflake query id to export via RESULT_SCAN. Mutually exclusive with sql.",
+                false,
+            ),
+            ParamSpec::string_enum("format", "Output format.", false, &["csv", "jsonl"]),
+        ];
+        if plan {
+            params.extend([
+                ParamSpec::string(
+                    "location",
+                    "Stage location for COPY INTO, e.g. @my_stage/exports/run_001.",
+                    true,
+                ),
+                ParamSpec::string("compression", "Stage file compression (e.g. gzip).", false),
+                ParamSpec::string("header", "Emit a header row: true or false.", false),
+                ParamSpec::boolean(
+                    "overwrite",
+                    "Allow overwriting existing stage files.",
+                    false,
+                ),
+                ParamSpec::boolean("single", "Write a single file.", false),
+                ParamSpec::string("max_file_size", "Maximum stage file size in bytes.", false),
+            ]);
+        } else {
+            params.push(ParamSpec::string("out", "Local file path to write.", true));
+        }
+        params
+    }
+
+    fn export_args(verb: &str, arguments: &Value) -> McpResult<Vec<String>> {
+        let mut args = vec![
+            "export".to_string(),
+            verb.to_string(),
+            "--profile".to_string(),
+            required_string(arguments, "profile")?,
+        ];
+        match (
+            optional_string(arguments, "sql")?,
+            optional_string(arguments, "query_id")?,
+        ) {
+            (Some(sql), None) => {
+                args.push("--sql".to_string());
+                args.push(sql);
+            }
+            (None, Some(query_id)) => {
+                args.push("--query-id".to_string());
+                args.push(query_id);
+            }
+            (Some(_), Some(_)) => {
+                return Err(invalid_params(
+                    "pass either `sql` or `query_id`, not both",
+                    None,
+                ));
+            }
+            (None, None) => {
+                return Err(invalid_params(
+                    "one of `sql` or `query_id` is required",
+                    None,
+                ));
+            }
+        }
+        if let Some(format) = optional_string(arguments, "format")? {
+            args.push("--format".to_string());
+            args.push(format);
+        }
+        if verb == "plan" {
+            args.push("--location".to_string());
+            args.push(required_string(arguments, "location")?);
+            for (key, flag) in [
+                ("compression", "--compression"),
+                ("header", "--header"),
+                ("max_file_size", "--max-file-size"),
+            ] {
+                if let Some(value) = optional_string(arguments, key)? {
+                    args.push(flag.to_string());
+                    args.push(value);
+                }
+            }
+            if optional_bool(arguments, "overwrite")?.unwrap_or(false) {
+                args.push("--overwrite".to_string());
+            }
+            if optional_bool(arguments, "single")?.unwrap_or(false) {
+                args.push("--single".to_string());
+            }
+        } else {
+            args.push("--out".to_string());
+            args.push(required_string(arguments, "out")?);
+        }
+        args.push("--json".to_string());
+        Ok(args)
     }
 
     impl ParamSpec {
@@ -735,8 +1001,8 @@ mod fastmcp_surface {
                     .annotations
                     .as_ref()
                     .and_then(|annotations| annotations.read_only);
-                if tool.name == "query_cancel" {
-                    assert_eq!(read_only, Some(false));
+                if tool.name == "query_cancel" || tool.name == "export_run" {
+                    assert_eq!(read_only, Some(false), "{} has side effects", tool.name);
                 } else {
                     assert_eq!(
                         read_only,
@@ -767,14 +1033,175 @@ mod fastmcp_surface {
         }
 
         #[test]
+        fn query_tools_map_dataset_mode_and_session_flags_to_the_cli_contract() {
+            let args = ReadVerb::QueryRun
+                .cli_args(&json!({
+                    "dataset_id": "analytics_public_events_b3_abc",
+                    "entity": "ENTITY123",
+                    "from": "2024-01-01",
+                    "to": "2024-12-31",
+                    "select": "EVENT_DATE,VALUE",
+                    "limit": "10",
+                    "role": "ANALYST",
+                    "statement_timeout": "120"
+                }))
+                .expect("dataset-mode run args");
+            assert_eq!(
+                args,
+                vec![
+                    "query",
+                    "run",
+                    "--dataset",
+                    "analytics_public_events_b3_abc",
+                    "--entity",
+                    "ENTITY123",
+                    "--from",
+                    "2024-01-01",
+                    "--to",
+                    "2024-12-31",
+                    "--select",
+                    "EVENT_DATE,VALUE",
+                    "--limit",
+                    "10",
+                    "--role",
+                    "ANALYST",
+                    "--statement-timeout",
+                    "120",
+                    "--json",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+            );
+            let plan = ReadVerb::QueryPlan
+                .cli_args(&json!({"profile": "demo", "sql": "select 1", "role": "IGNORED_ON_PLAN"}))
+                .expect("raw plan args");
+            assert_eq!(
+                plan,
+                vec![
+                    "query",
+                    "plan",
+                    "--profile",
+                    "demo",
+                    "--sql",
+                    "select 1",
+                    "--json"
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+            );
+            let both = ReadVerb::QueryRun
+                .cli_args(&json!({"sql": "select 1", "dataset_id": "x"}))
+                .expect_err("sql and dataset_id together must be refused");
+            assert_eq!(both.code, McpErrorCode::InvalidParams);
+            let neither = ReadVerb::QueryPlan
+                .cli_args(&json!({"profile": "demo"}))
+                .expect_err("neither sql nor dataset_id must be refused");
+            assert_eq!(neither.code, McpErrorCode::InvalidParams);
+        }
+
+        #[test]
+        fn export_tools_map_to_the_cli_contract() {
+            let plan = ReadVerb::ExportPlan
+                .cli_args(&json!({
+                    "profile": "demo",
+                    "sql": "select * from events",
+                    "location": "@my_stage/exports/run_001",
+                    "format": "jsonl",
+                    "compression": "gzip",
+                    "header": "false",
+                    "overwrite": true,
+                    "single": true,
+                    "max_file_size": "1000000"
+                }))
+                .expect("export plan args");
+            assert_eq!(
+                plan,
+                vec![
+                    "export",
+                    "plan",
+                    "--profile",
+                    "demo",
+                    "--sql",
+                    "select * from events",
+                    "--format",
+                    "jsonl",
+                    "--location",
+                    "@my_stage/exports/run_001",
+                    "--compression",
+                    "gzip",
+                    "--header",
+                    "false",
+                    "--max-file-size",
+                    "1000000",
+                    "--overwrite",
+                    "--single",
+                    "--json",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+            );
+            let run = ReadVerb::ExportRun
+                .cli_args(&json!({"profile": "demo", "query_id": "01b2-qid", "out": "events.csv"}))
+                .expect("export run args");
+            assert_eq!(
+                run,
+                vec![
+                    "export",
+                    "run",
+                    "--profile",
+                    "demo",
+                    "--query-id",
+                    "01b2-qid",
+                    "--out",
+                    "events.csv",
+                    "--json",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+            );
+            let missing_location = ReadVerb::ExportPlan
+                .cli_args(&json!({"profile": "demo", "sql": "select 1"}))
+                .expect_err("export plan needs a stage location");
+            assert_eq!(missing_location.code, McpErrorCode::InvalidParams);
+        }
+
+        #[test]
+        fn graph_profile_and_cancel_tools_forward_their_new_flags() {
+            let graph = ReadVerb::CatalogGraph
+                .cli_args(&json!({"profile": "demo", "database": "DB", "refresh": true, "format": "mermaid"}))
+                .expect("graph args");
+            assert!(graph.contains(&"--refresh".to_string()));
+            assert!(graph.contains(&"--mermaid".to_string()));
+            let profile = ReadVerb::DatasetProfile
+                .cli_args(&json!({"dataset_id": "ds", "execute": true}))
+                .expect("profile args");
+            assert_eq!(
+                profile,
+                vec!["dataset", "profile", "ds", "--execute", "--json"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            );
+            let cancel = ReadVerb::QueryCancel
+                .cli_args(&json!({"statement_handle": "01bc", "profile": "demo"}))
+                .expect("cancel args");
+            assert_eq!(
+                cancel,
+                vec!["query", "cancel", "01bc", "--profile", "demo", "--json"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
         fn tool_schema_json_is_stable_json() {
-            let schemas = match mcp_tool_schema_json(fake_runner) {
-                Ok(schemas) => schemas,
-                Err(err) => {
-                    assert!(false, "tool schemas serialize: {err}");
-                    String::new()
-                }
-            };
+            let schemas = mcp_tool_schema_json(fake_runner)
+                .unwrap_or_else(|err| panic!("tool schemas serialize: {err}"));
             assert!(schemas.contains("\"name\":\"capabilities\""));
             assert!(schemas.contains("\"name\":\"profile_validate\""));
             assert!(schemas.contains("\"inputSchema\""));
@@ -785,26 +1212,18 @@ mod fastmcp_surface {
             let stdout = "{\"ok\":false,\"error\":{\"code\":\"FSNOW-3001\"}}".to_string();
             let stderr = "FSNOW-3001: mutation refused".to_string();
 
-            let err = match cli_output_to_mcp_result(CliContractOutput {
+            let Err(err) = cli_output_to_mcp_result(CliContractOutput {
                 exit_code: 2,
                 stdout: stdout.clone(),
                 stderr: Some(stderr.clone()),
-            }) {
-                Ok(_) => {
-                    assert!(
-                        false,
-                        "CLI refusal must not be returned as successful MCP content"
-                    );
-                    return;
-                }
-                Err(err) => err,
+            }) else {
+                panic!("CLI refusal must not be returned as successful MCP content");
             };
 
             assert_eq!(err.code, McpErrorCode::ToolExecutionError);
             assert_eq!(err.message, stdout);
             let Some(Value::Object(data)) = err.data else {
-                assert!(false, "tool error should carry CLI parity data");
-                return;
+                panic!("tool error should carry CLI parity data");
             };
             assert_eq!(data.get("exit_code").and_then(Value::as_i64), Some(2));
             assert_eq!(
@@ -819,20 +1238,14 @@ mod fastmcp_surface {
 
         #[test]
         fn cli_findings_remain_successful_mcp_content() {
-            let content = match cli_output_to_mcp_result(CliContractOutput {
+            let content = cli_output_to_mcp_result(CliContractOutput {
                 exit_code: 1,
                 stdout: "{\"ok\":true,\"outcome_kind\":\"partial_success\"}".to_string(),
                 stderr: None,
-            }) {
-                Ok(content) => content,
-                Err(err) => {
-                    assert!(
-                        false,
-                        "CLI findings are ok=true and should stay successful: {err:?}"
-                    );
-                    return;
-                }
-            };
+            })
+            .unwrap_or_else(|err| {
+                panic!("CLI findings are ok=true and should stay successful: {err:?}")
+            });
 
             assert_eq!(content.len(), 1);
         }
@@ -843,17 +1256,10 @@ mod fastmcp_surface {
             // `database` is now required for catalog_graph and is validated before
             // `format`; supply it so the unsupported-format (secret-shaped) value is
             // the failure under test.
-            let err = match ReadVerb::CatalogGraph
+            let Err(err) = ReadVerb::CatalogGraph
                 .cli_args(&json!({"profile": "demo", "database": "DB", "format": raw_secret}))
-            {
-                Ok(_) => {
-                    assert!(
-                        false,
-                        "secret-shaped unsupported graph format should be rejected"
-                    );
-                    return;
-                }
-                Err(err) => err,
+            else {
+                panic!("secret-shaped unsupported graph format should be rejected");
             };
 
             assert_eq!(err.code, McpErrorCode::InvalidParams);

@@ -172,6 +172,24 @@ several commands returned "reserved" stubs. This window closes those gaps:
   assembled: the statement completes early, `CompletedStatement::is_partial`
   is set, and the envelope reports `partitions_fetched` plus a warning. Eight
   new driver tests observe the overlap through the fake transport.
+- **MCP surface parity.** The MCP tool registry now covers every wired
+  surface: `export_plan` takes its real parameters (it previously accepted
+  none and could only return a usage error), `export_run` is new,
+  `query_plan`/`query_run` accept dataset mode (`dataset_id`, `entity`,
+  `from`, `to`, `as_of`, `select`, `filter`, `limit`) and the session flags,
+  `catalog_graph` takes `refresh`, `dataset_profile` takes `execute`, and
+  `query_cancel` takes `profile`. The stdio parity test asserts 19 tools and
+  round-trips an `export_plan` and a dataset-mode `query_plan` envelope.
+- **Live-proof CLI battery.** `scripts/live-proof-cli.sh` (run by
+  `scripts/live-proof.sh`) drives the wired surfaces end to end against a
+  real profile, writes every envelope and an `events.jsonl`, scans everything
+  captured for the profile's secret values, and exits non-zero on the first
+  hard failure; `--selftest` proves the harness offline with a planted canary.
+  Without opt-in it records a typed skip.
+- **Cross-compile proof.** `x86_64-pc-windows-msvc` (cargo xwin) and
+  `aarch64-unknown-linux-gnu` (cargo zigbuild) build with `--features
+  live,mcp`; `aarch64-pc-windows-msvc` does not (ring/cargo-xwin, see
+  `docs/RELEASE.md`) and leaves the release target set.
 - **Raw-transport seam.** `SnowflakeHttpClient` is generic over a `RawHttp`
   trait (one HTTP exchange; the Asupersync pooled client in production), so
   the transport's retry/backoff/resubmit/cancel loop is now covered by eight

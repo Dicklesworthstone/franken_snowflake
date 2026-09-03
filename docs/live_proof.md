@@ -29,6 +29,32 @@ cargo test -p franken-snowflake-sqlapi --test live_proof -- --nocapture
 Artifacts are written under
 `${FRANKEN_SNOWFLAKE_LIVE_ARTIFACTS_DIR:-$CARGO_TARGET_DIR/fsnow-live-proof}`.
 
+`scripts/live-proof.sh` runs two lanes: the driver-level test above, then the
+**CLI battery** `scripts/live-proof-cli.sh`, which builds the binary with
+`--features live,mcp` (or uses `FSNOW_BIN`) and drives the wired surfaces end
+to end with `--json`, asserting the typed fields with `jq`:
+
+| step | asserts |
+|---|---|
+| `profile_validate`, `profile_doctor_online` | `ok`, `data_source=live`, a 64-hex `receipt_hash` |
+| `query_run_small` then `receipt_show` | rows returned; the receipt reads back from the local store and names the statement handle |
+| `query_run_partitioned` (+ `partition_early_stop`) | `--limit 10` returns 10 rows and stops fetching partitions early (a single-partition trial result is a finding, not a failure) |
+| `query_cancel_completed_handle` | the cancel endpoint answers with a well-formed typed envelope |
+| `catalog_scan`, `dataset_inspect`, `query_plan_dataset`, `query_run_dataset`, `dataset_profile_execute` | the snapshot persists, dataset mode plans and runs with typed bindings, profiling executes |
+| `export_plan`, `export_run_csv`, `export_file` | a `COPY INTO` plan; a CSV written to disk |
+| `secret_scan` | no secret handle value, private-key line, or bearer-token shape appears in anything captured |
+
+Every step's envelope is saved as `<step>.json` next to `events.jsonl` and
+`summary.json` in a fresh run directory that also holds the run's own local
+store (`data/`), so receipts and snapshots are inspectable afterwards. The
+script exits non-zero on the first hard failure. `scripts/live-proof-cli.sh
+--selftest` proves the harness offline: it runs an offline command, an
+offline refusal, and a planted-canary scan (the scan must report the hit).
+
+The credentialed run of this battery is the evidence that closes bead
+`fsnow-agent-ergonomic-cli-cli-live-e2e-and-receipts-bvf`; until it exists,
+every live path stays "unverified" in the README.
+
 ## Required Opt-In
 
 ```bash
