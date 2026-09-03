@@ -1383,10 +1383,18 @@ struct LiveConn {
     endpoint: SnowflakeEndpoint,
     auth_profile: AuthProfile,
     max_polls: u32,
+    /// Test-only: answers every `execute_request` from a script instead of the
+    /// SQL API (see `test_support`). Always `None` in production builds.
+    #[cfg(test)]
+    script: Option<test_support::Script>,
 }
 
 impl LiveConn {
     fn resolve(profile: &str, overrides: &SessionOverrides) -> Result<Self, SnowflakeError> {
+        #[cfg(test)]
+        if let Some(conn) = test_support::scripted_conn(profile, overrides) {
+            return Ok(conn);
+        }
         if !crate::is_valid_profile_id(profile) {
             return Err(SnowflakeError::new(
                 SnowflakeErrorCode::ProfileInvalid,
@@ -1472,6 +1480,8 @@ impl LiveConn {
             endpoint,
             auth_profile,
             max_polls: env_u32(&name(&prefix, "MAX_POLLS")).unwrap_or(DEFAULT_MAX_POLLS),
+            #[cfg(test)]
+            script: None,
         })
     }
 }
@@ -1604,6 +1614,10 @@ fn execute_request(
     conn: &LiveConn,
     request: SubmitStatementRequest,
 ) -> Result<(CompletedStatement, DriverStats, String), SnowflakeError> {
+    #[cfg(test)]
+    if let Some(script) = &conn.script {
+        return script.execute(request);
+    }
     let sql_api_request_id = unique_request_id();
     let params = SubmitQueryParams {
         request_id: Some(sql_api_request_id.clone()),
@@ -2240,6 +2254,169 @@ fn unique_request_id() -> String {
     )
 }
 
+/// A scripted stand-in for the SQL API at the `execute_request` seam.
+///
+/// The public outcome functions resolve a `LiveConn` for the installed profile
+/// without any env handles, and every statement they submit is answered from
+/// the script in order, so the whole live outcome layer (request shaping,
+/// session overrides, receipts, audit, store persistence, envelope shape) runs
+/// offline. This is **not** transport-level proof: nothing below
+/// `execute_request` (http client, driver, auth) runs here; those have their
+/// own scripted-transport tests in the sqlapi driver.
+#[cfg(test)]
+mod test_support {
+    use super::*;
+    use franken_snowflake_sqlapi::lifecycle::{Progress, StatementMachine};
+    use franken_snowflake_sqlapi::status::ResponseClass;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
+    struct ScriptState {
+        responses: VecDeque<Result<CompletedStatement, SnowflakeError>>,
+        submitted: Vec<SubmitStatementRequest>,
+    }
+
+    /// Shared handle to the script: the test keeps one to inspect what was
+    /// submitted; the resolved `LiveConn` keeps one to answer statements.
+    #[derive(Clone)]
+    pub(super) struct Script(Rc<RefCell<ScriptState>>);
+
+    impl Script {
+        pub(super) fn execute(
+            &self,
+            request: SubmitStatementRequest,
+        ) -> Result<(CompletedStatement, DriverStats, String), SnowflakeError> {
+            let mut state = self.0.borrow_mut();
+            state.submitted.push(request);
+            let ordinal = state.submitted.len();
+            match state.responses.pop_front() {
+                Some(Ok(done)) => Ok((
+                    done,
+                    DriverStats {
+                        polls: 1,
+                        partitions_fetched: 0,
+                    },
+                    format!("scripted-request-{ordinal}"),
+                )),
+                Some(Err(error)) => Err(error),
+                None => Err(SnowflakeError::new(
+                    SnowflakeErrorCode::Internal,
+                    "scripted transport has no response left for this statement",
+                )),
+            }
+        }
+
+        pub(super) fn submitted(&self) -> Vec<SubmitStatementRequest> {
+            self.0.borrow().submitted.clone()
+        }
+
+        pub(super) fn remaining(&self) -> usize {
+            self.0.borrow().responses.len()
+        }
+    }
+
+    struct ScriptedProfile {
+        profile: String,
+        database: Option<String>,
+        schema: Option<String>,
+        script: Script,
+    }
+
+    thread_local! {
+        static SCRIPTED: RefCell<Option<ScriptedProfile>> = const { RefCell::new(None) };
+    }
+
+    /// Install a scripted profile for this test thread: `LiveConn::resolve`
+    /// for `profile` succeeds without env handles and each submitted statement
+    /// is answered from `responses` in order.
+    pub(super) fn install(
+        profile: &str,
+        database: Option<&str>,
+        schema: Option<&str>,
+        responses: Vec<Result<CompletedStatement, SnowflakeError>>,
+    ) -> Script {
+        let script = Script(Rc::new(RefCell::new(ScriptState {
+            responses: responses.into(),
+            submitted: Vec::new(),
+        })));
+        SCRIPTED.with(|slot| {
+            *slot.borrow_mut() = Some(ScriptedProfile {
+                profile: profile.to_owned(),
+                database: database.map(str::to_owned),
+                schema: schema.map(str::to_owned),
+                script: script.clone(),
+            });
+        });
+        script
+    }
+
+    pub(super) fn scripted_conn(profile: &str, overrides: &SessionOverrides) -> Option<LiveConn> {
+        SCRIPTED.with(|slot| {
+            let slot = slot.borrow();
+            let scripted = slot.as_ref().filter(|entry| entry.profile == profile)?;
+            let account = "xy12345.us-east-1";
+            Some(LiveConn {
+                profile: profile.to_owned(),
+                account: account.to_owned(),
+                user: "SVC_TEST".to_owned(),
+                warehouse: overrides
+                    .warehouse
+                    .clone()
+                    .unwrap_or_else(|| "WH_TEST".to_owned()),
+                database: overrides
+                    .database
+                    .clone()
+                    .or_else(|| scripted.database.clone()),
+                schema: overrides.schema.clone().or_else(|| scripted.schema.clone()),
+                role: overrides.role.clone(),
+                statement_timeout_seconds: overrides
+                    .statement_timeout
+                    .unwrap_or(DEFAULT_STATEMENT_TIMEOUT_SECONDS),
+                endpoint: SnowflakeEndpoint::parse(endpoint_url(account)).ok()?,
+                auth_profile: build_auth_profile("FSNOW_SCRIPTED", "pat").ok()?,
+                max_polls: 10,
+                script: Some(scripted.script.clone()),
+            })
+        })
+    }
+
+    /// Build a completed single-partition statement the way the driver would:
+    /// a `200` body with typed column metadata, fed through the lifecycle machine.
+    pub(super) fn completed(
+        handle: &str,
+        columns: &[(&str, &str)],
+        rows: &[Vec<Option<&str>>],
+    ) -> CompletedStatement {
+        let row_type: Vec<serde_json::Value> = columns
+            .iter()
+            .map(|(name, ty)| serde_json::json!({ "name": name, "type": ty, "nullable": true }))
+            .collect();
+        let body = serde_json::json!({
+            "resultSetMetaData": {
+                "numRows": rows.len(),
+                "format": "jsonv2",
+                "rowType": row_type,
+                "partitionInfo": [{ "rowCount": rows.len(), "uncompressedSize": 1 }]
+            },
+            "data": rows,
+            "code": "090001",
+            "statementHandle": handle,
+            "statementStatusUrl": format!("/api/v2/statements/{handle}"),
+            "sqlState": "00000",
+            "message": "Statement executed successfully.",
+            "requestId": "11111111-1111-1111-1111-111111111111",
+            "createdOn": 1_700_000_000_000_u64
+        });
+        let bytes = serde_json::to_vec(&body).expect("fixture body serializes");
+        let mut machine = StatementMachine::new(PollPlan::default());
+        match machine.on_submit(ResponseClass::Completed, &bytes) {
+            Ok(Progress::Complete(done)) => done,
+            _ => panic!("scripted fixture did not complete on submit"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2329,5 +2506,458 @@ mod tests {
     fn status_labels_cover_every_class() {
         assert_eq!(status_class_label(StatusClass::Completed), "completed");
         assert_eq!(status_class_label(StatusClass::Unexpected), "unexpected");
+    }
+
+    // -----------------------------------------------------------------------
+    // Scripted live outcome lane: the public outcome functions run end to end
+    // against a scripted `execute_request`, with real store side effects.
+    // -----------------------------------------------------------------------
+
+    use super::test_support::{completed, install};
+
+    fn envelope(outcome: crate::Outcome) -> serde_json::Value {
+        match outcome.body {
+            crate::Body::Envelope { envelope, .. } => {
+                serde_json::from_str(&crate::render_json(&crate::envelope_json(&envelope)))
+                    .expect("envelope renders as JSON")
+            }
+            crate::Body::Raw { data } => panic!("expected an envelope, got raw output: {data}"),
+        }
+    }
+
+    fn request_json(request: &SubmitStatementRequest) -> serde_json::Value {
+        serde_json::to_value(request).expect("request serializes")
+    }
+
+    const EVENT_COLUMNS: &[(&str, &str)] = &[
+        ("EVENT_DATE", "DATE"),
+        ("ENTITY_ID", "TEXT"),
+        ("VALUE", "FIXED"),
+    ];
+
+    fn information_schema_script() -> Vec<Result<CompletedStatement, SnowflakeError>> {
+        vec![
+            Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000cc01",
+                &[
+                    ("TABLE_CATALOG", "TEXT"),
+                    ("TABLE_SCHEMA", "TEXT"),
+                    ("TABLE_NAME", "TEXT"),
+                    ("TABLE_TYPE", "TEXT"),
+                    ("COMMENT", "TEXT"),
+                    ("ROW_COUNT", "FIXED"),
+                    ("BYTES", "FIXED"),
+                ],
+                &[vec![
+                    Some("ANALYTICS"),
+                    Some("PUBLIC"),
+                    Some("EVENTS"),
+                    Some("BASE TABLE"),
+                    None,
+                    Some("1200"),
+                    Some("65536"),
+                ]],
+            )),
+            Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000cc02",
+                &[
+                    ("TABLE_CATALOG", "TEXT"),
+                    ("TABLE_SCHEMA", "TEXT"),
+                    ("TABLE_NAME", "TEXT"),
+                    ("COLUMN_NAME", "TEXT"),
+                    ("ORDINAL_POSITION", "FIXED"),
+                    ("DATA_TYPE", "TEXT"),
+                    ("NUMERIC_PRECISION", "FIXED"),
+                    ("NUMERIC_SCALE", "FIXED"),
+                    ("CHARACTER_MAXIMUM_LENGTH", "FIXED"),
+                    ("IS_NULLABLE", "TEXT"),
+                    ("COMMENT", "TEXT"),
+                ],
+                &[
+                    vec![
+                        Some("ANALYTICS"),
+                        Some("PUBLIC"),
+                        Some("EVENTS"),
+                        Some("EVENT_DATE"),
+                        Some("1"),
+                        Some("DATE"),
+                        None,
+                        None,
+                        None,
+                        Some("NO"),
+                        None,
+                    ],
+                    vec![
+                        Some("ANALYTICS"),
+                        Some("PUBLIC"),
+                        Some("EVENTS"),
+                        Some("ENTITY_ID"),
+                        Some("2"),
+                        Some("TEXT"),
+                        None,
+                        None,
+                        Some("16"),
+                        Some("NO"),
+                        None,
+                    ],
+                    vec![
+                        Some("ANALYTICS"),
+                        Some("PUBLIC"),
+                        Some("EVENTS"),
+                        Some("VALUE"),
+                        Some("3"),
+                        Some("NUMBER"),
+                        Some("38"),
+                        Some("2"),
+                        None,
+                        Some("YES"),
+                        None,
+                    ],
+                ],
+            )),
+        ]
+    }
+
+    #[test]
+    fn unscripted_profiles_still_require_env_handles() {
+        // The seam is opt-in per profile: a profile nobody scripted resolves
+        // through the real env path and fails typed, never silently succeeds.
+        install("demo", None, None, Vec::new());
+        let env = envelope(run_query_outcome(
+            OutputFormat::Json,
+            "req-unscripted".to_owned(),
+            "someone_else".to_owned(),
+            "select 1",
+            &crate::QueryRunOptions::default(),
+        ));
+        assert_eq!(env["ok"], false, "{env}");
+        assert!(
+            env["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("missing required env handles"),
+            "{env}"
+        );
+    }
+
+    #[test]
+    fn scripted_query_run_shapes_the_request_and_records_a_readable_receipt() {
+        let script = install(
+            "demo",
+            Some("ANALYTICS"),
+            Some("PUBLIC"),
+            vec![Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000aa01",
+                EVENT_COLUMNS,
+                &[
+                    vec![Some("18262"), Some("ENTITY123"), Some("1.50")],
+                    vec![Some("18263"), Some("ENTITY124"), None],
+                    vec![Some("18264"), Some("ENTITY125"), Some("2.25")],
+                ],
+            ))],
+        );
+        let options = crate::QueryRunOptions {
+            limit: Some("2".to_owned()),
+            role: Some("ANALYST".to_owned()),
+            warehouse: Some("WH_OVERRIDE".to_owned()),
+            statement_timeout: Some("120".to_owned()),
+            query_tag: Some("fsnow.test.1".to_owned()),
+            ..Default::default()
+        };
+        let env = envelope(run_query_outcome(
+            OutputFormat::Json,
+            "req-query-1".to_owned(),
+            "demo".to_owned(),
+            "select event_date, entity_id, value from events",
+            &options,
+        ));
+        assert_eq!(env["ok"], true, "{env}");
+        assert_eq!(env["data_source"], "live");
+        assert_eq!(env["data"]["row_count"], 3);
+        assert_eq!(env["data"]["returned_rows"], 2);
+        assert_eq!(env["data"]["rows"].as_array().map(Vec::len), Some(2));
+        assert_eq!(env["data"]["truncated"], true);
+        assert_eq!(env["budget_consumed"]["polls"], 1);
+        let hash = env["receipt_hash"]
+            .as_str()
+            .expect("receipt hash")
+            .to_owned();
+        assert_eq!(hash.len(), 64, "{hash}");
+
+        // The one submitted request carries every honored flag.
+        let submitted = script.submitted();
+        assert_eq!(submitted.len(), 1);
+        let request = request_json(&submitted[0]);
+        assert_eq!(request["role"], "ANALYST", "{request}");
+        assert_eq!(request["warehouse"], "WH_OVERRIDE", "{request}");
+        assert_eq!(request["timeout"], 120, "{request}");
+        assert_eq!(request["database"], "ANALYTICS", "{request}");
+        assert_eq!(
+            request["parameters"]["QUERY_TAG"], "fsnow.test.1",
+            "{request}"
+        );
+        assert_eq!(script.remaining(), 0);
+
+        // The receipt is readable back from the store by its hash.
+        let shown = envelope(catalog_surface::receipt_show_outcome(
+            OutputFormat::Json,
+            "req-receipt-1".to_owned(),
+            hash,
+        ));
+        assert_eq!(shown["ok"], true, "{shown}");
+        assert_eq!(shown["data_source"], "cache");
+        assert!(
+            shown
+                .to_string()
+                .contains("01b2c3d4-0000-0000-0000-00000000aa01"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn scripted_query_failure_is_a_typed_error_envelope_without_a_receipt() {
+        install(
+            "demo",
+            None,
+            None,
+            vec![Err(SnowflakeError::new(
+                SnowflakeErrorCode::StatementFailed,
+                "SQL compilation error: Object 'NOPE' does not exist",
+            ))],
+        );
+        let env = envelope(run_query_outcome(
+            OutputFormat::Json,
+            "req-query-2".to_owned(),
+            "demo".to_owned(),
+            "select * from nope",
+            &crate::QueryRunOptions::default(),
+        ));
+        assert_eq!(env["ok"], false, "{env}");
+        assert!(
+            env["error"]["code"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("FSNOW-"),
+            "{env}"
+        );
+        assert!(
+            env["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("compilation error"),
+            "{env}"
+        );
+        assert!(env["receipt_hash"].is_null(), "{env}");
+    }
+
+    #[test]
+    fn scripted_catalog_scan_persists_a_snapshot_the_offline_surfaces_read_back() {
+        let script = install("demo", None, None, information_schema_script());
+        let env = envelope(run_catalog_scan_outcome(
+            OutputFormat::Json,
+            "req-scan-1".to_owned(),
+            "demo".to_owned(),
+            "ANALYTICS".to_owned(),
+            "PUBLIC".to_owned(),
+        ));
+        assert_eq!(env["ok"], true, "{env}");
+        assert_eq!(env["data_source"], "live");
+        let datasets = env["data"]["datasets"]
+            .as_array()
+            .unwrap_or_else(|| panic!("datasets array in {env}"));
+        assert_eq!(datasets.len(), 1, "{env}");
+        let dataset_id = datasets[0]["dataset_id"]
+            .as_str()
+            .expect("dataset id")
+            .to_owned();
+        assert!(
+            dataset_id.starts_with("analytics_public_events_b3_"),
+            "{dataset_id}"
+        );
+        assert_eq!(datasets[0]["approx_row_count"], 1200, "{env}");
+        assert_eq!(env["receipt_hash"].as_str().map(str::len), Some(64));
+
+        // Discovery statements are bound, never interpolated, and carry the
+        // session context.
+        let submitted = script.submitted();
+        assert_eq!(submitted.len(), 2);
+        for request in &submitted {
+            let json = request_json(request);
+            let statement = json["statement"].as_str().expect("statement");
+            assert!(statement.contains("TABLE_CATALOG = ?"), "{statement}");
+            assert!(statement.contains("TABLE_SCHEMA = ?"), "{statement}");
+            assert!(
+                !statement.contains("ANALYTICS"),
+                "scope must be bound: {statement}"
+            );
+            assert_eq!(json["timeout"], 60, "{json}");
+            assert_eq!(json["warehouse"], "WH_TEST", "{json}");
+            assert_eq!(json["bindings"]["1"]["value"], "ANALYTICS", "{json}");
+            assert_eq!(json["bindings"]["2"]["value"], "PUBLIC", "{json}");
+        }
+
+        // Offline surfaces read the persisted snapshot back.
+        let inspect = envelope(catalog_surface::dataset_inspect_outcome(
+            OutputFormat::Json,
+            "req-inspect-1".to_owned(),
+            dataset_id.clone(),
+        ));
+        assert_eq!(inspect["ok"], true, "{inspect}");
+        assert_eq!(inspect["data_source"], "cache");
+        assert!(
+            inspect.to_string().contains("ENTITY_ID"),
+            "column catalog missing: {inspect}"
+        );
+        let graph = envelope(run_catalog_graph_outcome(
+            OutputFormat::Json,
+            "req-graph-1".to_owned(),
+            "demo".to_owned(),
+            Some("ANALYTICS".to_owned()),
+            Some("PUBLIC".to_owned()),
+            GraphOutput::Json,
+            false,
+        ));
+        assert_eq!(graph["ok"], true, "{graph}");
+        assert_eq!(graph["data_source"], "cache");
+        assert!(graph.to_string().contains("EVENTS"), "{graph}");
+
+        // Dataset mode plans against the snapshot and runs through the same seam.
+        let run_script = install(
+            "demo",
+            None,
+            None,
+            vec![Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000dd01",
+                &[("EVENT_DATE", "DATE"), ("VALUE", "FIXED")],
+                &[vec![Some("19724"), Some("2.50")]],
+            ))],
+        );
+        let spec = crate::dataset_mode::DatasetQuerySpec {
+            dataset_id: dataset_id.clone(),
+            profile: Some("demo".to_owned()),
+            entity: Some("ENTITY123".to_owned()),
+            from: Some("2024-01-01".to_owned()),
+            to: Some("2024-12-31".to_owned()),
+            select: vec!["EVENT_DATE".to_owned(), "VALUE".to_owned()],
+            limit: Some("10".to_owned()),
+            ..Default::default()
+        };
+        let run = envelope(run_dataset_query_outcome(
+            OutputFormat::Json,
+            "req-dsrun-1".to_owned(),
+            spec,
+            &crate::QueryRunOptions::default(),
+        ));
+        assert_eq!(run["ok"], true, "{run}");
+        assert_eq!(run["data_source"], "live");
+        assert_eq!(run["data"]["row_count"], 1, "{run}");
+        let submitted = run_script.submitted();
+        assert_eq!(submitted.len(), 1);
+        let json = request_json(&submitted[0]);
+        let statement = json["statement"].as_str().expect("statement");
+        assert!(statement.contains("ENTITY_ID"), "{statement}");
+        assert!(
+            !statement.contains("ENTITY123"),
+            "entity must be bound: {statement}"
+        );
+        assert!(
+            json["bindings"].as_object().is_some_and(|b| b.len() >= 3),
+            "{json}"
+        );
+        assert_eq!(json["database"], "ANALYTICS", "{json}");
+        assert_eq!(json["schema"], "PUBLIC", "{json}");
+
+        // `dataset profile --execute` maps the returned stats by column name.
+        let profile_script = install(
+            "demo",
+            None,
+            None,
+            vec![Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000ee01",
+                &[("EVENT_DATE__MIN", "DATE"), ("EVENT_DATE__MAX", "DATE")],
+                &[vec![Some("19000"), Some("19724")]],
+            ))],
+        );
+        let profile = envelope(dataset_profile_execute_outcome(
+            OutputFormat::Json,
+            "req-profile-1".to_owned(),
+            dataset_id,
+        ));
+        assert_eq!(profile["ok"], true, "{profile}");
+        assert_eq!(
+            profile["data"]["stats"]["EVENT_DATE__MAX"], "19724",
+            "{profile}"
+        );
+        assert_eq!(profile_script.submitted().len(), 1);
+    }
+
+    #[test]
+    fn scripted_export_run_writes_a_local_csv() {
+        install(
+            "demo",
+            None,
+            None,
+            vec![Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000ff01",
+                &[("ID", "FIXED"), ("NAME", "TEXT")],
+                &[vec![Some("1"), Some("alpha")], vec![Some("2"), None]],
+            ))],
+        );
+        let out = std::env::temp_dir().join(format!(
+            "fsnow-scripted-export-{}-{}.csv",
+            std::process::id(),
+            local_store::now_unix_ms()
+        ));
+        let spec = ExportPlanSpec {
+            profile: Some("demo".to_owned()),
+            sql: Some("select id, name from events".to_owned()),
+            format: Some("csv".to_owned()),
+            ..Default::default()
+        };
+        let env = envelope(export_run_outcome(
+            OutputFormat::Json,
+            "req-export-1".to_owned(),
+            spec,
+            Some(out.display().to_string()),
+        ));
+        assert_eq!(env["ok"], true, "{env}");
+        assert_eq!(env["data_source"], "live");
+        let written = std::fs::read_to_string(&out).expect("export file written");
+        let _ = std::fs::remove_file(&out);
+        assert!(written.starts_with("ID,NAME"), "{written}");
+        assert!(written.contains("1,alpha"), "{written}");
+        assert_eq!(written.lines().count(), 3, "{written}");
+        assert_eq!(
+            env["receipt_hash"].as_str().map(str::len),
+            Some(64),
+            "{env}"
+        );
+    }
+
+    #[test]
+    fn scripted_profile_doctor_online_reports_the_probe_result() {
+        install(
+            "demo",
+            None,
+            None,
+            vec![Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000ab01",
+                &[("SNOWFLAKE_VERSION", "TEXT")],
+                &[vec![Some("9.12.0")]],
+            ))],
+        );
+        let env = envelope(profile_doctor_online_outcome(
+            OutputFormat::Json,
+            "req-doctor-1".to_owned(),
+            "demo".to_owned(),
+        ));
+        assert_eq!(env["ok"], true, "{env}");
+        assert_eq!(env["data_source"], "live");
+        assert!(env.to_string().contains("9.12.0"), "{env}");
+        assert_eq!(
+            env["receipt_hash"].as_str().map(str::len),
+            Some(64),
+            "{env}"
+        );
     }
 }
