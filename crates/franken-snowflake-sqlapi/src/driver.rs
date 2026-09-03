@@ -37,6 +37,15 @@ use crate::status::ResponseClass;
 /// four `SnowflakeOutcome` terminal states.
 pub type StatementOutcome = SnowflakeOutcome<CompletedStatement>;
 
+/// Observed effort for one driven statement, for `budget_consumed` reporting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DriverStats {
+    /// Number of `GET /statements/{handle}` polls issued after the submit.
+    pub polls: u32,
+    /// Number of non-inline partitions fetched.
+    pub partitions_fetched: u32,
+}
+
 /// Submit a statement and drive it to completion: submit -> poll/await ->
 /// partition fetch -> assemble, firing the remote cancel endpoint if the ambient
 /// `Cx` is cancelled mid-flight.
@@ -50,6 +59,34 @@ pub async fn run_statement(
     request: SubmitStatementRequest,
     params: SubmitQueryParams,
     poll_plan: PollPlan,
+) -> StatementOutcome {
+    run_statement_with_stats(cx, client, auth, request, params, poll_plan)
+        .await
+        .0
+}
+
+/// [`run_statement`] plus the poll/partition counts it consumed.
+pub async fn run_statement_with_stats(
+    cx: &Cx,
+    client: &SnowflakeHttpClient,
+    auth: AuthorizationDescriptor,
+    request: SubmitStatementRequest,
+    params: SubmitQueryParams,
+    poll_plan: PollPlan,
+) -> (StatementOutcome, DriverStats) {
+    let mut stats = DriverStats::default();
+    let outcome = drive(cx, client, auth, request, params, poll_plan, &mut stats).await;
+    (outcome, stats)
+}
+
+async fn drive(
+    cx: &Cx,
+    client: &SnowflakeHttpClient,
+    auth: AuthorizationDescriptor,
+    request: SubmitStatementRequest,
+    params: SubmitQueryParams,
+    poll_plan: PollPlan,
+    stats: &mut DriverStats,
 ) -> StatementOutcome {
     let body = match serde_json::to_vec(&request) {
         Ok(body) => body,
@@ -114,6 +151,7 @@ pub async fn run_statement(
                 if let Err(reason) = wait_poll_interval(cx, poll_interval).await {
                     return cancel_locally(cx, client, &auth, &handle, reason).await;
                 }
+                stats.polls = stats.polls.saturating_add(1);
                 let poll = client
                     .poll_statement(
                         cx,
@@ -143,6 +181,7 @@ pub async fn run_statement(
                     return cancel_locally(cx, client, &auth, &handle, local_cancel_reason(cx))
                         .await;
                 }
+                stats.partitions_fetched = stats.partitions_fetched.saturating_add(1);
                 let fetch = client
                     .fetch_partition(
                         cx,

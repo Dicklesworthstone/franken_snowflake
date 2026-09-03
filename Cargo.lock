@@ -1633,10 +1633,15 @@ version = "0.0.2"
 dependencies = [
  "asupersync",
  "franken-snowflake-auth",
+ "franken-snowflake-cache",
+ "franken-snowflake-catalog",
  "franken-snowflake-core",
+ "franken-snowflake-export",
+ "franken-snowflake-graph",
  "franken-snowflake-http",
  "franken-snowflake-mcp",
  "franken-snowflake-sqlapi",
+ "serde",
  "serde_json",
  "tru",
 ]

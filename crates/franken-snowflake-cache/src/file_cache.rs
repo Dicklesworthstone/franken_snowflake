@@ -21,7 +21,7 @@
 
 use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
@@ -128,9 +128,10 @@ impl FileCache {
         self.load_table(Table::QueryReceipts, |record: QueryReceiptRecord| {
             self.inner.append_query_receipt(record)
         })?;
-        self.load_table(Table::PartitionMetadata, |record: PartitionMetadataRecord| {
-            self.inner.append_partition_metadata(record)
-        })?;
+        self.load_table(
+            Table::PartitionMetadata,
+            |record: PartitionMetadataRecord| self.inner.append_partition_metadata(record),
+        )?;
         self.load_table(Table::Exports, |record: ExportRecord| {
             self.inner.append_export(record)
         })?;
@@ -157,12 +158,22 @@ impl FileCache {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(io_error("open table log", &path, &error)),
         };
-        for line in BufReader::new(file).lines() {
-            let line = line.map_err(|error| io_error("read table log", &path, &error))?;
+        let mut content = String::new();
+        BufReader::new(file)
+            .read_to_string(&mut content)
+            .map_err(|error| io_error("read table log", &path, &error))?;
+        // A concurrent writer may be mid-append: the final unterminated fragment
+        // is in flight, not corruption, so it is ignored without counting as a
+        // skipped line. Only newline-terminated records are complete.
+        let complete = match content.rfind('\n') {
+            Some(last_newline) => &content[..=last_newline],
+            None => "",
+        };
+        for line in complete.lines() {
             if line.trim().is_empty() {
                 continue;
             }
-            match serde_json::from_str::<Line<T>>(&line) {
+            match serde_json::from_str::<Line<T>>(line) {
                 Ok(parsed) if parsed.v == LINE_VERSION => {
                     if apply(parsed.r).is_err() {
                         self.skipped_lines.set(self.skipped_lines.get() + 1);
@@ -228,6 +239,16 @@ impl CacheBackend for FileCache {
         self.inner.catalog_snapshot(snapshot_id)
     }
 
+    fn latest_catalog_snapshot(
+        &self,
+        profile_id: &str,
+        database_name: Option<&str>,
+        schema_name: Option<&str>,
+    ) -> CacheResult<Option<CatalogSnapshotRecord>> {
+        self.inner
+            .latest_catalog_snapshot(profile_id, database_name, schema_name)
+    }
+
     fn upsert_dataset_manifest(&self, record: DatasetManifestRecord) -> CacheResult<()> {
         self.inner.upsert_dataset_manifest(record.clone())?;
         self.append_line(Table::DatasetManifests, &record)
@@ -235,6 +256,10 @@ impl CacheBackend for FileCache {
 
     fn dataset_manifest(&self, dataset_id: &str) -> CacheResult<Option<DatasetManifestRecord>> {
         self.inner.dataset_manifest(dataset_id)
+    }
+
+    fn dataset_ids(&self) -> CacheResult<Vec<String>> {
+        self.inner.dataset_ids()
     }
 
     fn upsert_query_plan(&self, record: QueryPlanRecord) -> CacheResult<()> {
@@ -417,7 +442,10 @@ mod tests {
         assert_eq!(latest.receipt_id, "r2");
         let events = reopened.audit_events()?;
         assert_eq!(
-            events.iter().map(|e| e.event_id.as_str()).collect::<Vec<_>>(),
+            events
+                .iter()
+                .map(|e| e.event_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["e1", "e2"],
             "audit events replay in chronological order"
         );
@@ -444,10 +472,7 @@ mod tests {
             cache.append_query_receipt(receipt("good", "plan", "ok", 1))?;
         }
         let path = dir.join("query_receipts.jsonl");
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .expect("append");
+        let mut file = OpenOptions::new().append(true).open(&path).expect("append");
         file.write_all(b"{this is not json}\n{\"v\":99,\"r\":{}}\n")
             .expect("write junk");
         drop(file);

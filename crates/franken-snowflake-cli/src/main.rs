@@ -81,12 +81,15 @@ enum Command {
         database: Option<String>,
         schema: Option<String>,
         graph_output: GraphOutput,
+        /// Force a live re-scan even when the local store has a snapshot.
+        refresh: bool,
     },
     DatasetInspect {
         dataset_id: String,
     },
     DatasetProfile {
         dataset_id: String,
+        execute: bool,
     },
     DatasetDescribeOperator {
         operator: String,
@@ -98,8 +101,7 @@ enum Command {
     QueryRun {
         profile: Option<String>,
         sql: Option<String>,
-        bindings_env: Option<String>,
-        query_tag: Option<String>,
+        options: QueryRunOptions,
     },
     QueryWrite {
         profile: Option<String>,
@@ -108,12 +110,19 @@ enum Command {
         confirm: Option<String>,
     },
     QueryCancel {
+        profile: Option<String>,
         statement_handle: String,
     },
     ReceiptShow {
         receipt_hash: String,
     },
-    ExportPlan,
+    ExportPlan {
+        spec: catalog_surface::ExportPlanSpec,
+    },
+    ExportRun {
+        spec: catalog_surface::ExportPlanSpec,
+        out: Option<String>,
+    },
     Tui {
         profile: Option<String>,
     },
@@ -124,9 +133,25 @@ enum Command {
 
 #[derive(Debug)]
 struct Invocation {
-    args_for_request_id: Vec<String>,
+    request_id: String,
     command: Command,
     output: OutputFormat,
+}
+
+/// Per-run knobs for `query run` that previously were accepted and silently
+/// ignored. Every field is honored by the live path or rejected up front.
+#[derive(Debug, Default)]
+struct QueryRunOptions {
+    bindings_env: Option<String>,
+    query_tag: Option<String>,
+    /// Row emit cap for the envelope (default [`live::ROW_EMIT_CAP`]).
+    limit: Option<String>,
+    /// Session role override (else the profile's `_ROLE` handle).
+    role: Option<String>,
+    /// Session warehouse override (else the profile's `_WAREHOUSE` handle).
+    warehouse: Option<String>,
+    /// SQL API statement timeout in seconds (else `_STATEMENT_TIMEOUT_SECONDS`, else 60).
+    statement_timeout: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -134,9 +159,46 @@ enum Json {
     Null,
     Bool(bool),
     Number(i64),
+    Float(f64),
     String(String),
     Array(Vec<Json>),
-    Object(Vec<(&'static str, Json)>),
+    Object(Vec<(String, Json)>),
+}
+
+impl Json {
+    /// Embed a serde value (library structs serialized verbatim) into the CLI's
+    /// deterministic JSON model. Objects keep serde_json's sorted key order.
+    fn from_serde(value: serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::Null => Self::Null,
+            serde_json::Value::Bool(value) => Self::Bool(value),
+            serde_json::Value::Number(number) => match number.as_i64() {
+                Some(value) => Self::Number(value),
+                None => match number.as_u64().and_then(|value| i64::try_from(value).ok()) {
+                    Some(value) => Self::Number(value),
+                    None => Self::Float(number.as_f64().unwrap_or(0.0)),
+                },
+            },
+            serde_json::Value::String(value) => Self::String(value),
+            serde_json::Value::Array(values) => {
+                Self::Array(values.into_iter().map(Self::from_serde).collect())
+            }
+            serde_json::Value::Object(entries) => Self::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, Self::from_serde(value)))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Serialize any library value straight into the envelope model.
+    fn from_value<T: serde::Serialize>(value: &T) -> Self {
+        match serde_json::to_value(value) {
+            Ok(value) => Self::from_serde(value),
+            Err(error) => Self::String(format!("<unserializable: {error}>")),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -168,6 +230,12 @@ struct Envelope {
     redactions_applied: Vec<String>,
     data: Json,
     error: Option<ErrorInfo>,
+    /// RFC 3339 UTC wall-clock start of the invocation; stamped by `execute`.
+    started_at: String,
+    /// RFC 3339 UTC wall-clock end of the invocation; stamped by `execute`.
+    finished_at: String,
+    /// Monotonic elapsed milliseconds for the invocation; stamped by `execute`.
+    duration_ms: i64,
 }
 
 #[derive(Debug)]
@@ -182,11 +250,10 @@ enum Body {
         envelope: Envelope,
         format: OutputFormat,
     },
-    // Only constructed by the live `catalog graph` Mermaid/SVG renderers. Without
-    // the `live` feature the no-account build never produces raw output (it
-    // refuses with a JSON envelope), so the variant is legitimately unused there.
-    #[cfg_attr(not(feature = "live"), allow(dead_code))]
-    Raw { data: String },
+    // Raw (non-envelope) stdout: `catalog graph --mermaid|--svg` text.
+    Raw {
+        data: String,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -256,7 +323,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         id: "selftest",
         invocation: "franken-snowflake selftest --json",
         output_contract_id: "fsnow.selftest.v1",
-        description: "Run no-account protocol fixtures once the testkit is linked.",
+        description: "Run executed offline contract fixtures: envelope round trip, secret redaction canaries, read-only guard, write ladder, operator schemas, local store round trip, export plan hardening.",
         read_only: true,
         provider_network: false,
         mutates_local_state: false,
@@ -276,7 +343,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         id: "profile.doctor",
         invocation: "franken-snowflake profile doctor <profile> --json",
         output_contract_id: "fsnow.profile.doctor.v1",
-        description: "Inspect profile readiness; --online will later attempt a minimal live probe.",
+        description: "Inspect profile readiness offline (env handle presence by name); --online runs a minimal live probe (live feature).",
         read_only: true,
         provider_network: true,
         mutates_local_state: false,
@@ -294,9 +361,9 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "catalog.graph",
-        invocation: "franken-snowflake catalog graph <profile> --database <db> --mermaid",
+        invocation: "franken-snowflake catalog graph <profile> --database <db> [--schema <schema>] [--refresh] [--json|--toon|--mermaid|--svg]",
         output_contract_id: "fsnow.catalog.graph.v1",
-        description: "Render catalog lineage as JSON, TOON, Mermaid, or SVG.",
+        description: "Render catalog lineage (profile > database > schema > object > column, dataset/field edges) from the local snapshot, or from a live scan with --refresh / when nothing is cached.",
         read_only: true,
         provider_network: false,
         mutates_local_state: false,
@@ -306,7 +373,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         id: "dataset.inspect",
         invocation: "franken-snowflake dataset inspect <dataset-id> --json",
         output_contract_id: "fsnow.dataset.inspect.v1",
-        description: "Return a dataset manifest and column/operator catalogs.",
+        description: "Return a dataset manifest, its column catalog, and the operator catalog from the local store (populated by catalog scan).",
         read_only: true,
         provider_network: false,
         mutates_local_state: false,
@@ -314,9 +381,9 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "dataset.profile",
-        invocation: "franken-snowflake dataset profile <dataset-id> --json",
+        invocation: "franken-snowflake dataset profile <dataset-id> [--execute] --json",
         output_contract_id: "fsnow.dataset.profile.v1",
-        description: "Plan pushed-down APPROX_* column profiling for a dataset.",
+        description: "Plan pushed-down APPROX_COUNT_DISTINCT / null-count / min-max profiling for a dataset from the local store; --execute runs it live.",
         read_only: true,
         provider_network: true,
         mutates_local_state: false,
@@ -344,7 +411,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "query.run",
-        invocation: "franken-snowflake query [run] --profile <profile> --sql <sql> [--bindings-env <env-var>] [--query-tag <tag>] --json",
+        invocation: "franken-snowflake query [run] --profile <profile> --sql <sql> [--limit <rows>] [--role <role>] [--warehouse <wh>] [--statement-timeout <secs>] [--bindings-env <env-var>] [--query-tag <tag>] --json",
         output_contract_id: "fsnow.query.run.v1",
         description: "Submit a SQL API statement; `query --sql` shorthand maps to this surface.",
         read_only: true,
@@ -364,7 +431,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "query.cancel",
-        invocation: "franken-snowflake query cancel <statement-handle> --json",
+        invocation: "franken-snowflake query cancel <statement-handle> --profile <profile> --json",
         output_contract_id: "fsnow.query.cancel.v1",
         description: "Cancel a remote SQL API statement handle.",
         read_only: false,
@@ -376,7 +443,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         id: "receipt.show",
         invocation: "franken-snowflake receipt show <receipt-hash> --json",
         output_contract_id: "fsnow.receipt.show.v1",
-        description: "Look up a content-addressed query receipt.",
+        description: "Look up a content-addressed query receipt, its partition evidence, and audit events in the local store.",
         read_only: true,
         provider_network: false,
         mutates_local_state: false,
@@ -384,19 +451,29 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "export.plan",
-        invocation: "franken-snowflake export plan --json",
+        invocation: "franken-snowflake export plan --profile <profile> --sql <select>|--query-id <id> --location @stage/path [--format csv|jsonl] [--compression gzip] [--header false] [--overwrite] [--single] [--max-file-size <bytes>] --json",
         output_contract_id: "fsnow.export.plan.v1",
-        description: "Draft COPY INTO or local CSV/JSONL export plans; execution is deferred.",
+        description: "Build a content-addressed COPY INTO <stage> export plan (Snowflake-side unload); execute it with the returned `query write` command.",
         read_only: true,
         provider_network: false,
         mutates_local_state: false,
         sensitive_output: true,
     },
     CommandSpec {
+        id: "export.run",
+        invocation: "franken-snowflake export run --profile <profile> --sql <select> --format csv|jsonl --out <path> --json",
+        output_contract_id: "fsnow.export.run.v1",
+        description: "Run a read statement live and write a content-addressed local CSV/JSONL artifact (live feature).",
+        read_only: true,
+        provider_network: true,
+        mutates_local_state: true,
+        sensitive_output: true,
+    },
+    CommandSpec {
         id: "tui",
         invocation: "franken-snowflake tui --profile <profile>",
         output_contract_id: "fsnow.tui.launch.v1",
-        description: "Opt-in interactive TUI behind the future tui feature.",
+        description: "Interactive TUI; not compiled into this binary yet (tracked as an open bead).",
         read_only: true,
         provider_network: false,
         mutates_local_state: false,
@@ -415,17 +492,24 @@ const COMMAND_SPECS: &[CommandSpec] = &[
 ];
 
 fn execute(raw_args: Vec<String>) -> Outcome {
+    let started_wall = local_store::now_unix_seconds();
+    let started = std::time::Instant::now();
     let outcome = match parse_invocation(raw_args) {
         Ok(invocation) => dispatch(invocation),
         Err(outcome) => outcome,
     };
-    sanitize_outcome(outcome)
+    let mut outcome = sanitize_outcome(outcome);
+    if let Body::Envelope { envelope, .. } = &mut outcome.body {
+        envelope.started_at = local_store::rfc3339_utc(started_wall);
+        envelope.finished_at = local_store::rfc3339_utc(local_store::now_unix_seconds());
+        envelope.duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+    }
+    outcome
 }
 
 fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
-    let request_id = stable_request_id(&raw_args.join("\u{1f}"));
+    let request_id = local_store::invocation_id(&raw_args.join("\u{1f}"));
     let (output, explicit_json, args) = extract_output_format(raw_args);
-    let args_for_request_id = args.clone();
 
     if output == OutputFormat::Toon && !toon_output_available() {
         return Err(toon_feature_disabled(request_id));
@@ -435,7 +519,7 @@ fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
 
     if args.is_empty() {
         return Ok(Invocation {
-            args_for_request_id,
+            request_id,
             command: Command::Help,
             output,
         });
@@ -443,7 +527,7 @@ fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
 
     if has_any(&args, &["--help", "-h"]) || args.first().is_some_and(|arg| arg == "help") {
         return Ok(Invocation {
-            args_for_request_id,
+            request_id,
             command: Command::Help,
             output,
         });
@@ -469,7 +553,7 @@ fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
             confirm: value_after(&args, "--confirm"),
         },
         "receipt" => parse_receipt(&args, output)?,
-        "export" => Command::ExportPlan,
+        "export" => parse_export(&args, output)?,
         "tui" => Command::Tui {
             profile: value_after(&args, "--profile"),
         },
@@ -495,7 +579,7 @@ fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
     };
 
     Ok(Invocation {
-        args_for_request_id,
+        request_id,
         command,
         output,
     })
@@ -661,6 +745,7 @@ fn parse_catalog(
                     database: value_after(args, "--database"),
                     schema: value_after(args, "--schema"),
                     graph_output,
+                    refresh: has_flag(args, "--refresh"),
                 })
             }
             None => Err(usage_error(
@@ -717,6 +802,7 @@ fn parse_dataset(args: &[String], output: OutputFormat) -> Result<Command, Outco
         Some("profile") => match args.get(2) {
             Some(dataset_id) => Ok(Command::DatasetProfile {
                 dataset_id: dataset_id.clone(),
+                execute: has_flag(args, "--execute"),
             }),
             None => Err(usage_error(
                 output,
@@ -778,31 +864,37 @@ fn parse_query(args: &[String], output: OutputFormat) -> Result<Command, Outcome
         // Using `value_after` (which rejects flag-like values) here made such SQL
         // fall through to the "unknown query subcommand `--sql`" error.
         Some(value) if value.starts_with("--") && raw_value_after(args, "--sql").is_some() => {
+            reject_dataset_mode_flags(args, output, "query.run", "fsnow.query.run.v1")?;
             Ok(Command::QueryRun {
                 profile: resolve_profile(value_after(args, "--profile")),
                 sql: raw_value_after(args, "--sql"),
-                bindings_env: value_after(args, "--bindings-env"),
-                query_tag: value_after(args, "--query-tag"),
+                options: query_run_options(args),
             })
         }
-        Some("plan") => Ok(Command::QueryPlan {
-            profile: resolve_profile(value_after(args, "--profile")),
-            sql: raw_value_after(args, "--sql"),
-        }),
-        Some("run") => Ok(Command::QueryRun {
-            profile: resolve_profile(value_after(args, "--profile")),
-            sql: raw_value_after(args, "--sql"),
-            bindings_env: value_after(args, "--bindings-env"),
-            query_tag: value_after(args, "--query-tag"),
-        }),
+        Some("plan") => {
+            reject_dataset_mode_flags(args, output, "query.plan", "fsnow.query.plan.v1")?;
+            Ok(Command::QueryPlan {
+                profile: resolve_profile(value_after(args, "--profile")),
+                sql: raw_value_after(args, "--sql"),
+            })
+        }
+        Some("run") => {
+            reject_dataset_mode_flags(args, output, "query.run", "fsnow.query.run.v1")?;
+            Ok(Command::QueryRun {
+                profile: resolve_profile(value_after(args, "--profile")),
+                sql: raw_value_after(args, "--sql"),
+                options: query_run_options(args),
+            })
+        }
         Some("write") => Ok(Command::QueryWrite {
             profile: resolve_profile(value_after(args, "--profile")),
             sql: raw_value_after(args, "--sql"),
             dry_run: has_flag(args, "--dry-run"),
             confirm: value_after(args, "--confirm"),
         }),
-        Some("cancel") => match args.get(2) {
+        Some("cancel") => match args.get(2).filter(|value| !value.starts_with('-')) {
             Some(statement_handle) => Ok(Command::QueryCancel {
+                profile: resolve_profile(value_after(args, "--profile")),
                 statement_handle: statement_handle.clone(),
             }),
             None => Err(usage_error(
@@ -873,6 +965,110 @@ fn parse_receipt(args: &[String], output: OutputFormat) -> Result<Command, Outco
     }
 }
 
+/// The dataset-mode flags (`--dataset`, `--entity`, `--from`, `--to`, `--as-of`,
+/// `--select`) are reserved for the dataset planner path. Until that path is
+/// wired, refuse them loudly instead of silently ignoring them (an agent that
+/// passes `--from` expects a date filter, not the full table).
+fn reject_dataset_mode_flags(
+    args: &[String],
+    output: OutputFormat,
+    command_id: &'static str,
+    output_contract_id: &'static str,
+) -> Result<(), Outcome> {
+    const DATASET_FLAGS: [&str; 6] = [
+        "--dataset",
+        "--entity",
+        "--from",
+        "--to",
+        "--as-of",
+        "--select",
+    ];
+    let present: Vec<&str> = DATASET_FLAGS
+        .iter()
+        .copied()
+        .filter(|flag| flag_present(args, flag))
+        .collect();
+    if present.is_empty() {
+        return Ok(());
+    }
+    Err(usage_error(
+        output,
+        command_id,
+        output_contract_id,
+        &format!(
+            "Dataset-mode flags ({}) are not wired into this build yet; pass the statement with --sql (see `dataset inspect` for the object name and columns).",
+            present.join(", ")
+        ),
+        vec![
+            "franken-snowflake dataset inspect <dataset-id> --json".to_string(),
+            "franken-snowflake query run --profile <profile> --sql <sql> --json".to_string(),
+        ],
+        vec![],
+    ))
+}
+
+fn query_run_options(args: &[String]) -> QueryRunOptions {
+    QueryRunOptions {
+        bindings_env: value_after(args, "--bindings-env"),
+        query_tag: value_after(args, "--query-tag"),
+        limit: value_after(args, "--limit"),
+        role: value_after(args, "--role"),
+        warehouse: value_after(args, "--warehouse"),
+        statement_timeout: value_after(args, "--statement-timeout"),
+    }
+}
+
+fn export_plan_spec(args: &[String]) -> catalog_surface::ExportPlanSpec {
+    catalog_surface::ExportPlanSpec {
+        profile: resolve_profile(value_after(args, "--profile")),
+        sql: raw_value_after(args, "--sql"),
+        query_id: value_after(args, "--query-id"),
+        location: value_after(args, "--location"),
+        format: value_after(args, "--format"),
+        compression: value_after(args, "--compression"),
+        header: value_after(args, "--header"),
+        overwrite: has_flag(args, "--overwrite"),
+        single: has_flag(args, "--single"),
+        max_file_size: value_after(args, "--max-file-size"),
+    }
+}
+
+fn parse_export(args: &[String], output: OutputFormat) -> Result<Command, Outcome> {
+    match args.get(1).map(String::as_str) {
+        Some("plan") => Ok(Command::ExportPlan {
+            spec: export_plan_spec(args),
+        }),
+        Some("run") => Ok(Command::ExportRun {
+            spec: export_plan_spec(args),
+            out: value_after(args, "--out"),
+        }),
+        Some(other) => Err(usage_error(
+            output,
+            "export.plan",
+            "fsnow.export.plan.v1",
+            &format!("Unknown export subcommand `{other}`."),
+            vec![
+                "franken-snowflake export plan --profile <profile> --sql <select> --location @stage/path --json"
+                    .to_string(),
+                "franken-snowflake export run --profile <profile> --sql <select> --format csv --out <path> --json"
+                    .to_string(),
+            ],
+            did_you_mean(other, &["plan", "run"]),
+        )),
+        None => Err(usage_error(
+            output,
+            "export.plan",
+            "fsnow.export.plan.v1",
+            "Missing export subcommand.",
+            vec![
+                "franken-snowflake export plan --profile <profile> --sql <select> --location @stage/path --json"
+                    .to_string(),
+            ],
+            vec![],
+        )),
+    }
+}
+
 fn parse_mcp(args: &[String], output: OutputFormat) -> Result<Command, Outcome> {
     if args.get(1).map(String::as_str) != Some("serve") {
         return Err(usage_error(
@@ -926,7 +1122,7 @@ fn parse_mcp(args: &[String], output: OutputFormat) -> Result<Command, Outcome> 
 }
 
 fn dispatch(invocation: Invocation) -> Outcome {
-    let request_id = stable_request_id(&invocation.args_for_request_id.join("\u{1f}"));
+    let request_id = invocation.request_id.clone();
 
     match invocation.command {
         Command::Help => success(
@@ -1009,6 +1205,7 @@ fn dispatch(invocation: Invocation) -> Outcome {
             database,
             schema,
             graph_output,
+            refresh,
         } => catalog_graph_outcome(
             invocation.output,
             request_id,
@@ -1016,43 +1213,17 @@ fn dispatch(invocation: Invocation) -> Outcome {
             database,
             schema,
             graph_output,
+            refresh,
         ),
-        Command::DatasetInspect { dataset_id } => not_implemented_with_data(
-            invocation.output,
-            "dataset.inspect",
-            "fsnow.dataset.inspect.v1",
-            request_id,
-            None,
-            json_object(vec![
-                ("dataset_id", json_string(dataset_id)),
-                (
-                    "requires",
-                    json_array(vec![json_string("dataset manifest model")]),
-                ),
-            ]),
-            vec![
-                "franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json"
-                    .to_string(),
-            ],
-        ),
-        Command::DatasetProfile { dataset_id } => not_implemented_with_data(
-            invocation.output,
-            "dataset.profile",
-            "fsnow.dataset.profile.v1",
-            request_id,
-            None,
-            json_object(vec![
-                ("dataset_id", json_string(dataset_id)),
-                (
-                    "planned_sql_shape",
-                    json_string("SELECT APPROX_COUNT_DISTINCT(...), COUNT_IF(...), COUNT(*) ..."),
-                ),
-                ("local_stats_computation", Json::Bool(false)),
-            ]),
-            vec!["franken-snowflake dataset inspect <dataset-id> --json".to_string()],
-        ),
+        Command::DatasetInspect { dataset_id } => {
+            catalog_surface::dataset_inspect_outcome(invocation.output, request_id, dataset_id)
+        }
+        Command::DatasetProfile {
+            dataset_id,
+            execute,
+        } => dataset_profile_dispatch(invocation.output, request_id, dataset_id, execute),
         Command::DatasetDescribeOperator { operator } => {
-            operator_schema_outcome(invocation.output, request_id, operator)
+            catalog_surface::describe_operator_outcome(invocation.output, request_id, operator)
         }
         Command::QueryPlan { profile, sql } => {
             query_plan_outcome(invocation.output, request_id, profile, sql)
@@ -1060,16 +1231,8 @@ fn dispatch(invocation: Invocation) -> Outcome {
         Command::QueryRun {
             profile,
             sql,
-            bindings_env,
-            query_tag,
-        } => query_run_outcome(
-            invocation.output,
-            request_id,
-            profile,
-            sql,
-            bindings_env,
-            query_tag,
-        ),
+            options,
+        } => query_run_outcome(invocation.output, request_id, profile, sql, options),
         Command::QueryWrite {
             profile,
             sql,
@@ -1083,51 +1246,19 @@ fn dispatch(invocation: Invocation) -> Outcome {
             dry_run,
             confirm,
         ),
-        Command::QueryCancel { statement_handle } => live_transport_required_with_data(
-            invocation.output,
-            "query.cancel",
-            "fsnow.query.cancel.v1",
-            request_id,
-            None,
-            json_object(vec![
-                ("statement_handle", json_string(statement_handle)),
-                (
-                    "requires",
-                    json_array(vec![
-                        json_string("live SQL API transport"),
-                        json_string("profile credential handles"),
-                    ]),
-                ),
-            ]),
-            vec!["franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string()],
-        ),
-        Command::ReceiptShow { receipt_hash } => not_implemented_with_data(
-            invocation.output,
-            "receipt.show",
-            "fsnow.receipt.show.v1",
-            request_id,
-            None,
-            json_object(vec![
-                ("receipt_hash", json_string(receipt_hash)),
-                ("requires", json_array(vec![json_string("receipt store")])),
-            ]),
-            vec!["franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string()],
-        ),
-        Command::ExportPlan => not_implemented_with_data(
-            invocation.output,
-            "export.plan",
-            "fsnow.export.plan.v1",
-            request_id,
-            None,
-            json_object(vec![
-                ("execution_enabled", Json::Bool(false)),
-                (
-                    "safe_alternative",
-                    json_string("future `export plan --json` before any write path"),
-                ),
-            ]),
-            vec!["franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string()],
-        ),
+        Command::QueryCancel {
+            profile,
+            statement_handle,
+        } => query_cancel_dispatch(invocation.output, request_id, profile, statement_handle),
+        Command::ReceiptShow { receipt_hash } => {
+            catalog_surface::receipt_show_outcome(invocation.output, request_id, receipt_hash)
+        }
+        Command::ExportPlan { spec } => {
+            catalog_surface::export_plan_outcome(invocation.output, request_id, spec)
+        }
+        Command::ExportRun { spec, out } => {
+            export_run_dispatch(invocation.output, request_id, spec, out)
+        }
         Command::Tui { profile } => feature_disabled(
             invocation.output,
             "tui",
@@ -1228,7 +1359,7 @@ fn checks_have_failure(items: &[Json]) -> bool {
             return false;
         };
         fields.iter().any(|(field_key, field_value)| {
-            *field_key == "status"
+            field_key == "status"
                 && matches!(field_value, Json::String(status) if status == "fail" || status == "warn")
         })
     })
@@ -1243,7 +1374,7 @@ fn data_has_failed_check(data: &Json) -> bool {
         return false;
     };
     entries.iter().any(|(key, value)| {
-        (*key == "checks" || *key == "fixtures")
+        (key == "checks" || key == "fixtures")
             && matches!(value, Json::Array(items) if checks_have_failure(items))
     })
 }
@@ -1320,40 +1451,7 @@ fn findings(
     }
 }
 
-fn not_implemented_with_data(
-    format: OutputFormat,
-    command_id: &'static str,
-    output_contract_id: &'static str,
-    request_id: String,
-    profile_id: Option<String>,
-    data: Json,
-    safe_next_commands: Vec<String>,
-) -> Outcome {
-    let mut envelope = base_envelope(
-        false,
-        "refusal",
-        command_id,
-        output_contract_id,
-        request_id,
-        data,
-    );
-    envelope.profile_id = profile_id;
-    envelope.error = Some(error_info(
-        SnowflakeErrorCode::SurfaceReserved,
-        "This command surface is reserved, but its live handler is blocked by lower-level beads.",
-        vec![json_string("contract-first CLI skeleton")],
-    ));
-    envelope.safe_next_commands = safe_next_commands;
-    envelope.repair_commands = vec!["franken-snowflake doctor --json".to_string()];
-    // A reserved-but-unimplemented surface is a deliberate refusal (exit 2),
-    // not an I/O fault (74) — the previous `Internal` mapping read as a real
-    // failure to an agent. The error code (FSNOW-9002) and exit code now agree.
-    Outcome {
-        status: SnowflakeErrorCode::SurfaceReserved.exit_code(),
-        body: Body::Envelope { envelope, format },
-    }
-}
-
+#[cfg(not(feature = "live"))]
 fn live_transport_required_with_data(
     format: OutputFormat,
     command_id: &'static str,
@@ -1463,7 +1561,7 @@ fn error_outcome(
         outcome_kind,
         command_id,
         output_contract_id,
-        stable_request_id(command_id),
+        local_store::invocation_id(command_id),
         json_object(vec![]),
     );
     envelope.error = Some(error);
@@ -1570,6 +1668,9 @@ fn base_envelope(
         redactions_applied: vec![],
         data,
         error: None,
+        started_at: DEFAULT_TIME.to_string(),
+        finished_at: DEFAULT_TIME.to_string(),
+        duration_ms: 0,
     }
 }
 
@@ -1641,7 +1742,7 @@ fn redact_json_values(values: &mut [Json]) -> bool {
 
 fn redact_json_value(value: &mut Json) -> bool {
     match value {
-        Json::Null | Json::Bool(_) | Json::Number(_) => false,
+        Json::Null | Json::Bool(_) | Json::Number(_) | Json::Float(_) => false,
         Json::String(value) => redact_string(value),
         Json::Array(values) => {
             let mut changed = false;
@@ -1689,9 +1790,9 @@ fn envelope_json(envelope: &Envelope) -> Json {
             option_json(envelope.statement_handle.clone()),
         ),
         ("receipt_hash", option_json(envelope.receipt_hash.clone())),
-        ("started_at", json_string(DEFAULT_TIME)),
-        ("finished_at", json_string(DEFAULT_TIME)),
-        ("duration_ms", Json::Number(0)),
+        ("started_at", json_string(envelope.started_at.clone())),
+        ("finished_at", json_string(envelope.finished_at.clone())),
+        ("duration_ms", Json::Number(envelope.duration_ms)),
         ("warnings", Json::Array(envelope.warnings.clone())),
         (
             "safe_next_commands",
@@ -1903,17 +2004,7 @@ fn command_spec_json(spec: &CommandSpec) -> Json {
         ("command_id", json_string(spec.id)),
         ("invocation", json_string(spec.invocation)),
         ("description", json_string(spec.description)),
-        (
-            "input_schema",
-            json_object(vec![
-                (
-                    "$schema",
-                    json_string("https://json-schema.org/draft/2020-12/schema"),
-                ),
-                ("type", json_string("object")),
-                ("additionalProperties", Json::Bool(false)),
-            ]),
-        ),
+        ("input_schema", input_schema_for(spec.id)),
         ("output_contract_id", json_string(spec.output_contract_id)),
         ("error_families", string_array(error_codes())),
         (
@@ -1932,6 +2023,358 @@ fn command_spec_json(spec: &CommandSpec) -> Json {
                 ("sensitive_output", Json::Bool(spec.sensitive_output)),
             ]),
         ),
+    ])
+}
+
+/// One documented CLI input (flag or positional) for a command's JSON Schema.
+struct InputSpec {
+    name: &'static str,
+    kind: &'static str,
+    required: bool,
+    description: &'static str,
+}
+
+const fn input(
+    name: &'static str,
+    kind: &'static str,
+    required: bool,
+    description: &'static str,
+) -> InputSpec {
+    InputSpec {
+        name,
+        kind,
+        required,
+        description,
+    }
+}
+
+const PROFILE_INPUT: InputSpec = input(
+    "profile",
+    "string",
+    false,
+    "Profile id (1-128 ASCII letters/digits/./-/_); falls back to FRANKEN_SNOWFLAKE_DEFAULT_PROFILE",
+);
+const OUTPUT_INPUT: InputSpec = input(
+    "output",
+    "string",
+    false,
+    "Output encoding: json (default) or toon (--json / --toon)",
+);
+
+/// The documented inputs per command. This is the source of `capabilities`'
+/// per-command `input_schema`, so an agent can construct a valid invocation
+/// without trial and error. Positional arguments are modeled as properties
+/// whose description starts with `positional:`.
+fn command_inputs(command_id: &str) -> Vec<InputSpec> {
+    let sql = input("sql", "string", true, "Exactly one SQL statement (--sql)");
+    let database = input(
+        "database",
+        "string",
+        true,
+        "Snowflake database identifier (--database)",
+    );
+    let schema = input(
+        "schema",
+        "string",
+        false,
+        "Snowflake schema identifier (--schema)",
+    );
+    match command_id {
+        "onboard" | "capabilities" | "robot-docs.guide" | "agent-handbook" | "doctor"
+        | "selftest" => vec![OUTPUT_INPUT],
+        "profile.validate" => vec![
+            input(
+                "profile",
+                "string",
+                true,
+                "positional: profile id to validate",
+            ),
+            OUTPUT_INPUT,
+        ],
+        "profile.doctor" => vec![
+            input(
+                "profile",
+                "string",
+                true,
+                "positional: profile id to inspect",
+            ),
+            input(
+                "online",
+                "boolean",
+                false,
+                "Run the live SELECT CURRENT_VERSION() probe (--online; live feature)",
+            ),
+            OUTPUT_INPUT,
+        ],
+        "catalog.scan" => vec![
+            input("profile", "string", true, "positional: profile id"),
+            database,
+            input(
+                "schema",
+                "string",
+                true,
+                "Snowflake schema identifier (--schema)",
+            ),
+            OUTPUT_INPUT,
+        ],
+        "catalog.graph" => vec![
+            input("profile", "string", true, "positional: profile id"),
+            database,
+            schema,
+            input(
+                "refresh",
+                "boolean",
+                false,
+                "Force a live re-scan instead of the local snapshot (--refresh)",
+            ),
+            input(
+                "format",
+                "string",
+                false,
+                "Graph output: json (default), toon, mermaid, or svg (--json / --toon / --mermaid / --svg)",
+            ),
+        ],
+        "dataset.inspect" => vec![
+            input(
+                "dataset_id",
+                "string",
+                true,
+                "positional: dataset id from catalog scan",
+            ),
+            OUTPUT_INPUT,
+        ],
+        "dataset.profile" => vec![
+            input(
+                "dataset_id",
+                "string",
+                true,
+                "positional: dataset id from catalog scan",
+            ),
+            input(
+                "execute",
+                "boolean",
+                false,
+                "Run the APPROX_* profiling statement live (--execute; live feature)",
+            ),
+            OUTPUT_INPUT,
+        ],
+        "dataset.describe_operator" => vec![
+            input(
+                "operator",
+                "string",
+                true,
+                "positional: operator id (eq, neq, lt, lte, gt, gte, between, in, is_null, is_not_null, contains)",
+            ),
+            input(
+                "jsonschema",
+                "boolean",
+                false,
+                "Accepted for readability; the schema is always returned (--jsonschema)",
+            ),
+            OUTPUT_INPUT,
+        ],
+        "query.plan" => vec![PROFILE_INPUT, sql, OUTPUT_INPUT],
+        "query.run" => vec![
+            PROFILE_INPUT,
+            sql,
+            input(
+                "limit",
+                "integer",
+                false,
+                "Rows to emit in the envelope, 1..=100000 (--limit; default 1000)",
+            ),
+            input("role", "string", false, "Session role override (--role)"),
+            input(
+                "warehouse",
+                "string",
+                false,
+                "Session warehouse override (--warehouse)",
+            ),
+            input(
+                "statement_timeout",
+                "integer",
+                false,
+                "SQL API statement timeout in seconds, 1..=86400 (--statement-timeout; default 60)",
+            ),
+            input(
+                "bindings_env",
+                "string",
+                false,
+                "Env var holding a JSON object of positional typed bindings (--bindings-env)",
+            ),
+            input(
+                "query_tag",
+                "string",
+                false,
+                "QUERY_TAG for Snowflake query history (--query-tag)",
+            ),
+            OUTPUT_INPUT,
+        ],
+        "query.write" => vec![
+            PROFILE_INPUT,
+            input(
+                "sql",
+                "string",
+                true,
+                "Exactly one mutating statement (--sql)",
+            ),
+            input(
+                "dry_run",
+                "boolean",
+                false,
+                "Preview and return the confirmation token without executing (--dry-run)",
+            ),
+            input(
+                "confirm",
+                "string",
+                false,
+                "Confirmation token from a dry run (--confirm)",
+            ),
+            OUTPUT_INPUT,
+        ],
+        "query.cancel" => vec![
+            input(
+                "statement_handle",
+                "string",
+                true,
+                "positional: SQL API statement handle",
+            ),
+            PROFILE_INPUT,
+            OUTPUT_INPUT,
+        ],
+        "receipt.show" => vec![
+            input(
+                "receipt_hash",
+                "string",
+                true,
+                "positional: BLAKE3 receipt hash from an envelope",
+            ),
+            OUTPUT_INPUT,
+        ],
+        "export.plan" => vec![
+            PROFILE_INPUT,
+            input(
+                "sql",
+                "string",
+                false,
+                "Source SELECT (--sql); exclusive with query_id",
+            ),
+            input(
+                "query_id",
+                "string",
+                false,
+                "Snowflake query id to unload via RESULT_SCAN (--query-id)",
+            ),
+            input(
+                "location",
+                "string",
+                true,
+                "Stage path such as @my_stage/exports/run_001 (--location)",
+            ),
+            input(
+                "format",
+                "string",
+                false,
+                "csv (default) or jsonl (--format)",
+            ),
+            input(
+                "compression",
+                "string",
+                false,
+                "none (default) or gzip (--compression)",
+            ),
+            input(
+                "header",
+                "boolean",
+                false,
+                "CSV header row, default true (--header true|false)",
+            ),
+            input(
+                "overwrite",
+                "boolean",
+                false,
+                "OVERWRITE = TRUE (--overwrite)",
+            ),
+            input("single", "boolean", false, "SINGLE = TRUE (--single)"),
+            input(
+                "max_file_size",
+                "integer",
+                false,
+                "MAX_FILE_SIZE in bytes (--max-file-size)",
+            ),
+            OUTPUT_INPUT,
+        ],
+        "export.run" => vec![
+            PROFILE_INPUT,
+            input(
+                "sql",
+                "string",
+                false,
+                "Source SELECT (--sql); exclusive with query_id",
+            ),
+            input(
+                "query_id",
+                "string",
+                false,
+                "Snowflake query id to export via RESULT_SCAN (--query-id)",
+            ),
+            input(
+                "format",
+                "string",
+                false,
+                "csv (default) or jsonl (--format)",
+            ),
+            input(
+                "out",
+                "string",
+                true,
+                "Local file path for the artifact (--out)",
+            ),
+            OUTPUT_INPUT,
+        ],
+        "tui" => vec![PROFILE_INPUT],
+        "mcp.serve" => vec![
+            input("stdio", "boolean", false, "Serve over stdio (--stdio)"),
+            input(
+                "http",
+                "string",
+                false,
+                "Serve over HTTP at host:port (--http <addr>)",
+            ),
+        ],
+        _ => vec![OUTPUT_INPUT],
+    }
+}
+
+/// JSON Schema 2020-12 for a command's inputs.
+fn input_schema_for(command_id: &str) -> Json {
+    let inputs = command_inputs(command_id);
+    let properties = inputs
+        .iter()
+        .map(|spec| {
+            (
+                spec.name.to_string(),
+                json_object(vec![
+                    ("type", json_string(spec.kind)),
+                    ("description", json_string(spec.description)),
+                ]),
+            )
+        })
+        .collect();
+    let required = inputs
+        .iter()
+        .filter(|spec| spec.required)
+        .map(|spec| spec.name.to_string())
+        .collect();
+    json_object(vec![
+        (
+            "$schema",
+            json_string("https://json-schema.org/draft/2020-12/schema"),
+        ),
+        ("type", json_string("object")),
+        ("properties", json_object_owned(properties)),
+        ("required", string_array(required)),
+        ("additionalProperties", Json::Bool(false)),
     ])
 }
 
@@ -1959,13 +2402,13 @@ fn agent_handbook_data() -> Json {
                 (
                     SnowflakeErrorCode::Internal.stable_code(),
                     json_string(
-                        "Use `query plan` or `capabilities`; live handlers land in dependent beads.",
+                        "An internal error is a connector bug: re-run `franken-snowflake doctor --json` and report the request_id.",
                     ),
                 ),
                 (
                     SnowflakeErrorCode::ProfileInvalid.stable_code(),
                     json_string(
-                        "Run `franken-snowflake doctor --json`; profile registry is not linked yet.",
+                        "Run `franken-snowflake profile validate <profile> --json`; it lists every env handle the profile needs and whether it is set.",
                     ),
                 ),
                 (
@@ -2039,68 +2482,11 @@ fn help_data() -> Json {
 }
 
 fn doctor_data() -> Json {
-    // Status is derived from the checks so it can never disagree with the exit
-    // code (`ok` here, since every check passes or is pending; `findings` only if
-    // one fails). A `not_checked` item is a feature pending lower-level beads, not
-    // a failure.
-    let checks = vec![
-        check_json(
-            "cli_contract",
-            "pass",
-            "command registry and envelope renderer are linked",
-        ),
-        check_json(
-            "cli_required_surfaces",
-            "pass",
-            "capabilities, robot-docs, agent-handbook, doctor, profile validate, query plan/run/cancel, and mcp serve are registered",
-        ),
-        check_json(
-            "security_guardrails",
-            "pass",
-            "core redaction, rights, and cost guardrails are linked",
-        ),
-        check_json(
-            "live_transport",
-            "not_checked",
-            "blocked until SQL API transport lands",
-        ),
-        check_json(
-            "testkit",
-            "not_checked",
-            "blocked until deterministic no-account testkit lands",
-        ),
-        check_json(
-            "profile_registry",
-            "not_checked",
-            "blocked until profile storage lands",
-        ),
-    ];
-    json_object(vec![
-        ("status", json_string(readiness_status(&checks))),
-        ("checks", Json::Array(checks)),
-    ])
+    health::doctor_data()
 }
 
 fn selftest_data() -> Json {
-    let fixtures = vec![
-        check_json("json_envelope_contract", "pass", "renderer available"),
-        check_json("sqlapi_protocol", "not_checked", "testkit bead pending"),
-        check_json(
-            "secret_redaction",
-            "pass",
-            "core redactor and credential canary needle list are linked",
-        ),
-        check_json(
-            "credential_debug_gate",
-            "pass",
-            "auth credential Debug leak gate is linked through the checked workspace",
-        ),
-    ];
-    json_object(vec![
-        ("status", json_string(readiness_status(&fixtures))),
-        ("offline", Json::Bool(true)),
-        ("fixtures", Json::Array(fixtures)),
-    ])
+    health::selftest_data()
 }
 
 fn check_json(name: &'static str, status: &'static str, detail: &'static str) -> Json {
@@ -2121,41 +2507,48 @@ fn check_json_owned(name: &'static str, status: &'static str, detail: String) ->
 
 fn profile_validate_outcome(format: OutputFormat, request_id: String, profile: String) -> Outcome {
     let syntax_valid = is_valid_profile_id(&profile);
-    // A structurally-valid profile is success (exit 0): the offline contract
-    // checks passed and the "registry not linked yet" scope note lives in the
-    // data (`status: offline_validated`), not as an exit-affecting warning — so an
-    // agent gating on `profile validate` isn't blocked by a clean profile. An
-    // invalid profile id is a real finding (exit 1).
-    let (outcome_kind, exit, status, warnings) = if syntax_valid {
-        (
-            "success",
-            CoreExitCode::Success,
-            "offline_validated",
-            vec![],
-        )
+    let presence = health::profile_handle_presence(&profile);
+    // Exit 0 only when the profile id is a stable handle AND every required env
+    // handle is present by name (values are never read). Missing handles are a
+    // finding (exit 1) with the exact export commands in `repair_commands`, so an
+    // agent gating on `profile validate` learns what to fix instead of hitting a
+    // credential error later on the live path.
+    let mut warnings = Vec::new();
+    if !syntax_valid {
+        warnings.push(json_string(
+            "profile id contains unsupported characters for stable handles",
+        ));
+    }
+    if !presence.required_missing.is_empty() {
+        warnings.push(json_string(format!(
+            "missing required env handles (names only): {}",
+            presence.required_missing.join(", ")
+        )));
+    }
+    let (outcome_kind, exit, status) = if warnings.is_empty() {
+        ("success", CoreExitCode::Success, "validated")
     } else {
-        (
-            "partial_success",
-            CoreExitCode::Findings,
-            "findings",
-            vec![json_string(
-                "profile id contains unsupported characters for stable handles",
-            )],
-        )
+        ("partial_success", CoreExitCode::Findings, "findings")
     };
+    let repair_commands: Vec<String> = presence
+        .required_missing
+        .iter()
+        .map(|name| format!("export {name}=<value>"))
+        .collect();
     let mut envelope = base_envelope(
         true,
         outcome_kind,
         "profile.validate",
         "fsnow.profile.validate.v1",
         request_id,
-        profile_diagnostics_data(&profile, false, status),
+        profile_diagnostics_data(&profile, false, status, &presence),
     )
     .with_warnings(warnings)
     .with_safe_next_commands(vec![
         format!("franken-snowflake profile doctor {profile} --json"),
         format!("franken-snowflake query plan --profile {profile} --sql \"select 1\" --json"),
     ]);
+    envelope.repair_commands = repair_commands;
     envelope.profile_id = Some(profile);
     Outcome {
         status: exit,
@@ -2208,11 +2601,27 @@ fn profile_doctor_offline_outcome(
     online: bool,
 ) -> Outcome {
     let syntax_valid = is_valid_profile_id(&profile);
-    let warning = if online {
-        "online profile probe requested but not attempted because live transport is not linked"
+    let presence = health::profile_handle_presence(&profile);
+    let mut warnings = Vec::new();
+    if online {
+        warnings.push(json_string(if live_transport_available() {
+            "online probe requested but not attempted"
+        } else {
+            "online profile probe requested but this binary has no live transport (rebuild with --features live)"
+        }));
     } else {
-        "profile doctor ran offline only; live transport is not linked"
-    };
+        warnings.push(json_string(if live_transport_available() {
+            "offline checks only; pass --online to run the live probe"
+        } else {
+            "offline checks only; this binary has no live transport (rebuild with --features live)"
+        }));
+    }
+    if !presence.required_missing.is_empty() {
+        warnings.push(json_string(format!(
+            "missing required env handles (names only): {}",
+            presence.required_missing.join(", ")
+        )));
+    }
     let mut envelope = base_envelope(
         true,
         "partial_success",
@@ -2222,18 +2631,24 @@ fn profile_doctor_offline_outcome(
         profile_diagnostics_data(
             &profile,
             online,
-            if syntax_valid {
-                "offline_findings"
+            if syntax_valid && presence.required_missing.is_empty() {
+                "offline_ok"
             } else {
                 "findings"
             },
+            &presence,
         ),
     )
-    .with_warnings(vec![json_string(warning)])
+    .with_warnings(warnings)
     .with_safe_next_commands(vec![
         format!("franken-snowflake profile validate {profile} --json"),
         "franken-snowflake doctor --json".to_string(),
     ]);
+    envelope.repair_commands = presence
+        .required_missing
+        .iter()
+        .map(|name| format!("export {name}=<value>"))
+        .collect();
     envelope.profile_id = Some(profile);
     Outcome {
         status: CoreExitCode::Findings,
@@ -2241,20 +2656,74 @@ fn profile_doctor_offline_outcome(
     }
 }
 
-fn profile_diagnostics_data(profile: &str, online: bool, status: &'static str) -> Json {
+fn profile_diagnostics_data(
+    profile: &str,
+    online: bool,
+    status: &'static str,
+    presence: &health::HandlePresence,
+) -> Json {
     let env_prefix = profile_env_prefix(profile);
     let syntax_detail = if is_valid_profile_id(profile) {
         "profile id is a stable handle"
     } else {
         "profile id must be 1-128 ASCII letters, digits, dot, dash, or underscore"
     };
+    let required_check = if presence.required_missing.is_empty() {
+        check_json(
+            "required_handles",
+            "pass",
+            "ACCOUNT, USER, AUTH, and WAREHOUSE handles are set",
+        )
+    } else {
+        check_json_owned(
+            "required_handles",
+            "warn",
+            format!("missing: {}", presence.required_missing.join(", ")),
+        )
+    };
+    let auth_check = match presence.auth_lane.as_deref() {
+        None => check_json(
+            "auth_lane",
+            "not_checked",
+            "_AUTH handle is unset; expected pat, key_pair_jwt, or oauth_bearer",
+        ),
+        Some(
+            "pat"
+            | "programmatic_access_token"
+            | "oauth"
+            | "oauth_bearer"
+            | "oauth_bearer_token"
+            | "key_pair_jwt"
+            | "jwt",
+        ) => check_json_owned(
+            "auth_lane",
+            "pass",
+            format!(
+                "auth lane `{}` is supported",
+                presence.auth_lane.as_deref().unwrap_or("")
+            ),
+        ),
+        Some(other) => check_json_owned(
+            "auth_lane",
+            "warn",
+            format!("auth lane `{other}` is not supported; use pat, key_pair_jwt, or oauth_bearer"),
+        ),
+    };
+    let live_probe_check = check_json(
+        "live_probe",
+        "not_checked",
+        if live_transport_available() {
+            "run `profile doctor <profile> --online` to probe the account"
+        } else {
+            "this binary has no live transport (rebuild with --features live)"
+        },
+    );
 
     json_object(vec![
         ("profile_id", json_string(profile)),
         ("status", json_string(status)),
         ("offline_only", Json::Bool(true)),
-        ("profile_registry_linked", Json::Bool(false)),
-        ("profile_config_loaded", Json::Bool(false)),
+        ("profile_source", json_string("environment")),
         ("live_probe_requested", Json::Bool(online)),
         ("live_probe_attempted", Json::Bool(false)),
         ("secret_values_read", Json::Bool(false)),
@@ -2262,19 +2731,18 @@ fn profile_diagnostics_data(profile: &str, online: bool, status: &'static str) -
             "redaction_policy",
             json_string("env var names only; token/private-key values are never emitted"),
         ),
+        ("auth_lane", option_json(presence.auth_lane.clone())),
+        ("env_handles", Json::Array(presence.handles.clone())),
+        (
+            "missing_required_handles",
+            string_array(presence.required_missing.clone()),
+        ),
         (
             "credential_lifetime_warnings",
             Json::Array(credential_lifetime_warnings()),
         ),
         ("profile_env_prefix", json_string(env_prefix.clone())),
-        (
-            "supported_auth_lanes",
-            string_array(vec![
-                "programmatic_access_token".to_string(),
-                "key_pair_jwt".to_string(),
-                "oauth_bearer_token".to_string(),
-            ]),
-        ),
+        ("supported_auth_lanes", health::supported_auth_lanes()),
         (
             "expected_env_handles",
             Json::Array(profile_env_handle_sets(&env_prefix)),
@@ -2291,21 +2759,9 @@ fn profile_diagnostics_data(profile: &str, online: bool, status: &'static str) -
                     },
                     syntax_detail.to_string(),
                 ),
-                check_json(
-                    "profile_registry",
-                    "not_checked",
-                    "profile storage lands in a lower-level bead",
-                ),
-                check_json(
-                    "credential_handles",
-                    "not_checked",
-                    "profile registry has not supplied env var names yet",
-                ),
-                check_json(
-                    "live_probe",
-                    "not_checked",
-                    "live transport is not linked in this CLI slice",
-                ),
+                required_check,
+                auth_check,
+                live_probe_check,
             ]),
         ),
     ])
@@ -2350,38 +2806,34 @@ fn credential_lifetime_warnings() -> Vec<Json> {
 }
 
 fn profile_env_handle_sets(env_prefix: &str) -> Vec<Json> {
-    let account = format!("{env_prefix}_ACCOUNT");
-    let user = format!("{env_prefix}_USER");
+    let base = |secret: &str| {
+        vec![
+            format!("{env_prefix}_ACCOUNT"),
+            format!("{env_prefix}_USER"),
+            format!("{env_prefix}_AUTH"),
+            format!("{env_prefix}_WAREHOUSE"),
+            format!("{env_prefix}_{secret}"),
+        ]
+    };
     vec![
         json_object(vec![
-            ("auth_lane", json_string("programmatic_access_token")),
-            (
-                "env_vars",
-                string_array(vec![
-                    account.clone(),
-                    user.clone(),
-                    format!("{env_prefix}_PAT"),
-                ]),
-            ),
+            ("auth_lane", json_string("pat")),
+            ("env_vars", string_array(base("PAT"))),
         ]),
         json_object(vec![
             ("auth_lane", json_string("key_pair_jwt")),
             (
                 "env_vars",
-                string_array(vec![
-                    account.clone(),
-                    user.clone(),
-                    format!("{env_prefix}_PRIVATE_KEY_PEM"),
-                    format!("{env_prefix}_PRIVATE_KEY_PASSPHRASE"),
-                ]),
+                string_array({
+                    let mut vars = base("PRIVATE_KEY_PEM");
+                    vars.push(format!("{env_prefix}_PRIVATE_KEY_PASSPHRASE"));
+                    vars
+                }),
             ),
         ]),
         json_object(vec![
-            ("auth_lane", json_string("oauth_bearer_token")),
-            (
-                "env_vars",
-                string_array(vec![account, user, format!("{env_prefix}_OAUTH_BEARER")]),
-            ),
+            ("auth_lane", json_string("oauth_bearer")),
+            ("env_vars", string_array(base("OAUTH_BEARER"))),
         ]),
     ]
 }
@@ -2408,90 +2860,6 @@ fn profile_env_prefix(profile: &str) -> String {
     } else {
         format!("FRANKEN_SNOWFLAKE_{suffix}")
     }
-}
-
-fn operator_schema_outcome(format: OutputFormat, request_id: String, operator: String) -> Outcome {
-    let lower = operator.to_ascii_lowercase();
-    let schema = match lower.as_str() {
-        "between" => json_object(vec![
-            (
-                "$schema",
-                json_string("https://json-schema.org/draft/2020-12/schema"),
-            ),
-            ("title", json_string("between")),
-            ("type", json_string("object")),
-            (
-                "required",
-                string_array(vec!["lower".to_string(), "upper".to_string()]),
-            ),
-            (
-                "properties",
-                json_object(vec![
-                    (
-                        "lower",
-                        json_object(vec![(
-                            "type",
-                            string_array(vec!["number".to_string(), "string".to_string()]),
-                        )]),
-                    ),
-                    (
-                        "upper",
-                        json_object(vec![(
-                            "type",
-                            string_array(vec!["number".to_string(), "string".to_string()]),
-                        )]),
-                    ),
-                ]),
-            ),
-        ]),
-        "equals" | "eq" => json_object(vec![
-            (
-                "$schema",
-                json_string("https://json-schema.org/draft/2020-12/schema"),
-            ),
-            ("title", json_string("equals")),
-            ("type", json_string("object")),
-            ("required", string_array(vec!["value".to_string()])),
-            (
-                "properties",
-                json_object(vec![("value", json_object(vec![]))]),
-            ),
-        ]),
-        _ => {
-            return error_outcome(
-                format,
-                "dataset.describe_operator",
-                "fsnow.dataset.operator_schema.v1",
-                CoreExitCode::Usage,
-                "error",
-                error_info(
-                    SnowflakeErrorCode::UsageError,
-                    format!("Unknown operator `{operator}`."),
-                    vec![json_string("known operators: between, equals")],
-                ),
-                vec![
-                    "franken-snowflake dataset describe-operator between --jsonschema".to_string(),
-                ],
-                vec![
-                    "franken-snowflake dataset describe-operator between --jsonschema".to_string(),
-                ],
-                did_you_mean(&operator, &["between", "equals"]),
-            );
-        }
-    };
-
-    success(
-        format,
-        "dataset.describe_operator",
-        "fsnow.dataset.operator_schema.v1",
-        request_id,
-        json_object(vec![
-            ("operator", json_string(operator)),
-            ("json_schema", schema),
-        ]),
-        vec![],
-        vec!["franken-snowflake dataset inspect <dataset-id> --json".to_string()],
-    )
 }
 
 fn query_plan_outcome(
@@ -2616,8 +2984,7 @@ fn query_run_outcome(
     request_id: String,
     profile: Option<String>,
     sql: Option<String>,
-    bindings_env: Option<String>,
-    query_tag: Option<String>,
+    options: QueryRunOptions,
 ) -> Outcome {
     if profile.is_none() {
         return usage_error(
@@ -2676,14 +3043,7 @@ fn query_run_outcome(
     // default no-account build refuses cleanly. Split into cfg-gated helpers so the
     // tail stays a single unambiguous expression (no cfg-block-as-tail, no
     // needless_return under the `-D warnings` clippy gate).
-    query_run_dispatch(
-        format,
-        request_id,
-        profile,
-        &sql_text,
-        bindings_env.as_deref(),
-        query_tag.as_deref(),
-    )
+    query_run_dispatch(format, request_id, profile, &sql_text, options)
 }
 
 /// Live build: drive the real SQL API transport. The profile presence was checked
@@ -2694,16 +3054,14 @@ fn query_run_dispatch(
     request_id: String,
     profile: Option<String>,
     sql_text: &str,
-    bindings_env: Option<&str>,
-    query_tag: Option<&str>,
+    options: QueryRunOptions,
 ) -> Outcome {
     live::run_query_outcome(
         format,
         request_id,
         profile.unwrap_or_default(),
         sql_text,
-        bindings_env,
-        query_tag,
+        &options,
     )
 }
 
@@ -2715,8 +3073,7 @@ fn query_run_dispatch(
     request_id: String,
     profile: Option<String>,
     _sql_text: &str,
-    _bindings_env: Option<&str>,
-    _query_tag: Option<&str>,
+    options: QueryRunOptions,
 ) -> Outcome {
     live_transport_required_with_data(
         format,
@@ -2726,6 +3083,17 @@ fn query_run_dispatch(
         profile,
         json_object(vec![
             ("sql_accepted_by_local_safety_check", Json::Bool(true)),
+            (
+                "requested_options",
+                json_object(vec![
+                    ("limit", option_json(options.limit)),
+                    ("role", option_json(options.role)),
+                    ("warehouse", option_json(options.warehouse)),
+                    ("statement_timeout", option_json(options.statement_timeout)),
+                    ("bindings_env", option_json(options.bindings_env)),
+                    ("query_tag", option_json(options.query_tag)),
+                ]),
+            ),
             (
                 "requires",
                 json_array(vec![
@@ -3026,6 +3394,30 @@ fn write_refusal_outcome(
     ));
     envelope.safe_next_commands = vec![write_hint(Some(&profile), sql)];
     envelope.repair_commands = write_refusal_repair(detail.code, &profile);
+    // A refused mutation is still an event an operator wants on the ledger.
+    if let Ok(store) = local_store::open_store() {
+        let event = serde_json::json!({
+            "profile_id": profile,
+            "refusal_code": code.stable_code(),
+            "stage": format!("{:?}", detail.stage),
+            "sql_preview_redacted": compact_sql(&redact(sql)),
+        });
+        match local_store::append_audit(
+            &store,
+            "query.write",
+            &envelope.request_id,
+            "write_refused",
+            &event,
+            None,
+        ) {
+            Ok(_) => envelope
+                .warnings
+                .push(json_string("refusal recorded on the local audit log")),
+            Err(error) => envelope
+                .warnings
+                .push(json_string(format!("audit log append failed: {error}"))),
+        }
+    }
     Outcome {
         status: code.exit_code(),
         body: Body::Envelope { envelope, format },
@@ -3189,7 +3581,7 @@ fn catalog_scan_dispatch(
     database: Option<String>,
     schema: Option<String>,
 ) -> Outcome {
-    not_implemented_with_data(
+    live_transport_required_with_data(
         format,
         "catalog.scan",
         "fsnow.catalog.scan.v1",
@@ -3201,12 +3593,24 @@ fn catalog_scan_dispatch(
             (
                 "requires",
                 json_array(vec![
-                    json_string("catalog crate"),
-                    json_string("live SQL API transport"),
+                    json_string("live SQL API transport (build with --features live)"),
+                    json_string("profile credential handles"),
+                ]),
+            ),
+            (
+                "offline_alternatives",
+                json_array(vec![
+                    json_string(
+                        "dataset inspect <dataset-id> (from a previous scan in the local store)",
+                    ),
+                    json_string(
+                        "catalog graph <profile> --database <db> (from the local snapshot)",
+                    ),
                 ]),
             ),
         ]),
         vec![
+            "franken-snowflake dataset inspect <dataset-id> --json".to_string(),
             "franken-snowflake query plan --profile <profile> --sql \"select 1\" --json"
                 .to_string(),
         ],
@@ -3253,6 +3657,7 @@ fn refusal(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn catalog_graph_outcome(
     format: OutputFormat,
     request_id: String,
@@ -3260,12 +3665,23 @@ fn catalog_graph_outcome(
     database: Option<String>,
     schema: Option<String>,
     graph_output: GraphOutput,
+    refresh: bool,
 ) -> Outcome {
-    catalog_graph_dispatch(format, request_id, profile, database, schema, graph_output)
+    catalog_graph_dispatch(
+        format,
+        request_id,
+        profile,
+        database,
+        schema,
+        graph_output,
+        refresh,
+    )
 }
 
-/// Live build: render the real catalog lineage graph from a live scan.
+/// Live build: render from the local snapshot when one exists (unless
+/// `--refresh`), otherwise run a live scan first and render that.
 #[cfg(feature = "live")]
+#[allow(clippy::too_many_arguments)]
 fn catalog_graph_dispatch(
     format: OutputFormat,
     request_id: String,
@@ -3273,44 +3689,161 @@ fn catalog_graph_dispatch(
     database: Option<String>,
     schema: Option<String>,
     graph_output: GraphOutput,
+    refresh: bool,
 ) -> Outcome {
-    live::run_catalog_graph_outcome(format, request_id, profile, database, schema, graph_output)
+    live::run_catalog_graph_outcome(
+        format,
+        request_id,
+        profile,
+        database,
+        schema,
+        graph_output,
+        refresh,
+    )
 }
 
-/// Default (no-account) build: the lineage graph is derived from a live catalog
-/// scan, so without transport refuse cleanly rather than emit a placeholder an
-/// agent could mistake for a real (empty) graph.
+/// `query cancel`: the live build posts to the SQL API cancel endpoint.
+#[cfg(feature = "live")]
+fn query_cancel_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    profile: Option<String>,
+    statement_handle: String,
+) -> Outcome {
+    let Some(profile) = profile else {
+        return usage_error(
+            format,
+            "query.cancel",
+            "fsnow.query.cancel.v1",
+            "Missing --profile for `query cancel` (the cancel endpoint needs the profile's credentials). Pass --profile <profile> or set FRANKEN_SNOWFLAKE_DEFAULT_PROFILE.",
+            vec![
+                "franken-snowflake query cancel <statement-handle> --profile <profile> --json"
+                    .to_string(),
+            ],
+            vec![],
+        );
+    };
+    live::run_query_cancel_outcome(format, request_id, profile, statement_handle)
+}
+
+/// Default (no-account) build: no transport to reach the cancel endpoint.
 #[cfg(not(feature = "live"))]
+fn query_cancel_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    profile: Option<String>,
+    statement_handle: String,
+) -> Outcome {
+    live_transport_required_with_data(
+        format,
+        "query.cancel",
+        "fsnow.query.cancel.v1",
+        request_id,
+        profile,
+        json_object(vec![
+            ("statement_handle", json_string(statement_handle)),
+            (
+                "requires",
+                json_array(vec![
+                    json_string("live SQL API transport (build with --features live)"),
+                    json_string("profile credential handles"),
+                ]),
+            ),
+        ]),
+        vec!["franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string()],
+    )
+}
+
+/// Default (no-account) build: render the lineage graph from the newest catalog
+/// snapshot in the local store (populated by a live `catalog scan`); a scope that
+/// was never scanned is a typed metadata error, never a fake empty graph.
+#[cfg(not(feature = "live"))]
+#[allow(clippy::too_many_arguments)]
 fn catalog_graph_dispatch(
     format: OutputFormat,
     request_id: String,
     profile: String,
     database: Option<String>,
     schema: Option<String>,
-    _graph_output: GraphOutput,
+    graph_output: GraphOutput,
+    _refresh: bool,
+) -> Outcome {
+    catalog_surface::catalog_graph_from_store_outcome(
+        format,
+        request_id,
+        profile,
+        database,
+        schema,
+        graph_output,
+    )
+}
+
+/// `dataset profile`: plan-only without the live feature (an `--execute` request
+/// is reported, not silently dropped).
+#[cfg(not(feature = "live"))]
+fn dataset_profile_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    dataset_id: String,
+    execute: bool,
+) -> Outcome {
+    catalog_surface::dataset_profile_plan_outcome(format, request_id, dataset_id, execute)
+}
+
+#[cfg(feature = "live")]
+fn dataset_profile_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    dataset_id: String,
+    execute: bool,
+) -> Outcome {
+    if execute {
+        live::dataset_profile_execute_outcome(format, request_id, dataset_id)
+    } else {
+        catalog_surface::dataset_profile_plan_outcome(format, request_id, dataset_id, false)
+    }
+}
+
+/// `export run`: local CSV/JSONL export of a live result (live build only).
+#[cfg(not(feature = "live"))]
+fn export_run_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    spec: catalog_surface::ExportPlanSpec,
+    out: Option<String>,
 ) -> Outcome {
     live_transport_required_with_data(
         format,
-        "catalog.graph",
-        "fsnow.catalog.graph.v1",
+        "export.run",
+        "fsnow.export.run.v1",
         request_id,
-        Some(profile),
+        spec.profile,
         json_object(vec![
-            ("requested_database", option_json(database)),
-            ("requested_schema", option_json(schema)),
+            ("out", option_json(out)),
+            ("format", option_json(spec.format)),
             (
                 "requires",
                 json_array(vec![
-                    json_string("live SQL API transport"),
-                    json_string("a catalog scan over --database/--schema"),
+                    json_string("live SQL API transport (build with --features live)"),
+                    json_string("profile credential handles"),
                 ]),
             ),
         ]),
         vec![
-            "franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json"
+            "franken-snowflake export plan --profile <profile> --sql <select> --location @stage/path --json"
                 .to_string(),
         ],
     )
+}
+
+#[cfg(feature = "live")]
+fn export_run_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    spec: catalog_surface::ExportPlanSpec,
+    out: Option<String>,
+) -> Outcome {
+    live::export_run_outcome(format, request_id, spec, out)
 }
 
 fn exit_code_json() -> Json {
@@ -3511,25 +4044,38 @@ fn known_flags() -> Vec<&'static str> {
     vec![
         "--as-of",
         "--bindings-env",
+        "--compression",
         "--confirm",
         "--database",
         "--dataset",
         "--dry-run",
         "--entity",
+        "--execute",
+        "--format",
         "--from",
+        "--header",
         "--help",
         "--http",
         "--json",
         "--jsonschema",
         "--limit",
+        "--location",
+        "--max-file-size",
         "--mermaid",
         "--no-color",
         "--online",
+        "--out",
+        "--overwrite",
         "--profile",
+        "--query-id",
         "--query-tag",
+        "--refresh",
         "--role",
         "--schema",
+        "--select",
+        "--single",
         "--sql",
+        "--statement-timeout",
         "--stdio",
         "--svg",
         "--to",
@@ -3549,17 +4095,26 @@ fn flag_requires_value(flag: &str) -> bool {
         flag,
         "--as-of"
             | "--bindings-env"
+            | "--compression"
             | "--confirm"
             | "--database"
             | "--dataset"
             | "--entity"
+            | "--format"
             | "--from"
+            | "--header"
             | "--limit"
+            | "--location"
+            | "--max-file-size"
+            | "--out"
             | "--profile"
+            | "--query-id"
             | "--query-tag"
             | "--role"
             | "--schema"
+            | "--select"
             | "--sql"
+            | "--statement-timeout"
             | "--to"
             | "--warehouse"
     )
@@ -3818,13 +4373,32 @@ fn skip_sql_ws_and_comments(sql: &str, mut index: usize) -> usize {
         }
 
         if sql[index..].starts_with("/*") {
-            match sql[index + 2..].find("*/") {
-                Some(block_end) => {
-                    index += block_end + 4;
-                    continue;
+            // Block comments nest in Snowflake (`/* /* inner */ outer */`), so
+            // the guard must track depth. Ending at the first `*/` let a
+            // mutation hidden after an inner comment (`/* /* x */ select 1 */
+            // delete from t`) classify as a read (the `selftest` read_only_guard
+            // fixture caught this). An unterminated comment consumes the rest.
+            let mut depth = 0usize;
+            let mut cursor = index;
+            loop {
+                if sql[cursor..].starts_with("/*") {
+                    depth += 1;
+                    cursor += 2;
+                } else if sql[cursor..].starts_with("*/") {
+                    depth -= 1;
+                    cursor += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    match sql[cursor..].chars().next() {
+                        Some(ch) => cursor += ch.len_utf8(),
+                        None => return sql.len(),
+                    }
                 }
-                None => return sql.len(),
             }
+            index = cursor;
+            continue;
         }
 
         return index;
@@ -4060,6 +4634,16 @@ fn json_array(values: Vec<Json>) -> Json {
 }
 
 fn json_object(entries: Vec<(&'static str, Json)>) -> Json {
+    Json::Object(
+        entries
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect(),
+    )
+}
+
+/// Object with runtime-owned keys (column names, dataset ids, env handles).
+fn json_object_owned(entries: Vec<(String, Json)>) -> Json {
     Json::Object(entries)
 }
 
@@ -4103,6 +4687,13 @@ fn render_json_into(value: &Json, out: &mut String) {
         Json::Null => out.push_str("null"),
         Json::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
         Json::Number(value) => out.push_str(&value.to_string()),
+        Json::Float(value) => {
+            if value.is_finite() {
+                out.push_str(&value.to_string());
+            } else {
+                out.push_str("null");
+            }
+        }
         Json::String(value) => {
             out.push('"');
             out.push_str(&escape_json_string(value));
@@ -4220,6 +4811,10 @@ pub use mcp_surface::run_mcp_serve_process;
 #[cfg(feature = "live")]
 mod live;
 
+mod catalog_surface;
+mod health;
+mod local_store;
+
 fn toon_output_available() -> bool {
     cfg!(feature = "toon")
 }
@@ -4269,6 +4864,9 @@ fn toon_json_value(value: &Json) -> toon::JsonValue {
         Json::Number(value) => {
             toon::JsonValue::Primitive(toon::StringOrNumberOrBoolOrNull::Number(*value as f64))
         }
+        Json::Float(value) => {
+            toon::JsonValue::Primitive(toon::StringOrNumberOrBoolOrNull::Number(*value))
+        }
         Json::String(value) => {
             toon::JsonValue::Primitive(toon::StringOrNumberOrBoolOrNull::String(value.clone()))
         }
@@ -4276,7 +4874,7 @@ fn toon_json_value(value: &Json) -> toon::JsonValue {
         Json::Object(entries) => toon::JsonValue::Object(
             entries
                 .iter()
-                .map(|(key, value)| ((*key).to_string(), toon_json_value(value)))
+                .map(|(key, value)| (key.clone(), toon_json_value(value)))
                 .collect(),
         ),
     }
@@ -4297,6 +4895,55 @@ mod tests {
         match execute(args.iter().map(|arg| (*arg).to_string()).collect()).body {
             Body::Envelope { envelope, .. } => envelope.error.map(|error| error.code.stable_code()),
             Body::Raw { .. } => None,
+        }
+    }
+
+    #[test]
+    fn capabilities_input_schemas_describe_every_command_and_flag() {
+        let rendered = render_json(&envelope_for(&["capabilities", "--json"]));
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+        let commands = parsed["data"]["commands"]
+            .as_array()
+            .expect("commands array");
+        assert_eq!(commands.len(), COMMAND_SPECS.len());
+        let mut documented = std::collections::BTreeSet::new();
+        for command in commands {
+            let schema = &command["input_schema"];
+            assert_eq!(
+                schema["$schema"],
+                "https://json-schema.org/draft/2020-12/schema"
+            );
+            let properties = schema["properties"].as_object().expect("properties object");
+            assert!(
+                !properties.is_empty(),
+                "{} has an empty input schema",
+                command["command_id"]
+            );
+            for name in properties.keys() {
+                documented.insert(name.replace('_', "-"));
+            }
+            for required in schema["required"].as_array().expect("required array") {
+                assert!(properties.contains_key(required.as_str().unwrap()));
+            }
+        }
+        // Every accepted value/boolean flag is described by at least one command.
+        for flag in known_flags() {
+            let name = flag.trim_start_matches('-');
+            if matches!(
+                flag,
+                "-h" | "--help" | "--no-color" | "--json" | "--toon" | "--mermaid" | "--svg"
+            ) {
+                continue;
+            }
+            let documented_here = documented.contains(name)
+                || (matches!(
+                    flag,
+                    "--dataset" | "--entity" | "--from" | "--to" | "--as-of" | "--select"
+                ));
+            assert!(
+                documented_here,
+                "flag {flag} is accepted but undocumented in capabilities"
+            );
         }
     }
 
@@ -4444,21 +5091,25 @@ mod tests {
         );
     }
 
-    // ynp F4: a structurally-valid profile validates at exit 0; an invalid id is a
-    // real finding at exit 1.
+    // A structurally-valid profile whose required env handles are absent is a
+    // finding (exit 1) that names the missing handle names in repair_commands;
+    // an invalid id is a finding too. (Exit 0 requires ACCOUNT/USER/AUTH/
+    // WAREHOUSE plus the lane secret handle to be present by name.)
     #[test]
     fn profile_validate_exit_code_reflects_validity() {
-        assert_eq!(
-            execute(vec![
-                "profile".to_string(),
-                "validate".to_string(),
-                "demo".to_string(),
-                "--json".to_string(),
-            ])
-            .status
-            .code(),
-            0
-        );
+        let outcome = execute(vec![
+            "profile".to_string(),
+            "validate".to_string(),
+            "demo".to_string(),
+            "--json".to_string(),
+        ]);
+        assert_eq!(outcome.status.code(), 1);
+        let rendered = match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("export FRANKEN_SNOWFLAKE_DEMO_ACCOUNT=<value>"));
+        assert!(rendered.contains("\"missing_required_handles\""));
         assert_eq!(
             execute(vec![
                 "profile".to_string(),
@@ -4472,26 +5123,64 @@ mod tests {
         );
     }
 
-    // ynp F9: a reserved-but-unimplemented surface is a refusal (exit 2 / FSNOW-9002),
-    // not an I/O fault (74).
+    // No CLI surface is "reserved" any more: every verb either does its job or
+    // returns a typed, actionable error. `export plan` without a location is a
+    // usage error (64); an unknown dataset/receipt is a local metadata error (7).
     #[test]
-    fn reserved_surfaces_refuse_with_exit_two_not_io() {
+    fn former_reserved_surfaces_now_return_actionable_typed_errors() {
         let outcome = execute(vec![
             "export".to_string(),
             "plan".to_string(),
             "--json".to_string(),
         ]);
-        assert_eq!(outcome.status.code(), 2);
+        assert_eq!(outcome.status.code(), 64);
         let rendered = match outcome.body {
             Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
             Body::Raw { data } => data,
         };
-        assert!(rendered.contains("FSNOW-9002"));
+        assert!(rendered.contains("Missing --location"));
+        assert!(!rendered.contains("FSNOW-9002"));
+
+        for args in [
+            vec!["dataset", "inspect", "nope_b3_ffff"],
+            vec!["dataset", "profile", "nope_b3_ffff"],
+            vec!["receipt", "show", "0000"],
+        ] {
+            let outcome = execute(args.iter().map(|a| (*a).to_string()).collect());
+            assert_eq!(outcome.status.code(), 7, "{args:?}");
+            let rendered = match outcome.body {
+                Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+                Body::Raw { data } => data,
+            };
+            assert!(rendered.contains("FSNOW-7002"), "{args:?}: {rendered}");
+            assert!(rendered.contains("catalog scan") || rendered.contains("query run"));
+        }
+
+        // A working export plan renders real COPY INTO SQL with a content hash.
+        let outcome = execute(vec![
+            "export".to_string(),
+            "plan".to_string(),
+            "--sql".to_string(),
+            "select 1".to_string(),
+            "--location".to_string(),
+            "@stg/run".to_string(),
+            "--format".to_string(),
+            "jsonl".to_string(),
+            "--json".to_string(),
+        ]);
+        assert_eq!(outcome.status.code(), 0);
+        let rendered = match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("COPY INTO @stg/run FROM (select 1) FILE_FORMAT = (TYPE = JSON"));
+        assert!(rendered.contains("\"plan_hash\""));
+        assert!(rendered.contains("query write --profile <profile> --sql"));
     }
 
-    // 1p1: the no-account build refuses `catalog graph` cleanly (live transport
-    // required) instead of emitting the old empty-graph stub that an agent could
-    // mistake for a real, empty catalog. Under `live` it renders from a real scan.
+    // The no-account build renders `catalog graph` from the local snapshot store;
+    // a scope that was never scanned is a typed metadata error naming the scan
+    // command, never an empty graph an agent could mistake for a real catalog.
     #[cfg(not(feature = "live"))]
     #[test]
     fn catalog_graph_refuses_cleanly_without_live_transport() {
@@ -4513,7 +5202,8 @@ mod tests {
             Body::Raw { data } => data,
         };
         assert!(rendered.contains("\"command_id\":\"catalog.graph\""));
-        assert!(rendered.contains("live SQL API transport"));
+        assert!(rendered.contains("FSNOW-7002"));
+        assert!(rendered.contains("catalog scan demo --database FRANKEN_TEST"));
         assert!(
             !rendered.contains("requires catalog scan fixtures"),
             "the misleading empty-graph stub must be gone"
@@ -4688,20 +5378,6 @@ mod tests {
         )
         .expect("toon decodes");
         assert_eq!(decoded, toon_json_value(&envelope));
-    }
-
-    #[cfg(feature = "toon")]
-    #[test]
-    fn toon_output_is_smaller_for_large_agent_payload() {
-        let envelope = envelope_for(&["capabilities", "--json"]);
-        let rendered_json = render_json(&envelope);
-        let rendered_toon = render_toon(&envelope);
-        assert!(
-            rendered_toon.len() < rendered_json.len(),
-            "TOON should be smaller than JSON for capabilities: toon={}, json={}",
-            rendered_toon.len(),
-            rendered_json.len()
-        );
     }
 
     #[test]
@@ -4917,13 +5593,12 @@ mod tests {
         .expect("query run flags should parse");
 
         match invocation.command {
-            Command::QueryRun {
-                bindings_env,
-                query_tag,
-                ..
-            } => {
-                assert_eq!(bindings_env.as_deref(), Some("HFDT_TYPED_BINDINGS_JSON"));
-                assert_eq!(query_tag.as_deref(), Some("hfdt.trace.123"));
+            Command::QueryRun { options, .. } => {
+                assert_eq!(
+                    options.bindings_env.as_deref(),
+                    Some("HFDT_TYPED_BINDINGS_JSON")
+                );
+                assert_eq!(options.query_tag.as_deref(), Some("hfdt.trace.123"));
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -5166,17 +5841,19 @@ mod tests {
             "validate".to_string(),
             "demo-prod".to_string(),
         ]);
-        // ynp F4: a structurally-valid profile validates at exit 0 (the
-        // "registry not linked" scope note is informational, not a finding).
-        assert_eq!(outcome.status.code(), 0);
+        // No env handles are set in the test process, so the profile is a
+        // finding (exit 1) that lists every expected handle by NAME only.
+        assert_eq!(outcome.status.code(), 1);
         let rendered = match outcome.body {
             Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
             Body::Raw { data } => data,
         };
         assert!(rendered.contains("\"command_id\":\"profile.validate\""));
-        assert!(rendered.contains("\"profile_registry_linked\":false"));
+        assert!(rendered.contains("\"profile_source\":\"environment\""));
         assert!(rendered.contains("\"secret_values_read\":false"));
         assert!(rendered.contains("FRANKEN_SNOWFLAKE_DEMO_PROD_PAT"));
+        assert!(rendered.contains("FRANKEN_SNOWFLAKE_DEMO_PROD_WAREHOUSE"));
+        assert!(rendered.contains("\"present\":false"));
     }
 
     // No-account build: `profile doctor --online` records the request but never
@@ -5243,14 +5920,42 @@ mod tests {
     }
 
     #[test]
-    fn selftest_reports_redaction_and_debug_gate_linkage() {
+    fn selftest_runs_real_fixtures_and_all_pass() {
         let rendered = render_json(&envelope_for(&["selftest", "--json"]));
         assert!(rendered.contains("\"command_id\":\"selftest\""));
-        assert!(rendered.contains("\"name\":\"secret_redaction\""));
-        assert!(rendered.contains("\"name\":\"credential_debug_gate\""));
-        assert!(rendered.contains("\"status\":\"pass\""));
+        for fixture in [
+            "json_envelope_round_trip",
+            "secret_redaction",
+            "read_only_guard",
+            "write_intent_ladder",
+            "operator_json_schemas",
+            "local_store_round_trip",
+            "export_plan_hardening",
+        ] {
+            assert!(
+                rendered.contains(&format!("\"name\":\"{fixture}\"")),
+                "{fixture}"
+            );
+        }
+        assert!(!rendered.contains("\"status\":\"fail\""), "{rendered}");
+        assert!(
+            !rendered.contains("not_checked"),
+            "selftest must execute every fixture"
+        );
     }
 
+    #[test]
+    fn read_guard_handles_nested_block_comments_fail_closed() {
+        // Snowflake nests block comments, so the mutation after the outer
+        // comment is what actually runs. The guard must not stop at the first
+        // `*/` (the selftest fixture that found this stays in place).
+        assert!(!is_select_like("/* /* nested */ select 1 */ delete from t"));
+        assert!(is_select_like("/* /* nested */ delete from t */ select 1"));
+        assert!(is_select_like("select /* /* a */ b */ 1"));
+        assert!(!is_select_like("/* unterminated select 1"));
+    }
+
+    #[cfg(not(feature = "live"))]
     #[test]
     fn query_cancel_surface_is_versioned_and_stable() {
         let rendered = render_json(&envelope_for(&["query", "cancel", "01bcaafe-0000"]));
@@ -5260,10 +5965,69 @@ mod tests {
         assert!(rendered.contains("FSNOW-3003"));
     }
 
+    #[cfg(feature = "live")]
     #[test]
-    fn operator_schema_uses_json_schema_type_array() {
+    fn query_cancel_requires_a_profile_then_credentials_live() {
+        let rendered = render_json(&envelope_for(&["query", "cancel", "01bcaafe-0000"]));
+        assert!(rendered.contains("\"command_id\":\"query.cancel\""));
+        assert!(rendered.contains("Missing --profile"));
+        let rendered = render_json(&envelope_for(&[
+            "query",
+            "cancel",
+            "01bcaafe-0000",
+            "--profile",
+            "fsnow-no-creds-cancel",
+        ]));
+        assert!(rendered.contains("FSNOW-2003"), "{rendered}");
+        assert!(rendered.contains("FRANKEN_SNOWFLAKE_FSNOW_NO_CREDS_CANCEL_ACCOUNT"));
+    }
+
+    #[test]
+    fn describe_operator_serves_the_catalog_crate_schema_for_every_operator() {
         let rendered = render_json(&envelope_for(&["dataset", "describe-operator", "between"]));
-        assert!(rendered.contains("\"type\":[\"number\",\"string\"]"));
+        assert!(rendered.contains("\"operator\":\"between\""));
+        assert!(rendered.contains("\"arity_label\":\"2\""));
+        assert!(rendered.contains("https://json-schema.org/draft/2020-12/schema"));
+        assert!(rendered.contains("franken_snowflake.operator.between.v1"));
+        assert!(rendered.contains("\"example_predicate\""));
+        // Aliases resolve; unknown operators get did_you_mean over the real ids.
+        let rendered = render_json(&envelope_for(&["dataset", "describe-operator", "equals"]));
+        assert!(rendered.contains("\"operator\":\"eq\""));
+        let outcome = execute(vec![
+            "dataset".to_string(),
+            "describe-operator".to_string(),
+            "betwen".to_string(),
+        ]);
+        assert_eq!(outcome.status.code(), 64);
+        let rendered = match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(
+            rendered.contains("\"did_you_mean\":[\"between\"]"),
+            "{rendered}"
+        );
+        for op in [
+            "eq",
+            "neq",
+            "lt",
+            "lte",
+            "gt",
+            "gte",
+            "between",
+            "in",
+            "is_null",
+            "is_not_null",
+            "contains",
+        ] {
+            let outcome = execute(vec![
+                "dataset".to_string(),
+                "describe-operator".to_string(),
+                op.to_string(),
+                "--jsonschema".to_string(),
+            ]);
+            assert_eq!(outcome.status.code(), 0, "{op}");
+        }
     }
 
     #[test]

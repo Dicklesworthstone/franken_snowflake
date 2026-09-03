@@ -1,23 +1,25 @@
 //! Live SQL API transport wiring for the CLI (`feature = "live"`).
 //!
 //! Only compiled with `--features live`. It reuses the crate-root envelope
-//! machinery (`crate::base_envelope`, `crate::Json`, `crate::Outcome`, ...) and
-//! the published transport stack (`franken-snowflake-{auth,http,sqlapi}` +
-//! Asupersync), driving the exact submit -> poll -> partition -> assemble flow the
-//! opt-in `live_proof` integration test already proves end-to-end.
+//! machinery and the published transport stack (`franken-snowflake-{auth,http,
+//! sqlapi}` + Asupersync), driving the exact submit -> poll -> partition ->
+//! assemble flow the opt-in `live_proof` integration test proves end-to-end.
+//!
+//! What every live command does after a successful execution:
+//! - stamps `data_source = "live"`, the real statement handle, and the
+//!   poll/row budget it consumed;
+//! - writes a content-addressed (BLAKE3) receipt, partition evidence, and an
+//!   append-only audit event to the local store, and puts the receipt hash on
+//!   the envelope (a store failure is a warning, never a fabricated hash);
+//! - caps the rows it *emits* (default [`ROW_EMIT_CAP`], `--limit` overrides)
+//!   with an explicit `truncated` flag.
 //!
 //! Provenance and safety contract:
-//! - On success the envelope carries `data_source = "live"` and the real
-//!   statement handle; it never substitutes fixture or empty data.
-//! - When a profile's credential env handles are absent the command returns a
-//!   typed credential error (exit code 3), not a silent empty result.
-//! - Result rows are capped into the envelope at [`ROW_EMIT_CAP`] with an explicit
-//!   `truncated` flag and a warning, so an agent never has an unbounded payload
-//!   silently appear (full extraction is a Snowflake-side `LIMIT`/`COPY INTO`).
-//! - Secrets are never read into any message here; auth/transport errors arrive
-//!   already redacted, and the crate-root `sanitize_envelope` pass runs the
-//!   secret-leak redactor over the whole envelope (including row data) before
-//!   output.
+//! - a missing credential env handle is a typed error (exit 3), never a silent
+//!   empty result;
+//! - secrets are never read into any message; auth/transport errors arrive
+//!   already redacted and the crate-root `sanitize_envelope` pass runs the
+//!   secret-leak redactor over the whole envelope before output.
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,42 +30,78 @@ use franken_snowflake_auth::{
     AuthProfile, KEYPAIR_JWT_TOKEN_TYPE, OAUTH_TOKEN_TYPE, PROGRAMMATIC_ACCESS_TOKEN_TYPE,
     ProcessSecretResolver, SecretSource, SnowflakeAuth,
 };
+use franken_snowflake_cache::{
+    CacheBackend, CatalogSnapshotRecord, ContentAddress as CacheAddress, ExportKind, ExportRecord,
+    VerifiedPayload,
+};
+use franken_snowflake_catalog::discovery::{
+    CatalogDiscoveryInput, CatalogDiscoveryTables, DiscoveryStatementKind,
+    build_information_schema_requests, build_snapshot_from_information_schema, persist_snapshot,
+};
+use franken_snowflake_catalog::model::{CatalogSnapshot, DataSourceClass};
+use franken_snowflake_core::cancel::CancelKind;
 use franken_snowflake_core::error::{SnowflakeError, SnowflakeErrorCode};
 use franken_snowflake_core::exit::ExitCode as CoreExitCode;
-use franken_snowflake_core::ids::{DatabaseName, RoleName, SchemaName, WarehouseName};
-use franken_snowflake_http::{
-    AuthorizationDescriptor, SnowflakeAuthTokenType, SnowflakeEndpoint, SnowflakeHttpClient,
-    TransportConfig,
+use franken_snowflake_core::ids::{
+    DatabaseName, RoleName, SchemaName, StatementHandle, WarehouseName,
 };
-use franken_snowflake_sqlapi::driver::run_statement;
+use franken_snowflake_core::redact::redact;
+use franken_snowflake_export::{
+    CopySource, ExportColumn, LocalExportInput, ResultPartition, export_csv, export_jsonl,
+};
+use franken_snowflake_http::{
+    AuthorizationDescriptor, CancelHttpRequest, SnowflakeAuthTokenType, SnowflakeEndpoint,
+    SnowflakeHttpClient, StatusClass, TransportConfig,
+};
+use franken_snowflake_sqlapi::driver::{DriverStats, run_statement_with_stats};
 use franken_snowflake_sqlapi::lifecycle::{CompletedStatement, PollPlan};
 use franken_snowflake_sqlapi::request::{Binding, SubmitQueryParams, SubmitStatementRequest};
 
+use crate::catalog_surface::{self, DATA_SOURCE_CACHE, ExportPlanSpec};
+use crate::local_store::{self, ExecutionFacts, Store};
 use crate::{
-    Body, Json, OutputFormat, base_envelope, error_info, json_array, json_object, json_string,
+    Body, GraphOutput, Json, OutputFormat, QueryRunOptions, base_envelope, error_info, json_array,
+    json_object, json_object_owned, json_string, option_json,
 };
 
-/// SQL API statement timeout (seconds) requested per submit.
-const REQUEST_TIMEOUT_SECONDS: u32 = 60;
+/// Default SQL API statement timeout (seconds) requested per submit; a profile
+/// overrides it with `<PREFIX>_STATEMENT_TIMEOUT_SECONDS`, a run with
+/// `--statement-timeout`.
+const DEFAULT_STATEMENT_TIMEOUT_SECONDS: u32 = 60;
+/// Upper bound on a requested statement timeout (one day).
+const MAX_STATEMENT_TIMEOUT_SECONDS: u32 = 86_400;
 /// Poll budget if a profile does not override `<PREFIX>_MAX_POLLS`.
 const DEFAULT_MAX_POLLS: u32 = 120;
-/// Maximum rows materialized into a single response envelope. The driver still
-/// assembles the full result; this only bounds the JSON payload an agent sees.
-const ROW_EMIT_CAP: usize = 1000;
-/// Upper bound on tables listed by one `catalog scan` (pushed down as a SQL
-/// `LIMIT`, so an unbounded schema never floods the result).
-const CATALOG_SCAN_LIMIT: usize = 10_000;
+/// Maximum rows materialized into a single response envelope by default. The
+/// driver still assembles the full result; this only bounds the JSON payload an
+/// agent sees. `--limit` overrides it up to [`MAX_ROW_EMIT_CAP`].
+pub const ROW_EMIT_CAP: usize = 1000;
+/// Hard ceiling for `--limit`.
+const MAX_ROW_EMIT_CAP: usize = 100_000;
 /// Keep caller-supplied bind payloads bounded before parsing or transport.
 const MAX_BINDINGS_JSON_BYTES: usize = 1_048_576;
 /// The connector materializes at most this many positional binds in one request.
 const MAX_BINDING_COUNT: usize = 1_000;
 /// Snowflake documents QUERY_TAG as a bounded session string.
 const MAX_QUERY_TAG_BYTES: usize = 2_000;
+/// Longest cancel-endpoint body preview echoed into an envelope.
+const CANCEL_BODY_PREVIEW_BYTES: usize = 512;
 
 #[derive(Default)]
 struct QueryRequestOptions {
     bindings: Option<BTreeMap<String, Binding>>,
     query_tag: Option<String>,
+}
+
+/// Per-run session overrides resolved from flags (validated) on top of the
+/// profile's env handles.
+#[derive(Clone, Debug, Default)]
+struct SessionOverrides {
+    database: Option<String>,
+    schema: Option<String>,
+    role: Option<String>,
+    warehouse: Option<String>,
+    statement_timeout: Option<u32>,
 }
 
 /// A column's name/type/nullability, projected from the result-set metadata.
@@ -76,11 +114,30 @@ struct LiveColumn {
 /// The assembled rows plus the metadata an agent needs to interpret them.
 struct LiveRows {
     statement_handle: String,
+    sql_api_request_id: String,
     columns: Vec<LiveColumn>,
     rows: Vec<Vec<Option<String>>>,
     total_rows: i64,
     partition_count: usize,
+    partitions: Vec<(u32, u64, Option<u64>, Option<u64>)>,
+    stats: DriverStats,
+    /// The full completed statement (metadata + rows) for consumers that read
+    /// the SQL API shape directly (the catalog crate's row normalizer).
+    completed: CompletedStatement,
 }
+
+impl LiveRows {
+    fn column_pairs(&self) -> Vec<(String, String)> {
+        self.columns
+            .iter()
+            .map(|column| (column.name.clone(), column.type_name.clone()))
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// query run
+// ---------------------------------------------------------------------------
 
 /// Run one read-only statement live and return a `query run` envelope. Caller
 /// guarantees `profile` is present and `sql` already passed the local read-only
@@ -90,34 +147,73 @@ pub fn run_query_outcome(
     request_id: String,
     profile: String,
     sql: &str,
-    bindings_env: Option<&str>,
-    query_tag: Option<&str>,
+    options: &QueryRunOptions,
 ) -> crate::Outcome {
-    let options = match query_request_options(bindings_env, query_tag) {
-        Ok(options) => options,
-        Err(error) => {
-            return failure_outcome(
-                format,
-                "query.run",
-                "fsnow.query.run.v1",
-                request_id,
-                profile,
-                &error,
-            );
-        }
-    };
-    match execute(&profile, sql, None, None, options) {
-        Ok(rows) => query_success(format, request_id, profile, &rows),
-        Err(error) => failure_outcome(
+    let fail = |error: &SnowflakeError, profile: String| {
+        failure_outcome(
             format,
             "query.run",
             "fsnow.query.run.v1",
-            request_id,
+            request_id.clone(),
             profile,
-            &error,
-        ),
+            error,
+        )
+    };
+    let request_options = match query_request_options(
+        options.bindings_env.as_deref(),
+        options.query_tag.as_deref(),
+    ) {
+        Ok(request_options) => request_options,
+        Err(error) => return fail(&error, profile),
+    };
+    let emit_cap = match parse_limit(options.limit.as_deref()) {
+        Ok(cap) => cap,
+        Err(error) => return fail(&error, profile),
+    };
+    let overrides = match session_overrides(options, None, None) {
+        Ok(overrides) => overrides,
+        Err(error) => return fail(&error, profile),
+    };
+    let conn = match LiveConn::resolve(&profile, &overrides) {
+        Ok(conn) => conn,
+        Err(error) => return fail(&error, profile),
+    };
+    match execute(&conn, sql, request_options) {
+        Ok(rows) => {
+            let (receipt_hash, warnings) = record_receipt(
+                "query.run",
+                &conn,
+                &request_id,
+                sql,
+                &rows,
+                "statement_executed",
+                serde_json::json!({}),
+            );
+            rows_success(
+                format,
+                request_id,
+                profile,
+                "query.run",
+                "fsnow.query.run.v1",
+                Vec::new(),
+                &rows,
+                emit_cap,
+                receipt_hash,
+                warnings,
+                vec![
+                    "franken-snowflake receipt show <receipt-hash> --json".to_string(),
+                    "franken-snowflake query plan --profile <profile> --sql <sql> --json"
+                        .to_string(),
+                ],
+            )
+        }
+        Err(error) => fail(&error, profile),
     }
 }
+
+// ---------------------------------------------------------------------------
+// query write
+// ---------------------------------------------------------------------------
 
 /// The authorized-write facts the live executor stamps into the execution
 /// receipt. Built by the CLI from a core `WriteIntentDecision::ExecutionAuthorized`
@@ -141,24 +237,60 @@ pub struct AuthorizedWrite<'a> {
 
 /// Execute an authorized mutating statement live and return an execution-receipt
 /// envelope. The caller guarantees the write-intent ladder already authorized this
-/// statement (dry-run + exact confirmation token) and that the profile is
-/// write-enabled. Reuses the exact submit -> poll -> assemble transport as the read
-/// path; the SQL API does not distinguish read from write. Credential/transport
-/// failures collapse to typed errors and never claim `data_source = "live"`.
+/// statement and that the profile is write-enabled. Reuses the exact submit ->
+/// poll -> assemble transport as the read path; the SQL API does not distinguish
+/// read from write. Credential/transport failures collapse to typed errors and
+/// never claim `data_source = "live"`.
 pub fn run_write_outcome(
     format: OutputFormat,
     request_id: String,
     profile: String,
     write: &AuthorizedWrite<'_>,
 ) -> crate::Outcome {
-    match execute(
-        &profile,
-        write.sql,
-        write.database.as_deref(),
-        write.schema.as_deref(),
-        QueryRequestOptions::default(),
-    ) {
-        Ok(rows) => write_success(format, request_id, profile, write, &rows),
+    let overrides = SessionOverrides {
+        database: write.database.clone(),
+        schema: write.schema.clone(),
+        ..SessionOverrides::default()
+    };
+    let conn = match LiveConn::resolve(&profile, &overrides) {
+        Ok(conn) => conn,
+        Err(error) => {
+            return failure_outcome(
+                format,
+                "query.write",
+                "fsnow.query.write.v1",
+                request_id,
+                profile,
+                &error,
+            );
+        }
+    };
+    match execute(&conn, write.sql, QueryRequestOptions::default()) {
+        Ok(rows) => {
+            let (receipt_hash, warnings) = record_receipt(
+                "query.write",
+                &conn,
+                &request_id,
+                write.sql,
+                &rows,
+                "write_executed",
+                serde_json::json!({
+                    "statement_kind": write.statement_kind,
+                    "safety_class": write.safety_class,
+                    "idempotency_request_id": write.idempotency_request_id,
+                    "rows_affected": dml_rows_affected(&rows),
+                }),
+            );
+            write_success(
+                format,
+                request_id,
+                profile,
+                write,
+                &rows,
+                receipt_hash,
+                warnings,
+            )
+        }
         Err(error) => failure_outcome(
             format,
             "query.write",
@@ -187,48 +319,18 @@ fn dml_rows_affected(rows: &LiveRows) -> Option<i64> {
     saw_count.then_some(total)
 }
 
-/// Build the `data_source = "live"` execution-receipt envelope for an authorized
-/// write: the real statement handle, best-effort rows-affected, the write-intent
-/// receipt id, and a capped preview of any result the SQL API returned.
 fn write_success(
     format: OutputFormat,
     request_id: String,
     profile: String,
     write: &AuthorizedWrite<'_>,
     rows: &LiveRows,
+    receipt_hash: Option<String>,
+    mut warnings: Vec<Json>,
 ) -> crate::Outcome {
     let returned = rows.rows.len().min(ROW_EMIT_CAP);
     let truncated = rows.rows.len() > ROW_EMIT_CAP;
     let rows_affected = dml_rows_affected(rows);
-
-    let columns_json = json_array(
-        rows.columns
-            .iter()
-            .map(|column| {
-                json_object(vec![
-                    ("name", json_string(column.name.clone())),
-                    ("type", json_string(column.type_name.clone())),
-                    ("nullable", Json::Bool(column.nullable)),
-                ])
-            })
-            .collect(),
-    );
-    let rows_json = json_array(
-        rows.rows
-            .iter()
-            .take(returned)
-            .map(|row| {
-                json_array(
-                    row.iter()
-                        .map(|cell| match cell {
-                            Some(value) => json_string(value.clone()),
-                            None => Json::Null,
-                        })
-                        .collect(),
-                )
-            })
-            .collect(),
-    );
 
     let mut envelope = base_envelope(
         true,
@@ -256,46 +358,167 @@ fn write_success(
                 "rows_affected",
                 rows_affected.map_or(Json::Null, Json::Number),
             ),
-            ("columns", columns_json),
-            ("rows", rows_json),
+            ("columns", columns_json(rows)),
+            ("rows", rows_json(rows, returned)),
             ("result_row_count", Json::Number(rows.total_rows)),
             ("returned_rows", Json::Number(returned as i64)),
             ("partition_count", Json::Number(rows.partition_count as i64)),
             ("row_emit_cap", Json::Number(ROW_EMIT_CAP as i64)),
             ("truncated", Json::Bool(truncated)),
+            (
+                "sql_api_request_id",
+                json_string(rows.sql_api_request_id.clone()),
+            ),
         ]),
     );
-    envelope.data_source = "live";
-    envelope.profile_id = Some(profile);
-    envelope.statement_handle = Some(rows.statement_handle.clone());
-    envelope.query_id = Some(rows.statement_handle.clone());
-    envelope.budget_consumed = json_object(vec![
-        ("deadline_ms", Json::Number(0)),
-        ("polls", Json::Number(0)),
-        ("rows", Json::Number(rows.total_rows)),
-    ]);
+    stamp_live(&mut envelope, &profile, rows, receipt_hash);
     envelope.safe_next_commands = vec![
+        "franken-snowflake receipt show <receipt-hash> --json".to_string(),
         "franken-snowflake query run --profile <profile> --sql <select-to-verify> --json"
             .to_string(),
     ];
     if truncated {
-        envelope.warnings = vec![json_string(format!(
+        warnings.push(json_string(format!(
             "write result truncated to {ROW_EMIT_CAP} rows in this envelope; {} total rows were \
              returned",
             rows.total_rows
-        ))];
+        )));
     }
-
+    envelope.warnings = warnings;
     crate::Outcome {
         status: CoreExitCode::Success,
         body: Body::Envelope { envelope, format },
     }
 }
 
-/// Run a live `INFORMATION_SCHEMA.TABLES` scan for the given database/schema and
-/// return a `catalog scan` envelope. The caller (`parse_catalog`) guarantees both
-/// `database` and `schema` are present. Both are validated as plain SQL
-/// identifiers before interpolation so the discovery SQL cannot be injected.
+// ---------------------------------------------------------------------------
+// catalog scan / catalog graph
+// ---------------------------------------------------------------------------
+
+/// A live discovery scan: the snapshot, its store record, the two statements'
+/// row sets, and what happened to persistence.
+struct ScanResult {
+    input: CatalogDiscoveryInput,
+    snapshot: CatalogSnapshot,
+    record: CatalogSnapshotRecord,
+    tables: LiveRows,
+    columns: LiveRows,
+    store_dir: Option<String>,
+    warnings: Vec<Json>,
+}
+
+/// Run the catalog crate's bound INFORMATION_SCHEMA discovery statements
+/// (TABLES + COLUMNS) live, build the snapshot, and persist it to the local
+/// store. `schema = None` scans every schema in the database.
+fn scan_catalog(
+    conn: &LiveConn,
+    profile: &str,
+    database: &str,
+    schema: Option<&str>,
+    trace_id: &str,
+) -> Result<ScanResult, SnowflakeError> {
+    let now_ms = local_store::now_unix_ms();
+    let snapshot_id = format!(
+        "snap-{}",
+        &local_store::blake3_hex(&format!(
+            "{profile}|{database}|{}|{now_ms}",
+            schema.unwrap_or("*")
+        ))[..24]
+    );
+    let input = CatalogDiscoveryInput {
+        profile_id: profile.to_owned(),
+        profile_fingerprint: format!("profile:{}", &local_store::blake3_hex(profile)[..16]),
+        database: Some(database.to_owned()),
+        schema: schema.map(str::to_owned),
+        object: None,
+        snapshot_id,
+        discovered_at: local_store::rfc3339_utc(local_store::now_unix_seconds()),
+        data_source: DataSourceClass::Live,
+        command_id: "catalog.scan".to_owned(),
+        trace_id: trace_id.to_owned(),
+        redactions_applied: Vec::new(),
+    };
+    let requests = build_information_schema_requests(&input);
+    let mut tables = None;
+    let mut columns = None;
+    for discovery in requests {
+        match discovery.kind {
+            DiscoveryStatementKind::Tables | DiscoveryStatementKind::Columns => {}
+            DiscoveryStatementKind::Databases | DiscoveryStatementKind::Schemas => continue,
+        }
+        let mut request = discovery.request;
+        apply_session(conn, &mut request);
+        let (completed, stats, sql_api_request_id) = execute_request(conn, request)?;
+        let rows = into_rows(completed, stats, sql_api_request_id);
+        match discovery.kind {
+            DiscoveryStatementKind::Tables => tables = Some(rows),
+            DiscoveryStatementKind::Columns => columns = Some(rows),
+            DiscoveryStatementKind::Databases | DiscoveryStatementKind::Schemas => {}
+        }
+    }
+    let (Some(tables), Some(columns)) = (tables, columns) else {
+        return Err(SnowflakeError::new(
+            SnowflakeErrorCode::Internal,
+            "discovery did not produce both TABLES and COLUMNS statements",
+        ));
+    };
+    let discovery_tables = CatalogDiscoveryTables {
+        databases: None,
+        schemas: None,
+        tables: tables.completed_view(),
+        columns: columns.completed_view(),
+    };
+    let snapshot = build_snapshot_from_information_schema(&input, &discovery_tables);
+    let canonical = serde_json::to_string(&snapshot).map_err(|error| {
+        SnowflakeError::new(
+            SnowflakeErrorCode::Internal,
+            format!("snapshot serialization failed: {error}"),
+        )
+    })?;
+    let record = CatalogSnapshotRecord {
+        snapshot_id: input.snapshot_id.clone(),
+        profile_id: profile.to_owned(),
+        source_kind: "information_schema".to_owned(),
+        database_name: Some(database.to_owned()),
+        schema_name: schema.map(str::to_owned),
+        captured_at_ms: now_ms,
+        payload: VerifiedPayload {
+            address: CacheAddress::blake3(canonical.as_bytes()),
+            canonical,
+        },
+    };
+    let mut warnings = Vec::new();
+    let store_dir = match local_store::open_store() {
+        Ok(store) => match persist_snapshot(&store.cache, &input, &snapshot, now_ms) {
+            Ok(()) => Some(store.dir.display().to_string()),
+            Err(error) => {
+                warnings.push(json_string(format!(
+                    "snapshot was not persisted to the local store: {error}"
+                )));
+                None
+            }
+        },
+        Err(error) => {
+            warnings.push(json_string(format!(
+                "snapshot was not persisted: {}",
+                error.message()
+            )));
+            None
+        }
+    };
+    Ok(ScanResult {
+        input,
+        snapshot,
+        record,
+        tables,
+        columns,
+        store_dir,
+        warnings,
+    })
+}
+
+/// `catalog scan <profile> --database <db> --schema <schema>`: live discovery
+/// through the catalog crate, persisted locally, summarized in the envelope.
 pub fn run_catalog_scan_outcome(
     format: OutputFormat,
     request_id: String,
@@ -303,372 +526,630 @@ pub fn run_catalog_scan_outcome(
     database: String,
     schema: String,
 ) -> crate::Outcome {
-    if !is_safe_sql_identifier(&database) {
-        return failure_outcome(
+    let fail = |error: &SnowflakeError| {
+        failure_outcome(
             format,
             "catalog.scan",
             "fsnow.catalog.scan.v1",
-            request_id,
-            profile,
-            &SnowflakeError::new(
-                SnowflakeErrorCode::UsageError,
-                "--database must be a plain SQL identifier (letters, digits, _ or $)",
-            ),
-        );
+            request_id.clone(),
+            profile.clone(),
+            error,
+        )
+    };
+    if let Err(error) = validate_identifier("--database", &database) {
+        return fail(&error);
     }
-    if !is_safe_sql_identifier(&schema) {
-        return failure_outcome(
-            format,
-            "catalog.scan",
-            "fsnow.catalog.scan.v1",
-            request_id,
-            profile,
-            &SnowflakeError::new(
-                SnowflakeErrorCode::UsageError,
-                "--schema must be a plain SQL identifier (letters, digits, _ or $)",
-            ),
-        );
+    if let Err(error) = validate_identifier("--schema", &schema) {
+        return fail(&error);
     }
-
-    let sql = format!(
-        "SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, ROW_COUNT, BYTES \
-         FROM {database}.INFORMATION_SCHEMA.TABLES \
-         WHERE TABLE_SCHEMA = '{schema}' \
-         ORDER BY TABLE_SCHEMA, TABLE_NAME \
-         LIMIT {CATALOG_SCAN_LIMIT}"
+    let overrides = SessionOverrides {
+        database: Some(database.clone()),
+        schema: Some(schema.clone()),
+        ..SessionOverrides::default()
+    };
+    let conn = match LiveConn::resolve(&profile, &overrides) {
+        Ok(conn) => conn,
+        Err(error) => return fail(&error),
+    };
+    let scan = match scan_catalog(&conn, &profile, &database, Some(&schema), &request_id) {
+        Ok(scan) => scan,
+        Err(error) => return fail(&error),
+    };
+    let (receipt_hash, mut warnings) = record_receipt(
+        "catalog.scan",
+        &conn,
+        &request_id,
+        "INFORMATION_SCHEMA.TABLES + INFORMATION_SCHEMA.COLUMNS discovery",
+        &scan.tables,
+        "catalog_scanned",
+        serde_json::json!({
+            "snapshot_id": scan.input.snapshot_id,
+            "columns_statement_handle": scan.columns.statement_handle,
+            "dataset_count": scan.snapshot.datasets.len(),
+            "column_count": scan.snapshot.columns.len(),
+        }),
     );
-    match execute(
-        &profile,
-        &sql,
-        Some(&database),
-        Some(&schema),
-        QueryRequestOptions::default(),
-    ) {
-        Ok(rows) => rows_success(
-            format,
-            request_id,
-            profile,
-            "catalog.scan",
-            "fsnow.catalog.scan.v1",
-            vec![
-                ("database", json_string(database)),
-                ("schema", json_string(schema)),
-            ],
-            &rows,
-            vec![
-                "franken-snowflake catalog graph <profile> --database <db> --mermaid".to_string(),
-                "franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string(),
-            ],
+    warnings.extend(scan.warnings.iter().cloned());
+
+    let mut data = vec![
+        ("profile_id", json_string(profile.clone())),
+        ("database", json_string(database)),
+        ("schema", json_string(schema)),
+    ];
+    data.extend(catalog_surface::snapshot_summary_json(&scan.snapshot));
+    data.push((
+        "statements",
+        json_object(vec![
+            (
+                "tables",
+                json_object(vec![
+                    (
+                        "statement_handle",
+                        json_string(scan.tables.statement_handle.clone()),
+                    ),
+                    ("rows", Json::Number(scan.tables.total_rows)),
+                    ("polls", Json::Number(i64::from(scan.tables.stats.polls))),
+                ]),
+            ),
+            (
+                "columns",
+                json_object(vec![
+                    (
+                        "statement_handle",
+                        json_string(scan.columns.statement_handle.clone()),
+                    ),
+                    ("rows", Json::Number(scan.columns.total_rows)),
+                    ("polls", Json::Number(i64::from(scan.columns.stats.polls))),
+                ]),
+            ),
+        ]),
+    ));
+    data.push((
+        "store",
+        json_object(vec![
+            ("persisted", Json::Bool(scan.store_dir.is_some())),
+            ("data_dir", option_json(scan.store_dir.clone())),
+            ("snapshot_id", json_string(scan.input.snapshot_id.clone())),
+        ]),
+    ));
+    let mut envelope = base_envelope(
+        true,
+        "success",
+        "catalog.scan",
+        "fsnow.catalog.scan.v1",
+        request_id,
+        json_object(data),
+    );
+    stamp_live(&mut envelope, &profile, &scan.tables, receipt_hash);
+    envelope.budget_consumed = json_object(vec![
+        ("deadline_ms", Json::Number(0)),
+        (
+            "polls",
+            Json::Number(i64::from(scan.tables.stats.polls) + i64::from(scan.columns.stats.polls)),
         ),
-        Err(error) => failure_outcome(
-            format,
-            "catalog.scan",
-            "fsnow.catalog.scan.v1",
-            request_id,
-            profile,
-            &error,
+        (
+            "rows",
+            Json::Number(
+                scan.tables
+                    .total_rows
+                    .saturating_add(scan.columns.total_rows),
+            ),
         ),
+    ]);
+    envelope.warnings = warnings;
+    envelope.safe_next_commands = vec![
+        "franken-snowflake dataset inspect <dataset-id> --json".to_string(),
+        format!("franken-snowflake catalog graph {profile} --database <db> --mermaid"),
+        "franken-snowflake dataset profile <dataset-id> --json".to_string(),
+    ];
+    crate::Outcome {
+        status: CoreExitCode::Success,
+        body: Body::Envelope { envelope, format },
     }
 }
 
-/// Live build: render the catalog lineage graph (profile -> database -> schema ->
-/// object) from a real `INFORMATION_SCHEMA.TABLES` scan. Mirrors `catalog scan`'s
-/// scoping and safety: requires `--database`, validates identifiers, never
-/// substitutes fixture data. Mermaid/SVG return raw text; JSON/TOON carry
-/// nodes + edges + the Mermaid rendering in a `data_source: live` envelope.
+/// `catalog graph` in the live build: render from the local snapshot when one
+/// exists (and `--refresh` was not passed); otherwise scan live, persist, and
+/// render that.
+#[allow(clippy::too_many_arguments)]
 pub fn run_catalog_graph_outcome(
     format: OutputFormat,
     request_id: String,
     profile: String,
     database: Option<String>,
     schema: Option<String>,
-    graph_output: crate::GraphOutput,
+    graph_output: GraphOutput,
+    refresh: bool,
 ) -> crate::Outcome {
+    let fail = |error: &SnowflakeError| {
+        failure_outcome(
+            format,
+            "catalog.graph",
+            "fsnow.catalog.graph.v1",
+            request_id.clone(),
+            profile.clone(),
+            error,
+        )
+    };
+    if !refresh {
+        let cached = local_store::open_store().ok().and_then(|store| {
+            store
+                .cache
+                .latest_catalog_snapshot(&profile, database.as_deref(), schema.as_deref())
+                .ok()
+                .flatten()
+        });
+        if let Some(record) = cached
+            && let Ok(snapshot) = serde_json::from_str::<CatalogSnapshot>(&record.payload.canonical)
+        {
+            return catalog_surface::render_graph_outcome(
+                format,
+                request_id,
+                profile,
+                database,
+                schema,
+                &snapshot,
+                &record,
+                "local_store",
+                DATA_SOURCE_CACHE,
+                graph_output,
+            );
+        }
+    }
     let Some(database) = database else {
-        return failure_outcome(
-            format,
-            "catalog.graph",
-            "fsnow.catalog.graph.v1",
-            request_id,
-            profile,
-            &SnowflakeError::new(
-                SnowflakeErrorCode::UsageError,
-                "catalog graph requires --database (and optionally --schema) to scope the live scan",
-            ),
-        );
+        return fail(&SnowflakeError::new(
+            SnowflakeErrorCode::UsageError,
+            "catalog graph needs --database (and optionally --schema) to scope the live scan; nothing is cached for this profile yet",
+        ));
     };
-    if !is_safe_sql_identifier(&database) {
-        return failure_outcome(
-            format,
-            "catalog.graph",
-            "fsnow.catalog.graph.v1",
-            request_id,
-            profile,
-            &SnowflakeError::new(
-                SnowflakeErrorCode::UsageError,
-                "--database must be a plain SQL identifier (letters, digits, _ or $)",
-            ),
-        );
+    if let Err(error) = validate_identifier("--database", &database) {
+        return fail(&error);
     }
-    if let Some(schema_name) = &schema {
-        if !is_safe_sql_identifier(schema_name) {
-            return failure_outcome(
-                format,
-                "catalog.graph",
-                "fsnow.catalog.graph.v1",
-                request_id,
-                profile,
-                &SnowflakeError::new(
-                    SnowflakeErrorCode::UsageError,
-                    "--schema must be a plain SQL identifier (letters, digits, _ or $)",
-                ),
-            );
-        }
+    if let Some(schema_name) = &schema
+        && let Err(error) = validate_identifier("--schema", schema_name)
+    {
+        return fail(&error);
     }
-
-    let where_clause = match &schema {
-        Some(schema_name) => format!("WHERE TABLE_SCHEMA = '{schema_name}' "),
-        None => String::new(),
+    let overrides = SessionOverrides {
+        database: Some(database.clone()),
+        schema: schema.clone(),
+        ..SessionOverrides::default()
     };
-    let sql = format!(
-        "SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE \
-         FROM {database}.INFORMATION_SCHEMA.TABLES \
-         {where_clause}\
-         ORDER BY TABLE_SCHEMA, TABLE_NAME \
-         LIMIT {CATALOG_SCAN_LIMIT}"
+    let conn = match LiveConn::resolve(&profile, &overrides) {
+        Ok(conn) => conn,
+        Err(error) => return fail(&error),
+    };
+    let scan = match scan_catalog(&conn, &profile, &database, schema.as_deref(), &request_id) {
+        Ok(scan) => scan,
+        Err(error) => return fail(&error),
+    };
+    let _ = record_receipt(
+        "catalog.graph",
+        &conn,
+        &request_id,
+        "INFORMATION_SCHEMA.TABLES + INFORMATION_SCHEMA.COLUMNS discovery",
+        &scan.tables,
+        "catalog_scanned",
+        serde_json::json!({ "snapshot_id": scan.input.snapshot_id }),
     );
-    let rows = match execute(
-        &profile,
-        &sql,
-        Some(&database),
-        schema.as_deref(),
-        QueryRequestOptions::default(),
-    ) {
+    let mut outcome = catalog_surface::render_graph_outcome(
+        format,
+        request_id,
+        profile.clone(),
+        Some(database),
+        schema,
+        &scan.snapshot,
+        &scan.record,
+        "live_scan",
+        "live",
+        graph_output,
+    );
+    if let Body::Envelope { envelope, .. } = &mut outcome.body {
+        envelope.statement_handle = Some(scan.tables.statement_handle.clone());
+        envelope.query_id = Some(scan.tables.statement_handle.clone());
+        envelope.warnings.extend(scan.warnings);
+    }
+    outcome
+}
+
+// ---------------------------------------------------------------------------
+// query cancel
+// ---------------------------------------------------------------------------
+
+/// `query cancel <handle> --profile <profile>`: POST to the SQL API cancel
+/// endpoint with the profile's credentials.
+pub fn run_query_cancel_outcome(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    statement_handle: String,
+) -> crate::Outcome {
+    let fail = |error: &SnowflakeError| {
+        failure_outcome(
+            format,
+            "query.cancel",
+            "fsnow.query.cancel.v1",
+            request_id.clone(),
+            profile.clone(),
+            error,
+        )
+    };
+    if statement_handle.is_empty()
+        || statement_handle.len() > 128
+        || !statement_handle
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        return fail(&SnowflakeError::new(
+            SnowflakeErrorCode::UsageError,
+            "statement handle must be 1-128 ASCII letters, digits, or dashes",
+        ));
+    }
+    let conn = match LiveConn::resolve(&profile, &SessionOverrides::default()) {
+        Ok(conn) => conn,
+        Err(error) => return fail(&error),
+    };
+    let handle = StatementHandle::new(statement_handle.clone());
+    let response = match with_runtime(&conn, |cx, client, auth| {
+        Box::pin(async move {
+            match client
+                .cancel_statement(
+                    cx,
+                    CancelHttpRequest {
+                        auth,
+                        statement_handle: handle,
+                        reason_kind: CancelKind::User,
+                    },
+                )
+                .await
+            {
+                Outcome::Ok(response) => Ok(response),
+                Outcome::Err(error) => Err(error),
+                Outcome::Cancelled(reason) => Err(SnowflakeError::new(
+                    SnowflakeErrorCode::Internal,
+                    format!("cancel request was cancelled locally: {:?}", reason.kind),
+                )),
+                Outcome::Panicked(_) => Err(SnowflakeError::new(
+                    SnowflakeErrorCode::Internal,
+                    "cancel task panicked",
+                )),
+            }
+        })
+    }) {
+        Ok(response) => response,
+        Err(error) => return fail(&error),
+    };
+    let status_label = status_class_label(response.status);
+    let preview = redact(&String::from_utf8_lossy(
+        &response.body[..response.body.len().min(CANCEL_BODY_PREVIEW_BYTES)],
+    ))
+    .into_owned();
+    let acknowledged = matches!(response.status, StatusClass::Completed);
+    let audit = local_store::open_store().ok().and_then(|store| {
+        local_store::append_audit(
+            &store,
+            "query.cancel",
+            &request_id,
+            "statement_cancel_requested",
+            &serde_json::json!({
+                "profile_id": profile,
+                "statement_handle": statement_handle,
+                "cancel_status": status_label,
+                "acknowledged": acknowledged,
+            }),
+            None,
+        )
+        .ok()
+    });
+    let mut envelope = base_envelope(
+        acknowledged,
+        if acknowledged { "success" } else { "error" },
+        "query.cancel",
+        "fsnow.query.cancel.v1",
+        request_id,
+        json_object(vec![
+            ("profile_id", json_string(profile.clone())),
+            ("statement_handle", json_string(statement_handle.clone())),
+            ("cancel_status", json_string(status_label)),
+            ("acknowledged", Json::Bool(acknowledged)),
+            ("response_preview", json_string(preview.clone())),
+            ("audit_event_id", option_json(audit)),
+        ]),
+    );
+    envelope.data_source = "live";
+    envelope.profile_id = Some(profile);
+    envelope.statement_handle = Some(statement_handle);
+    if !acknowledged {
+        envelope.error = Some(error_info(
+            SnowflakeErrorCode::UpstreamError,
+            format!("cancel endpoint returned {status_label}: {preview}"),
+            vec![json_string("live SQL API transport")],
+        ));
+        envelope.repair_commands =
+            vec!["franken-snowflake profile doctor <profile> --online --json".to_string()];
+    }
+    envelope.safe_next_commands =
+        vec!["franken-snowflake receipt show <receipt-hash> --json".to_string()];
+    crate::Outcome {
+        status: if acknowledged {
+            CoreExitCode::Success
+        } else {
+            SnowflakeErrorCode::UpstreamError.exit_code()
+        },
+        body: Body::Envelope { envelope, format },
+    }
+}
+
+fn status_class_label(status: StatusClass) -> &'static str {
+    match status {
+        StatusClass::Completed => "completed",
+        StatusClass::Running => "running",
+        StatusClass::StatementTimeout => "statement_timeout",
+        StatusClass::QueryFailure => "query_failure",
+        StatusClass::RateLimited => "rate_limited",
+        StatusClass::ServerErrorRetryable => "server_error",
+        StatusClass::Unexpected => "unexpected",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dataset profile --execute
+// ---------------------------------------------------------------------------
+
+/// `dataset profile <id> --execute`: run the pushdown profiling statement live
+/// and return per-column statistics.
+pub fn dataset_profile_execute_outcome(
+    format: OutputFormat,
+    request_id: String,
+    dataset_id: String,
+) -> crate::Outcome {
+    let plan = match catalog_surface::resolve_profile_plan(format, &request_id, &dataset_id) {
+        Ok(plan) => plan,
+        Err(outcome) => return outcome,
+    };
+    let fail = |error: &SnowflakeError| {
+        failure_outcome(
+            format,
+            "dataset.profile",
+            "fsnow.dataset.profile.v1",
+            request_id.clone(),
+            plan.profile.clone(),
+            error,
+        )
+    };
+    let overrides = SessionOverrides {
+        database: Some(plan.database.clone()),
+        schema: Some(plan.schema.clone()),
+        statement_timeout: Some(plan.statement_timeout_seconds),
+        ..SessionOverrides::default()
+    };
+    let conn = match LiveConn::resolve(&plan.profile, &overrides) {
+        Ok(conn) => conn,
+        Err(error) => return fail(&error),
+    };
+    let rows = match execute(&conn, &plan.sql, QueryRequestOptions::default()) {
         Ok(rows) => rows,
-        Err(error) => {
-            return failure_outcome(
-                format,
-                "catalog.graph",
-                "fsnow.catalog.graph.v1",
-                request_id,
-                profile,
-                &error,
-            );
+        Err(error) => return fail(&error),
+    };
+    let (receipt_hash, warnings) = record_receipt(
+        "dataset.profile",
+        &conn,
+        &request_id,
+        &plan.sql,
+        &rows,
+        "dataset_profiled",
+        serde_json::json!({ "dataset_id": plan.dataset_id }),
+    );
+    let stats: Vec<(String, Json)> = rows
+        .rows
+        .first()
+        .map(|row| {
+            rows.columns
+                .iter()
+                .zip(row.iter())
+                .map(|(column, cell)| {
+                    (
+                        column.name.clone(),
+                        cell.clone().map_or(Json::Null, json_string),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut data = catalog_surface::profile_plan_json(&plan, true);
+    data.push(("stats", json_object_owned(stats)));
+    let mut envelope = base_envelope(
+        true,
+        "success",
+        "dataset.profile",
+        "fsnow.dataset.profile.v1",
+        request_id,
+        json_object(data),
+    );
+    stamp_live(&mut envelope, &plan.profile, &rows, receipt_hash);
+    envelope.warnings = warnings;
+    envelope.safe_next_commands = vec![
+        format!("franken-snowflake dataset inspect {dataset_id} --json"),
+        "franken-snowflake receipt show <receipt-hash> --json".to_string(),
+    ];
+    crate::Outcome {
+        status: CoreExitCode::Success,
+        body: Body::Envelope { envelope, format },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// export run (local CSV/JSONL from a live result)
+// ---------------------------------------------------------------------------
+
+/// `export run --profile P --sql <select> --format csv|jsonl --out <path>`: run
+/// the read live and write a content-addressed local artifact through the export
+/// crate's streaming writers; record the export against the query receipt.
+pub fn export_run_outcome(
+    format: OutputFormat,
+    request_id: String,
+    spec: ExportPlanSpec,
+    out: Option<String>,
+) -> crate::Outcome {
+    let profile = spec.profile.clone().unwrap_or_default();
+    let fail = |error: &SnowflakeError| {
+        failure_outcome(
+            format,
+            "export.run",
+            "fsnow.export.run.v1",
+            request_id.clone(),
+            profile.clone(),
+            error,
+        )
+    };
+    let usage = |message: &str| SnowflakeError::new(SnowflakeErrorCode::UsageError, message);
+    if profile.is_empty() {
+        return fail(&usage(
+            "Missing --profile for `export run`. Pass --profile <profile> or set FRANKEN_SNOWFLAKE_DEFAULT_PROFILE.",
+        ));
+    }
+    let Some(out_path) = out else {
+        return fail(&usage("Missing --out <path> for `export run`."));
+    };
+    let sql = match (spec.sql.clone(), spec.query_id.clone()) {
+        (Some(sql), None) => sql,
+        (None, Some(query_id)) => match (CopySource::ResultScan { query_id }).to_sql() {
+            Ok(sql) => sql,
+            Err(error) => return fail(&usage(&format!("export run refused: {error}"))),
+        },
+        (None, None) => return fail(&usage("Provide --sql <select> or --query-id <id>.")),
+        (Some(_), Some(_)) => return fail(&usage("Choose either --sql or --query-id, not both.")),
+    };
+    if !crate::is_select_like(&sql) || crate::has_multiple_statements(&sql) {
+        return fail(&SnowflakeError::new(
+            SnowflakeErrorCode::MutationRefused,
+            "export run only exports a single read statement (SELECT/WITH/SHOW/DESCRIBE/EXPLAIN)",
+        ));
+    }
+    let export_format = match spec
+        .format
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("csv") => "csv",
+        Some("jsonl") | Some("json") => "jsonl",
+        Some(other) => {
+            return fail(&usage(&format!(
+                "Unknown --format `{other}`; use csv or jsonl."
+            )));
         }
     };
-
-    let graph = CatalogHierarchy::from_rows(&profile, &rows);
-
-    match graph_output {
-        crate::GraphOutput::Mermaid => crate::Outcome {
-            status: CoreExitCode::Success,
-            body: Body::Raw {
-                data: graph.to_mermaid(),
-            },
-        },
-        crate::GraphOutput::Svg => crate::Outcome {
-            status: CoreExitCode::Success,
-            body: Body::Raw {
-                data: graph.to_svg(),
-            },
-        },
-        crate::GraphOutput::Json | crate::GraphOutput::Toon => {
-            let out_format = if matches!(graph_output, crate::GraphOutput::Toon) {
-                OutputFormat::Toon
-            } else {
-                format
-            };
-            let mut envelope = base_envelope(
-                true,
-                "success",
-                "catalog.graph",
-                "fsnow.catalog.graph.v1",
-                request_id,
-                json_object(vec![
-                    ("profile_id", json_string(profile.clone())),
-                    ("database", json_string(database)),
-                    ("schema", schema.map_or(Json::Null, json_string)),
-                    ("nodes", graph.nodes_json()),
-                    ("edges", graph.edges_json()),
-                    ("node_count", Json::Number(graph.nodes.len() as i64)),
-                    ("edge_count", Json::Number(graph.edges.len() as i64)),
-                    ("mermaid", json_string(graph.to_mermaid())),
-                ]),
-            );
-            envelope.data_source = "live";
-            envelope.profile_id = Some(profile);
-            envelope.safe_next_commands = vec![
-                "franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json"
-                    .to_string(),
-            ];
-            crate::Outcome {
-                status: CoreExitCode::Success,
-                body: Body::Envelope {
-                    envelope,
-                    format: out_format,
-                },
-            }
-        }
-    }
-}
-
-/// A deterministic profile -> database -> schema -> object containment graph built
-/// directly from `INFORMATION_SCHEMA.TABLES` rows. Index-based node ids keep the
-/// Mermaid/SVG output collision-free and safe regardless of object names.
-#[derive(Default)]
-struct CatalogHierarchy {
-    ids: BTreeMap<String, usize>,
-    /// `(kind, label)` indexed by node id.
-    nodes: Vec<(&'static str, String)>,
-    edge_set: std::collections::BTreeSet<(usize, usize)>,
-    edges: Vec<(usize, usize)>,
-}
-
-impl CatalogHierarchy {
-    fn from_rows(profile: &str, rows: &LiveRows) -> Self {
-        let mut h = Self::default();
-        let profile_node = h.ensure(
-            format!("P|{profile}"),
-            "profile",
-            format!("profile: {profile}"),
-        );
-        for row in &rows.rows {
-            let cell = |i: usize| row.get(i).and_then(Clone::clone).unwrap_or_default();
-            let database = cell(0);
-            let schema = cell(1);
-            let table = cell(2);
-            if database.is_empty() || schema.is_empty() || table.is_empty() {
-                continue;
-            }
-            let db = h.ensure(format!("D|{database}"), "database", database.clone());
-            let sc = h.ensure(format!("S|{database}.{schema}"), "schema", schema.clone());
-            let ob = h.ensure(
-                format!("O|{database}.{schema}.{table}"),
-                "object",
-                table.clone(),
-            );
-            h.edge(profile_node, db);
-            h.edge(db, sc);
-            h.edge(sc, ob);
-        }
-        h
-    }
-
-    fn ensure(&mut self, key: String, kind: &'static str, label: String) -> usize {
-        if let Some(&idx) = self.ids.get(&key) {
-            return idx;
-        }
-        let idx = self.nodes.len();
-        self.ids.insert(key, idx);
-        self.nodes.push((kind, label));
-        idx
-    }
-
-    fn edge(&mut self, source: usize, target: usize) {
-        if self.edge_set.insert((source, target)) {
-            self.edges.push((source, target));
-        }
-    }
-
-    fn to_mermaid(&self) -> String {
-        let mut out = String::from("graph TD\n");
-        if self.nodes.is_empty() {
-            out.push_str("  EMPTY[\"no objects found for this scope\"]\n");
-            return out;
-        }
-        for (idx, (_kind, label)) in self.nodes.iter().enumerate() {
-            out.push_str(&format!("  n{idx}[\"{}\"]\n", escape_mermaid_label(label)));
-        }
-        for (source, target) in &self.edges {
-            out.push_str(&format!("  n{source} --> n{target}\n"));
-        }
-        out
-    }
-
-    fn to_svg(&self) -> String {
-        let line_height = 18;
-        let height = (self.nodes.len().max(1) * line_height) + 20;
-        let mut out = format!(
-            "<svg xmlns=\"http://www.w3.org/2000/svg\" role=\"img\" aria-label=\"catalog graph\" \
-             width=\"480\" height=\"{height}\">\n"
-        );
-        for (idx, (kind, label)) in self.nodes.iter().enumerate() {
-            let y = 20 + idx * line_height;
-            out.push_str(&format!(
-                "  <text x=\"10\" y=\"{y}\">{}: {}</text>\n",
-                escape_xml(kind),
-                escape_xml(label)
+    let conn = match LiveConn::resolve(&profile, &SessionOverrides::default()) {
+        Ok(conn) => conn,
+        Err(error) => return fail(&error),
+    };
+    let rows = match execute(&conn, &sql, QueryRequestOptions::default()) {
+        Ok(rows) => rows,
+        Err(error) => return fail(&error),
+    };
+    let input = LocalExportInput::new(
+        rows.columns
+            .iter()
+            .map(|column| {
+                ExportColumn::new(column.name.clone(), column.type_name.clone())
+                    .nullable(column.nullable)
+            })
+            .collect(),
+        vec![ResultPartition::new(0, rows.rows.clone())],
+    );
+    let created_at_ms = local_store::now_unix_ms();
+    let target_label = redact(&out_path).into_owned();
+    let artifact = match export_format {
+        "csv" => export_csv(&input, target_label.clone(), created_at_ms),
+        _ => export_jsonl(&input, target_label.clone(), created_at_ms),
+    };
+    let artifact = match artifact {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            return fail(&SnowflakeError::new(
+                SnowflakeErrorCode::UsageError,
+                format!("local export failed: {error}"),
             ));
         }
-        out.push_str("</svg>\n");
-        out
+    };
+    if let Err(error) = std::fs::write(&out_path, &artifact.bytes) {
+        return fail(&SnowflakeError::new(
+            SnowflakeErrorCode::Internal,
+            format!("could not write {target_label}: {error}"),
+        ));
     }
-
-    fn nodes_json(&self) -> Json {
-        json_array(
-            self.nodes
-                .iter()
-                .enumerate()
-                .map(|(idx, (kind, label))| {
-                    json_object(vec![
-                        ("id", json_string(format!("n{idx}"))),
-                        ("kind", json_string(*kind)),
-                        ("label", json_string(label.clone())),
-                    ])
-                })
-                .collect(),
-        )
-    }
-
-    fn edges_json(&self) -> Json {
-        json_array(
-            self.edges
-                .iter()
-                .map(|(source, target)| {
-                    json_object(vec![
-                        ("source", json_string(format!("n{source}"))),
-                        ("target", json_string(format!("n{target}"))),
-                        ("kind", json_string("contains")),
-                    ])
-                })
-                .collect(),
-        )
-    }
-}
-
-/// HTML-entity-encode a Mermaid node label so an object name can never inject
-/// graph structure. The label sits inside `id["..."]`; encoding `"`/`<`/`>`/`&`
-/// and flattening newlines makes structural breakout impossible (`]` and `\` are
-/// literal inside the quoted span, so they need no escaping).
-fn escape_mermaid_label(label: &str) -> String {
-    let mut out = String::with_capacity(label.len());
-    for ch in label.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '"' => out.push_str("&quot;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '\n' | '\r' => out.push(' '),
-            other => out.push(other),
+    let (receipt_hash, mut warnings) = record_receipt(
+        "export.run",
+        &conn,
+        &request_id,
+        &sql,
+        &rows,
+        "export_written",
+        serde_json::json!({
+            "format": export_format,
+            "export_id": artifact.receipt.export_id,
+            "content_hash": artifact.receipt.content_address.digest_hex,
+            "byte_len": artifact.receipt.content_address.byte_len,
+        }),
+    );
+    if let (Some(receipt_id), Ok(store)) = (receipt_hash.as_ref(), local_store::open_store()) {
+        let record = ExportRecord {
+            export_id: artifact.receipt.export_id.clone(),
+            receipt_id: receipt_id.clone(),
+            export_kind: if export_format == "csv" {
+                ExportKind::LocalCsv
+            } else {
+                ExportKind::LocalJsonl
+            },
+            target_uri_redacted: target_label.clone(),
+            content_address: CacheAddress {
+                algorithm: artifact.receipt.content_address.algorithm.clone(),
+                digest_hex: artifact.receipt.content_address.digest_hex.clone(),
+                byte_len: artifact.receipt.content_address.byte_len,
+            },
+            row_count: artifact.receipt.row_count,
+            created_at_ms,
+        };
+        if let Err(error) = store.cache.append_export(record) {
+            warnings.push(json_string(format!("export record not persisted: {error}")));
         }
     }
-    out
+    let mut envelope = base_envelope(
+        true,
+        "success",
+        "export.run",
+        "fsnow.export.run.v1",
+        request_id,
+        json_object(vec![
+            ("profile_id", json_string(profile.clone())),
+            ("format", json_string(export_format)),
+            ("out", json_string(target_label)),
+            (
+                "bytes_written",
+                Json::Number(i64::try_from(artifact.bytes.len()).unwrap_or(i64::MAX)),
+            ),
+            ("row_count", Json::Number(rows.total_rows)),
+            ("export_receipt", Json::from_value(&artifact.receipt)),
+            (
+                "export_log_line",
+                json_string(artifact.log_line.trim_end().to_string()),
+            ),
+        ]),
+    );
+    stamp_live(&mut envelope, &profile, &rows, receipt_hash);
+    envelope.warnings = warnings;
+    envelope.safe_next_commands =
+        vec!["franken-snowflake receipt show <receipt-hash> --json".to_string()];
+    crate::Outcome {
+        status: CoreExitCode::Success,
+        body: Body::Envelope { envelope, format },
+    }
 }
 
-fn escape_xml(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            other => out.push(other),
-        }
-    }
-    out
-}
+// ---------------------------------------------------------------------------
+// profile doctor --online
+// ---------------------------------------------------------------------------
 
 /// Attempt a real credential/connectivity probe for `profile doctor --online`:
 /// run a minimal `SELECT CURRENT_VERSION()` and report whether it succeeded,
@@ -680,20 +1161,44 @@ pub fn profile_doctor_online_outcome(
     profile: String,
 ) -> crate::Outcome {
     const PROBE_SQL: &str = "SELECT CURRENT_VERSION() AS SNOWFLAKE_VERSION";
-    match execute(
-        &profile,
-        PROBE_SQL,
-        None,
-        None,
-        QueryRequestOptions::default(),
-    ) {
+    let conn = match LiveConn::resolve(&profile, &SessionOverrides::default()) {
+        Ok(conn) => conn,
+        Err(error) => {
+            return failure_outcome(
+                format,
+                "profile.doctor",
+                "fsnow.profile.doctor.v1",
+                request_id,
+                profile,
+                &error,
+            );
+        }
+    };
+    match execute(&conn, PROBE_SQL, QueryRequestOptions::default()) {
         Ok(rows) => {
             let version = rows
                 .rows
                 .first()
                 .and_then(|row| row.first())
                 .and_then(Clone::clone);
-            probe_success(format, request_id, profile, version)
+            let (receipt_hash, warnings) = record_receipt(
+                "profile.doctor",
+                &conn,
+                &request_id,
+                PROBE_SQL,
+                &rows,
+                "profile_probed",
+                serde_json::json!({ "snowflake_version": version }),
+            );
+            probe_success(
+                format,
+                request_id,
+                profile,
+                version,
+                &rows,
+                receipt_hash,
+                warnings,
+            )
         }
         Err(error) => failure_outcome(
             format,
@@ -711,6 +1216,9 @@ fn probe_success(
     request_id: String,
     profile: String,
     version: Option<String>,
+    rows: &LiveRows,
+    receipt_hash: Option<String>,
+    warnings: Vec<Json>,
 ) -> crate::Outcome {
     let data = json_object(vec![
         ("profile_id", json_string(profile.clone())),
@@ -738,8 +1246,8 @@ fn probe_success(
         request_id,
         data,
     );
-    envelope.data_source = "live";
-    envelope.profile_id = Some(profile);
+    stamp_live(&mut envelope, &profile, rows, receipt_hash);
+    envelope.warnings = warnings;
     envelope.safe_next_commands = vec![
         "franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json"
             .to_string(),
@@ -751,15 +1259,188 @@ fn probe_success(
     }
 }
 
-/// Resolve credentials, drive the statement to completion, and assemble rows.
-fn execute(
-    profile: &str,
-    sql: &str,
+// ---------------------------------------------------------------------------
+// Shared: connection resolution, execution, receipts, envelopes
+// ---------------------------------------------------------------------------
+
+/// A profile's resolved live connection inputs (no secret values; the PAT/key is
+/// referenced only through a `SecretSource` resolved at request time).
+struct LiveConn {
+    profile: String,
+    account: String,
+    user: String,
+    warehouse: String,
+    database: Option<String>,
+    schema: Option<String>,
+    role: Option<String>,
+    statement_timeout_seconds: u32,
+    endpoint: SnowflakeEndpoint,
+    auth_profile: AuthProfile,
+    max_polls: u32,
+}
+
+impl LiveConn {
+    fn resolve(profile: &str, overrides: &SessionOverrides) -> Result<Self, SnowflakeError> {
+        if !crate::is_valid_profile_id(profile) {
+            return Err(SnowflakeError::new(
+                SnowflakeErrorCode::ProfileInvalid,
+                "profile id must be 1-128 ASCII letters, digits, dot, dash, or underscore",
+            ));
+        }
+        let prefix = crate::profile_env_prefix(profile);
+
+        let account = env_value(&name(&prefix, "ACCOUNT"));
+        let user = env_value(&name(&prefix, "USER"));
+        let auth_lane = env_value(&name(&prefix, "AUTH"));
+        let warehouse = overrides
+            .warehouse
+            .clone()
+            .or_else(|| env_value(&name(&prefix, "WAREHOUSE")));
+
+        let mut missing = Vec::new();
+        if account.is_none() {
+            missing.push(name(&prefix, "ACCOUNT"));
+        }
+        if user.is_none() {
+            missing.push(name(&prefix, "USER"));
+        }
+        if auth_lane.is_none() {
+            missing.push(name(&prefix, "AUTH"));
+        }
+        if warehouse.is_none() {
+            missing.push(name(&prefix, "WAREHOUSE"));
+        }
+
+        let lane = auth_lane.clone().unwrap_or_default();
+        let secret_env = secret_env_for_lane(&prefix, &lane);
+        if let Some(secret_env) = &secret_env
+            && env_value(secret_env).is_none()
+        {
+            missing.push(secret_env.clone());
+        }
+        if !missing.is_empty() {
+            return Err(SnowflakeError::new(
+                SnowflakeErrorCode::CredentialMissing,
+                format!(
+                    "missing required env handles for profile credentials: {}",
+                    missing.join(", ")
+                ),
+            ));
+        }
+        if secret_env.is_none() {
+            return Err(SnowflakeError::new(
+                SnowflakeErrorCode::ProfileInvalid,
+                format!("auth lane must be one of pat, oauth_bearer, or key_pair_jwt (got {lane})"),
+            ));
+        }
+
+        let account = account.unwrap_or_default();
+        let endpoint = SnowflakeEndpoint::parse(endpoint_url(&account)).map_err(|error| {
+            SnowflakeError::new(SnowflakeErrorCode::ProfileInvalid, error.message)
+        })?;
+        let auth_profile = build_auth_profile(&prefix, &lane)?;
+        let statement_timeout_seconds = overrides
+            .statement_timeout
+            .or_else(|| env_u32(&name(&prefix, "STATEMENT_TIMEOUT_SECONDS")))
+            .unwrap_or(DEFAULT_STATEMENT_TIMEOUT_SECONDS)
+            .clamp(1, MAX_STATEMENT_TIMEOUT_SECONDS);
+
+        Ok(Self {
+            profile: profile.to_owned(),
+            account,
+            user: user.unwrap_or_default(),
+            warehouse: warehouse.unwrap_or_default(),
+            database: overrides
+                .database
+                .clone()
+                .or_else(|| env_value(&name(&prefix, "DATABASE"))),
+            schema: overrides
+                .schema
+                .clone()
+                .or_else(|| env_value(&name(&prefix, "SCHEMA"))),
+            role: overrides
+                .role
+                .clone()
+                .or_else(|| env_value(&name(&prefix, "ROLE"))),
+            statement_timeout_seconds,
+            endpoint,
+            auth_profile,
+            max_polls: env_u32(&name(&prefix, "MAX_POLLS")).unwrap_or(DEFAULT_MAX_POLLS),
+        })
+    }
+}
+
+/// Validate the `--limit`/`--role`/`--warehouse`/`--statement-timeout` flags a
+/// run passed; a bad value is a usage error, never silently ignored.
+fn session_overrides(
+    options: &QueryRunOptions,
     database: Option<&str>,
     schema: Option<&str>,
-    options: QueryRequestOptions,
-) -> Result<LiveRows, SnowflakeError> {
-    let conn = LiveConn::resolve(profile, database, schema)?;
+) -> Result<SessionOverrides, SnowflakeError> {
+    if let Some(role) = &options.role {
+        validate_identifier("--role", role)?;
+    }
+    if let Some(warehouse) = &options.warehouse {
+        validate_identifier("--warehouse", warehouse)?;
+    }
+    let statement_timeout = match options.statement_timeout.as_deref() {
+        None => None,
+        Some(raw) => match raw.parse::<u32>() {
+            Ok(value) if (1..=MAX_STATEMENT_TIMEOUT_SECONDS).contains(&value) => Some(value),
+            _ => {
+                return Err(SnowflakeError::new(
+                    SnowflakeErrorCode::UsageError,
+                    format!(
+                        "--statement-timeout must be 1..={MAX_STATEMENT_TIMEOUT_SECONDS} seconds (got `{raw}`)"
+                    ),
+                ));
+            }
+        },
+    };
+    Ok(SessionOverrides {
+        database: database.map(str::to_owned),
+        schema: schema.map(str::to_owned),
+        role: options.role.clone(),
+        warehouse: options.warehouse.clone(),
+        statement_timeout,
+    })
+}
+
+fn parse_limit(raw: Option<&str>) -> Result<usize, SnowflakeError> {
+    match raw {
+        None => Ok(ROW_EMIT_CAP),
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(value) if (1..=MAX_ROW_EMIT_CAP).contains(&value) => Ok(value),
+            _ => Err(SnowflakeError::new(
+                SnowflakeErrorCode::UsageError,
+                format!("--limit must be 1..={MAX_ROW_EMIT_CAP} rows (got `{raw}`)"),
+            )),
+        },
+    }
+}
+
+fn validate_identifier(flag: &str, value: &str) -> Result<(), SnowflakeError> {
+    if is_safe_sql_identifier(value) {
+        Ok(())
+    } else {
+        Err(SnowflakeError::new(
+            SnowflakeErrorCode::UsageError,
+            format!("{flag} must be a plain SQL identifier (letters, digits, _ or $)"),
+        ))
+    }
+}
+
+/// Run `body` inside a fresh Asupersync runtime with the resolved client + auth.
+fn with_runtime<T, F>(conn: &LiveConn, body: F) -> Result<T, SnowflakeError>
+where
+    F: for<'a> FnOnce(
+        &'a Cx,
+        &'a SnowflakeHttpClient,
+        AuthorizationDescriptor,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<T, SnowflakeError>> + 'a>,
+    >,
+{
     let runtime = RuntimeBuilder::current_thread().build().map_err(|error| {
         SnowflakeError::new(
             SnowflakeErrorCode::Internal,
@@ -784,132 +1465,154 @@ fn execute(
                 SnowflakeError::new(SnowflakeErrorCode::CredentialMissing, error.to_string())
             })?;
         let auth = authorization_descriptor(&mut mechanism)?;
-        let request = build_request(&conn, sql, options);
-        let params = SubmitQueryParams {
-            request_id: Some(unique_request_id()),
-            retry: true,
-            asynchronous: false,
-            nullable: None,
-        };
-        match run_statement(
-            &cx,
-            &client,
-            auth,
-            request,
-            params,
-            PollPlan::with_max_polls(conn.max_polls),
-        )
-        .await
-        {
-            Outcome::Ok(done) => Ok(into_rows(done)),
-            Outcome::Err(error) => Err(error),
-            Outcome::Cancelled(reason) => Err(SnowflakeError::new(
-                SnowflakeErrorCode::Internal,
-                format!(
-                    "statement was cancelled before completion: {:?}",
-                    reason.kind
-                ),
-            )),
-            Outcome::Panicked(_) => Err(SnowflakeError::new(
-                SnowflakeErrorCode::Internal,
-                "statement task panicked before completion",
-            )),
-        }
+        body(&cx, &client, auth).await
     })
 }
 
-/// A profile's resolved live connection inputs (no secret values — the PAT/key is
-/// referenced only through a `SecretSource` resolved at request time).
-struct LiveConn {
-    account: String,
-    user: String,
-    warehouse: String,
-    database: Option<String>,
-    schema: Option<String>,
-    role: Option<String>,
-    endpoint: SnowflakeEndpoint,
-    auth_profile: AuthProfile,
-    max_polls: u32,
+/// Submit one prepared request and drive it to completion. Returns the completed
+/// statement, the driver's poll/partition stats, and the SQL API `requestId`.
+fn execute_request(
+    conn: &LiveConn,
+    request: SubmitStatementRequest,
+) -> Result<(CompletedStatement, DriverStats, String), SnowflakeError> {
+    let sql_api_request_id = unique_request_id();
+    let params = SubmitQueryParams {
+        request_id: Some(sql_api_request_id.clone()),
+        retry: true,
+        asynchronous: false,
+        nullable: None,
+    };
+    let max_polls = conn.max_polls;
+    let (outcome, stats) = with_runtime(conn, move |cx, client, auth| {
+        Box::pin(async move {
+            Ok(run_statement_with_stats(
+                cx,
+                client,
+                auth,
+                request,
+                params,
+                PollPlan::with_max_polls(max_polls),
+            )
+            .await)
+        })
+    })?;
+    match outcome {
+        Outcome::Ok(done) => Ok((done, stats, sql_api_request_id)),
+        Outcome::Err(error) => Err(error),
+        Outcome::Cancelled(reason) => Err(SnowflakeError::new(
+            SnowflakeErrorCode::Internal,
+            format!(
+                "statement was cancelled before completion: {:?}",
+                reason.kind
+            ),
+        )),
+        Outcome::Panicked(_) => Err(SnowflakeError::new(
+            SnowflakeErrorCode::Internal,
+            "statement task panicked before completion",
+        )),
+    }
 }
 
-impl LiveConn {
-    fn resolve(
-        profile: &str,
-        database: Option<&str>,
-        schema: Option<&str>,
-    ) -> Result<Self, SnowflakeError> {
-        if !crate::is_valid_profile_id(profile) {
-            return Err(SnowflakeError::new(
-                SnowflakeErrorCode::ProfileInvalid,
-                "profile id must be 1-128 ASCII letters, digits, dot, dash, or underscore",
-            ));
-        }
-        let prefix = crate::profile_env_prefix(profile);
+/// Build the request for `sql` from the resolved connection, run it, assemble rows.
+fn execute(
+    conn: &LiveConn,
+    sql: &str,
+    options: QueryRequestOptions,
+) -> Result<LiveRows, SnowflakeError> {
+    let request = build_request(conn, sql, options);
+    let (done, stats, sql_api_request_id) = execute_request(conn, request)?;
+    Ok(into_rows(done, stats, sql_api_request_id))
+}
 
-        let account = env_value(&name(&prefix, "ACCOUNT"));
-        let user = env_value(&name(&prefix, "USER"));
-        let auth_lane = env_value(&name(&prefix, "AUTH"));
-        let warehouse = env_value(&name(&prefix, "WAREHOUSE"));
-
-        let mut missing = Vec::new();
-        if account.is_none() {
-            missing.push(name(&prefix, "ACCOUNT"));
-        }
-        if user.is_none() {
-            missing.push(name(&prefix, "USER"));
-        }
-        if auth_lane.is_none() {
-            missing.push(name(&prefix, "AUTH"));
-        }
-        if warehouse.is_none() {
-            missing.push(name(&prefix, "WAREHOUSE"));
-        }
-
-        let lane = auth_lane.clone().unwrap_or_default();
-        let secret_env = secret_env_for_lane(&prefix, &lane);
-        if let Some(secret_env) = &secret_env {
-            if env_value(secret_env).is_none() {
-                missing.push(secret_env.clone());
-            }
-        }
-        if !missing.is_empty() {
-            return Err(SnowflakeError::new(
-                SnowflakeErrorCode::CredentialMissing,
-                format!(
-                    "missing required env handles for profile credentials: {}",
-                    missing.join(", ")
-                ),
-            ));
-        }
-        if secret_env.is_none() {
-            return Err(SnowflakeError::new(
-                SnowflakeErrorCode::ProfileInvalid,
-                format!("auth lane must be one of pat, oauth_bearer, or key_pair_jwt (got {lane})"),
-            ));
-        }
-
-        let account = account.unwrap_or_default();
-        let endpoint = SnowflakeEndpoint::parse(endpoint_url(&account)).map_err(|error| {
-            SnowflakeError::new(SnowflakeErrorCode::ProfileInvalid, error.message)
-        })?;
-        let auth_profile = build_auth_profile(&prefix, &lane)?;
-
-        Ok(Self {
-            account,
-            user: user.unwrap_or_default(),
-            warehouse: warehouse.unwrap_or_default(),
-            database: database
-                .map(str::to_string)
-                .or_else(|| env_value(&name(&prefix, "DATABASE"))),
-            schema: schema
-                .map(str::to_string)
-                .or_else(|| env_value(&name(&prefix, "SCHEMA"))),
-            role: env_value(&name(&prefix, "ROLE")),
-            endpoint,
-            auth_profile,
-            max_polls: env_u32(&name(&prefix, "MAX_POLLS")).unwrap_or(DEFAULT_MAX_POLLS),
-        })
+/// Stamp session context from the connection onto a prepared request (used for
+/// the catalog crate's discovery statements, which carry only SQL + bindings).
+fn apply_session(conn: &LiveConn, request: &mut SubmitStatementRequest) {
+    request.timeout = Some(conn.statement_timeout_seconds);
+    request.warehouse = Some(WarehouseName::new(conn.warehouse.clone()));
+    if request.database.is_none() {
+        request.database = conn.database.clone().map(DatabaseName::new);
     }
+    if request.schema.is_none() {
+        request.schema = conn.schema.clone().map(SchemaName::new);
+    }
+    request.role = conn.role.clone().map(RoleName::new);
+    let mut parameters = deterministic_session_parameters();
+    if let Some(existing) = request.parameters.take() {
+        parameters.extend(existing);
+    }
+    request.parameters = Some(parameters);
+}
+
+/// Write the receipt/audit trail for a completed execution. Returns the receipt
+/// hash and any warnings (a store failure is a warning, never a fake hash).
+fn record_receipt(
+    command_id: &str,
+    conn: &LiveConn,
+    trace_id: &str,
+    sql: &str,
+    rows: &LiveRows,
+    event_kind: &str,
+    extra: serde_json::Value,
+) -> (Option<String>, Vec<Json>) {
+    let store: Store = match local_store::open_store() {
+        Ok(store) => store,
+        Err(error) => {
+            return (
+                None,
+                vec![json_string(format!(
+                    "receipt not recorded: {}",
+                    error.message()
+                ))],
+            );
+        }
+    };
+    let preview = crate::compact_sql(&redact(sql));
+    let columns = rows.column_pairs();
+    let facts = ExecutionFacts {
+        command_id,
+        profile: &conn.profile,
+        trace_id,
+        sql_preview_redacted: &preview,
+        statement_handle: &rows.statement_handle,
+        sql_api_request_id: Some(&rows.sql_api_request_id),
+        row_count: u64::try_from(rows.total_rows).unwrap_or(0),
+        partitions: &rows.partitions,
+        columns: &columns,
+        warehouse: Some(&conn.warehouse),
+        database: conn.database.as_deref(),
+        schema: conn.schema.as_deref(),
+        role: conn.role.as_deref(),
+        statement_timeout_seconds: conn.statement_timeout_seconds,
+        polls: u64::from(rows.stats.polls),
+        event_kind,
+        extra,
+    };
+    match local_store::record_execution(&store, &facts) {
+        Ok(hash) => (Some(hash), Vec::new()),
+        Err(error) => (
+            None,
+            vec![json_string(format!("receipt not recorded: {error}"))],
+        ),
+    }
+}
+
+/// Stamp the live provenance fields shared by every successful live envelope.
+fn stamp_live(
+    envelope: &mut crate::Envelope,
+    profile: &str,
+    rows: &LiveRows,
+    receipt_hash: Option<String>,
+) {
+    envelope.data_source = "live";
+    envelope.profile_id = Some(profile.to_owned());
+    envelope.statement_handle = Some(rows.statement_handle.clone());
+    envelope.query_id = Some(rows.statement_handle.clone());
+    envelope.receipt_hash = receipt_hash;
+    envelope.budget_consumed = json_object(vec![
+        ("deadline_ms", Json::Number(0)),
+        ("polls", Json::Number(i64::from(rows.stats.polls))),
+        ("rows", Json::Number(rows.total_rows)),
+    ]);
 }
 
 /// The secret env-var name a given auth lane requires, or `None` for an
@@ -957,12 +1660,7 @@ fn build_request(
     options: QueryRequestOptions,
 ) -> SubmitStatementRequest {
     let mut request = SubmitStatementRequest::new(sql);
-    request.timeout = Some(REQUEST_TIMEOUT_SECONDS);
-    request.warehouse = Some(WarehouseName::new(conn.warehouse.clone()));
-    request.database = conn.database.clone().map(DatabaseName::new);
-    request.schema = conn.schema.clone().map(SchemaName::new);
-    request.role = conn.role.clone().map(RoleName::new);
-    request.parameters = Some(deterministic_session_parameters());
+    apply_session(conn, &mut request);
     apply_query_request_options(&mut request, options);
     request
 }
@@ -1126,7 +1824,15 @@ fn authorization_descriptor(
     ))
 }
 
-fn into_rows(done: CompletedStatement) -> LiveRows {
+impl LiveRows {
+    /// A lightweight `CompletedStatement` view for the catalog crate's row
+    /// normalizer (which reads `rows` and `result_set.result_set_meta_data`).
+    fn completed_view(&self) -> CompletedStatement {
+        self.completed.clone()
+    }
+}
+
+fn into_rows(done: CompletedStatement, stats: DriverStats, sql_api_request_id: String) -> LiveRows {
     let columns = done
         .result_set
         .result_set_meta_data
@@ -1140,54 +1846,37 @@ fn into_rows(done: CompletedStatement) -> LiveRows {
         .collect();
     let total_rows = done.result_set.total_rows();
     let partition_count = done.result_set.partition_count();
+    let partitions = done
+        .result_set
+        .result_set_meta_data
+        .partition_info
+        .iter()
+        .enumerate()
+        .map(|(index, info)| {
+            (
+                u32::try_from(index).unwrap_or(u32::MAX),
+                u64::try_from(info.row_count).unwrap_or(0),
+                info.compressed_size.and_then(|v| u64::try_from(v).ok()),
+                info.uncompressed_size.and_then(|v| u64::try_from(v).ok()),
+            )
+        })
+        .collect();
     let statement_handle = done.statement_handle.as_str().to_string();
     LiveRows {
         statement_handle,
+        sql_api_request_id,
         columns,
         total_rows,
         partition_count,
-        rows: done.rows,
+        partitions,
+        stats,
+        rows: done.rows.clone(),
+        completed: done,
     }
 }
 
-fn query_success(
-    format: OutputFormat,
-    request_id: String,
-    profile: String,
-    rows: &LiveRows,
-) -> crate::Outcome {
-    rows_success(
-        format,
-        request_id,
-        profile,
-        "query.run",
-        "fsnow.query.run.v1",
-        Vec::new(),
-        rows,
-        vec!["franken-snowflake query plan --profile <profile> --sql <sql> --json".to_string()],
-    )
-}
-
-/// Build a `data_source = "live"` success envelope carrying assembled rows. The
-/// rows are projected positionally (matching the `columns` order, the jsonv2
-/// shape) and capped at [`ROW_EMIT_CAP`] with an explicit `truncated` flag.
-/// `leading` fields (e.g. catalog `database`/`schema`) are placed before the row
-/// payload in `data`.
-#[allow(clippy::too_many_arguments)]
-fn rows_success(
-    format: OutputFormat,
-    request_id: String,
-    profile: String,
-    command_id: &'static str,
-    output_contract_id: &'static str,
-    mut leading: Vec<(&'static str, Json)>,
-    rows: &LiveRows,
-    safe_next_commands: Vec<String>,
-) -> crate::Outcome {
-    let returned = rows.rows.len().min(ROW_EMIT_CAP);
-    let truncated = rows.rows.len() > ROW_EMIT_CAP;
-
-    let columns_json = json_array(
+fn columns_json(rows: &LiveRows) -> Json {
+    json_array(
         rows.columns
             .iter()
             .map(|column| {
@@ -1198,8 +1887,11 @@ fn rows_success(
                 ])
             })
             .collect(),
-    );
-    let rows_json = json_array(
+    )
+}
+
+fn rows_json(rows: &LiveRows, returned: usize) -> Json {
+    json_array(
         rows.rows
             .iter()
             .take(returned)
@@ -1214,15 +1906,40 @@ fn rows_success(
                 )
             })
             .collect(),
-    );
+    )
+}
+
+/// Build a `data_source = "live"` success envelope carrying assembled rows. The
+/// rows are projected positionally (matching the `columns` order, the jsonv2
+/// shape) and capped at `emit_cap` with an explicit `truncated` flag.
+#[allow(clippy::too_many_arguments)]
+fn rows_success(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    command_id: &'static str,
+    output_contract_id: &'static str,
+    mut leading: Vec<(&'static str, Json)>,
+    rows: &LiveRows,
+    emit_cap: usize,
+    receipt_hash: Option<String>,
+    mut warnings: Vec<Json>,
+    safe_next_commands: Vec<String>,
+) -> crate::Outcome {
+    let returned = rows.rows.len().min(emit_cap);
+    let truncated = rows.rows.len() > emit_cap;
     leading.extend(vec![
-        ("columns", columns_json),
-        ("rows", rows_json),
+        ("columns", columns_json(rows)),
+        ("rows", rows_json(rows, returned)),
         ("row_count", Json::Number(rows.total_rows)),
         ("returned_rows", Json::Number(returned as i64)),
         ("partition_count", Json::Number(rows.partition_count as i64)),
-        ("row_emit_cap", Json::Number(ROW_EMIT_CAP as i64)),
+        ("row_emit_cap", Json::Number(emit_cap as i64)),
         ("truncated", Json::Bool(truncated)),
+        (
+            "sql_api_request_id",
+            json_string(rows.sql_api_request_id.clone()),
+        ),
     ]);
 
     let mut envelope = base_envelope(
@@ -1233,23 +1950,16 @@ fn rows_success(
         request_id,
         json_object(leading),
     );
-    envelope.data_source = "live";
-    envelope.profile_id = Some(profile);
-    envelope.statement_handle = Some(rows.statement_handle.clone());
-    envelope.query_id = Some(rows.statement_handle.clone());
-    envelope.budget_consumed = json_object(vec![
-        ("deadline_ms", Json::Number(0)),
-        ("polls", Json::Number(0)),
-        ("rows", Json::Number(rows.total_rows)),
-    ]);
+    stamp_live(&mut envelope, &profile, rows, receipt_hash);
     envelope.safe_next_commands = safe_next_commands;
     if truncated {
-        envelope.warnings = vec![json_string(format!(
-            "result truncated to {ROW_EMIT_CAP} rows in this envelope; {} total rows were \
-             returned (use a Snowflake-side LIMIT or COPY INTO for full extraction)",
+        warnings.push(json_string(format!(
+            "result truncated to {emit_cap} rows in this envelope; {} total rows were \
+             returned (raise --limit up to {MAX_ROW_EMIT_CAP}, or use a Snowflake-side LIMIT / COPY INTO)",
             rows.total_rows
-        ))];
+        )));
     }
+    envelope.warnings = warnings;
 
     crate::Outcome {
         status: CoreExitCode::Success,
@@ -1333,8 +2043,7 @@ fn deterministic_session_parameters() -> BTreeMap<String, String> {
 
 /// A conservative Snowflake unquoted-identifier check: a leading letter or
 /// underscore, then letters/digits/underscore/`$`, bounded length. Used to gate
-/// `database`/`schema` before they are interpolated into the discovery SQL, so a
-/// crafted value cannot inject (it is rejected, never escaped-and-trusted).
+/// `--database`/`--schema`/`--role`/`--warehouse` values.
 fn is_safe_sql_identifier(value: &str) -> bool {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
@@ -1455,5 +2164,41 @@ mod tests {
         assert!(validate_query_tag("hfdt\ntrace").is_err());
         assert!(is_safe_env_name("HFDT_TYPED_BINDINGS_JSON"));
         assert!(!is_safe_env_name("HFDT-TYPED-BINDINGS"));
+    }
+
+    #[test]
+    fn run_flags_are_validated_not_ignored() {
+        assert_eq!(parse_limit(None).ok(), Some(ROW_EMIT_CAP));
+        assert_eq!(parse_limit(Some("5")).ok(), Some(5));
+        assert!(parse_limit(Some("0")).is_err());
+        assert!(parse_limit(Some("abc")).is_err());
+        assert!(parse_limit(Some("1000000")).is_err());
+
+        let bad_role = QueryRunOptions {
+            role: Some("READ ONLY; DROP".to_owned()),
+            ..QueryRunOptions::default()
+        };
+        assert!(session_overrides(&bad_role, None, None).is_err());
+        let bad_timeout = QueryRunOptions {
+            statement_timeout: Some("0".to_owned()),
+            ..QueryRunOptions::default()
+        };
+        assert!(session_overrides(&bad_timeout, None, None).is_err());
+        let good = QueryRunOptions {
+            role: Some("ANALYST".to_owned()),
+            warehouse: Some("COMPUTE_WH".to_owned()),
+            statement_timeout: Some("30".to_owned()),
+            ..QueryRunOptions::default()
+        };
+        let overrides = session_overrides(&good, Some("DB"), None).expect("valid overrides");
+        assert_eq!(overrides.role.as_deref(), Some("ANALYST"));
+        assert_eq!(overrides.statement_timeout, Some(30));
+        assert_eq!(overrides.database.as_deref(), Some("DB"));
+    }
+
+    #[test]
+    fn status_labels_cover_every_class() {
+        assert_eq!(status_class_label(StatusClass::Completed), "completed");
+        assert_eq!(status_class_label(StatusClass::Unexpected), "unexpected");
     }
 }

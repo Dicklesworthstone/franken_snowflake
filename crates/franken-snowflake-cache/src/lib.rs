@@ -523,9 +523,19 @@ pub trait CacheBackend {
 
     fn insert_catalog_snapshot(&self, record: CatalogSnapshotRecord) -> CacheResult<()>;
     fn catalog_snapshot(&self, snapshot_id: &str) -> CacheResult<Option<CatalogSnapshotRecord>>;
+    /// The newest snapshot captured for exactly this (profile, database, schema)
+    /// scope, or `None` when that scope was never scanned.
+    fn latest_catalog_snapshot(
+        &self,
+        profile_id: &str,
+        database_name: Option<&str>,
+        schema_name: Option<&str>,
+    ) -> CacheResult<Option<CatalogSnapshotRecord>>;
 
     fn upsert_dataset_manifest(&self, record: DatasetManifestRecord) -> CacheResult<()>;
     fn dataset_manifest(&self, dataset_id: &str) -> CacheResult<Option<DatasetManifestRecord>>;
+    /// Every stored dataset id, sorted (for `did_you_mean` and listings).
+    fn dataset_ids(&self) -> CacheResult<Vec<String>>;
 
     fn upsert_query_plan(&self, record: QueryPlanRecord) -> CacheResult<()>;
     fn query_plan(&self, plan_id: &str) -> CacheResult<Option<QueryPlanRecord>>;
@@ -638,6 +648,29 @@ impl CacheBackend for InMemoryCache {
         Ok(self.catalog_snapshots.borrow().get(snapshot_id).cloned())
     }
 
+    fn latest_catalog_snapshot(
+        &self,
+        profile_id: &str,
+        database_name: Option<&str>,
+        schema_name: Option<&str>,
+    ) -> CacheResult<Option<CatalogSnapshotRecord>> {
+        Ok(self
+            .catalog_snapshots
+            .borrow()
+            .values()
+            .filter(|record| {
+                record.profile_id == profile_id
+                    && record.database_name.as_deref() == database_name
+                    && record.schema_name.as_deref() == schema_name
+            })
+            .max_by(|a, b| {
+                a.captured_at_ms
+                    .cmp(&b.captured_at_ms)
+                    .then_with(|| a.snapshot_id.cmp(&b.snapshot_id))
+            })
+            .cloned())
+    }
+
     fn upsert_dataset_manifest(&self, record: DatasetManifestRecord) -> CacheResult<()> {
         record.manifest.verify("dataset_manifest")?;
         self.dataset_manifests
@@ -648,6 +681,10 @@ impl CacheBackend for InMemoryCache {
 
     fn dataset_manifest(&self, dataset_id: &str) -> CacheResult<Option<DatasetManifestRecord>> {
         Ok(self.dataset_manifests.borrow().get(dataset_id).cloned())
+    }
+
+    fn dataset_ids(&self) -> CacheResult<Vec<String>> {
+        Ok(self.dataset_manifests.borrow().keys().cloned().collect())
     }
 
     fn upsert_query_plan(&self, record: QueryPlanRecord) -> CacheResult<()> {
@@ -982,6 +1019,27 @@ impl CacheBackend for FrankenSqliteCache {
         rows.first().map(row_catalog_snapshot).transpose()
     }
 
+    fn latest_catalog_snapshot(
+        &self,
+        profile_id: &str,
+        database_name: Option<&str>,
+        schema_name: Option<&str>,
+    ) -> CacheResult<Option<CatalogSnapshotRecord>> {
+        let rows = self.query(
+            "SELECT snapshot_id, profile_id, source_kind, database_name, schema_name, \
+                    captured_at_ms, payload_json, payload_hash, payload_bytes \
+             FROM catalog_snapshots \
+             WHERE profile_id = ?1 AND database_name IS ?2 AND schema_name IS ?3 \
+             ORDER BY captured_at_ms DESC, snapshot_id DESC LIMIT 1",
+            &[
+                Value::Text(profile_id.to_owned()),
+                opt_text(database_name.map(str::to_owned)),
+                opt_text(schema_name.map(str::to_owned)),
+            ],
+        )?;
+        rows.first().map(row_catalog_snapshot).transpose()
+    }
+
     fn upsert_dataset_manifest(&self, record: DatasetManifestRecord) -> CacheResult<()> {
         record.manifest.verify("dataset_manifest")?;
         self.execute(
@@ -1017,6 +1075,16 @@ impl CacheBackend for FrankenSqliteCache {
             &[Value::Text(dataset_id.to_owned())],
         )?;
         rows.first().map(row_dataset_manifest).transpose()
+    }
+
+    fn dataset_ids(&self) -> CacheResult<Vec<String>> {
+        self.query(
+            "SELECT dataset_id FROM dataset_manifests ORDER BY dataset_id",
+            &[],
+        )?
+        .iter()
+        .map(|row| row_text(row, 0, "dataset_id"))
+        .collect()
     }
 
     fn upsert_query_plan(&self, record: QueryPlanRecord) -> CacheResult<()> {
@@ -2425,9 +2493,7 @@ mod frankensqlite_tests {
         assert_eq!(r1.row_count, Some(7));
         assert_eq!(cache.query_receipt("missing")?, None);
 
-        let latest = cache
-            .latest_successful_receipt("plan-1")?
-            .expect("latest");
+        let latest = cache.latest_successful_receipt("plan-1")?.expect("latest");
         assert_eq!(latest.receipt_id, "r2");
         let by_qid = cache
             .receipt_by_snowflake_query_id("demo", "qid-r2")?
@@ -2459,7 +2525,10 @@ mod frankensqlite_tests {
         }
         let events = cache.audit_events()?;
         assert_eq!(
-            events.iter().map(|e| e.event_id.as_str()).collect::<Vec<_>>(),
+            events
+                .iter()
+                .map(|e| e.event_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["e1", "e2"]
         );
         assert!(matches!(
