@@ -55,7 +55,19 @@ pub const PARTITION_1_GZIP: &[u8] = include_bytes!(concat!(
     "/fixtures/packets/partition_1.json.gz"
 ));
 /// The decompressed bytes of [`PARTITION_1_GZIP`], for round-trip verification.
-pub const PARTITION_1_PLAIN: &[u8] = br#"[["3","gamma"],["4","delta"]]"#;
+///
+/// This is the **live** shape: a non-inline partition fetched with
+/// `GET /api/v2/statements/{handle}?partition=N` is a JSON object
+/// `{"data":[[...]]}` (observed against a real account, 2026-06-25). Every
+/// offline lane (mock, replay golden, e2e harness, sqlapi lifecycle) consumes
+/// this form so that deleting the object branch of
+/// `parse_partition_rows` fails offline, not only under credentials.
+pub const PARTITION_1_PLAIN: &[u8] = br#"{"data":[["3","gamma"],["4","delta"]]}"#;
+
+/// A partition body in the documented **fallback** shape: a bare top-level row
+/// array. Kept as one explicit case so the fallback branch stays covered; it is
+/// not what the live SQL API returns.
+pub const PARTITION_BARE_ARRAY_FALLBACK: &[u8] = br#"[["5","epsilon"]]"#;
 
 /// The handle issued by [`default_async_lifecycle`] — matches the `202` golden.
 pub const DEFAULT_HANDLE: &str = "01b2c3d4-0000-0000-0000-000000000002";
@@ -190,6 +202,23 @@ mod tests {
         assert_eq!(statement_timeout().class(), ResponseClass::StatementTimeout);
         assert_eq!(statement_failed().class(), ResponseClass::StatementFailed);
         assert_eq!(rate_limited().class(), ResponseClass::RateLimited);
+    }
+
+    #[test]
+    fn canonical_partition_fixture_is_the_live_object_form() {
+        // Planted-negative guard for the object branch of
+        // `parse_partition_rows`: the canonical fixture must be the object
+        // form, and the gzip packet must decompress to exactly it.
+        assert!(PARTITION_1_PLAIN.starts_with(br#"{"data":"#));
+        assert!(PARTITION_BARE_ARRAY_FALLBACK.starts_with(b"[["));
+        use asupersync::http::compress::{Decompressor, GzipDecompressor};
+        let mut decompressor = GzipDecompressor::new(Some(4096));
+        let mut plain = Vec::new();
+        decompressor
+            .decompress(PARTITION_1_GZIP, &mut plain)
+            .and_then(|()| decompressor.finish(&mut plain))
+            .expect("gzip packet decodes");
+        assert_eq!(plain.as_slice(), PARTITION_1_PLAIN);
     }
 
     #[test]

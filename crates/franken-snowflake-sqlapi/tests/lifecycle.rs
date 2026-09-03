@@ -132,9 +132,12 @@ fn gzip_partition_fixture_is_assembled_after_transport_decode() -> Result<(), St
     )
     .immediate()
     .with_partition(1, scenarios::gzip_partition())
+    // Partition 2 is served in the documented bare-array fallback shape so the
+    // fallback branch of `parse_partition_rows` stays covered offline, while
+    // partition 1 (the gzip packet) is the live `{"data":[...]}` object form.
     .with_partition(
         2,
-        MockHttpResponse::json(200, br#"[["5","epsilon"]]"#.to_vec()),
+        MockHttpResponse::json(200, scenarios::PARTITION_BARE_ARRAY_FALLBACK.to_vec()),
     );
     let mut machine = StatementMachine::new(PollPlan::default());
 

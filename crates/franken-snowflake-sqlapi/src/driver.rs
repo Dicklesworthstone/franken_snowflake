@@ -699,11 +699,12 @@ mod tests {
                 .clone();
             let partition_count = partitions.len();
             // Each fetched partition must carry exactly the rowCount the metadata
-            // promised; the machine refuses mismatches (integrity check).
+            // promised; the machine refuses mismatches (integrity check). Bodies
+            // use the live `{"data":[...]}` object form, not the bare array.
             for info in partitions.iter().skip(1) {
                 let rows = info["rowCount"].as_u64().unwrap_or(0);
                 let body = format!(
-                    "[{}]",
+                    r#"{{"data":[{}]}}"#,
                     (0..rows)
                         .map(|_| r#"["2024-01-02","ENTITY","2.50"]"#)
                         .collect::<Vec<_>>()
