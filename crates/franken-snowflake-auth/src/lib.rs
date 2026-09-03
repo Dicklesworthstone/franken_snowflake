@@ -858,6 +858,23 @@ impl KeyPairJwtRefreshSession {
             reason: "refresh session did not retain a signed token".to_string(),
         })
     }
+
+    /// Discard the cached token and sign a fresh one now, regardless of how far
+    /// it is from expiry. Used after the SQL API answers `401` mid-flight
+    /// (server-side clock skew, revoked key rotation, or a token that outlived
+    /// its validity while a statement kept polling).
+    pub fn force_resign_at(
+        &mut self,
+        now_unix_seconds: i64,
+    ) -> Result<&SignedKeyPairJwt, AuthError> {
+        self.current = Some(
+            self.signer
+                .sign_at(now_unix_seconds, self.requested_validity_seconds)?,
+        );
+        self.current.as_ref().ok_or(AuthError::JwtSigning {
+            reason: "refresh session did not retain a re-signed token".to_string(),
+        })
+    }
 }
 
 impl fmt::Debug for KeyPairJwtRefreshSession {
@@ -1386,10 +1403,19 @@ impl SnowflakeAuth for KeyPairJwtAuth {
         }
     }
 
-    fn on_unauthorized_mid_poll(&mut self, _now_unix_seconds: i64) -> ReauthDecision {
-        ReauthDecision::ResignJwt {
-            reason: "key-pair JWT returned 401 while polling; re-sign before retrying the poll"
-                .to_string(),
+    fn on_unauthorized_mid_poll(&mut self, now_unix_seconds: i64) -> ReauthDecision {
+        // Actually re-sign here, so the next `headers_at` carries a fresh token
+        // instead of the one the SQL API just rejected.
+        match self.session.force_resign_at(now_unix_seconds) {
+            Ok(_) => ReauthDecision::ResignJwt {
+                reason: "key-pair JWT returned 401 while polling; re-signed before retrying"
+                    .to_string(),
+            },
+            Err(error) => ReauthDecision::ReauthRequired {
+                lane: AuthLane::KeyPairJwt,
+                credential_handle: self.credential_handle.clone(),
+                reason: format!("key-pair JWT returned 401 and re-signing failed: {error}"),
+            },
         }
     }
 }
@@ -1538,6 +1564,16 @@ fn account_identifier_input(account: &str) -> &str {
     account
 }
 
+/// Drop a `<region>[.<cloud>]` suffix from an account **locator** form
+/// (`xy12345.us-east-1`, `xy12345.east-us-2.azure`, `xy12345.us-central1.gcp`,
+/// `xy12345.us-east-1.privatelink`) while leaving an **organization.account**
+/// form alone (`myorg.prod2`, `org1.acct_2`).
+///
+/// Every Snowflake region id contains a hyphen (`us-east-1`, `west-europe`,
+/// `us-central1`), and the trailing cloud/privatelink labels are a fixed
+/// vocabulary, so a suffix is a locator region only when one of its labels has
+/// a hyphen or is one of those keywords. A bare alphanumeric label with digits
+/// (`prod2`) is an account name, not a region.
 fn strip_locator_region_suffix(account: &str) -> &str {
     if account.to_ascii_lowercase().contains(".global") {
         return account;
@@ -1554,9 +1590,8 @@ fn strip_locator_region_suffix(account: &str) -> &str {
 
 fn looks_like_locator_region_suffix(suffix: &str) -> bool {
     suffix.split('.').any(|label| {
-        label
-            .bytes()
-            .any(|byte| byte.is_ascii_digit() || byte == b'-')
+        let label = label.to_ascii_lowercase();
+        label.contains('-') || matches!(label.as_str(), "aws" | "azure" | "gcp" | "privatelink")
     })
 }
 
@@ -1724,6 +1759,60 @@ mod tests {
         );
         assert_eq!(normalize_account_for_jwt("org.account")?, "ORG-ACCOUNT");
         assert_eq!(normalize_user_for_jwt("svc_user")?, "SVC_USER");
+        Ok(())
+    }
+
+    #[test]
+    fn org_account_names_with_digits_are_not_mistaken_for_locator_regions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Organization.account forms keep both halves (digits are legal in
+        // account names); the old heuristic truncated `myorg.prod2` to `MYORG`.
+        assert_eq!(normalize_account_for_jwt("myorg.prod2")?, "MYORG-PROD2");
+        assert_eq!(normalize_account_for_jwt("org1.acct_2")?, "ORG1-ACCT_2");
+        assert_eq!(normalize_account_for_jwt("MyOrg.Prod2")?, "MYORG-PROD2");
+        // Locator forms still drop every region/cloud/privatelink label.
+        assert_eq!(
+            normalize_account_for_jwt("xy12345.us-central1.gcp")?,
+            "XY12345"
+        );
+        assert_eq!(
+            normalize_account_for_jwt("xy12345.east-us-2.azure")?,
+            "XY12345"
+        );
+        assert_eq!(
+            normalize_account_for_jwt("xy12345.us-east-1.privatelink")?,
+            "XY12345"
+        );
+        assert_eq!(normalize_account_for_jwt("xy12345.west-europe")?, "XY12345");
+        assert_eq!(normalize_account_for_jwt("xy12345")?, "XY12345");
+        Ok(())
+    }
+
+    #[test]
+    fn jwt_auth_resigns_on_unauthorized_mid_poll() -> Result<(), Box<dyn std::error::Error>> {
+        let mut auth = KeyPairJwtAuth::from_signer(signer()?, 3_600);
+        let first = auth
+            .headers_at(1_800_000_000)?
+            .authorization_value()
+            .to_owned();
+        // Far from expiry: a later poll reuses the cached token.
+        let reused = auth
+            .headers_at(1_800_000_010)?
+            .authorization_value()
+            .to_owned();
+        assert_eq!(first, reused);
+        // A 401 forces a fresh signature even though the token is not near expiry.
+        let decision = auth.on_unauthorized_mid_poll(1_800_000_010);
+        assert!(
+            matches!(decision, ReauthDecision::ResignJwt { .. }),
+            "{decision:?}"
+        );
+        let resigned = auth
+            .headers_at(1_800_000_010)?
+            .authorization_value()
+            .to_owned();
+        assert_ne!(first, resigned, "re-sign must produce a different token");
+        assert!(resigned.starts_with("Bearer "));
         Ok(())
     }
 

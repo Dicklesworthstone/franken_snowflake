@@ -1326,6 +1326,9 @@ pub enum StatusClass {
     RateLimited,
     /// Retryable 5xx.
     ServerErrorRetryable,
+    /// 401: the bearer token was rejected (expired JWT, revoked key, bad PAT).
+    /// The driver may re-sign once for the key-pair JWT lane and retry.
+    Unauthorized,
     /// Any other unexpected status.
     Unexpected,
 }
@@ -1336,6 +1339,7 @@ pub fn classify_status(status: StatusCode) -> StatusClass {
     match status.as_u16() {
         200 => StatusClass::Completed,
         202 => StatusClass::Running,
+        401 => StatusClass::Unauthorized,
         408 => StatusClass::StatementTimeout,
         422 => StatusClass::QueryFailure,
         429 => StatusClass::RateLimited,
@@ -2689,6 +2693,8 @@ mod tests {
     fn status_classification_keeps_202_and_429_distinct() {
         assert_eq!(classify_status(StatusCode(200)), StatusClass::Completed);
         assert_eq!(classify_status(StatusCode(202)), StatusClass::Running);
+        assert_eq!(classify_status(StatusCode(401)), StatusClass::Unauthorized);
+        assert_eq!(classify_status(StatusCode(403)), StatusClass::Unexpected);
         assert_eq!(
             classify_status(StatusCode(408)),
             StatusClass::StatementTimeout

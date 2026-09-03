@@ -27,8 +27,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
 use franken_snowflake_auth::{
-    AuthProfile, KEYPAIR_JWT_TOKEN_TYPE, OAUTH_TOKEN_TYPE, PROGRAMMATIC_ACCESS_TOKEN_TYPE,
-    ProcessSecretResolver, SecretSource, SnowflakeAuth,
+    AuthMechanism, AuthProfile, KEYPAIR_JWT_TOKEN_TYPE, OAUTH_TOKEN_TYPE,
+    PROGRAMMATIC_ACCESS_TOKEN_TYPE, ProcessSecretResolver, ReauthDecision, SecretSource,
+    SnowflakeAuth,
 };
 use franken_snowflake_cache::{
     CacheBackend, CatalogSnapshotRecord, ContentAddress as CacheAddress, ExportKind, ExportRecord,
@@ -53,7 +54,7 @@ use franken_snowflake_http::{
     AuthorizationDescriptor, CancelHttpRequest, SnowflakeAuthTokenType, SnowflakeEndpoint,
     SnowflakeHttpClient, StatusClass, TransportConfig,
 };
-use franken_snowflake_sqlapi::driver::{DriverStats, run_statement_with_stats};
+use franken_snowflake_sqlapi::driver::{AuthProvider, DriverStats, run_statement_with_auth};
 use franken_snowflake_sqlapi::lifecycle::{CompletedStatement, PollPlan};
 use franken_snowflake_sqlapi::request::{Binding, SubmitQueryParams, SubmitStatementRequest};
 
@@ -895,6 +896,7 @@ pub fn run_query_cancel_outcome(
     let handle = StatementHandle::new(statement_handle.clone());
     let response = match with_runtime(&conn, |cx, client, auth| {
         Box::pin(async move {
+            let auth = auth.descriptor()?;
             match client
                 .cancel_statement(
                     cx,
@@ -991,6 +993,7 @@ fn status_class_label(status: StatusClass) -> &'static str {
         StatusClass::QueryFailure => "query_failure",
         StatusClass::RateLimited => "rate_limited",
         StatusClass::ServerErrorRetryable => "server_error",
+        StatusClass::Unauthorized => "unauthorized",
         StatusClass::Unexpected => "unexpected",
     }
 }
@@ -1533,13 +1536,33 @@ fn validate_identifier(flag: &str, value: &str) -> Result<(), SnowflakeError> {
     }
 }
 
+/// The resolved auth mechanism as the driver's [`AuthProvider`]: every request
+/// re-derives its bearer (so a key-pair JWT is re-signed near expiry while a
+/// statement keeps polling) and a `401` re-signs once for the JWT lane.
+struct MechanismAuth {
+    mechanism: AuthMechanism,
+}
+
+impl AuthProvider for MechanismAuth {
+    fn descriptor(&mut self) -> Result<AuthorizationDescriptor, SnowflakeError> {
+        authorization_descriptor(&mut self.mechanism)
+    }
+
+    fn on_unauthorized(&mut self) -> Result<bool, SnowflakeError> {
+        match self.mechanism.on_unauthorized_mid_poll(now_unix_seconds()) {
+            ReauthDecision::ResignJwt { .. } => Ok(true),
+            ReauthDecision::ReauthRequired { .. } | ReauthDecision::NotRequired => Ok(false),
+        }
+    }
+}
+
 /// Run `body` inside a fresh Asupersync runtime with the resolved client + auth.
 fn with_runtime<T, F>(conn: &LiveConn, body: F) -> Result<T, SnowflakeError>
 where
     F: for<'a> FnOnce(
         &'a Cx,
         &'a SnowflakeHttpClient,
-        AuthorizationDescriptor,
+        &'a mut MechanismAuth,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<T, SnowflakeError>> + 'a>,
     >,
@@ -1561,14 +1584,17 @@ where
             TransportConfig::new(conn.endpoint.clone()),
             &cx,
         );
-        let mut mechanism = conn
+        let mechanism = conn
             .auth_profile
             .resolve(&ProcessSecretResolver, &conn.account, &conn.user)
             .map_err(|error| {
                 SnowflakeError::new(SnowflakeErrorCode::CredentialMissing, error.to_string())
             })?;
-        let auth = authorization_descriptor(&mut mechanism)?;
-        body(&cx, &client, auth).await
+        let mut auth = MechanismAuth { mechanism };
+        // Resolve once up front so a missing/invalid credential fails before
+        // any request is built, with the same typed error as before.
+        auth.descriptor()?;
+        body(&cx, &client, &mut auth).await
     })
 }
 
@@ -1588,7 +1614,7 @@ fn execute_request(
     let max_polls = conn.max_polls;
     let (outcome, stats) = with_runtime(conn, move |cx, client, auth| {
         Box::pin(async move {
-            Ok(run_statement_with_stats(
+            Ok(run_statement_with_auth(
                 cx,
                 client,
                 auth,

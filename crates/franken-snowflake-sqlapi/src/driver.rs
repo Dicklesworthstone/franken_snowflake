@@ -123,6 +123,36 @@ impl StatementTransport for SnowflakeHttpClient {
     }
 }
 
+/// Supplies the bearer for each SQL API request and decides what to do when the
+/// API answers `401`.
+///
+/// The driver asks for a fresh [`AuthorizationDescriptor`] before every submit,
+/// poll, and partition fetch, so a lane that re-signs near expiry (key-pair
+/// JWT) keeps a long-polling statement authenticated past the token lifetime
+/// without any special casing. On a `401` the driver calls
+/// [`AuthProvider::on_unauthorized`]; `Ok(true)` means the credential was
+/// refreshed and the same step is retried exactly once, `Ok(false)` means the
+/// lane cannot recover (PAT/OAuth) and the statement fails with a typed
+/// `CredentialExpired` error (and an orphan cancel if a handle exists).
+pub trait AuthProvider {
+    /// The descriptor to attach to the next request.
+    fn descriptor(&mut self) -> Result<AuthorizationDescriptor, SnowflakeError>;
+    /// The API rejected the last descriptor with `401`. Return `Ok(true)` after
+    /// refreshing the credential so the step is retried once.
+    fn on_unauthorized(&mut self) -> Result<bool, SnowflakeError>;
+}
+
+/// A frozen bearer: never refreshes, so a `401` is terminal.
+impl AuthProvider for AuthorizationDescriptor {
+    fn descriptor(&mut self) -> Result<AuthorizationDescriptor, SnowflakeError> {
+        Ok(self.clone())
+    }
+
+    fn on_unauthorized(&mut self) -> Result<bool, SnowflakeError> {
+        Ok(false)
+    }
+}
+
 /// Observed effort for one driven statement, for `budget_consumed` reporting.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DriverStats {
@@ -160,15 +190,62 @@ pub async fn run_statement_with_stats<T: StatementTransport>(
     params: SubmitQueryParams,
     poll_plan: PollPlan,
 ) -> (StatementOutcome, DriverStats) {
+    let mut frozen = auth;
+    run_statement_with_auth(cx, client, &mut frozen, request, params, poll_plan).await
+}
+
+/// [`run_statement_with_stats`] with a refreshing [`AuthProvider`]: the bearer
+/// is re-derived before every request and a `401` triggers one re-sign + retry
+/// of the same step when the provider can refresh.
+pub async fn run_statement_with_auth<T: StatementTransport, A: AuthProvider>(
+    cx: &Cx,
+    client: &T,
+    auth: &mut A,
+    request: SubmitStatementRequest,
+    params: SubmitQueryParams,
+    poll_plan: PollPlan,
+) -> (StatementOutcome, DriverStats) {
     let mut stats = DriverStats::default();
     let outcome = drive(cx, client, auth, request, params, poll_plan, &mut stats).await;
     (outcome, stats)
 }
 
-async fn drive<T: StatementTransport>(
+/// Build the typed error for a `401` the driver could not recover from.
+fn unauthorized_error(step: &str, detail: &str) -> SnowflakeError {
+    SnowflakeError::new(
+        SnowflakeErrorCode::CredentialExpired,
+        format!("SQL API returned 401 Unauthorized on {step}: {detail}"),
+    )
+}
+
+/// After a `401`: spend the one retry allowed for this step by asking the
+/// provider to refresh. Returns the new descriptor to retry with, or the typed
+/// error to surface.
+fn refresh_after_unauthorized<A: AuthProvider>(
+    provider: &mut A,
+    reauth_left: &mut u8,
+    step: &str,
+) -> Result<AuthorizationDescriptor, SnowflakeError> {
+    if *reauth_left == 0 {
+        return Err(unauthorized_error(
+            step,
+            "the re-signed credential was rejected again; not retrying further",
+        ));
+    }
+    *reauth_left = reauth_left.saturating_sub(1);
+    match provider.on_unauthorized()? {
+        true => provider.descriptor(),
+        false => Err(unauthorized_error(
+            step,
+            "this credential lane cannot re-sign mid-flight; issue a fresh token and retry",
+        )),
+    }
+}
+
+async fn drive<T: StatementTransport, A: AuthProvider>(
     cx: &Cx,
     client: &T,
-    auth: AuthorizationDescriptor,
+    provider: &mut A,
     request: SubmitStatementRequest,
     params: SubmitQueryParams,
     poll_plan: PollPlan,
@@ -184,18 +261,36 @@ async fn drive<T: StatementTransport>(
         }
     };
 
-    let submit = SubmitHttpRequest {
-        route: submit_route(&params),
-        auth: auth.clone(),
-        body,
-        retry_resubmit: params.retry,
+    let mut auth = match provider.descriptor() {
+        Ok(auth) => auth,
+        Err(error) => return SnowflakeOutcome::err(error),
     };
-    let submit_response = match client.submit_statement(cx, submit).await {
-        SnowflakeOutcome::Ok(response) => response,
-        SnowflakeOutcome::Err(error) => return SnowflakeOutcome::err(error),
-        SnowflakeOutcome::Cancelled(reason) => return SnowflakeOutcome::cancelled(reason),
-        SnowflakeOutcome::Panicked(payload) => return SnowflakeOutcome::panicked(payload),
+    // One 401 retry per step; reset after any accepted response.
+    let mut reauth_left: u8 = 1;
+
+    let submit_response = loop {
+        let submit = SubmitHttpRequest {
+            route: submit_route(&params),
+            auth: auth.clone(),
+            body: body.clone(),
+            retry_resubmit: params.retry,
+        };
+        match client.submit_statement(cx, submit).await {
+            SnowflakeOutcome::Ok(response) if response.status == StatusClass::Unauthorized => {
+                // No handle was issued, so a resubmit with the same requestId
+                // is safe; nothing to cancel server-side.
+                match refresh_after_unauthorized(provider, &mut reauth_left, "submit") {
+                    Ok(fresh) => auth = fresh,
+                    Err(error) => return SnowflakeOutcome::err(error),
+                }
+            }
+            SnowflakeOutcome::Ok(response) => break response,
+            SnowflakeOutcome::Err(error) => return SnowflakeOutcome::err(error),
+            SnowflakeOutcome::Cancelled(reason) => return SnowflakeOutcome::cancelled(reason),
+            SnowflakeOutcome::Panicked(payload) => return SnowflakeOutcome::panicked(payload),
+        }
     };
+    reauth_left = 1;
 
     // Captured before the machine takes ownership; `PollPlan` is `Copy`. The 202
     // poll loop waits this long between GETs (see `wait_poll_interval`).
@@ -238,6 +333,14 @@ async fn drive<T: StatementTransport>(
                     return cancel_locally(cx, client, &auth, &handle, reason).await;
                 }
                 stats.polls = stats.polls.saturating_add(1);
+                // Re-derive the bearer so a near-expiry JWT is re-signed before
+                // the GET instead of after a 401.
+                auth = match provider.descriptor() {
+                    Ok(fresh) => fresh,
+                    Err(error) => {
+                        return abandon_with_error(cx, client, &auth, &handle, error).await;
+                    }
+                };
                 let poll = client
                     .poll_statement(
                         cx,
@@ -259,6 +362,19 @@ async fn drive<T: StatementTransport>(
                         return SnowflakeOutcome::panicked(payload);
                     }
                 };
+                if response.status == StatusClass::Unauthorized {
+                    match refresh_after_unauthorized(provider, &mut reauth_left, "poll") {
+                        Ok(fresh) => {
+                            auth = fresh;
+                            progress = Progress::PollAgain(handle);
+                            continue;
+                        }
+                        Err(error) => {
+                            return abandon_with_error(cx, client, &auth, &handle, error).await;
+                        }
+                    }
+                }
+                reauth_left = 1;
                 progress = match machine.on_poll(response_class(response.status), &response.body) {
                     Ok(progress) => progress,
                     Err(error) => {
@@ -279,6 +395,12 @@ async fn drive<T: StatementTransport>(
                         .await;
                 }
                 stats.partitions_fetched = stats.partitions_fetched.saturating_add(1);
+                auth = match provider.descriptor() {
+                    Ok(fresh) => fresh,
+                    Err(error) => {
+                        return abandon_with_error(cx, client, &auth, &handle, error).await;
+                    }
+                };
                 let fetch = client
                     .fetch_partition(
                         cx,
@@ -301,6 +423,20 @@ async fn drive<T: StatementTransport>(
                         return SnowflakeOutcome::panicked(payload);
                     }
                 };
+                if response.status == StatusClass::Unauthorized {
+                    match refresh_after_unauthorized(provider, &mut reauth_left, "partition fetch")
+                    {
+                        Ok(fresh) => {
+                            auth = fresh;
+                            progress = Progress::FetchPartition { handle, partition };
+                            continue;
+                        }
+                        Err(error) => {
+                            return abandon_with_error(cx, client, &auth, &handle, error).await;
+                        }
+                    }
+                }
+                reauth_left = 1;
                 // `response.body` is already gzip-decoded by the transport.
                 progress = match machine.on_partition(
                     response_class(response.status),
@@ -423,6 +559,9 @@ const fn response_class(status: StatusClass) -> ResponseClass {
         StatusClass::QueryFailure => ResponseClass::StatementFailed,
         StatusClass::RateLimited => ResponseClass::RateLimited,
         StatusClass::ServerErrorRetryable => ResponseClass::Other(503),
+        // The driver intercepts 401 before the machine sees it; if one ever
+        // reaches here it is terminal-unexpected, never "still running".
+        StatusClass::Unauthorized => ResponseClass::Other(401),
         StatusClass::Unexpected => ResponseClass::Other(0),
     }
 }
@@ -442,6 +581,8 @@ mod tests {
     const RESP_202: &[u8] = include_bytes!("../tests/fixtures/resp_202_running.json");
     const RESP_200_MULTI: &[u8] =
         include_bytes!("../tests/fixtures/resp_200_resultset_multi_partition.json");
+    const RESP_200_SINGLE: &[u8] =
+        include_bytes!("../tests/fixtures/resp_200_resultset_single_partition.json");
 
     /// What the fake answers on each route; `Err` produces a transport error.
     #[derive(Clone)]
@@ -453,20 +594,26 @@ mod tests {
     /// A scripted transport recording every cancel the driver issues.
     struct FakeTransport {
         submit: Scripted,
+        /// Consumed by the first submit only (models a 401 on the initial POST).
+        submit_first: RefCell<Option<Scripted>>,
         polls: RefCell<Vec<Scripted>>,
         partitions: RefCell<Vec<Scripted>>,
         cancels_after_local: RefCell<Vec<(StatementHandle, CancelKind)>>,
         orphan_cancels: RefCell<Vec<StatementHandle>>,
+        /// Credential fingerprint attached to every submit/poll/partition, in order.
+        auth_seen: RefCell<Vec<String>>,
     }
 
     impl FakeTransport {
         fn new(submit: Scripted) -> Self {
             Self {
                 submit,
+                submit_first: RefCell::new(None),
                 polls: RefCell::new(Vec::new()),
                 partitions: RefCell::new(Vec::new()),
                 cancels_after_local: RefCell::new(Vec::new()),
                 orphan_cancels: RefCell::new(Vec::new()),
+                auth_seen: RefCell::new(Vec::new()),
             }
         }
 
@@ -480,9 +627,17 @@ mod tests {
         async fn submit_statement(
             &self,
             _cx: &Cx,
-            _request: SubmitHttpRequest,
+            request: SubmitHttpRequest,
         ) -> TransportOutcome<SubmitHttpResponse> {
-            match self.submit.clone() {
+            self.auth_seen
+                .borrow_mut()
+                .push(request.auth.redacted_fingerprint().to_owned());
+            let scripted = self
+                .submit_first
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| self.submit.clone());
+            match scripted {
                 Scripted::Ok(status, body) => {
                     TransportOutcome::ok(SubmitHttpResponse { status, body })
                 }
@@ -493,8 +648,11 @@ mod tests {
         async fn poll_statement(
             &self,
             _cx: &Cx,
-            _request: PollHttpRequest,
+            request: PollHttpRequest,
         ) -> TransportOutcome<PollHttpResponse> {
+            self.auth_seen
+                .borrow_mut()
+                .push(request.auth.redacted_fingerprint().to_owned());
             let next = self.polls.borrow_mut().remove(0);
             match next {
                 Scripted::Ok(status, body) => {
@@ -507,8 +665,11 @@ mod tests {
         async fn fetch_partition(
             &self,
             _cx: &Cx,
-            _request: PartitionHttpRequest,
+            request: PartitionHttpRequest,
         ) -> TransportOutcome<PartitionBody> {
+            self.auth_seen
+                .borrow_mut()
+                .push(request.auth.redacted_fingerprint().to_owned());
             let next = self.partitions.borrow_mut().remove(0);
             match next {
                 Scripted::Ok(status, body) => TransportOutcome::ok(PartitionBody {
@@ -557,6 +718,266 @@ mod tests {
             "fake-token",
             "cred_test",
         )
+    }
+
+    /// A provider whose descriptor fingerprint carries its generation, so the
+    /// transport log shows exactly which requests used the re-signed token.
+    struct FakeAuth {
+        can_resign: bool,
+        generation: u32,
+        resigns: u32,
+    }
+
+    impl FakeAuth {
+        fn resigning() -> Self {
+            Self {
+                can_resign: true,
+                generation: 0,
+                resigns: 0,
+            }
+        }
+
+        fn frozen_lane() -> Self {
+            Self {
+                can_resign: false,
+                generation: 0,
+                resigns: 0,
+            }
+        }
+    }
+
+    impl AuthProvider for FakeAuth {
+        fn descriptor(&mut self) -> Result<AuthorizationDescriptor, SnowflakeError> {
+            Ok(AuthorizationDescriptor::bearer(
+                SnowflakeAuthTokenType::KeypairJwt,
+                format!("jwt-gen-{}", self.generation),
+                format!("cred_gen{}", self.generation),
+            ))
+        }
+
+        fn on_unauthorized(&mut self) -> Result<bool, SnowflakeError> {
+            if !self.can_resign {
+                return Ok(false);
+            }
+            self.generation += 1;
+            self.resigns += 1;
+            Ok(true)
+        }
+    }
+
+    fn unauthorized() -> Scripted {
+        Scripted::Ok(
+            StatusClass::Unauthorized,
+            b"{\"message\":\"JWT token is invalid.\"}".to_vec(),
+        )
+    }
+
+    #[test]
+    fn poll_401_resigns_once_and_retries_with_the_new_token() {
+        asupersync::test_utils::run_test(|| async {
+            let transport =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            transport.polls.borrow_mut().push(unauthorized());
+            transport
+                .polls
+                .borrow_mut()
+                .push(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            transport.polls.borrow_mut().push(Scripted::Ok(
+                StatusClass::Completed,
+                RESP_200_SINGLE.to_vec(),
+            ));
+            let mut auth = FakeAuth::resigning();
+            let cx = Cx::for_testing();
+            let (outcome, stats) = run_statement_with_auth(
+                &cx,
+                &transport,
+                &mut auth,
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5),
+            )
+            .await;
+            assert!(matches!(outcome, SnowflakeOutcome::Ok(_)), "{outcome:?}");
+            assert_eq!(auth.resigns, 1);
+            assert_eq!(stats.polls, 3, "the retried poll is a real GET");
+            assert_eq!(
+                *transport.auth_seen.borrow(),
+                vec!["cred_gen0", "cred_gen0", "cred_gen1", "cred_gen1"],
+                "submit + first poll used gen0; the retry and the next poll used the re-signed gen1"
+            );
+            assert!(transport.orphan_cancels.borrow().is_empty());
+            assert!(transport.cancels_after_local.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn submit_401_resigns_and_resubmits_without_a_cancel() {
+        asupersync::test_utils::run_test(|| async {
+            let transport =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            *transport.submit_first.borrow_mut() = Some(unauthorized());
+            transport.polls.borrow_mut().push(Scripted::Ok(
+                StatusClass::Completed,
+                RESP_200_SINGLE.to_vec(),
+            ));
+            let mut auth = FakeAuth::resigning();
+            let cx = Cx::for_testing();
+            let (outcome, stats) = run_statement_with_auth(
+                &cx,
+                &transport,
+                &mut auth,
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5),
+            )
+            .await;
+            assert!(matches!(outcome, SnowflakeOutcome::Ok(_)), "{outcome:?}");
+            assert_eq!(auth.resigns, 1);
+            assert_eq!(stats.polls, 1);
+            assert_eq!(
+                *transport.auth_seen.borrow(),
+                vec!["cred_gen0", "cred_gen1", "cred_gen1"]
+            );
+            assert!(transport.orphan_cancels.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn poll_401_on_a_lane_that_cannot_resign_is_typed_and_cancels_the_orphan() {
+        asupersync::test_utils::run_test(|| async {
+            let transport =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            transport.polls.borrow_mut().push(unauthorized());
+            let mut auth = FakeAuth::frozen_lane();
+            let cx = Cx::for_testing();
+            let (outcome, _) = run_statement_with_auth(
+                &cx,
+                &transport,
+                &mut auth,
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5),
+            )
+            .await;
+            let SnowflakeOutcome::Err(error) = outcome else {
+                panic!("expected a typed error, got {outcome:?}");
+            };
+            assert_eq!(error.code, SnowflakeErrorCode::CredentialExpired);
+            assert!(error.message.contains("401"), "{}", error.message);
+            assert_eq!(auth.resigns, 0);
+            assert_eq!(transport.orphan_cancels.borrow().len(), 1);
+        });
+    }
+
+    #[test]
+    fn frozen_descriptor_entry_point_treats_401_as_terminal() {
+        asupersync::test_utils::run_test(|| async {
+            let transport =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            transport.polls.borrow_mut().push(unauthorized());
+            let cx = Cx::for_testing();
+            let (outcome, _) = run_statement_with_stats(
+                &cx,
+                &transport,
+                fake_auth(),
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5),
+            )
+            .await;
+            let SnowflakeOutcome::Err(error) = outcome else {
+                panic!("expected a typed error, got {outcome:?}");
+            };
+            assert_eq!(error.code, SnowflakeErrorCode::CredentialExpired);
+            assert_eq!(transport.orphan_cancels.borrow().len(), 1);
+        });
+    }
+
+    #[test]
+    fn two_consecutive_401s_stop_after_exactly_one_resign() {
+        asupersync::test_utils::run_test(|| async {
+            let transport =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            transport.polls.borrow_mut().push(unauthorized());
+            transport.polls.borrow_mut().push(unauthorized());
+            let mut auth = FakeAuth::resigning();
+            let cx = Cx::for_testing();
+            let (outcome, stats) = run_statement_with_auth(
+                &cx,
+                &transport,
+                &mut auth,
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5),
+            )
+            .await;
+            let SnowflakeOutcome::Err(error) = outcome else {
+                panic!("expected a typed error, got {outcome:?}");
+            };
+            assert_eq!(error.code, SnowflakeErrorCode::CredentialExpired);
+            assert!(
+                error.message.contains("rejected again"),
+                "{}",
+                error.message
+            );
+            assert_eq!(auth.resigns, 1, "exactly one re-sign, no loop");
+            assert_eq!(stats.polls, 2);
+            assert_eq!(transport.orphan_cancels.borrow().len(), 1);
+            assert!(transport.polls.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn partition_401_resigns_once_and_refetches() {
+        asupersync::test_utils::run_test(|| async {
+            let transport =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            transport.polls.borrow_mut().push(Scripted::Ok(
+                StatusClass::Completed,
+                RESP_200_MULTI.to_vec(),
+            ));
+            let multi: serde_json::Value = serde_json::from_slice(RESP_200_MULTI).unwrap();
+            let partitions = multi["resultSetMetaData"]["partitionInfo"]
+                .as_array()
+                .unwrap()
+                .clone();
+            let partition_count = partitions.len();
+            // First non-inline partition answers 401 once, then every partition
+            // is served in the live object form with the promised rowCount.
+            transport.partitions.borrow_mut().push(unauthorized());
+            for info in partitions.iter().skip(1) {
+                let rows = info["rowCount"].as_u64().unwrap_or(0);
+                let body = format!(
+                    r#"{{"data":[{}]}}"#,
+                    (0..rows)
+                        .map(|_| r#"["2024-01-02","ENTITY","2.50"]"#)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                transport
+                    .partitions
+                    .borrow_mut()
+                    .push(Scripted::Ok(StatusClass::Completed, body.into_bytes()));
+            }
+            let mut auth = FakeAuth::resigning();
+            let cx = Cx::for_testing();
+            let (outcome, stats) = run_statement_with_auth(
+                &cx,
+                &transport,
+                &mut auth,
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5),
+            )
+            .await;
+            assert!(matches!(outcome, SnowflakeOutcome::Ok(_)), "{outcome:?}");
+            assert_eq!(auth.resigns, 1);
+            assert_eq!(
+                stats.partitions_fetched as usize, partition_count,
+                "one extra fetch for the retry"
+            );
+            assert!(transport.orphan_cancels.borrow().is_empty());
+        });
     }
 
     fn fast_poll_plan(max_polls: u32) -> PollPlan {
