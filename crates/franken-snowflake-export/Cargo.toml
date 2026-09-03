@@ -22,3 +22,10 @@ blake3 = "1"
 franken-snowflake-core = { path = "../franken-snowflake-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Windows on ARM: blake3's NEON C path includes MSVC's arm_neon.h, which the
+# clang cross driver used by cargo-xwin cannot compile. The pure-Rust
+# implementation is functionally identical (same digests), only slower, and
+# only this target takes it.
+[target.'cfg(all(target_arch = "aarch64", target_os = "windows"))'.dependencies]
+blake3 = { version = "1", features = ["pure"] }

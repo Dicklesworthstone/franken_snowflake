@@ -24,3 +24,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlmodel-core = { version = "0.2.2", optional = true }
 sqlmodel-frankensqlite = { version = "0.2.2", optional = true }
+
+# Windows on ARM: blake3's NEON C path includes MSVC's arm_neon.h, which the
+# clang cross driver used by cargo-xwin cannot compile. The pure-Rust
+# implementation is functionally identical (same digests), only slower, and
+# only this target takes it.
+[target.'cfg(all(target_arch = "aarch64", target_os = "windows"))'.dependencies]
+blake3 = { version = "1", features = ["pure"] }
