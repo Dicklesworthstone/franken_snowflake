@@ -14,6 +14,7 @@
 //! cleanup request and single-sources the cancel-policy table. Either way the
 //! local outcome is `Cancelled`.
 
+use std::future::Future;
 use std::time::Duration;
 
 use asupersync::Cx;
@@ -23,8 +24,9 @@ use franken_snowflake_core::ids::StatementHandle;
 use franken_snowflake_core::outcome::SnowflakeOutcome;
 use franken_snowflake_core::redact::redact;
 use franken_snowflake_http::{
-    AuthorizationDescriptor, PartitionHttpRequest, PollHttpRequest, SnowflakeHttpClient,
-    StatusClass, SubmitHttpRequest, TransportRoute,
+    AuthorizationDescriptor, CancelHttpResponse, PartitionBody, PartitionHttpRequest,
+    PollHttpRequest, PollHttpResponse, SnowflakeHttpClient, StatusClass, SubmitHttpRequest,
+    SubmitHttpResponse, TransportOutcome, TransportRoute,
 };
 
 use crate::lifecycle::{
@@ -36,6 +38,90 @@ use crate::status::ResponseClass;
 /// The driver outcome: a fully-assembled [`CompletedStatement`] or one of the
 /// four `SnowflakeOutcome` terminal states.
 pub type StatementOutcome = SnowflakeOutcome<CompletedStatement>;
+
+/// The transport operations the driver needs. `SnowflakeHttpClient` is the
+/// production implementation; tests inject a scripted fake so the driver's
+/// error and cancellation paths are provable without a socket or an account.
+pub trait StatementTransport {
+    /// `POST /api/v2/statements`.
+    fn submit_statement(
+        &self,
+        cx: &Cx,
+        request: SubmitHttpRequest,
+    ) -> impl Future<Output = TransportOutcome<SubmitHttpResponse>>;
+    /// `GET /api/v2/statements/{handle}`.
+    fn poll_statement(
+        &self,
+        cx: &Cx,
+        request: PollHttpRequest,
+    ) -> impl Future<Output = TransportOutcome<PollHttpResponse>>;
+    /// `GET /api/v2/statements/{handle}?partition=N` (gzip already decoded).
+    fn fetch_partition(
+        &self,
+        cx: &Cx,
+        request: PartitionHttpRequest,
+    ) -> impl Future<Output = TransportOutcome<PartitionBody>>;
+    /// Policy-routed remote cancel after a local cancellation.
+    fn cancel_after_local_cancel(
+        &self,
+        cx: &Cx,
+        auth: AuthorizationDescriptor,
+        statement_handle: StatementHandle,
+        reason: CancelReason,
+    ) -> impl Future<Output = TransportOutcome<CancelHttpResponse>>;
+    /// Best-effort remote cancel when the driver abandons a handle after an error.
+    fn cancel_orphaned_statement(
+        &self,
+        cx: &Cx,
+        auth: AuthorizationDescriptor,
+        statement_handle: StatementHandle,
+    ) -> impl Future<Output = TransportOutcome<CancelHttpResponse>>;
+}
+
+impl StatementTransport for SnowflakeHttpClient {
+    async fn submit_statement(
+        &self,
+        cx: &Cx,
+        request: SubmitHttpRequest,
+    ) -> TransportOutcome<SubmitHttpResponse> {
+        Self::submit_statement(self, cx, request).await
+    }
+
+    async fn poll_statement(
+        &self,
+        cx: &Cx,
+        request: PollHttpRequest,
+    ) -> TransportOutcome<PollHttpResponse> {
+        Self::poll_statement(self, cx, request).await
+    }
+
+    async fn fetch_partition(
+        &self,
+        cx: &Cx,
+        request: PartitionHttpRequest,
+    ) -> TransportOutcome<PartitionBody> {
+        Self::fetch_partition(self, cx, request).await
+    }
+
+    async fn cancel_after_local_cancel(
+        &self,
+        cx: &Cx,
+        auth: AuthorizationDescriptor,
+        statement_handle: StatementHandle,
+        reason: CancelReason,
+    ) -> TransportOutcome<CancelHttpResponse> {
+        Self::cancel_after_local_cancel(self, cx, auth, statement_handle, reason).await
+    }
+
+    async fn cancel_orphaned_statement(
+        &self,
+        cx: &Cx,
+        auth: AuthorizationDescriptor,
+        statement_handle: StatementHandle,
+    ) -> TransportOutcome<CancelHttpResponse> {
+        Self::cancel_orphaned_statement(self, cx, auth, statement_handle).await
+    }
+}
 
 /// Observed effort for one driven statement, for `budget_consumed` reporting.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -52,9 +138,9 @@ pub struct DriverStats {
 ///
 /// `request` is the SQL API submit body; `params` carries the idempotency
 /// `requestId`/`retry` query contract that makes a resubmit safe.
-pub async fn run_statement(
+pub async fn run_statement<T: StatementTransport>(
     cx: &Cx,
-    client: &SnowflakeHttpClient,
+    client: &T,
     auth: AuthorizationDescriptor,
     request: SubmitStatementRequest,
     params: SubmitQueryParams,
@@ -66,9 +152,9 @@ pub async fn run_statement(
 }
 
 /// [`run_statement`] plus the poll/partition counts it consumed.
-pub async fn run_statement_with_stats(
+pub async fn run_statement_with_stats<T: StatementTransport>(
     cx: &Cx,
-    client: &SnowflakeHttpClient,
+    client: &T,
     auth: AuthorizationDescriptor,
     request: SubmitStatementRequest,
     params: SubmitQueryParams,
@@ -79,9 +165,9 @@ pub async fn run_statement_with_stats(
     (outcome, stats)
 }
 
-async fn drive(
+async fn drive<T: StatementTransport>(
     cx: &Cx,
-    client: &SnowflakeHttpClient,
+    client: &T,
     auth: AuthorizationDescriptor,
     request: SubmitStatementRequest,
     params: SubmitQueryParams,
@@ -163,7 +249,9 @@ async fn drive(
                     .await;
                 let response = match poll {
                     SnowflakeOutcome::Ok(response) => response,
-                    SnowflakeOutcome::Err(error) => return SnowflakeOutcome::err(error),
+                    SnowflakeOutcome::Err(error) => {
+                        return abandon_with_error(cx, client, &auth, &handle, error).await;
+                    }
                     SnowflakeOutcome::Cancelled(reason) => {
                         return cancel_locally(cx, client, &auth, &handle, reason).await;
                     }
@@ -173,7 +261,16 @@ async fn drive(
                 };
                 progress = match machine.on_poll(response_class(response.status), &response.body) {
                     Ok(progress) => progress,
-                    Err(error) => return SnowflakeOutcome::err(error.into_snowflake_error()),
+                    Err(error) => {
+                        return abandon_with_error(
+                            cx,
+                            client,
+                            &auth,
+                            &handle,
+                            error.into_snowflake_error(),
+                        )
+                        .await;
+                    }
                 };
             }
             Progress::FetchPartition { handle, partition } => {
@@ -194,7 +291,9 @@ async fn drive(
                     .await;
                 let response = match fetch {
                     SnowflakeOutcome::Ok(response) => response,
-                    SnowflakeOutcome::Err(error) => return SnowflakeOutcome::err(error),
+                    SnowflakeOutcome::Err(error) => {
+                        return abandon_with_error(cx, client, &auth, &handle, error).await;
+                    }
                     SnowflakeOutcome::Cancelled(reason) => {
                         return cancel_locally(cx, client, &auth, &handle, reason).await;
                     }
@@ -209,18 +308,44 @@ async fn drive(
                     &response.body,
                 ) {
                     Ok(progress) => progress,
-                    Err(error) => return SnowflakeOutcome::err(error.into_snowflake_error()),
+                    Err(error) => {
+                        return abandon_with_error(
+                            cx,
+                            client,
+                            &auth,
+                            &handle,
+                            error.into_snowflake_error(),
+                        )
+                        .await;
+                    }
                 };
             }
         }
     }
 }
 
+/// The driver is giving up on a live handle because of a local error (transport
+/// failure or an undecodable response). Fire a best-effort remote cancel so the
+/// statement is not left running server-side, then surface the original error.
+/// A failed cleanup does not change the error the caller sees.
+async fn abandon_with_error<T: StatementTransport>(
+    cx: &Cx,
+    client: &T,
+    auth: &AuthorizationDescriptor,
+    handle: &StatementHandle,
+    error: SnowflakeError,
+) -> StatementOutcome {
+    let _ = client
+        .cancel_orphaned_statement(cx, auth.clone(), handle.clone())
+        .await;
+    SnowflakeOutcome::err(error)
+}
+
 /// Fire the SQL API cancel endpoint through the transport's masked cleanup path,
 /// then report the local outcome as `Cancelled`.
-async fn cancel_locally(
+async fn cancel_locally<T: StatementTransport>(
     cx: &Cx,
-    client: &SnowflakeHttpClient,
+    client: &T,
     auth: &AuthorizationDescriptor,
     handle: &StatementHandle,
     reason: CancelReason,
@@ -308,6 +433,304 @@ mod tests {
     use crate::response::QueryFailureStatus;
     use asupersync::{Budget, CancelKind, Time};
     use franken_snowflake_core::outcome::{OutcomeKind, SnowflakeOutcomeExt};
+    use franken_snowflake_http::{
+        CompressionEvidence, ContentEncoding, SnowflakeAuthTokenType, TransportError,
+        TransportErrorCode,
+    };
+    use std::cell::RefCell;
+
+    const RESP_202: &[u8] = include_bytes!("../tests/fixtures/resp_202_running.json");
+    const RESP_200_MULTI: &[u8] =
+        include_bytes!("../tests/fixtures/resp_200_resultset_multi_partition.json");
+
+    /// What the fake answers on each route; `Err` produces a transport error.
+    #[derive(Clone)]
+    enum Scripted {
+        Ok(StatusClass, Vec<u8>),
+        Err,
+    }
+
+    /// A scripted transport recording every cancel the driver issues.
+    struct FakeTransport {
+        submit: Scripted,
+        polls: RefCell<Vec<Scripted>>,
+        partitions: RefCell<Vec<Scripted>>,
+        cancels_after_local: RefCell<Vec<(StatementHandle, CancelKind)>>,
+        orphan_cancels: RefCell<Vec<StatementHandle>>,
+    }
+
+    impl FakeTransport {
+        fn new(submit: Scripted) -> Self {
+            Self {
+                submit,
+                polls: RefCell::new(Vec::new()),
+                partitions: RefCell::new(Vec::new()),
+                cancels_after_local: RefCell::new(Vec::new()),
+                orphan_cancels: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn transport_error() -> SnowflakeError {
+            TransportError::new(TransportErrorCode::NetworkError, "connection reset")
+                .into_snowflake_error()
+        }
+    }
+
+    impl StatementTransport for FakeTransport {
+        async fn submit_statement(
+            &self,
+            _cx: &Cx,
+            _request: SubmitHttpRequest,
+        ) -> TransportOutcome<SubmitHttpResponse> {
+            match self.submit.clone() {
+                Scripted::Ok(status, body) => {
+                    TransportOutcome::ok(SubmitHttpResponse { status, body })
+                }
+                Scripted::Err => TransportOutcome::err(Self::transport_error()),
+            }
+        }
+
+        async fn poll_statement(
+            &self,
+            _cx: &Cx,
+            _request: PollHttpRequest,
+        ) -> TransportOutcome<PollHttpResponse> {
+            let next = self.polls.borrow_mut().remove(0);
+            match next {
+                Scripted::Ok(status, body) => {
+                    TransportOutcome::ok(PollHttpResponse { status, body })
+                }
+                Scripted::Err => TransportOutcome::err(Self::transport_error()),
+            }
+        }
+
+        async fn fetch_partition(
+            &self,
+            _cx: &Cx,
+            _request: PartitionHttpRequest,
+        ) -> TransportOutcome<PartitionBody> {
+            let next = self.partitions.borrow_mut().remove(0);
+            match next {
+                Scripted::Ok(status, body) => TransportOutcome::ok(PartitionBody {
+                    status,
+                    compression: CompressionEvidence {
+                        content_encoding: ContentEncoding::Identity,
+                        compressed_bytes: body.len() as u64,
+                        uncompressed_bytes: body.len() as u64,
+                    },
+                    body,
+                }),
+                Scripted::Err => TransportOutcome::err(Self::transport_error()),
+            }
+        }
+
+        async fn cancel_after_local_cancel(
+            &self,
+            _cx: &Cx,
+            _auth: AuthorizationDescriptor,
+            statement_handle: StatementHandle,
+            reason: CancelReason,
+        ) -> TransportOutcome<CancelHttpResponse> {
+            self.cancels_after_local
+                .borrow_mut()
+                .push((statement_handle, reason.kind));
+            TransportOutcome::cancelled(reason)
+        }
+
+        async fn cancel_orphaned_statement(
+            &self,
+            _cx: &Cx,
+            _auth: AuthorizationDescriptor,
+            statement_handle: StatementHandle,
+        ) -> TransportOutcome<CancelHttpResponse> {
+            self.orphan_cancels.borrow_mut().push(statement_handle);
+            TransportOutcome::ok(CancelHttpResponse {
+                status: StatusClass::Completed,
+                body: Vec::new(),
+            })
+        }
+    }
+
+    fn fake_auth() -> AuthorizationDescriptor {
+        AuthorizationDescriptor::bearer(
+            SnowflakeAuthTokenType::ProgrammaticAccessToken,
+            "fake-token",
+            "cred_test",
+        )
+    }
+
+    fn fast_poll_plan(max_polls: u32) -> PollPlan {
+        PollPlan {
+            max_polls,
+            poll_interval: Duration::ZERO,
+        }
+    }
+
+    fn fixture_handle() -> StatementHandle {
+        StatementHandle::new("01b2c3d4-0000-0000-0000-000000000002")
+    }
+
+    #[test]
+    fn poll_transport_error_after_submit_fires_an_orphan_cancel() {
+        asupersync::test_utils::run_test(|| async {
+            let transport =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            transport.polls.borrow_mut().push(Scripted::Err);
+            let cx = Cx::for_testing();
+            let (outcome, stats) = run_statement_with_stats(
+                &cx,
+                &transport,
+                fake_auth(),
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5),
+            )
+            .await;
+            assert!(matches!(outcome, SnowflakeOutcome::Err(_)));
+            assert_eq!(stats.polls, 1);
+            assert_eq!(
+                transport.orphan_cancels.borrow().as_slice(),
+                &[fixture_handle()],
+                "a transport error after the handle exists must cancel the orphaned statement"
+            );
+            assert!(transport.cancels_after_local.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn undecodable_poll_body_after_submit_fires_an_orphan_cancel() {
+        asupersync::test_utils::run_test(|| async {
+            let transport =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            transport
+                .polls
+                .borrow_mut()
+                .push(Scripted::Ok(StatusClass::Completed, b"not json".to_vec()));
+            let cx = Cx::for_testing();
+            let (outcome, _) = run_statement_with_stats(
+                &cx,
+                &transport,
+                fake_auth(),
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5),
+            )
+            .await;
+            assert!(matches!(outcome, SnowflakeOutcome::Err(_)));
+            assert_eq!(transport.orphan_cancels.borrow().len(), 1);
+        });
+    }
+
+    #[test]
+    fn partition_fetch_error_fires_an_orphan_cancel() {
+        asupersync::test_utils::run_test(|| async {
+            let transport = FakeTransport::new(Scripted::Ok(
+                StatusClass::Completed,
+                RESP_200_MULTI.to_vec(),
+            ));
+            transport.partitions.borrow_mut().push(Scripted::Err);
+            let cx = Cx::for_testing();
+            let (outcome, stats) = run_statement_with_stats(
+                &cx,
+                &transport,
+                fake_auth(),
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5),
+            )
+            .await;
+            assert!(matches!(outcome, SnowflakeOutcome::Err(_)));
+            assert_eq!(stats.partitions_fetched, 1);
+            assert_eq!(transport.orphan_cancels.borrow().len(), 1);
+        });
+    }
+
+    #[test]
+    fn deadline_during_poll_routes_through_the_policy_cancel_with_deadline_kind() {
+        asupersync::test_utils::run_test(|| async {
+            let transport =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            // Keep answering "running" so the deadline is what ends the loop.
+            for _ in 0..10 {
+                transport
+                    .polls
+                    .borrow_mut()
+                    .push(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            }
+            let cx = Cx::for_testing_with_budget(Budget::new().with_deadline(Time::from_millis(1)));
+            let (outcome, _) = run_statement_with_stats(
+                &cx,
+                &transport,
+                fake_auth(),
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                PollPlan {
+                    max_polls: 50,
+                    poll_interval: Duration::from_millis(5),
+                },
+            )
+            .await;
+            assert!(matches!(outcome, SnowflakeOutcome::Cancelled(_)));
+            let cancels = transport.cancels_after_local.borrow();
+            assert_eq!(cancels.len(), 1);
+            assert_eq!(cancels[0].0, fixture_handle());
+            assert_eq!(cancels[0].1, CancelKind::Deadline);
+            assert!(transport.orphan_cancels.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn happy_path_reports_polls_and_partitions_without_any_cancel() {
+        asupersync::test_utils::run_test(|| async {
+            let transport =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            transport
+                .polls
+                .borrow_mut()
+                .push(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            transport.polls.borrow_mut().push(Scripted::Ok(
+                StatusClass::Completed,
+                RESP_200_MULTI.to_vec(),
+            ));
+            let multi: serde_json::Value = serde_json::from_slice(RESP_200_MULTI).unwrap();
+            let partitions = multi["resultSetMetaData"]["partitionInfo"]
+                .as_array()
+                .unwrap()
+                .clone();
+            let partition_count = partitions.len();
+            // Each fetched partition must carry exactly the rowCount the metadata
+            // promised; the machine refuses mismatches (integrity check).
+            for info in partitions.iter().skip(1) {
+                let rows = info["rowCount"].as_u64().unwrap_or(0);
+                let body = format!(
+                    "[{}]",
+                    (0..rows)
+                        .map(|_| r#"["2024-01-02","ENTITY","2.50"]"#)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                transport
+                    .partitions
+                    .borrow_mut()
+                    .push(Scripted::Ok(StatusClass::Completed, body.into_bytes()));
+            }
+            let cx = Cx::for_testing();
+            let (outcome, stats) = run_statement_with_stats(
+                &cx,
+                &transport,
+                fake_auth(),
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5),
+            )
+            .await;
+            assert!(matches!(outcome, SnowflakeOutcome::Ok(_)), "{outcome:?}");
+            assert_eq!(stats.polls, 2);
+            assert_eq!(stats.partitions_fetched as usize, partition_count - 1);
+            assert!(transport.orphan_cancels.borrow().is_empty());
+            assert!(transport.cancels_after_local.borrow().is_empty());
+        });
+    }
 
     #[test]
     fn response_class_maps_each_transport_status() {

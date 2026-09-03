@@ -174,6 +174,11 @@ impl SnowflakeHttpClient {
     /// Send a remote cancel during a bounded cleanup phase after local
     /// cancellation. The caller owns the cleanup `Cx`; this function deliberately
     /// does not manufacture a detached context inside the transport layer.
+    ///
+    /// Every policy except quiet drain attempts the remote cancel
+    /// (`docs/transport_design.md`): a deadline/poll-quota/cost-budget
+    /// cancellation used to skip it, which orphaned the statement server-side
+    /// until `STATEMENT_TIMEOUT` even though the local caller had given up.
     pub async fn cancel_after_local_cancel(
         &self,
         cleanup_cx: &Cx,
@@ -181,25 +186,52 @@ impl SnowflakeHttpClient {
         statement_handle: StatementHandle,
         reason: CancelReason,
     ) -> TransportOutcome<CancelHttpResponse> {
-        match cancel_policy(reason.kind) {
-            CancelPolicy::RemoteCancelAndReceipt | CancelPolicy::BoundedDrain => {
-                run_with_cancellation_mask(
-                    cleanup_cx,
-                    self.cancel_statement(
-                        cleanup_cx,
-                        CancelHttpRequest {
-                            auth,
-                            statement_handle,
-                            reason_kind: reason.kind,
-                        },
-                    ),
-                )
-                .await
-            }
-            CancelPolicy::RetryOrDegrade | CancelPolicy::QuietDrain => {
-                TransportOutcome::cancelled(reason)
-            }
+        let policy = cancel_policy(reason.kind);
+        if !franken_snowflake_core::cancel::attempts_remote_cancel(policy) {
+            return TransportOutcome::cancelled(reason);
         }
+        debug_assert!(matches!(
+            policy,
+            CancelPolicy::RemoteCancelAndReceipt
+                | CancelPolicy::BoundedDrain
+                | CancelPolicy::RetryOrDegrade
+        ));
+        run_with_cancellation_mask(
+            cleanup_cx,
+            self.cancel_statement(
+                cleanup_cx,
+                CancelHttpRequest {
+                    auth,
+                    statement_handle,
+                    reason_kind: reason.kind,
+                },
+            ),
+        )
+        .await
+    }
+
+    /// Best-effort remote cancel of a statement the driver is abandoning because
+    /// of a local error (transport failure, undecodable response) after the
+    /// handle was issued. Runs under the cancellation mask so the cleanup request
+    /// completes even if the ambient context is already cancelled.
+    pub async fn cancel_orphaned_statement(
+        &self,
+        cleanup_cx: &Cx,
+        auth: AuthorizationDescriptor,
+        statement_handle: StatementHandle,
+    ) -> TransportOutcome<CancelHttpResponse> {
+        run_with_cancellation_mask(
+            cleanup_cx,
+            self.cancel_statement(
+                cleanup_cx,
+                CancelHttpRequest {
+                    auth,
+                    statement_handle,
+                    reason_kind: CancelKind::FailFast,
+                },
+            ),
+        )
+        .await
     }
 
     /// Fetch partitions in order and stream them into the caller's sink.

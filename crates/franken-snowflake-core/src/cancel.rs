@@ -44,6 +44,17 @@ pub fn cancel_policy(kind: CancelKind) -> CancelPolicy {
     }
 }
 
+/// Whether a cancellation policy still attempts the bounded remote cancel of a
+/// submitted statement handle. `docs/transport_design.md`: once a handle exists,
+/// user, deadline/budget, and shutdown cancellation must attempt a bounded
+/// remote cancel; only the quiet-drain kinds (`RaceLost`, `ParentCancelled`,
+/// `FailFast`, `LinkedExit`) skip it. "Retry or degrade" describes what the
+/// caller does next, not whether the orphaned statement gets cancelled.
+#[must_use]
+pub const fn attempts_remote_cancel(policy: CancelPolicy) -> bool {
+    !matches!(policy, CancelPolicy::QuietDrain)
+}
+
 /// The envelope `outcome_kind` for a cancellation. `Deadline`/`Timeout` read as
 /// [`OutcomeKind::Timeout`]; every other cancellation (including `CostBudget`)
 /// reads as [`OutcomeKind::Cancelled`], keeping `CostBudget` distinct from the
@@ -75,5 +86,39 @@ pub fn cancel_exit_code(kind: CancelKind) -> ExitCode {
         | CancelKind::RaceLost
         | CancelKind::ParentCancelled
         | CancelKind::LinkedExit => ExitCode::NetworkBudgetExhausted,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn budget_and_user_cancellations_attempt_the_remote_cancel() {
+        for kind in [
+            CancelKind::Deadline,
+            CancelKind::CostBudget,
+            CancelKind::PollQuota,
+            CancelKind::Timeout,
+            CancelKind::User,
+            CancelKind::Shutdown,
+            CancelKind::ResourceUnavailable,
+        ] {
+            assert!(
+                attempts_remote_cancel(cancel_policy(kind)),
+                "{kind:?} must attempt a bounded remote cancel (transport_design.md)"
+            );
+        }
+        for kind in [
+            CancelKind::RaceLost,
+            CancelKind::ParentCancelled,
+            CancelKind::FailFast,
+            CancelKind::LinkedExit,
+        ] {
+            assert!(
+                !attempts_remote_cancel(cancel_policy(kind)),
+                "{kind:?} drains quietly"
+            );
+        }
     }
 }
