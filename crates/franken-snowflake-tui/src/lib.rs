@@ -909,10 +909,20 @@ mod ftui_surface {
 
     /// Public alias for the model type when the terminal feature is enabled.
     pub type FrankenSnowflakeTuiModel = SnowflakeTuiApp;
+
+    /// Run the interactive program loop on the current terminal (crossterm
+    /// backend) until the user quits, then restore the terminal.
+    ///
+    /// # Errors
+    /// Any terminal setup or event-loop I/O error from FrankenTUI.
+    pub fn run_terminal(app: SnowflakeTuiApp) -> std::io::Result<()> {
+        let mut program = ftui::Program::new(app)?;
+        program.run()
+    }
 }
 
 #[cfg(feature = "tui")]
-pub use ftui_surface::{FrankenSnowflakeTuiModel, TuiMessage};
+pub use ftui_surface::{FrankenSnowflakeTuiModel, TuiMessage, run_terminal};
 
 #[cfg(test)]
 mod tests {

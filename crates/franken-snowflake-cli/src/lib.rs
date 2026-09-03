@@ -1306,16 +1306,7 @@ fn dispatch(invocation: Invocation) -> Outcome {
         Command::ExportRun { spec, out } => {
             export_run_dispatch(invocation.output, request_id, spec, out)
         }
-        Command::Tui { profile } => feature_disabled(
-            invocation.output,
-            "tui",
-            "fsnow.tui.launch.v1",
-            request_id,
-            profile,
-            SnowflakeErrorCode::UsageError,
-            "The TUI is default-off until its cargo-tree and cross-platform proofs land.",
-            vec!["franken-snowflake capabilities --json".to_string()],
-        ),
+        Command::Tui { profile } => tui_dispatch(invocation.output, request_id, profile),
         Command::McpServe { mode } => {
             #[cfg(feature = "mcp")]
             {
@@ -1531,6 +1522,25 @@ fn live_transport_required_with_data(
         status: SnowflakeErrorCode::RequireLiveRefused.exit_code(),
         body: Body::Envelope { envelope, format },
     }
+}
+
+#[cfg(feature = "tui")]
+fn tui_dispatch(format: OutputFormat, request_id: String, profile: Option<String>) -> Outcome {
+    tui_surface::launch_outcome(format, request_id, profile)
+}
+
+#[cfg(not(feature = "tui"))]
+fn tui_dispatch(format: OutputFormat, request_id: String, profile: Option<String>) -> Outcome {
+    feature_disabled(
+        format,
+        "tui",
+        "fsnow.tui.launch.v1",
+        request_id,
+        profile,
+        SnowflakeErrorCode::UsageError,
+        "This binary was built without the `tui` feature; rebuild with `--features tui` to launch the interactive catalog browser.",
+        vec!["franken-snowflake capabilities --json".to_string()],
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4979,6 +4989,8 @@ pub fn execute_cli_contract(args: Vec<String>) -> CliContractOutput {
 
 #[cfg(feature = "mcp")]
 mod mcp_surface;
+#[cfg(feature = "tui")]
+mod tui_surface;
 
 #[cfg(feature = "mcp")]
 pub use mcp_surface::run_mcp_serve_process;
@@ -5009,15 +5021,15 @@ fn live_transport_available() -> bool {
 
 // Shared by `capabilities` and the `onboard` mega-command so the two surfaces
 // can never drift on what this binary actually has compiled in. `live`/`mcp`/
-// `toon` are real CLI-crate features (reported via `cfg!`); `testkit` and `tui`
-// are NOT features of this binary — those surfaces live in sibling crates — so
-// they are definitionally false for any `franken-snowflake`/`fsnow` build.
+// `tui`/`toon` are real CLI-crate features (reported via `cfg!`); `testkit` is
+// NOT a feature of this binary — that surface lives in a sibling crate — so it
+// is definitionally false for any `franken-snowflake`/`fsnow` build.
 fn feature_flags_json() -> Json {
     json_object(vec![
         ("live", Json::Bool(live_transport_available())),
         ("testkit", Json::Bool(false)),
         ("mcp", Json::Bool(mcp_surface_available())),
-        ("tui", Json::Bool(false)),
+        ("tui", Json::Bool(cfg!(feature = "tui"))),
         ("toon", Json::Bool(toon_output_available())),
     ])
 }
@@ -5395,7 +5407,7 @@ mod tests {
         expect("live", cfg!(feature = "live"));
         // testkit/tui are not features of the CLI binary — always false here.
         expect("testkit", false);
-        expect("tui", false);
+        expect("tui", cfg!(feature = "tui"));
         expect("mcp", cfg!(feature = "mcp"));
         expect("toon", cfg!(feature = "toon"));
     }

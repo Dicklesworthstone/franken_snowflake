@@ -41,7 +41,7 @@ pub const PROFILE_COLUMN_CAP: usize = 50;
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn typed_error(
+pub(crate) fn typed_error(
     format: OutputFormat,
     command_id: &'static str,
     output_contract_id: &'static str,
@@ -73,7 +73,7 @@ fn typed_error(
     }
 }
 
-fn store_error(
+pub(crate) fn store_error(
     format: OutputFormat,
     command_id: &'static str,
     output_contract_id: &'static str,

@@ -585,7 +585,7 @@ or `%APPDATA%\franken-snowflake`); `FRANKEN_SNOWFLAKE_DATA_DIR` overrides it.
 |---|---|
 | `fsnow mcp serve --stdio` | Serve the read verbs as MCP tools over stdio (requires the `mcp` feature) |
 | `fsnow mcp serve --http <addr>` | Serve over HTTP at the given address |
-| `fsnow tui --profile <profile>` | Reserved: the TUI crate exists but is not compiled into this binary yet (typed `FSNOW-1002` refusal; tracked as an open bead) |
+| `fsnow tui --profile <profile>` | Interactive catalog browser + query planner (FrankenTUI) over the profile's latest local snapshot; needs a build with `--features tui` and a real terminal (a non-TTY invocation refuses typed instead of hanging). Executing a planned query from inside the TUI is not wired; use `query run` |
 
 ```bash
 fsnow mcp serve --stdio
@@ -842,8 +842,9 @@ confirmation required, `FSNOW-3009` DDL not opted in) with an exact next command
 - The local store is an append-only JSONL file store; the FrankenSQLite-backed
   store exists in the cache crate behind its `frankensqlite` feature but is not
   the CLI default (the locked fsqlite crates do not build on Windows yet).
-- The TUI crate exists but is not compiled into the binary; `fsnow tui` returns a
-  typed refusal.
+- The TUI is opt-in (`--features tui`) and offline: it browses the persisted
+  snapshot and plans raw SQL through the shared planner, but does not execute
+  queries from inside the session yet. Default builds answer a typed refusal.
 - The `--toon` encoding is byte-size-neutral rather than smaller for row
   payloads.
 - The CLI has no `completions` subcommand; discover commands via `capabilities`.

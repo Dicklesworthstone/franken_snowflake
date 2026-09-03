@@ -523,8 +523,10 @@ pub trait CacheBackend {
 
     fn insert_catalog_snapshot(&self, record: CatalogSnapshotRecord) -> CacheResult<()>;
     fn catalog_snapshot(&self, snapshot_id: &str) -> CacheResult<Option<CatalogSnapshotRecord>>;
-    /// The newest snapshot captured for exactly this (profile, database, schema)
-    /// scope, or `None` when that scope was never scanned.
+    /// The newest snapshot captured for this profile within the given scope:
+    /// `Some(name)` filters on exactly that database/schema, `None` means "any"
+    /// (so `(None, None)` is the profile's newest snapshot overall). `None` when
+    /// nothing in scope was ever scanned.
     fn latest_catalog_snapshot(
         &self,
         profile_id: &str,
@@ -660,8 +662,9 @@ impl CacheBackend for InMemoryCache {
             .values()
             .filter(|record| {
                 record.profile_id == profile_id
-                    && record.database_name.as_deref() == database_name
-                    && record.schema_name.as_deref() == schema_name
+                    && database_name
+                        .is_none_or(|name| record.database_name.as_deref() == Some(name))
+                    && schema_name.is_none_or(|name| record.schema_name.as_deref() == Some(name))
             })
             .max_by(|a, b| {
                 a.captured_at_ms
@@ -1029,7 +1032,9 @@ impl CacheBackend for FrankenSqliteCache {
             "SELECT snapshot_id, profile_id, source_kind, database_name, schema_name, \
                     captured_at_ms, payload_json, payload_hash, payload_bytes \
              FROM catalog_snapshots \
-             WHERE profile_id = ?1 AND database_name IS ?2 AND schema_name IS ?3 \
+             WHERE profile_id = ?1 \
+               AND (?2 IS NULL OR database_name = ?2) \
+               AND (?3 IS NULL OR schema_name = ?3) \
              ORDER BY captured_at_ms DESC, snapshot_id DESC LIMIT 1",
             &[
                 Value::Text(profile_id.to_owned()),
@@ -1988,6 +1993,64 @@ DROP TABLE IF EXISTS schema_migrations;
 mod tests {
     use super::*;
 
+    fn snapshot(
+        id: &str,
+        database: &str,
+        schema: &str,
+        captured_at_ms: u64,
+    ) -> CatalogSnapshotRecord {
+        let canonical = format!("{{\"snapshot\":\"{id}\"}}");
+        CatalogSnapshotRecord {
+            snapshot_id: id.to_owned(),
+            profile_id: "demo".to_owned(),
+            source_kind: "information_schema".to_owned(),
+            database_name: Some(database.to_owned()),
+            schema_name: Some(schema.to_owned()),
+            captured_at_ms,
+            payload: VerifiedPayload {
+                address: ContentAddress::blake3(canonical.as_bytes()),
+                canonical,
+            },
+        }
+    }
+
+    #[test]
+    fn latest_catalog_snapshot_treats_none_scope_as_any() -> CacheResult<()> {
+        let cache = InMemoryCache::default();
+        cache.insert_catalog_snapshot(snapshot("snap-public", "DB", "PUBLIC", 10))?;
+        cache.insert_catalog_snapshot(snapshot("snap-analytics", "DB", "ANALYTICS", 20))?;
+        cache.insert_catalog_snapshot(snapshot("snap-other", "OTHER", "PUBLIC", 15))?;
+        let id = |record: Option<CatalogSnapshotRecord>| record.map(|r| r.snapshot_id);
+        // Profile-wide: the newest across every scope.
+        assert_eq!(
+            id(cache.latest_catalog_snapshot("demo", None, None)?),
+            Some("snap-analytics".to_owned())
+        );
+        // Database only: newest within that database, any schema.
+        assert_eq!(
+            id(cache.latest_catalog_snapshot("demo", Some("DB"), None)?),
+            Some("snap-analytics".to_owned())
+        );
+        assert_eq!(
+            id(cache.latest_catalog_snapshot("demo", Some("OTHER"), None)?),
+            Some("snap-other".to_owned())
+        );
+        // Exact scope still filters exactly.
+        assert_eq!(
+            id(cache.latest_catalog_snapshot("demo", Some("DB"), Some("PUBLIC"))?),
+            Some("snap-public".to_owned())
+        );
+        assert_eq!(
+            cache.latest_catalog_snapshot("demo", Some("DB"), Some("NOPE"))?,
+            None
+        );
+        assert_eq!(
+            cache.latest_catalog_snapshot("someone-else", None, None)?,
+            None
+        );
+        Ok(())
+    }
+
     #[test]
     fn secret_prefixes_are_reexported_from_core() {
         assert_eq!(
@@ -2450,6 +2513,49 @@ mod frankensqlite_tests {
             receipt: payload(&format!("{{\"receipt\":\"{id}\"}}")),
             created_at_ms,
         }
+    }
+
+    fn snapshot(
+        id: &str,
+        database: &str,
+        schema: &str,
+        captured_at_ms: u64,
+    ) -> CatalogSnapshotRecord {
+        CatalogSnapshotRecord {
+            snapshot_id: id.to_owned(),
+            profile_id: "demo".to_owned(),
+            source_kind: "information_schema".to_owned(),
+            database_name: Some(database.to_owned()),
+            schema_name: Some(schema.to_owned()),
+            captured_at_ms,
+            payload: payload(&format!("{{\"snapshot\":\"{id}\"}}")),
+        }
+    }
+
+    #[test]
+    fn sqlite_latest_catalog_snapshot_treats_none_scope_as_any() -> CacheResult<()> {
+        let cache = FrankenSqliteCache::open_memory()?;
+        cache.insert_catalog_snapshot(snapshot("snap-public", "DB", "PUBLIC", 10))?;
+        cache.insert_catalog_snapshot(snapshot("snap-analytics", "DB", "ANALYTICS", 20))?;
+        cache.insert_catalog_snapshot(snapshot("snap-other", "OTHER", "PUBLIC", 15))?;
+        let id = |record: Option<CatalogSnapshotRecord>| record.map(|r| r.snapshot_id);
+        assert_eq!(
+            id(cache.latest_catalog_snapshot("demo", None, None)?),
+            Some("snap-analytics".to_owned())
+        );
+        assert_eq!(
+            id(cache.latest_catalog_snapshot("demo", Some("OTHER"), None)?),
+            Some("snap-other".to_owned())
+        );
+        assert_eq!(
+            id(cache.latest_catalog_snapshot("demo", Some("DB"), Some("PUBLIC"))?),
+            Some("snap-public".to_owned())
+        );
+        assert_eq!(
+            cache.latest_catalog_snapshot("demo", Some("DB"), Some("NOPE"))?,
+            None
+        );
+        Ok(())
     }
 
     #[test]

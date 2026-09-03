@@ -35,6 +35,10 @@ workspace = true
 [features]
 default = ["toon"]
 mcp = ["dep:franken-snowflake-mcp", "franken-snowflake-mcp/mcp"]
+# Opt-in interactive catalog browser + query planner (FrankenTUI, crossterm)
+# over the local store's latest snapshot. Default-off: agents use the JSON
+# surfaces, and a non-TTY invocation refuses typed instead of hanging.
+tui = ["dep:franken-snowflake-tui", "franken-snowflake-tui/tui"]
 toon = ["dep:toon"]
 # Opt-in live SQL API transport for `query run` / `catalog scan` / `profile
 # doctor --online`. Default-off so the agent CLI stays a no-account slice (no
@@ -58,6 +62,7 @@ franken-snowflake-cache = { path = "../franken-snowflake-cache" }
 franken-snowflake-graph = { path = "../franken-snowflake-graph" }
 franken-snowflake-export = { path = "../franken-snowflake-export", features = ["export"] }
 franken-snowflake-mcp = { path = "../franken-snowflake-mcp", optional = true }
+franken-snowflake-tui = { path = "../franken-snowflake-tui", optional = true }
 franken-snowflake-sqlapi = { path = "../franken-snowflake-sqlapi", optional = true }
 franken-snowflake-http = { path = "../franken-snowflake-http", optional = true }
 franken-snowflake-auth = { path = "../franken-snowflake-auth", optional = true }

@@ -253,7 +253,7 @@ fn capabilities_registry_documents_every_command_with_input_schemas() {
     let flags = &value["data"]["feature_flags"];
     assert_eq!(flags["live"], cfg!(feature = "live"));
     assert_eq!(flags["mcp"], cfg!(feature = "mcp"));
-    assert_eq!(flags["tui"], false);
+    assert_eq!(flags["tui"], cfg!(feature = "tui"));
 
     // TOON is an alternate encoding of the same envelope.
     let toon = h.run(&["capabilities", "--toon"]);
@@ -611,9 +611,26 @@ fn unknown_commands_and_flags_are_usage_errors_with_suggestions() {
     assert_eq!(flag.exit, 64);
     assert_eq!(flag.json()["error"]["code"], "FSNOW-1002");
 
+    // Without the feature `tui` is a typed feature refusal; with it, a profile
+    // that was never scanned is a typed metadata error that names the scan.
+    // Either way the child exits instead of waiting for keys.
     let tui = h.run(&["tui", "--profile", "e2e"]);
-    assert_eq!(tui.exit, 64);
-    assert_eq!(tui.json()["error"]["code"], "FSNOW-1002");
+    if cfg!(feature = "tui") {
+        assert_ne!(tui.exit, 0);
+        let value = tui.json();
+        assert_eq!(value["ok"], false);
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no catalog snapshot"),
+            "{value}"
+        );
+        assert!(value.to_string().contains("catalog scan e2e"), "{value}");
+    } else {
+        assert_eq!(tui.exit, 64);
+        assert_eq!(tui.json()["error"]["code"], "FSNOW-1002");
+    }
 
     if !cfg!(feature = "mcp") {
         let mcp = h.run(&["mcp", "serve", "--stdio"]);

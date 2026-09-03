@@ -151,6 +151,18 @@ several commands returned "reserved" stubs. This window closes those gaps:
   contains a digit (`myorg.prod2` → `MYORG-PROD2`); locator regions are
   recognized by hyphenated region labels and the aws/azure/gcp/privatelink
   keywords.
+- **`fsnow tui` launches.** The CLI gains an opt-in `tui` feature: with it,
+  `tui --profile <p>` loads the profile's latest catalog snapshot from the
+  local store and runs the FrankenTUI catalog browser + query planner
+  (crossterm) until the user quits, then prints a success envelope. Missing
+  snapshot, missing profile, and non-interactive stdin/stdout are typed
+  errors (no hang for agents). `capabilities.feature_flags.tui` now reflects
+  the build. Executing a planned query from inside the TUI is not wired yet.
+  The CLI body also moved to a library so `franken-snowflake` and `fsnow` are
+  two thin bins over one compiled unit (no duplicate test runs).
+- **Snapshot lookup scope.** `latest_catalog_snapshot` treats a `None`
+  database/schema as "any", so `catalog graph --database X` without
+  `--schema` finds the newest scan under X (it previously matched nothing).
 - **Concurrent partition fetch and row-cap early stop.** The driver fetches
   result partitions in a window (`PollPlan::with_partition_concurrency`,
   default 4, `<PREFIX>_PARTITION_CONCURRENCY` in the CLI) with every request

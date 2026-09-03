@@ -34,6 +34,7 @@ scripts/check-asupersync-single-version.sh
 python3 scripts/check-golden-lf.py
 cargo test --workspace --locked
 cargo test --locked -p franken-snowflake-cli --features live,mcp
+cargo test --locked -p franken-snowflake-cli --features tui
 cargo test --locked -p franken-snowflake-cache --features frankensqlite
 cargo test --locked -p franken-snowflake-frame --features frankenpandas
 cargo test --locked -p franken-snowflake-tui --features tui
