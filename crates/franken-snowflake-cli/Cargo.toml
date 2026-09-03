@@ -10,6 +10,12 @@ homepage.workspace = true
 description = "The agent-ergonomic franken-snowflake CLI binary."
 publish.workspace = true
 
+# The CLI body is a library so both binaries below share one compiled unit
+# (one build, one test run, no "main.rs present in multiple targets" warning).
+[lib]
+name = "franken_snowflake_cli"
+path = "src/lib.rs"
+
 # The installed binary is `franken-snowflake`, matching the documented contract.
 [[bin]]
 name = "franken-snowflake"
@@ -21,7 +27,7 @@ path = "src/main.rs"
 # documentation and the `invocation` strings in `capabilities`.
 [[bin]]
 name = "fsnow"
-path = "src/main.rs"
+path = "src/bin/fsnow.rs"
 
 [lints]
 workspace = true
