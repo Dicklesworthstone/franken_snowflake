@@ -5,9 +5,17 @@ receipt paths must not execute DDL, DML, stage file mutation, stored procedures,
 or session-state mutation. The deferred write-intent ladder below is the only
 designated path that may ever request a capability row wider than read-only.
 
-This document is a design contract, not an executor specification. The current
-implementation provides core types, typed refusals, and non-executing dry-run
-plans only. No Snowflake mutation transport is implemented by this bead.
+This document was the design contract for the ladder. Status as of
+2026-09-03: the executor **has landed** (`query write` / `write`, 2026-06-29).
+With the `live` feature and a profile that sets `WRITE_ENABLED`, a bare
+`query write` executes INSERT/MERGE/UPDATE/DELETE/COPY INTO/PUT directly and
+returns a live execution receipt; `--dry-run` previews and emits a confirmation
+token bound to (profile, SQL); `WRITE_REQUIRE_CONFIRM=true` makes the dry-run
+then `--confirm <token>` ceremony mandatory; DDL needs `WRITE_ALLOW_DDL=true`.
+Every executed or refused write is appended to the local audit ledger. The
+"Non-Goals" and "future" language below describes the original deferral and is
+kept for the rationale; where it conflicts with the README, the README and the
+code govern.
 
 ## Non-Goals
 

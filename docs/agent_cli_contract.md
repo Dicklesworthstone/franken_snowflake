@@ -77,12 +77,12 @@ Every JSON envelope includes:
 | `command_id` | Stable command identifier. |
 | `output_contract_id` | Identifies the payload shape. |
 | `schema_version` | Envelope schema version. |
-| `data_source` | `live \| fixture \| empty`; omitted when `unspecified`. |
+| `data_source` | `live` (a statement ran against Snowflake in this invocation), `cache` (served from the local store: snapshots, manifests, receipts), `fixture`, or `empty`. |
 | `profile_id` | Profile used (never a secret). |
-| `request_id` | Client-generated UUID; doubles as the SQL API idempotency `requestId`. |
+| `request_id` | Client-generated, UUID-shaped, unique per invocation (the envelope trace id). The SQL API idempotency `requestId` is a separate per-statement id reported as `data.sql_api_request_id`. |
 | `query_id` | Snowflake `query_id`, when applicable. |
 | `statement_handle` | SQL API statement handle, when applicable. |
-| `receipt_hash` | BLAKE3 content address of the query receipt. |
+| `receipt_hash` | BLAKE3 content address of the query receipt written to the local store by every successful live execution; `null` for offline commands and when the store could not be written (a warning says so). |
 | `started_at` / `finished_at` / `duration_ms` | Timing. |
 | `warnings` | Non-fatal findings. |
 | `safe_next_commands` | Suggested follow-ups. |

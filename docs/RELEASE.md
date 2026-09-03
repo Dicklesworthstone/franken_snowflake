@@ -6,7 +6,12 @@ requiring live Snowflake credentials.
 
 ## Current Release State
 
-- Package version: `0.0.0` workspace pre-release.
+- Package version: `0.0.2` (GitHub Release 2026-08-25). Its binaries were
+  built with the default feature set (no `live`, no `mcp`) and no Windows
+  assets, contrary to the README at the time; the next release must be built
+  with `--features live,mcp` for every target including
+  `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`, and `capabilities`
+  on each artifact must report `live=true, mcp=true` before upload.
 - Publish state: workspace crates inherit `publish = false`; crates.io publish
   remains blocked until the first tagged public release intentionally chooses a
   SemVer version and flips that flag.
@@ -27,9 +32,18 @@ cargo check --workspace --no-default-features
 python3 scripts/check-dependency-admissibility.py
 scripts/check-asupersync-single-version.sh
 python3 scripts/check-golden-lf.py
-cargo test --locked -p franken-snowflake-testkit --lib
-cargo test --locked -p franken-snowflake-testkit --test e2e_harness
+cargo test --workspace --locked
+cargo test --locked -p franken-snowflake-cli --features live,mcp
+cargo test --locked -p franken-snowflake-cache --features frankensqlite
+cargo test --locked -p franken-snowflake-frame --features frankenpandas
+cargo test --locked -p franken-snowflake-tui --features tui
+cargo test --locked -p franken-snowflake-text-indexing --features frankensearch
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
+
+`cargo test -p franken-snowflake-cli` includes the binary-spawning e2e lane
+(`tests/cli_e2e.rs`, planted canary secrets) and, with `mcp`, the stdio
+handshake/parity test (`tests/mcp_stdio.rs`).
 
 The dependency admissibility gate must emit passing JSON verdicts for the
 default production graph, the no-default-features graph, each production feature
@@ -45,7 +59,12 @@ The GitHub Actions matrix must pass on Linux, macOS, and Windows:
 - `cargo check --workspace --locked`
 - `python3 scripts/check-dependency-admissibility.py`
 - `python3 scripts/check-golden-lf.py`
-- `cargo test --locked -p franken-snowflake-testkit --test e2e_harness`
+- `cargo test --workspace --locked` plus every optional feature lane (see
+  `.github/workflows/ci.yml`; the `frankensqlite` lane is Unix-only)
+
+Until 2026-09-02 no CI run had ever produced a job (the workflow used the
+`runner` context in job-level `env`, which GitHub rejects); treat any "CI
+proof" claim older than that as unbacked.
 
 The Linux lint lane must also pass:
 

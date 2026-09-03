@@ -66,13 +66,13 @@ warehouse before any live credential exists.
 |---|---|
 | Rust-first, memory-safe | `forbid(unsafe_code)` workspace-wide; lints `deny` `unwrap`/`expect`/`panic`/`todo`/`dbg!` |
 | No hidden async runtime | Built on Asupersync; production crates forbid Tokio, reqwest, hyper, axum, tower, sqlx, diesel, sea-orm |
-| Agent-ergonomic by default | Deterministic `--json` (and token-efficient `--toon`), `capabilities`, `agent-handbook`, `onboard`, `did_you_mean`, stable exit codes |
+| Agent-ergonomic by default | Deterministic `--json` (or the alternate `--toon` encoding), `capabilities` with per-command JSON Schema inputs, `agent-handbook`, `onboard`, `did_you_mean`, stable exit codes |
 | Callable as a tool | Optional `mcp serve` exposing the same handlers and envelope contract over stdio or HTTP |
 | Deterministic tests | A mock SQL API server and a codec lane under a lab runtime exercise the contracts with no warehouse |
 | Never a fixture posing as live data | `data_source` provenance on every envelope; the live path refuses cleanly when credentials are absent |
 | Safe writes | `query write` runs DML, COPY INTO, and PUT directly once a profile sets `WRITE_ENABLED`; `--dry-run` previews and binds a (profile, SQL) confirmation token, `WRITE_REQUIRE_CONFIRM` re-arms that ceremony, and DDL needs a separate opt-in |
 | Secrets stay secret | No secret in config, `Debug`, JSON, or panic text; a compile-time leak gate enforces it |
-| Auditable after the fact | Content-addressed query receipts and an append-only audit log |
+| Auditable after the fact | Every live execution writes a BLAKE3 content-addressed receipt plus partition evidence and an append-only audit event to a local store; `receipt show <hash>` reads them back |
 
 ---
 
@@ -80,7 +80,9 @@ warehouse before any live credential exists.
 
 The commands below cover discovery, self-description, and offline planning, and
 they need no credentials. Read commands emit a deterministic JSON envelope on
-stdout (`--json`, the default) or a token-efficient `--toon` encoding.
+stdout (`--json`, the default) or the alternate `--toon` encoding (same data,
+round-trips exactly; byte size is comparable, token savings depend on your
+tokenizer and payload shape).
 Diagnostics go to stderr. An empty-but-valid result is exit 0 with an empty
 payload, never a non-zero exit.
 
@@ -103,8 +105,14 @@ fsnow dataset describe-operator between --jsonschema
 # Validate and explain a query plan without submitting it.
 fsnow query plan --profile demo-prod --sql "select * from events limit 10" --json
 
-# Render catalog lineage as Mermaid (live source requires the `live` feature + credentials).
+# Render catalog lineage as Mermaid from the local snapshot (populated by a live
+# `catalog scan`; a scope that was never scanned is a typed error, never an empty graph).
 fsnow catalog graph demo-prod --database ANALYTICS --schema PUBLIC --mermaid
+
+# Dataset mode, planned offline against the local catalog snapshot: pushed-down
+# SQL with typed bindings, a time range, an entity filter, and an enforced limit.
+fsnow query plan --dataset analytics_public_events_b3_<hash> \
+  --entity ENTITY123 --from 2024-01-01 --to 2024-12-31 --select EVENT_DATE,VALUE --json
 ```
 
 With the `live` feature compiled in and the profile's credential handles
@@ -221,6 +229,10 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_snowflake
 irm https://raw.githubusercontent.com/Dicklesworthstone/franken_snowflake/main/install.ps1 | iex
 ```
 
+> `v0.0.2` shipped no Windows assets, so the PowerShell one-liner fails on that
+> release with a missing-asset error. Use the `-FromSource` switch below, or a
+> release that includes the `pc-windows-msvc` archives.
+
 The installer accepts these flags (pass after `bash -s --` for the curl form):
 
 | Flag | Effect |
@@ -236,9 +248,13 @@ The installer accepts these flags (pass after `bash -s --` for the curl form):
 | `--no-gum` | Plain output with no styled prompts |
 | `--force` | Overwrite an existing install |
 
-Release binaries are built with the published live/MCP feature set. Credentials
-are still runtime-gated; the binary refuses live operations cleanly when the
-selected profile or environment does not provide credential handles.
+The `v0.0.2` release binaries were built with the **default** feature set: they
+report `feature_flags.live=false, mcp=false` in `capabilities`, so they cover the
+offline surfaces only. Live Snowflake access from a downloaded binary needs the
+next release (planned with `--features live,mcp`); until then build from source
+with the features below. Credentials are always runtime-gated: a live-capable
+binary refuses live operations cleanly when the selected profile or environment
+does not provide credential handles.
 
 To build the live-capable binary from source in one shot, pass both
 `--from-source` and `--live` through the pipe:
@@ -353,7 +369,7 @@ Asupersync dependency set; the pinned toolchain lives in `rust-toolchain.toml`.
 ## Command Reference
 
 The canonical binary is `franken-snowflake`; `fsnow` is the identical alias.
-Read commands default to `--json`. Pass `--toon` for the token-efficient
+Read commands default to `--json`. Pass `--toon` for the alternate TOON
 encoding (available when the default `toon` feature is compiled in). `--no-color`
 is accepted and ignored. There is no `--version` flag; the compiled version and
 feature set are reported inside the `capabilities` and `onboard` envelopes.
@@ -371,8 +387,8 @@ becomes optional, while an explicit value still wins. See
 | `fsnow capabilities --json` | The complete machine-readable command registry, including compiled `feature_flags` |
 | `fsnow robot-docs guide` | An embedded agent guide for first-contact usage |
 | `fsnow agent-handbook --json` | Envelope keys, exit codes, recovery commands, and non-goals |
-| `fsnow doctor --json` | Local readiness checks |
-| `fsnow selftest --json` | Deterministic protocol fixture readiness check |
+| `fsnow doctor --json` | Executed local readiness checks: binary/features, contract render+parse, data dir writable, local store opens, default-profile handle presence (names only) |
+| `fsnow selftest --json` | Executed offline contract fixtures: envelope round trip, secret-redaction canaries, read-only guard cases, write ladder, operator schemas, local store round trip, export plan hardening |
 | `fsnow help` / `fsnow --help` / `fsnow -h` | Top-level help envelope with `did_you_mean` on typos |
 
 ```bash
@@ -385,7 +401,7 @@ fsnow agent-handbook --json
 
 | Command | What it does |
 |---|---|
-| `fsnow profile validate <profile> --json` | Validate the profile id and the env-var handle names it references, with no live I/O |
+| `fsnow profile validate <profile> --json` | Validate the profile id and report which env-var handles are set, by name only (exit 1 lists the missing ones with exact `export` repair commands) |
 | `fsnow profile doctor <profile> --json` | Inspect profile readiness offline |
 | `fsnow profile doctor <profile> --online --json` | Attempt a minimal live probe (`SELECT CURRENT_VERSION()`); requires the `live` feature and credentials |
 
@@ -403,16 +419,17 @@ handle sets per auth lane.
 
 | Command | What it does |
 |---|---|
-| `fsnow catalog scan <profile> --database <db> --schema <schema> --json` | Discover catalog metadata through `INFORMATION_SCHEMA.TABLES` |
-| `fsnow catalog graph <profile> --database <db> [--schema <schema>] [--json\|--toon\|--mermaid\|--svg]` | Render catalog lineage (profile to database to schema to object) |
+| `fsnow catalog scan <profile> --database <db> --schema <schema> --json` | Discover tables, views, and columns through bound `INFORMATION_SCHEMA` statements, build dataset manifests (field roles, row/byte hints), and persist the snapshot to the local store |
+| `fsnow catalog graph <profile> --database <db> [--schema <schema>] [--refresh] [--json\|--toon\|--mermaid\|--svg]` | Render the lineage graph (profile > database > schema > object > column, dataset and field edges) from the local snapshot, or from a live scan with `--refresh` |
 
 Both `--database` and `--schema` are required for `catalog scan`. `catalog
 graph` requires `--database` and takes `--schema` optionally. Exactly one output
 format may be chosen for `catalog graph`; mixing `--mermaid` with `--json` (or
-two raw formats) is a usage error. Identifiers are validated as plain SQL
-identifiers before interpolation, so a crafted value is rejected rather than
-escaped-and-trusted. Live data requires the `live` feature plus credentials; the
-default build returns a typed "live transport required" envelope.
+two raw formats) is a usage error. Scope values are passed to Snowflake as
+positional bindings, never interpolated. `catalog scan` requires the `live`
+feature plus credentials (the default build returns a typed "live transport
+required" envelope); `catalog graph`, `dataset inspect`, and `dataset profile`
+then work offline from the persisted snapshot.
 
 ```bash
 fsnow catalog scan demo-prod --database ANALYTICS --schema PUBLIC --json
@@ -424,13 +441,14 @@ fsnow catalog graph demo-prod --database ANALYTICS --schema PUBLIC --svg
 
 | Command | What it does |
 |---|---|
-| `fsnow dataset inspect <dataset-id> --json` | Return a dataset manifest with its column and operator catalogs |
-| `fsnow dataset profile <dataset-id> --json` | Plan pushed-down `APPROX_*` column profiling for a dataset |
-| `fsnow dataset describe-operator <operator> --jsonschema` | Return JSON Schema 2020-12 for a supported filter operator |
+| `fsnow dataset inspect <dataset-id> --json` | Return the dataset manifest (roles, limits, row/byte hints), its column catalog, and the operator catalog from the local store |
+| `fsnow dataset profile <dataset-id> [--execute] --json` | Build the pushed-down `APPROX_COUNT_DISTINCT` / null-count / min-max profiling statement; `--execute` runs it live and returns the stats |
+| `fsnow dataset describe-operator <operator> --jsonschema` | Return the catalog entry and JSON Schema 2020-12 for one of the 11 filter operators (`eq neq lt lte gt gte between in is_null is_not_null contains`) |
 
 `dataset describe-operator` is fully offline and deterministic. `dataset
-inspect` and `dataset profile` return typed envelopes that describe the planned
-shape while the dataset-manifest model is finalized.
+inspect` and `dataset profile` read the snapshot a `catalog scan` persisted; an
+unknown dataset is a typed `FSNOW-7002` error naming the scan command. Dataset
+ids look like `<db>_<schema>_<object>_b3_<hash>` and are listed by `catalog scan`.
 
 ```bash
 fsnow dataset describe-operator between --jsonschema
@@ -443,10 +461,12 @@ fsnow dataset profile events_daily --json
 | Command | What it does |
 |---|---|
 | `fsnow query plan --profile <profile> --sql <sql> --json` | Validate and explain a read plan without submitting it |
-| `fsnow query run --profile <profile> --sql <sql> --json` | Submit a single read statement (SELECT / WITH / SHOW / DESCRIBE / EXPLAIN) |
+| `fsnow query plan --dataset <id> [--entity <v>] [--from <t>] [--to <t>] [--as-of <t>] [--select a,b] [--filter <json>] [--limit <n>] --json` | Dataset mode: compile pushed-down SQL with positional typed bindings, Time Travel `AT(TIMESTAMP => ...)` for `--as-of`, and an enforced limit, offline from the local snapshot |
+| `fsnow query run --profile <profile> --sql <sql> [--limit <rows>] [--role <r>] [--warehouse <w>] [--statement-timeout <s>] --json` | Submit a single read statement (SELECT / WITH / SHOW / DESCRIBE / EXPLAIN); every flag is honored or rejected, never silently ignored |
+| `fsnow query run --dataset <id> ... --json` | Dataset mode: plan as above, then execute live with the same bindings |
 | `fsnow query write --profile <profile> --sql <sql> [--dry-run \| --confirm <token>] --json` | Execute a mutation; direct once `WRITE_ENABLED` is set, with `--dry-run` as an optional preview (see [Writes](#writes)) |
 | `fsnow query --sql <sql> --profile <profile> --json` | Shorthand that maps to `query run` |
-| `fsnow query cancel <statement-handle> --json` | Cancel a remote SQL API statement handle |
+| `fsnow query cancel <statement-handle> --profile <profile> --json` | POST to the SQL API cancel endpoint for a statement handle with the profile's credentials (live feature) |
 
 `query plan` runs offline: it validates the statement, refuses multiple
 statements and mutating statements (UPDATE / DELETE / INSERT / MERGE / DDL), and
@@ -462,8 +482,13 @@ mutate data, use `query write`. Live read results are capped into the envelope
 ```bash
 fsnow query plan --profile demo-prod --sql "select * from events limit 10" --json
 fsnow query run  --profile demo-prod --sql "select current_version()" --json
-fsnow query cancel 01b2c3d4-0000-abcd-0000-000000000001 --json
+fsnow query cancel 01b2c3d4-0000-abcd-0000-000000000001 --profile demo-prod --json
 ```
+
+Every successful live execution stamps the envelope's `receipt_hash` with the
+BLAKE3 content address of a query receipt written to the local store, together
+with per-partition evidence and an append-only audit event; `receipt show
+<hash>` reads it back. `budget_consumed.polls` and `duration_ms` are measured.
 
 ### Writes
 
@@ -538,13 +563,21 @@ that live transport and credentials are required); it never fakes an execution.
 
 | Command | What it does |
 |---|---|
-| `fsnow receipt show <receipt-hash> --json` | Look up a content-addressed query receipt |
-| `fsnow export plan --json` | Draft a `COPY INTO` or local CSV/JSONL export plan; run a `COPY INTO` through `query write` |
+| `fsnow receipt show <receipt-hash> --json` | Look up a content-addressed query receipt, its partition evidence, and the audit events that reference it |
+| `fsnow export plan --profile <p> --sql <select>\|--query-id <id> --location @stage/path [--format csv\|jsonl] [--compression gzip] [--header false] [--overwrite] [--single] [--max-file-size <bytes>] --json` | Build a content-addressed `COPY INTO <stage>` plan (Snowflake-side unload) and the exact `query write` command that executes it |
+| `fsnow export run --profile <p> --sql <select> --format csv\|jsonl --out <path> --json` | Run a read live and write a content-addressed local CSV/JSONL artifact (live feature) |
 
 ```bash
-fsnow export plan --json
+fsnow export plan --profile demo-prod --sql "select * from events" --location @my_stage/exports/run_001 --format jsonl --json
+fsnow export run --profile demo-prod --sql "select * from events limit 1000" --format csv --out events.csv --json
 fsnow receipt show 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 --json
 ```
+
+Receipts, audit events, catalog snapshots, and dataset manifests live in an
+append-only JSONL store under the platform data directory
+(`~/.local/share/franken-snowflake`, `~/Library/Application Support/franken-snowflake`,
+or `%APPDATA%\franken-snowflake`); `FRANKEN_SNOWFLAKE_DATA_DIR` overrides it.
+`doctor` reports the resolved directory.
 
 ### MCP and TUI
 
@@ -552,7 +585,7 @@ fsnow receipt show 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00
 |---|---|
 | `fsnow mcp serve --stdio` | Serve the read verbs as MCP tools over stdio (requires the `mcp` feature) |
 | `fsnow mcp serve --http <addr>` | Serve over HTTP at the given address |
-| `fsnow tui --profile <profile>` | Launch the interactive TUI (requires the `tui` feature; opt-in and default-off) |
+| `fsnow tui --profile <profile>` | Reserved: the TUI crate exists but is not compiled into this binary yet (typed `FSNOW-1002` refusal; tracked as an open bead) |
 
 ```bash
 fsnow mcp serve --stdio
@@ -594,6 +627,7 @@ normalized to `_`, then prefixed with `FRANKEN_SNOWFLAKE_`. The profile
 | `<PREFIX>_SCHEMA` | Optional default schema (overridden by `--schema`) |
 | `<PREFIX>_ROLE` | Optional role |
 | `<PREFIX>_MAX_POLLS` | Optional poll budget (default 120) |
+| `<PREFIX>_STATEMENT_TIMEOUT_SECONDS` | Optional SQL API statement timeout in seconds (default 60; `--statement-timeout` overrides per run) |
 | `<PREFIX>_WRITE_ENABLED` | Set to `true` to enable data writes (DML, COPY INTO, PUT) for the profile; a bare `query write` then executes directly |
 | `<PREFIX>_WRITE_REQUIRE_CONFIRM` | Set to `true` to require the dry-run to confirm ceremony on every write (cautious opt-in); a bare `query write` refuses until you `--dry-run`, then `--confirm <token>` |
 | `<PREFIX>_WRITE_ALLOW_DDL` | Set to `true` to additionally allow DDL (CREATE/ALTER/DROP/TRUNCATE/GRANT/REVOKE) through `query write` |
@@ -605,6 +639,7 @@ These apply across profiles rather than to a single profile prefix.
 | Variable | Purpose |
 |---|---|
 | `FRANKEN_SNOWFLAKE_DEFAULT_PROFILE` | Default profile used when `--profile` (or the positional `<profile>`) is omitted. Set it once to make `--profile` optional on every command; an explicit profile always wins. |
+| `FRANKEN_SNOWFLAKE_DATA_DIR` | Override the local store directory (receipts, audit log, catalog snapshots, dataset manifests). |
 
 ```bash
 # Make --profile optional for the rest of the session.
@@ -673,7 +708,8 @@ statement handle.
    offline agent surface (no credentials needed)
    onboard · capabilities · robot-docs · agent-handbook · doctor · selftest
    profile validate · profile doctor · dataset describe-operator
-   query plan · query write (dry-run) · catalog graph render · export plan draft
+   query plan (raw SQL or --dataset) · query write (dry-run) · export plan
+   from the local store: catalog graph · dataset inspect · dataset profile · receipt show
               |
               v
    franken-snowflake-core
@@ -691,9 +727,10 @@ statement handle.
    sqlapi (submit · poll · partition stream · cancel · jsonv2 wire codec)
               |
               v
-   catalog (info-schema discovery · model · operator · planner · predicate AST)
-   graph (lineage · Mermaid/SVG) · frame (fp-columnar/fp-types) · export (COPY INTO + CSV/JSONL)
-   cache (FrankenSQLite/sqlmodel metadata store) · text-indexing (frankensearch hash/lexical)
+   catalog (info-schema discovery · manifests · operator catalog · dataset planner · predicate AST)
+   graph (lineage · Mermaid/SVG) · export (COPY INTO plans + local CSV/JSONL writers)
+   cache (local store: append-only JSONL by default; FrankenSQLite backend opt-in)
+   library-only today: frame (fp-columnar/fp-types) · text-indexing (frankensearch hash/lexical) · tui
               |
               v
         Snowflake SQL API  (HTTPS)
@@ -749,6 +786,8 @@ fsnow mcp serve --stdio
 | `query run` returns a "live transport required" envelope | The binary was built without the `live` feature | Rebuild with `--features live`, then export the profile's credential handles |
 | Credential error (exit 3) on a live command | A required `<PREFIX>_*` handle is missing | Run `fsnow profile validate <profile> --json` to see the expected handle set, then export the missing ones |
 | `--toon` rejected | The `toon` feature is not compiled in | Use `--json`, or rebuild with the default features (which include `toon`) |
+| `FSNOW-7002` (exit 7) from `dataset inspect` / `catalog graph` / `receipt show` | Nothing in the local store for that dataset, scope, or hash | Run `catalog scan <profile> --database <db> --schema <schema>` (live feature) first; `doctor` shows the store directory |
+| `--from`/`--to`/`--entity` refused (exit 64) | Dataset-mode flags need `--dataset <id>` | Get the dataset id from `catalog scan` or `dataset inspect`, then `query run --dataset <id> --from ... --to ...` |
 | Safety refusal (exit 2) on `query run` / `query plan` | The SQL is a mutation, DDL, or multiple statements | `query run` and `query plan` take a single read statement (SELECT / WITH / SHOW / DESCRIBE / EXPLAIN); to change data, use `query write` |
 | `query write` refuses with `FSNOW-3007` | Writes are not enabled for the profile | `export FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ENABLED=true`, then run `query write` directly |
 | `query write` refuses with `FSNOW-3008` | The profile sets `WRITE_REQUIRE_CONFIRM=true` and no matching token was supplied | Run `query write --dry-run` to get the token, then re-run with `--confirm <token>` (or unset the handle for direct writes) |
@@ -784,11 +823,20 @@ confirmation required, `FSNOW-3009` DDL not opted in) with an exact next command
   `WRITE_ENABLED`; DDL needs the additional `WRITE_ALLOW_DDL` opt-in, and
   `WRITE_REQUIRE_CONFIRM` re-arms the dry-run to confirm ceremony for cautious
   profiles.
-- `dataset inspect` and `dataset profile` currently return typed "planned" or
-  "requires model" envelopes while the dataset-manifest model is finalized.
+- `catalog scan` needs the `live` feature; everything that reads the snapshot
+  (`dataset inspect`, `dataset profile` planning, `catalog graph`, dataset-mode
+  `query plan`) works offline afterwards.
 - Local Arrow/Parquet export is not implemented yet; local export covers
   CSV/JSONL, and large export uses Snowflake-side `COPY INTO`.
-- The TUI ships behind the `tui` feature (opt-in, default-off).
+- The local store is an append-only JSONL file store; the FrankenSQLite-backed
+  store exists in the cache crate behind its `frankensqlite` feature but is not
+  the CLI default (the locked fsqlite crates do not build on Windows yet).
+- The TUI crate exists but is not compiled into the binary; `fsnow tui` returns a
+  typed refusal.
+- Long-running statements are not re-signed mid-flight for key-pair JWT (a poll
+  past ~1 hour fails typed rather than refreshing), partitions are fetched
+  sequentially, and the `--toon` encoding is byte-size-neutral rather than
+  smaller for row payloads.
 - The CLI has no `completions` subcommand; discover commands via `capabilities`.
 - The whole stack requires a nightly Rust toolchain (edition 2024), inherited
   from the FrankenSQLite, sqlmodel, and Asupersync dependency set.
