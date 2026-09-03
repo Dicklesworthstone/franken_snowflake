@@ -58,7 +58,19 @@ in a scanned lane blocks release.
 This repository does not use GitHub Actions. There is no `.github/workflows`
 directory and none may be added. Cross-platform builds, tests, and release
 artifacts run through `dsr` (Doodlestein Self-Releaser) on its Linux, macOS,
-and Windows build hosts. Before tagging, the following must pass on each of
+and Windows build hosts. The repository is registered with `dsr` as the tool
+`franken_snowflake` (six targets: x86_64/aarch64 Linux, macOS, and Windows;
+built with `--features live,mcp`; assets named
+`franken-snowflake-v<version>-<target-triple>.tar.gz|zip` as the installers
+expect):
+
+```bash
+dsr repos validate                     # config sanity (naming vs install.sh)
+dsr quality franken_snowflake          # the check list below, locally
+dsr build franken_snowflake --dry-run  # the six-target build plan
+dsr build franken_snowflake            # build on the dsr hosts
+dsr release franken_snowflake <ver>    # upload the artifacts + checksums
+``` Before tagging, the following must pass on each of
 the three platforms via `dsr`, and the release notes must cite the `dsr`
 run output:
 
