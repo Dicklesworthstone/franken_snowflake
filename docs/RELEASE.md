@@ -101,13 +101,13 @@ note is unbacked.
 | target | result | how |
 |---|---|---|
 | `x86_64-unknown-linux-gnu` | builds, tests pass | native |
-| `aarch64-unknown-linux-gnu` | builds (ELF aarch64 PIE) | `cargo zigbuild` |
+| `aarch64-unknown-linux-gnu` | builds (ELF aarch64 PIE) **and runs** under `qemu-aarch64`: `capabilities` reports `live=true, mcp=true`, `doctor` ok, `selftest` 7/7 | `cargo zigbuild`, `qemu-aarch64 -L /usr/aarch64-linux-gnu` |
 | `x86_64-pc-windows-msvc` | builds (PE32+ console exe, both binaries) | `cargo xwin build` |
 | `aarch64-pc-windows-msvc` | **does not build** | `cargo xwin` exports clang-cl-style `/imsvc` include flags, but `ring 0.17` compiles its arm64 C sources with plain `clang`, which rejects them; overriding `CFLAGS_aarch64_pc_windows_msvc` is ignored by cargo-xwin. Needs a native Windows-on-ARM host or an upstream fix; the target is out of the release set until then (v0.0.1's arm64 asset came from a hosted Windows runner). |
 | `aarch64-apple-darwin`, `x86_64-apple-darwin` | not attempted here (no macOS SDK); built on the dsr macOS host | `dsr build` |
 
-The Windows and aarch64 Linux binaries above were produced, not executed: no
-Windows or ARM machine was available in this session, so "builds" means the
+The Windows binary above was produced, not executed: no Windows machine or
+emulator was available in this session, so for that row "builds" means the
 linker produced the executable, not that `capabilities` was run on it.
 
 ## No-Account Proof Lanes
