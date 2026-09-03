@@ -130,6 +130,13 @@ pub struct DatasetManifest {
     pub default_limit: u64,
     /// Ceiling before export or explicit override.
     pub max_rows_without_export: u64,
+    /// Approximate row count reported by `INFORMATION_SCHEMA.TABLES.ROW_COUNT`
+    /// at discovery time (cost awareness for agents; not a live count).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approx_row_count: Option<u64>,
+    /// Storage bytes reported by `INFORMATION_SCHEMA.TABLES.BYTES` at discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
     /// Optional description from comments, tags, or overlays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,

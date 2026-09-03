@@ -107,12 +107,16 @@ pub enum DiscoveryStatementKind {
 }
 
 /// Completed result set group for snapshot generation.
+///
+/// Only `tables` and `columns` feed the snapshot today; the database and
+/// schema listings are optional so a caller can skip two metadata round trips
+/// (the CLI only runs the `Tables` and `Columns` statements).
 #[derive(Clone, Debug, PartialEq)]
 pub struct CatalogDiscoveryTables {
-    /// Database rows.
-    pub databases: CompletedStatement,
-    /// Schema rows.
-    pub schemas: CompletedStatement,
+    /// Database rows (optional; not used by snapshot generation).
+    pub databases: Option<CompletedStatement>,
+    /// Schema rows (optional; not used by snapshot generation).
+    pub schemas: Option<CompletedStatement>,
     /// Table/view rows.
     pub tables: CompletedStatement,
     /// Column rows.
@@ -238,6 +242,8 @@ pub fn build_snapshot_from_information_schema(
             rights_class: RightsClass::Restricted,
             default_limit: DEFAULT_LIMIT,
             max_rows_without_export: DEFAULT_MAX_ROWS_WITHOUT_EXPORT,
+            approx_row_count: parse_u64(table.get("ROW_COUNT")),
+            bytes: parse_u64(table.get("BYTES")),
             description,
             provenance: provenance_for_object(input, database, schema, object),
             fields,
@@ -369,7 +375,7 @@ fn schemas_sql(input: &CatalogDiscoveryInput) -> BuiltStatement {
 
 fn tables_sql(input: &CatalogDiscoveryInput) -> BuiltStatement {
     build_statement(
-        "SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, COMMENT FROM INFORMATION_SCHEMA.TABLES",
+        "SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, COMMENT, ROW_COUNT, BYTES FROM INFORMATION_SCHEMA.TABLES",
         &[
             ("TABLE_CATALOG", input.database.as_deref()),
             ("TABLE_SCHEMA", input.schema.as_deref()),
@@ -927,12 +933,12 @@ mod tests {
 
     fn slug_collision_tables() -> CatalogDiscoveryTables {
         CatalogDiscoveryTables {
-            databases: completed_statement(
+            databases: some_statement(
                 "h-db-collision",
                 &["DATABASE_NAME", "COMMENT"],
                 vec![vec![Some("DB"), Some("fixture database")]],
             ),
-            schemas: completed_statement(
+            schemas: some_statement(
                 "h-schema-collision",
                 &["CATALOG_NAME", "SCHEMA_NAME", "COMMENT"],
                 vec![
@@ -1013,14 +1019,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn snapshot_builds_without_database_and_schema_listings_and_carries_size_hints() {
+        let input = fixture_input();
+        let mut tables = fixture_tables();
+        tables.databases = None;
+        tables.schemas = None;
+        tables.tables = completed_statement(
+            "h-table",
+            &[
+                "TABLE_CATALOG",
+                "TABLE_SCHEMA",
+                "TABLE_NAME",
+                "TABLE_TYPE",
+                "COMMENT",
+                "ROW_COUNT",
+                "BYTES",
+            ],
+            vec![vec![
+                Some("DB"),
+                Some("PUBLIC"),
+                Some("EVENTS"),
+                Some("BASE TABLE"),
+                Some("event facts"),
+                Some("12345"),
+                Some("67890"),
+            ]],
+        );
+        let snapshot = build_snapshot_from_information_schema(&input, &tables);
+        assert_eq!(snapshot.datasets.len(), 1);
+        assert_eq!(snapshot.datasets[0].approx_row_count, Some(12_345));
+        assert_eq!(snapshot.datasets[0].bytes, Some(67_890));
+        let json = serde_json::to_string(&snapshot.datasets[0]).expect("serialize");
+        assert!(json.contains("\"approx_row_count\":12345"));
+    }
+
     fn fixture_tables() -> CatalogDiscoveryTables {
         CatalogDiscoveryTables {
-            databases: completed_statement(
+            databases: some_statement(
                 "h-db",
                 &["DATABASE_NAME", "COMMENT"],
                 vec![vec![Some("DB"), Some("fixture database")]],
             ),
-            schemas: completed_statement(
+            schemas: some_statement(
                 "h-schema",
                 &["CATALOG_NAME", "SCHEMA_NAME", "COMMENT"],
                 vec![vec![Some("DB"), Some("PUBLIC"), Some("fixture schema")]],
@@ -1109,6 +1150,14 @@ mod tests {
                 ],
             ),
         }
+    }
+
+    fn some_statement(
+        handle: &str,
+        column_names: &[&str],
+        rows: Vec<Vec<Option<&str>>>,
+    ) -> Option<CompletedStatement> {
+        Some(completed_statement(handle, column_names, rows))
     }
 
     fn completed_statement(

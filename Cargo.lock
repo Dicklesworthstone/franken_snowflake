@@ -1610,6 +1610,7 @@ dependencies = [
  "blake3",
  "franken-snowflake-core",
  "serde",
+ "serde_json",
  "sqlmodel-core",
  "sqlmodel-frankensqlite",
 ]

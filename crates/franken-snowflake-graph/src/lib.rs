@@ -1011,6 +1011,8 @@ mod tests {
             rights_class: RightsClass::Restricted,
             default_limit: 1_000,
             max_rows_without_export: 50_000,
+            approx_row_count: None,
+            bytes: None,
             description: None,
             provenance: provenance.clone(),
             fields: vec![

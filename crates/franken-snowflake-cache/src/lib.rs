@@ -24,6 +24,12 @@ use sqlmodel_core::{Row, Value};
 #[cfg(feature = "frankensqlite")]
 use sqlmodel_frankensqlite::FrankenConnection;
 
+pub mod file_cache;
+pub mod paths;
+
+pub use file_cache::FileCache;
+pub use paths::{DATA_DIR_ENV, DataDirEnv, DataDirOs, default_data_dir, resolve_data_dir};
+
 /// Crate version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -72,6 +78,8 @@ pub enum CacheError {
     AuditMutationRefused { statement: String },
     /// Serialized access wrapper observed a poisoned lock.
     PoisonedSerializedAccess,
+    /// A file-backed store could not be read or appended.
+    Io { message: String },
 }
 
 impl fmt::Display for CacheError {
@@ -114,6 +122,7 @@ impl fmt::Display for CacheError {
                 )
             }
             Self::PoisonedSerializedAccess => write!(f, "serialized cache access lock is poisoned"),
+            Self::Io { message } => write!(f, "local store I/O error: {message}"),
         }
     }
 }
@@ -522,6 +531,9 @@ pub trait CacheBackend {
     fn query_plan(&self, plan_id: &str) -> CacheResult<Option<QueryPlanRecord>>;
 
     fn append_query_receipt(&self, record: QueryReceiptRecord) -> CacheResult<()>;
+    /// Look up one receipt by its content-addressed id (the `receipt_hash` an
+    /// envelope carries).
+    fn query_receipt(&self, receipt_id: &str) -> CacheResult<Option<QueryReceiptRecord>>;
     fn latest_successful_receipt(&self, plan_id: &str) -> CacheResult<Option<QueryReceiptRecord>>;
     fn receipt_by_snowflake_query_id(
         &self,
@@ -660,6 +672,10 @@ impl CacheBackend for InMemoryCache {
             .entry(record.receipt_id.clone())
             .or_insert(record);
         Ok(())
+    }
+
+    fn query_receipt(&self, receipt_id: &str) -> CacheResult<Option<QueryReceiptRecord>> {
+        Ok(self.query_receipts.borrow().get(receipt_id).cloned())
     }
 
     fn latest_successful_receipt(&self, plan_id: &str) -> CacheResult<Option<QueryReceiptRecord>> {
@@ -1062,6 +1078,17 @@ impl CacheBackend for FrankenSqliteCache {
                 u64_value("created_at_ms", record.created_at_ms)?,
             ],
         )
+    }
+
+    fn query_receipt(&self, receipt_id: &str) -> CacheResult<Option<QueryReceiptRecord>> {
+        let rows = self.query(
+            "SELECT receipt_id, plan_id, profile_id, command_id, trace_id, outcome_kind, \
+                    receipt_state, statement_handle, snowflake_query_id, request_id, row_count, \
+                    receipt_json, receipt_hash, receipt_bytes, created_at_ms \
+             FROM query_receipts WHERE receipt_id = ?1 LIMIT 1",
+            &[Value::Text(receipt_id.to_owned())],
+        )?;
+        rows.first().map(row_query_receipt).transpose()
     }
 
     fn latest_successful_receipt(&self, plan_id: &str) -> CacheResult<Option<QueryReceiptRecord>> {
@@ -2322,5 +2349,127 @@ mod tests {
             },
             created_at_ms,
         }
+    }
+}
+
+/// First-ever tests of the FrankenSQLite backend. They run only with the
+/// `frankensqlite` feature (Linux/macOS lanes in CI; the locked fsqlite crates
+/// do not build on Windows yet).
+#[cfg(all(test, feature = "frankensqlite"))]
+mod frankensqlite_tests {
+    use super::*;
+
+    fn payload(text: &str) -> VerifiedPayload {
+        VerifiedPayload {
+            canonical: text.to_owned(),
+            address: ContentAddress::blake3(text.as_bytes()),
+        }
+    }
+
+    fn receipt(id: &str, outcome: &str, created_at_ms: u64) -> QueryReceiptRecord {
+        QueryReceiptRecord {
+            receipt_id: id.to_owned(),
+            plan_id: "plan-1".to_owned(),
+            profile_id: "demo".to_owned(),
+            command_id: "query.run".to_owned(),
+            trace_id: format!("trace-{id}"),
+            outcome_kind: outcome.to_owned(),
+            receipt_state: "completed".to_owned(),
+            statement_handle: Some(format!("handle-{id}")),
+            snowflake_query_id: Some(format!("qid-{id}")),
+            request_id: Some(format!("req-{id}")),
+            row_count: Some(7),
+            receipt: payload(&format!("{{\"receipt\":\"{id}\"}}")),
+            created_at_ms,
+        }
+    }
+
+    #[test]
+    fn sqlite_backend_migrates_and_round_trips_profiles() -> CacheResult<()> {
+        let cache = FrankenSqliteCache::open_memory()?;
+        assert_eq!(cache.schema_version(), CURRENT_SCHEMA_VERSION);
+        // Migrations are idempotent.
+        cache.migrate_up()?;
+
+        cache.upsert_profile(ProfileRecord {
+            profile_id: "demo".to_owned(),
+            display_name: "Demo".to_owned(),
+            account_locator_redacted: Some("[REDACTED]".to_owned()),
+            auth_lane: AuthLane::ProgrammaticAccessToken,
+            credential_ref: CredentialRef::env("FRANKEN_SNOWFLAKE_DEMO_PAT"),
+            default_database: Some("DB".to_owned()),
+            default_schema: None,
+            default_warehouse: Some("WH".to_owned()),
+            default_role: None,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        })?;
+        let stored = cache.profile("demo")?.expect("profile stored");
+        assert_eq!(stored.default_database.as_deref(), Some("DB"));
+        assert_eq!(cache.profiles()?.len(), 1);
+        assert_eq!(cache.profile("nope")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_backend_receipts_are_append_only_and_addressable() -> CacheResult<()> {
+        let cache = FrankenSqliteCache::open_memory()?;
+        cache.append_query_receipt(receipt("r1", "ok", 10))?;
+        cache.append_query_receipt(receipt("r2", "ok", 20))?;
+        // INSERT OR IGNORE keeps the first write for a reused id.
+        cache.append_query_receipt(receipt("r1", "error", 30))?;
+
+        let r1 = cache.query_receipt("r1")?.expect("r1");
+        assert_eq!(r1.outcome_kind, "ok");
+        assert_eq!(r1.created_at_ms, 10);
+        assert_eq!(r1.row_count, Some(7));
+        assert_eq!(cache.query_receipt("missing")?, None);
+
+        let latest = cache
+            .latest_successful_receipt("plan-1")?
+            .expect("latest");
+        assert_eq!(latest.receipt_id, "r2");
+        let by_qid = cache
+            .receipt_by_snowflake_query_id("demo", "qid-r2")?
+            .expect("by query id");
+        assert_eq!(by_qid.receipt_id, "r2");
+
+        let mut tampered = receipt("r3", "ok", 40);
+        tampered.receipt.address.digest_hex = "00".to_owned();
+        assert!(matches!(
+            cache.append_query_receipt(tampered),
+            Err(CacheError::HashMismatch { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_backend_audit_log_is_chronological_and_mutation_is_refused() -> CacheResult<()> {
+        let cache = FrankenSqliteCache::open_memory()?;
+        for (id, at) in [("e2", 200_u64), ("e1", 100_u64)] {
+            cache.append_audit_event(AuditEventRecord {
+                event_id: id.to_owned(),
+                receipt_id: None,
+                command_id: "query.write".to_owned(),
+                trace_id: "trace".to_owned(),
+                event_kind: "write_executed".to_owned(),
+                event_json: "{}".to_owned(),
+                created_at_ms: at,
+            })?;
+        }
+        let events = cache.audit_events()?;
+        assert_eq!(
+            events.iter().map(|e| e.event_id.as_str()).collect::<Vec<_>>(),
+            vec!["e1", "e2"]
+        );
+        assert!(matches!(
+            cache.execute("DELETE FROM query_audit_log", &[]),
+            Err(CacheError::AuditMutationRefused { .. })
+        ));
+        assert!(matches!(
+            cache.execute("UPDATE query_audit_log SET event_kind = 'x'", &[]),
+            Err(CacheError::AuditMutationRefused { .. })
+        ));
+        Ok(())
     }
 }
