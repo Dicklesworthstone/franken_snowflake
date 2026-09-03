@@ -462,7 +462,7 @@ fsnow dataset profile events_daily --json
 |---|---|
 | `fsnow query plan --profile <profile> --sql <sql> --json` | Validate and explain a read plan without submitting it |
 | `fsnow query plan --dataset <id> [--entity <v>] [--from <t>] [--to <t>] [--as-of <t>] [--select a,b] [--filter <json>] [--limit <n>] --json` | Dataset mode: compile pushed-down SQL with positional typed bindings, Time Travel `AT(TIMESTAMP => ...)` for `--as-of`, and an enforced limit, offline from the local snapshot |
-| `fsnow query run --profile <profile> --sql <sql> [--limit <rows>] [--role <r>] [--warehouse <w>] [--statement-timeout <s>] --json` | Submit a single read statement (SELECT / WITH / SHOW / DESCRIBE / EXPLAIN); every flag is honored or rejected, never silently ignored |
+| `fsnow query run --profile <profile> --sql <sql> [--limit <rows>] [--role <r>] [--warehouse <w>] [--statement-timeout <s>] --json` | Submit a single read statement (SELECT / WITH / SHOW / DESCRIBE / EXPLAIN); every flag is honored or rejected, never silently ignored. Result partitions are fetched in a concurrent window and the fetch stops once `--limit` rows are assembled (`partitions_fetched` and a warning say so) |
 | `fsnow query run --dataset <id> ... --json` | Dataset mode: plan as above, then execute live with the same bindings |
 | `fsnow query write --profile <profile> --sql <sql> [--dry-run \| --confirm <token>] --json` | Execute a mutation; direct once `WRITE_ENABLED` is set, with `--dry-run` as an optional preview (see [Writes](#writes)) |
 | `fsnow query --sql <sql> --profile <profile> --json` | Shorthand that maps to `query run` |
@@ -628,6 +628,7 @@ normalized to `_`, then prefixed with `FRANKEN_SNOWFLAKE_`. The profile
 | `<PREFIX>_ROLE` | Optional role |
 | `<PREFIX>_MAX_POLLS` | Optional poll budget (default 120) |
 | `<PREFIX>_STATEMENT_TIMEOUT_SECONDS` | Optional SQL API statement timeout in seconds (default 60; `--statement-timeout` overrides per run) |
+| `<PREFIX>_PARTITION_CONCURRENCY` | Optional partition fetch window, 1-16 (default 4): how many result partitions are downloaded at once; assembly stays in order |
 | `<PREFIX>_WRITE_ENABLED` | Set to `true` to enable data writes (DML, COPY INTO, PUT) for the profile; a bare `query write` then executes directly |
 | `<PREFIX>_WRITE_REQUIRE_CONFIRM` | Set to `true` to require the dry-run to confirm ceremony on every write (cautious opt-in); a bare `query write` refuses until you `--dry-run`, then `--confirm <token>` |
 | `<PREFIX>_WRITE_ALLOW_DDL` | Set to `true` to additionally allow DDL (CREATE/ALTER/DROP/TRUNCATE/GRANT/REVOKE) through `query write` |
@@ -843,8 +844,8 @@ confirmation required, `FSNOW-3009` DDL not opted in) with an exact next command
   the CLI default (the locked fsqlite crates do not build on Windows yet).
 - The TUI crate exists but is not compiled into the binary; `fsnow tui` returns a
   typed refusal.
-- Partitions are fetched sequentially, and the `--toon` encoding is
-  byte-size-neutral rather than smaller for row payloads.
+- The `--toon` encoding is byte-size-neutral rather than smaller for row
+  payloads.
 - The CLI has no `completions` subcommand; discover commands via `capabilities`.
 - The whole stack requires a nightly Rust toolchain (edition 2024), inherited
   from the FrankenSQLite, sqlmodel, and Asupersync dependency set.

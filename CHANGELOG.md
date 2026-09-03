@@ -151,6 +151,15 @@ several commands returned "reserved" stubs. This window closes those gaps:
   contains a digit (`myorg.prod2` → `MYORG-PROD2`); locator regions are
   recognized by hyphenated region labels and the aws/azure/gcp/privatelink
   keywords.
+- **Concurrent partition fetch and row-cap early stop.** The driver fetches
+  result partitions in a window (`PollPlan::with_partition_concurrency`,
+  default 4, `<PREFIX>_PARTITION_CONCURRENCY` in the CLI) with every request
+  of the window in flight at once and in-order assembly; a `401` inside a
+  window re-signs once and refetches only the rejected partitions. With a
+  row cap (`query run --limit`), fetching stops as soon as enough rows are
+  assembled: the statement completes early, `CompletedStatement::is_partial`
+  is set, and the envelope reports `partitions_fetched` plus a warning. Eight
+  new driver tests observe the overlap through the fake transport.
 - **Scripted CLI outcome lane.** A test-only seam at `execute_request` lets
   the public live outcome functions run offline against scripted completed
   statements with real store side effects; six tests cover query run

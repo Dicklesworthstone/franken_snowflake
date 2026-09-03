@@ -55,7 +55,9 @@ use franken_snowflake_http::{
     SnowflakeHttpClient, StatusClass, TransportConfig,
 };
 use franken_snowflake_sqlapi::driver::{AuthProvider, DriverStats, run_statement_with_auth};
-use franken_snowflake_sqlapi::lifecycle::{CompletedStatement, PollPlan};
+use franken_snowflake_sqlapi::lifecycle::{
+    CompletedStatement, DEFAULT_PARTITION_CONCURRENCY, MAX_PARTITION_CONCURRENCY, PollPlan,
+};
 use franken_snowflake_sqlapi::request::{Binding, SubmitQueryParams, SubmitStatementRequest};
 
 use crate::catalog_surface::{self, DATA_SOURCE_CACHE, ExportPlanSpec};
@@ -92,6 +94,9 @@ const CANCEL_BODY_PREVIEW_BYTES: usize = 512;
 struct QueryRequestOptions {
     bindings: Option<BTreeMap<String, Binding>>,
     query_tag: Option<String>,
+    /// Stop fetching partitions once this many rows are assembled (the
+    /// envelope's emit cap); `None` downloads every partition.
+    row_cap: Option<usize>,
 }
 
 /// Per-run session overrides resolved from flags (validated) on top of the
@@ -120,6 +125,9 @@ struct LiveRows {
     rows: Vec<Vec<Option<String>>>,
     total_rows: i64,
     partition_count: usize,
+    /// Partitions actually downloaded (inline partition 0 included); fewer than
+    /// `partition_count` when the row cap stopped the fetch early.
+    fetched_partitions: u32,
     partitions: Vec<(u32, u64, Option<u64>, Option<u64>)>,
     stats: DriverStats,
     /// The full completed statement (metadata + rows) for consumers that read
@@ -160,7 +168,7 @@ pub fn run_query_outcome(
             error,
         )
     };
-    let request_options = match query_request_options(
+    let mut request_options = match query_request_options(
         options.bindings_env.as_deref(),
         options.query_tag.as_deref(),
     ) {
@@ -171,6 +179,8 @@ pub fn run_query_outcome(
         Ok(cap) => cap,
         Err(error) => return fail(&error, profile),
     };
+    // Do not download partitions the envelope will never show.
+    request_options.row_cap = Some(emit_cap);
     let overrides = match session_overrides(options, None, None) {
         Ok(overrides) => overrides,
         Err(error) => return fail(&error, profile),
@@ -273,6 +283,7 @@ pub fn run_dataset_query_outcome(
         })
         .collect();
     let request_options = QueryRequestOptions {
+        row_cap: None,
         bindings: (!bindings.is_empty()).then_some(bindings),
         query_tag: Some(planned.plan.guardrails.query_tag.clone()),
     };
@@ -552,7 +563,7 @@ fn scan_catalog(
         }
         let mut request = discovery.request;
         apply_session(conn, &mut request);
-        let (completed, stats, sql_api_request_id) = execute_request(conn, request)?;
+        let (completed, stats, sql_api_request_id) = execute_request(conn, request, None)?;
         let rows = into_rows(completed, stats, sql_api_request_id);
         match discovery.kind {
             DiscoveryStatementKind::Tables => tables = Some(rows),
@@ -1383,6 +1394,8 @@ struct LiveConn {
     endpoint: SnowflakeEndpoint,
     auth_profile: AuthProfile,
     max_polls: u32,
+    /// Partition fetch window (`<PREFIX>_PARTITION_CONCURRENCY`, default 4).
+    partition_concurrency: usize,
     /// Test-only: answers every `execute_request` from a script instead of the
     /// SQL API (see `test_support`). Always `None` in production builds.
     #[cfg(test)]
@@ -1480,6 +1493,10 @@ impl LiveConn {
             endpoint,
             auth_profile,
             max_polls: env_u32(&name(&prefix, "MAX_POLLS")).unwrap_or(DEFAULT_MAX_POLLS),
+            partition_concurrency: env_u32(&name(&prefix, "PARTITION_CONCURRENCY"))
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(DEFAULT_PARTITION_CONCURRENCY)
+                .clamp(1, MAX_PARTITION_CONCURRENCY),
             #[cfg(test)]
             script: None,
         })
@@ -1613,10 +1630,11 @@ where
 fn execute_request(
     conn: &LiveConn,
     request: SubmitStatementRequest,
+    row_cap: Option<usize>,
 ) -> Result<(CompletedStatement, DriverStats, String), SnowflakeError> {
     #[cfg(test)]
     if let Some(script) = &conn.script {
-        return script.execute(request);
+        return script.execute(request, row_cap);
     }
     let sql_api_request_id = unique_request_id();
     let params = SubmitQueryParams {
@@ -1626,17 +1644,12 @@ fn execute_request(
         nullable: None,
     };
     let max_polls = conn.max_polls;
+    let poll_plan = PollPlan::with_max_polls(max_polls)
+        .with_partition_concurrency(conn.partition_concurrency)
+        .with_row_cap(row_cap);
     let (outcome, stats) = with_runtime(conn, move |cx, client, auth| {
         Box::pin(async move {
-            Ok(run_statement_with_auth(
-                cx,
-                client,
-                auth,
-                request,
-                params,
-                PollPlan::with_max_polls(max_polls),
-            )
-            .await)
+            Ok(run_statement_with_auth(cx, client, auth, request, params, poll_plan).await)
         })
     })?;
     match outcome {
@@ -1662,8 +1675,9 @@ fn execute(
     sql: &str,
     options: QueryRequestOptions,
 ) -> Result<LiveRows, SnowflakeError> {
+    let row_cap = options.row_cap;
     let request = build_request(conn, sql, options);
-    let (done, stats, sql_api_request_id) = execute_request(conn, request)?;
+    let (done, stats, sql_api_request_id) = execute_request(conn, request, row_cap)?;
     Ok(into_rows(done, stats, sql_api_request_id))
 }
 
@@ -1825,6 +1839,7 @@ fn query_request_options(
     let bindings = bindings_env.map(parse_bindings_env).transpose()?;
     let query_tag = query_tag.map(validate_query_tag).transpose()?;
     Ok(QueryRequestOptions {
+        row_cap: None,
         bindings,
         query_tag,
     })
@@ -2011,6 +2026,7 @@ fn into_rows(done: CompletedStatement, stats: DriverStats, sql_api_request_id: S
         columns,
         total_rows,
         partition_count,
+        fetched_partitions: done.fetched_partitions,
         partitions,
         stats,
         rows: done.rows.clone(),
@@ -2077,6 +2093,10 @@ fn rows_success(
         ("row_count", Json::Number(rows.total_rows)),
         ("returned_rows", Json::Number(returned as i64)),
         ("partition_count", Json::Number(rows.partition_count as i64)),
+        (
+            "partitions_fetched",
+            Json::Number(i64::from(rows.fetched_partitions)),
+        ),
         ("row_emit_cap", Json::Number(emit_cap as i64)),
         ("truncated", Json::Bool(truncated)),
         (
@@ -2100,6 +2120,13 @@ fn rows_success(
             "result truncated to {emit_cap} rows in this envelope; {} total rows were \
              returned (raise --limit up to {MAX_ROW_EMIT_CAP}, or use a Snowflake-side LIMIT / COPY INTO)",
             rows.total_rows
+        )));
+    }
+    if usize::try_from(rows.fetched_partitions).unwrap_or(usize::MAX) < rows.partition_count {
+        warnings.push(json_string(format!(
+            "partition fetch stopped after {} of {} partitions once the row emit cap \
+             ({emit_cap}) was reached; row_count is the server-side total and rows are a prefix",
+            rows.fetched_partitions, rows.partition_count
         )));
     }
     envelope.warnings = warnings;
@@ -2275,6 +2302,7 @@ mod test_support {
     struct ScriptState {
         responses: VecDeque<Result<CompletedStatement, SnowflakeError>>,
         submitted: Vec<SubmitStatementRequest>,
+        row_caps: Vec<Option<usize>>,
     }
 
     /// Shared handle to the script: the test keeps one to inspect what was
@@ -2286,9 +2314,11 @@ mod test_support {
         pub(super) fn execute(
             &self,
             request: SubmitStatementRequest,
+            row_cap: Option<usize>,
         ) -> Result<(CompletedStatement, DriverStats, String), SnowflakeError> {
             let mut state = self.0.borrow_mut();
             state.submitted.push(request);
+            state.row_caps.push(row_cap);
             let ordinal = state.submitted.len();
             match state.responses.pop_front() {
                 Some(Ok(done)) => Ok((
@@ -2313,6 +2343,11 @@ mod test_support {
 
         pub(super) fn remaining(&self) -> usize {
             self.0.borrow().responses.len()
+        }
+
+        /// The fetch row cap each submitted statement was driven with.
+        pub(super) fn row_caps(&self) -> Vec<Option<usize>> {
+            self.0.borrow().row_caps.clone()
         }
     }
 
@@ -2339,6 +2374,7 @@ mod test_support {
         let script = Script(Rc::new(RefCell::new(ScriptState {
             responses: responses.into(),
             submitted: Vec::new(),
+            row_caps: Vec::new(),
         })));
         SCRIPTED.with(|slot| {
             *slot.borrow_mut() = Some(ScriptedProfile {
@@ -2376,6 +2412,7 @@ mod test_support {
                 endpoint: SnowflakeEndpoint::parse(endpoint_url(account)).ok()?,
                 auth_profile: build_auth_profile("FSNOW_SCRIPTED", "pat").ok()?,
                 max_polls: 10,
+                partition_concurrency: DEFAULT_PARTITION_CONCURRENCY,
                 script: Some(scripted.script.clone()),
             })
         })
@@ -2433,6 +2470,7 @@ mod tests {
         apply_query_request_options(
             &mut request,
             QueryRequestOptions {
+                row_cap: None,
                 bindings: Some(bindings.clone()),
                 query_tag: Some("hfdt.trace.123".to_owned()),
             },
@@ -2697,6 +2735,12 @@ mod tests {
             "{request}"
         );
         assert_eq!(script.remaining(), 0);
+        assert_eq!(
+            script.row_caps(),
+            vec![Some(2)],
+            "the emit cap is passed down so unneeded partitions are not fetched"
+        );
+        assert_eq!(env["data"]["partitions_fetched"], 1, "{env}");
 
         // The receipt is readable back from the store by its hash.
         let shown = envelope(catalog_surface::receipt_show_outcome(
@@ -2777,10 +2821,11 @@ mod tests {
         assert_eq!(datasets[0]["approx_row_count"], 1200, "{env}");
         assert_eq!(env["receipt_hash"].as_str().map(str::len), Some(64));
 
-        // Discovery statements are bound, never interpolated, and carry the
-        // session context.
+        // Discovery statements are bound, never interpolated, carry the
+        // session context, and always fetch every partition.
         let submitted = script.submitted();
         assert_eq!(submitted.len(), 2);
+        assert_eq!(script.row_caps(), vec![None, None]);
         for request in &submitted {
             let json = request_json(request);
             let statement = json["statement"].as_str().expect("statement");

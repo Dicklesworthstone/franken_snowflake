@@ -1204,6 +1204,8 @@ mod tests {
             statement_handle,
             result_set,
             rows: owned_rows,
+            fetched_partitions: 1,
+            total_partitions: 1,
         }
     }
 

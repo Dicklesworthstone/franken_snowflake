@@ -17,6 +17,9 @@
 use std::future::Future;
 use std::time::Duration;
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use asupersync::Cx;
 use franken_snowflake_core::cancel::CancelReason;
 use franken_snowflake_core::error::{SnowflakeError, SnowflakeErrorCode};
@@ -394,68 +397,217 @@ async fn drive<T: StatementTransport, A: AuthProvider>(
                     return cancel_locally(cx, client, &auth, &handle, local_cancel_reason(cx))
                         .await;
                 }
-                stats.partitions_fetched = stats.partitions_fetched.saturating_add(1);
+                let (next, total) = machine
+                    .assembling_window()
+                    .unwrap_or((partition, partition.saturating_add(1)));
+                // Row-cap early stop: the caller already has enough rows, so do
+                // not download the remaining partitions.
+                if let Some(cap) = poll_plan.row_cap
+                    && machine.rows_assembled() >= cap
+                {
+                    return match machine.complete_early() {
+                        Ok(done) => SnowflakeOutcome::ok(done),
+                        Err(error) => {
+                            abandon_with_error(
+                                cx,
+                                client,
+                                &auth,
+                                &handle,
+                                error.into_snowflake_error(),
+                            )
+                            .await
+                        }
+                    };
+                }
                 auth = match provider.descriptor() {
                     Ok(fresh) => fresh,
                     Err(error) => {
                         return abandon_with_error(cx, client, &auth, &handle, error).await;
                     }
                 };
-                let fetch = client
-                    .fetch_partition(
-                        cx,
-                        PartitionHttpRequest {
-                            auth: auth.clone(),
-                            statement_handle: handle.clone(),
-                            partition,
-                        },
-                    )
-                    .await;
-                let response = match fetch {
-                    SnowflakeOutcome::Ok(response) => response,
-                    SnowflakeOutcome::Err(error) => {
-                        return abandon_with_error(cx, client, &auth, &handle, error).await;
-                    }
-                    SnowflakeOutcome::Cancelled(reason) => {
-                        return cancel_locally(cx, client, &auth, &handle, reason).await;
-                    }
-                    SnowflakeOutcome::Panicked(payload) => {
-                        return SnowflakeOutcome::panicked(payload);
-                    }
-                };
-                if response.status == StatusClass::Unauthorized {
-                    match refresh_after_unauthorized(provider, &mut reauth_left, "partition fetch")
-                    {
-                        Ok(fresh) => {
-                            auth = fresh;
-                            progress = Progress::FetchPartition { handle, partition };
-                            continue;
-                        }
-                        Err(error) => {
+                let window =
+                    u32::try_from(poll_plan.effective_partition_concurrency()).unwrap_or(u32::MAX);
+                let window_end = next.saturating_add(window).min(total);
+                let window_auth = auth.clone();
+                let fetched =
+                    fetch_window(cx, client, &window_auth, &handle, next..window_end).await;
+                stats.partitions_fetched = stats
+                    .partitions_fetched
+                    .saturating_add(window_end.saturating_sub(next));
+                let mut after_window = None;
+                for (offset, fetch) in fetched.into_iter().enumerate() {
+                    let index = next.saturating_add(u32::try_from(offset).unwrap_or(u32::MAX));
+                    let mut response = match fetch {
+                        SnowflakeOutcome::Ok(response) => response,
+                        SnowflakeOutcome::Err(error) => {
                             return abandon_with_error(cx, client, &auth, &handle, error).await;
                         }
+                        SnowflakeOutcome::Cancelled(reason) => {
+                            return cancel_locally(cx, client, &auth, &handle, reason).await;
+                        }
+                        SnowflakeOutcome::Panicked(payload) => {
+                            return SnowflakeOutcome::panicked(payload);
+                        }
+                    };
+                    if response.status == StatusClass::Unauthorized {
+                        // A window shares one bearer: re-sign once for the first
+                        // rejection, then refetch later rejections from the same
+                        // window with the already-refreshed credential.
+                        if auth == window_auth {
+                            auth = match refresh_after_unauthorized(
+                                provider,
+                                &mut reauth_left,
+                                "partition fetch",
+                            ) {
+                                Ok(fresh) => fresh,
+                                Err(error) => {
+                                    return abandon_with_error(cx, client, &auth, &handle, error)
+                                        .await;
+                                }
+                            };
+                        }
+                        stats.partitions_fetched = stats.partitions_fetched.saturating_add(1);
+                        let refetch = client
+                            .fetch_partition(
+                                cx,
+                                PartitionHttpRequest {
+                                    auth: auth.clone(),
+                                    statement_handle: handle.clone(),
+                                    partition: index,
+                                },
+                            )
+                            .await;
+                        response = match refetch {
+                            SnowflakeOutcome::Ok(response)
+                                if response.status == StatusClass::Unauthorized =>
+                            {
+                                return abandon_with_error(
+                                    cx,
+                                    client,
+                                    &auth,
+                                    &handle,
+                                    unauthorized_error(
+                                        "partition fetch",
+                                        "the re-signed credential was rejected again; not retrying further",
+                                    ),
+                                )
+                                .await;
+                            }
+                            SnowflakeOutcome::Ok(response) => response,
+                            SnowflakeOutcome::Err(error) => {
+                                return abandon_with_error(cx, client, &auth, &handle, error).await;
+                            }
+                            SnowflakeOutcome::Cancelled(reason) => {
+                                return cancel_locally(cx, client, &auth, &handle, reason).await;
+                            }
+                            SnowflakeOutcome::Panicked(payload) => {
+                                return SnowflakeOutcome::panicked(payload);
+                            }
+                        };
                     }
+                    reauth_left = 1;
+                    // `response.body` is already gzip-decoded by the transport.
+                    after_window = Some(
+                        match machine.on_partition(
+                            response_class(response.status),
+                            index,
+                            &response.body,
+                        ) {
+                            Ok(progress) => progress,
+                            Err(error) => {
+                                return abandon_with_error(
+                                    cx,
+                                    client,
+                                    &auth,
+                                    &handle,
+                                    error.into_snowflake_error(),
+                                )
+                                .await;
+                            }
+                        },
+                    );
                 }
-                reauth_left = 1;
-                // `response.body` is already gzip-decoded by the transport.
-                progress = match machine.on_partition(
-                    response_class(response.status),
-                    partition,
-                    &response.body,
-                ) {
-                    Ok(progress) => progress,
-                    Err(error) => {
+                progress = match after_window {
+                    Some(progress) => progress,
+                    None => {
+                        // The machine asked for a partition at or past `total`;
+                        // that is a lifecycle invariant violation, not a retry.
                         return abandon_with_error(
                             cx,
                             client,
                             &auth,
                             &handle,
-                            error.into_snowflake_error(),
+                            SnowflakeError::new(
+                                SnowflakeErrorCode::Internal,
+                                format!("empty partition window {next}..{window_end} of {total}"),
+                            ),
                         )
                         .await;
                     }
                 };
             }
+        }
+    }
+}
+
+/// Fetch `partitions` with every request in flight at once and return the
+/// outcomes in partition order. Nothing is abandoned mid-window: each fetch runs
+/// to its own terminal outcome, so a cancellation surfaces as `Cancelled` for
+/// that partition rather than as a dropped request.
+/// One in-flight partition fetch inside a window.
+type BoxedFetch<'a> = Pin<Box<dyn Future<Output = TransportOutcome<PartitionBody>> + 'a>>;
+
+async fn fetch_window<T: StatementTransport>(
+    cx: &Cx,
+    client: &T,
+    auth: &AuthorizationDescriptor,
+    handle: &StatementHandle,
+    partitions: std::ops::Range<u32>,
+) -> Vec<TransportOutcome<PartitionBody>> {
+    let pending: Vec<Option<BoxedFetch<'_>>> = partitions
+        .map(|partition| {
+            let request = PartitionHttpRequest {
+                auth: auth.clone(),
+                statement_handle: handle.clone(),
+                partition,
+            };
+            let fetch: BoxedFetch<'_> = Box::pin(client.fetch_partition(cx, request));
+            Some(fetch)
+        })
+        .collect();
+    let done = pending.iter().map(|_| None).collect();
+    JoinInOrder { pending, done }.await
+}
+
+/// Drives a fixed set of futures inside the current task: every still-pending
+/// future is polled on each wake, and the join resolves once all have completed,
+/// yielding their outputs in the original order.
+struct JoinInOrder<'a, T> {
+    pending: Vec<Option<Pin<Box<dyn Future<Output = T> + 'a>>>>,
+    done: Vec<Option<T>>,
+}
+
+impl<T: Unpin> Future for JoinInOrder<'_, T> {
+    type Output = Vec<T>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let mut all_done = true;
+        for (slot, done) in this.pending.iter_mut().zip(this.done.iter_mut()) {
+            if let Some(future) = slot.as_mut() {
+                match future.as_mut().poll(context) {
+                    Poll::Ready(value) => {
+                        *done = Some(value);
+                        *slot = None;
+                    }
+                    Poll::Pending => all_done = false,
+                }
+            }
+        }
+        if all_done {
+            Poll::Ready(this.done.iter_mut().filter_map(Option::take).collect())
+        } else {
+            Poll::Pending
         }
     }
 }
@@ -576,7 +728,8 @@ mod tests {
         CompressionEvidence, ContentEncoding, SnowflakeAuthTokenType, TransportError,
         TransportErrorCode,
     };
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
+    use std::collections::{BTreeMap, VecDeque};
 
     const RESP_202: &[u8] = include_bytes!("../tests/fixtures/resp_202_running.json");
     const RESP_200_MULTI: &[u8] =
@@ -597,11 +750,19 @@ mod tests {
         /// Consumed by the first submit only (models a 401 on the initial POST).
         submit_first: RefCell<Option<Scripted>>,
         polls: RefCell<Vec<Scripted>>,
-        partitions: RefCell<Vec<Scripted>>,
+        /// Per-partition answer queues (a partition may be scripted more than
+        /// once, e.g. `401` then the body).
+        partitions: RefCell<BTreeMap<u32, VecDeque<Scripted>>>,
         cancels_after_local: RefCell<Vec<(StatementHandle, CancelKind)>>,
         orphan_cancels: RefCell<Vec<StatementHandle>>,
         /// Credential fingerprint attached to every submit/poll/partition, in order.
         auth_seen: RefCell<Vec<String>>,
+        /// `("start", p)` when a partition fetch is first polled and `("done", p)`
+        /// when it resolves: proves whether fetches overlapped.
+        partition_events: RefCell<Vec<(&'static str, u32)>>,
+        /// When set, every partition fetch stays pending for one poll so that
+        /// concurrent fetches interleave observably.
+        yield_once: Cell<bool>,
     }
 
     impl FakeTransport {
@@ -610,11 +771,29 @@ mod tests {
                 submit,
                 submit_first: RefCell::new(None),
                 polls: RefCell::new(Vec::new()),
-                partitions: RefCell::new(Vec::new()),
+                partitions: RefCell::new(BTreeMap::new()),
                 cancels_after_local: RefCell::new(Vec::new()),
                 orphan_cancels: RefCell::new(Vec::new()),
                 auth_seen: RefCell::new(Vec::new()),
+                partition_events: RefCell::new(Vec::new()),
+                yield_once: Cell::new(false),
             }
+        }
+
+        fn script_partition(&self, partition: u32, scripted: Scripted) {
+            self.partitions
+                .borrow_mut()
+                .entry(partition)
+                .or_default()
+                .push_back(scripted);
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.partition_events
+                .borrow()
+                .iter()
+                .map(|(kind, partition)| format!("{kind}{partition}"))
+                .collect()
         }
 
         fn transport_error() -> SnowflakeError {
@@ -670,9 +849,22 @@ mod tests {
             self.auth_seen
                 .borrow_mut()
                 .push(request.auth.redacted_fingerprint().to_owned());
-            let next = self.partitions.borrow_mut().remove(0);
+            self.partition_events
+                .borrow_mut()
+                .push(("start", request.partition));
+            if self.yield_once.get() {
+                YieldOnce { yielded: false }.await;
+            }
+            self.partition_events
+                .borrow_mut()
+                .push(("done", request.partition));
+            let next = self
+                .partitions
+                .borrow_mut()
+                .get_mut(&request.partition)
+                .and_then(VecDeque::pop_front);
             match next {
-                Scripted::Ok(status, body) => TransportOutcome::ok(PartitionBody {
+                Some(Scripted::Ok(status, body)) => TransportOutcome::ok(PartitionBody {
                     status,
                     compression: CompressionEvidence {
                         content_encoding: ContentEncoding::Identity,
@@ -681,7 +873,7 @@ mod tests {
                     },
                     body,
                 }),
-                Scripted::Err => TransportOutcome::err(Self::transport_error()),
+                Some(Scripted::Err) | None => TransportOutcome::err(Self::transport_error()),
             }
         }
 
@@ -718,6 +910,341 @@ mod tests {
             "fake-token",
             "cred_test",
         )
+    }
+
+    /// Pending once (self-waking), then ready: lets a fake fetch be observably
+    /// "in flight" across one scheduler turn.
+    struct YieldOnce {
+        yielded: bool,
+    }
+
+    impl Future for YieldOnce {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+            if self.yielded {
+                Poll::Ready(())
+            } else {
+                self.yielded = true;
+                context.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    /// A completed `200` body with one TEXT column: `inline_rows` rows inline
+    /// (`"p0"`) and one extra partition per entry of `partition_rows`.
+    fn multi_partition_body(inline_rows: usize, partition_rows: &[usize]) -> Vec<u8> {
+        let mut partition_info = vec![serde_json::json!({ "rowCount": inline_rows })];
+        partition_info.extend(
+            partition_rows
+                .iter()
+                .map(|rows| serde_json::json!({ "rowCount": rows, "uncompressedSize": 1 })),
+        );
+        let total: usize = inline_rows + partition_rows.iter().sum::<usize>();
+        let body = serde_json::json!({
+            "resultSetMetaData": {
+                "numRows": total,
+                "format": "jsonv2",
+                "rowType": [{ "name": "P", "type": "TEXT", "nullable": false }],
+                "partitionInfo": partition_info
+            },
+            "data": (0..inline_rows).map(|_| vec!["p0"]).collect::<Vec<_>>(),
+            "code": "090001",
+            "statementHandle": "01b2c3d4-0000-0000-0000-000000000002",
+            "sqlState": "00000",
+            "message": "Statement executed successfully.",
+            "createdOn": 1_700_000_000_000_u64
+        });
+        serde_json::to_vec(&body).unwrap()
+    }
+
+    fn partition_body(partition: u32, rows: usize) -> Scripted {
+        let body = serde_json::json!({
+            "data": (0..rows).map(|_| vec![format!("p{partition}")]).collect::<Vec<_>>()
+        });
+        Scripted::Ok(StatusClass::Completed, serde_json::to_vec(&body).unwrap())
+    }
+
+    /// Submit completes immediately with `partition_rows.len()` extra partitions,
+    /// each scripted with its rows.
+    fn windowed_transport(inline_rows: usize, partition_rows: &[usize]) -> FakeTransport {
+        let transport = FakeTransport::new(Scripted::Ok(
+            StatusClass::Completed,
+            multi_partition_body(inline_rows, partition_rows),
+        ));
+        for (offset, rows) in partition_rows.iter().enumerate() {
+            let partition = u32::try_from(offset + 1).unwrap();
+            transport.script_partition(partition, partition_body(partition, *rows));
+        }
+        transport
+    }
+
+    fn column_values(done: &CompletedStatement) -> Vec<String> {
+        done.rows
+            .iter()
+            .map(|row| row[0].clone().unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn window_fetches_partitions_concurrently_and_assembles_in_order() {
+        asupersync::test_utils::run_test(|| async {
+            let transport = windowed_transport(1, &[1, 1, 1, 1, 1]);
+            transport.yield_once.set(true);
+            let cx = Cx::for_testing();
+            let (outcome, stats) = run_statement_with_stats(
+                &cx,
+                &transport,
+                fake_auth(),
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5).with_partition_concurrency(3),
+            )
+            .await;
+            let SnowflakeOutcome::Ok(done) = outcome else {
+                panic!("expected completion, got {outcome:?}");
+            };
+            assert_eq!(
+                column_values(&done),
+                vec!["p0", "p1", "p2", "p3", "p4", "p5"]
+            );
+            assert_eq!(done.fetched_partitions, 6);
+            assert_eq!(done.total_partitions, 6);
+            assert!(!done.is_partial());
+            assert_eq!(stats.partitions_fetched, 5);
+            // Window [1,2,3] was fully in flight before any of it resolved, then
+            // window [4,5] likewise.
+            assert_eq!(
+                transport.events(),
+                vec![
+                    "start1", "start2", "start3", "done1", "done2", "done3", "start4", "start5",
+                    "done4", "done5"
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn partition_concurrency_one_is_strictly_sequential() {
+        asupersync::test_utils::run_test(|| async {
+            let transport = windowed_transport(1, &[1, 1, 1]);
+            transport.yield_once.set(true);
+            let cx = Cx::for_testing();
+            let (outcome, _) = run_statement_with_stats(
+                &cx,
+                &transport,
+                fake_auth(),
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5).with_partition_concurrency(1),
+            )
+            .await;
+            assert!(matches!(outcome, SnowflakeOutcome::Ok(_)), "{outcome:?}");
+            assert_eq!(
+                transport.events(),
+                vec!["start1", "done1", "start2", "done2", "start3", "done3"]
+            );
+        });
+    }
+
+    #[test]
+    fn row_cap_stops_fetching_early_and_reports_a_partial_prefix() {
+        asupersync::test_utils::run_test(|| async {
+            // 1 inline row + 5 partitions of 1 row; the caller wants 3 rows.
+            let transport = windowed_transport(1, &[1, 1, 1, 1, 1]);
+            let cx = Cx::for_testing();
+            let (outcome, stats) = run_statement_with_stats(
+                &cx,
+                &transport,
+                fake_auth(),
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5)
+                    .with_partition_concurrency(1)
+                    .with_row_cap(Some(3)),
+            )
+            .await;
+            let SnowflakeOutcome::Ok(done) = outcome else {
+                panic!("expected completion, got {outcome:?}");
+            };
+            assert_eq!(column_values(&done), vec!["p0", "p1", "p2"]);
+            assert!(done.is_partial());
+            assert_eq!(done.fetched_partitions, 3);
+            assert_eq!(done.total_partitions, 6);
+            assert_eq!(done.result_set.result_set_meta_data.num_rows, 6);
+            assert_eq!(
+                stats.partitions_fetched, 2,
+                "partitions 3..5 were never fetched"
+            );
+            assert_eq!(
+                transport.events(),
+                vec!["start1", "done1", "start2", "done2"]
+            );
+            assert!(transport.orphan_cancels.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn row_cap_with_a_window_stops_after_the_window_that_crossed_it() {
+        asupersync::test_utils::run_test(|| async {
+            let transport = windowed_transport(1, &[1, 1, 1, 1, 1]);
+            let cx = Cx::for_testing();
+            let (outcome, stats) = run_statement_with_stats(
+                &cx,
+                &transport,
+                fake_auth(),
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5)
+                    .with_partition_concurrency(3)
+                    .with_row_cap(Some(3)),
+            )
+            .await;
+            let SnowflakeOutcome::Ok(done) = outcome else {
+                panic!("expected completion, got {outcome:?}");
+            };
+            assert_eq!(column_values(&done), vec!["p0", "p1", "p2", "p3"]);
+            assert!(done.is_partial());
+            assert_eq!(done.fetched_partitions, 4);
+            assert_eq!(stats.partitions_fetched, 3);
+        });
+    }
+
+    #[test]
+    fn row_cap_never_cuts_a_result_that_fits() {
+        asupersync::test_utils::run_test(|| async {
+            let transport = windowed_transport(1, &[1, 1]);
+            let cx = Cx::for_testing();
+            let (outcome, _) = run_statement_with_stats(
+                &cx,
+                &transport,
+                fake_auth(),
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5).with_row_cap(Some(1_000)),
+            )
+            .await;
+            let SnowflakeOutcome::Ok(done) = outcome else {
+                panic!("expected completion, got {outcome:?}");
+            };
+            assert!(!done.is_partial());
+            assert_eq!(done.rows.len(), 3);
+        });
+    }
+
+    #[test]
+    fn window_401_resigns_once_and_refetches_every_rejected_partition() {
+        asupersync::test_utils::run_test(|| async {
+            let transport = FakeTransport::new(Scripted::Ok(
+                StatusClass::Completed,
+                multi_partition_body(1, &[1, 1, 1]),
+            ));
+            // Partitions 1 and 3 reject the stale bearer once; 2 accepts it.
+            transport.script_partition(1, unauthorized());
+            transport.script_partition(1, partition_body(1, 1));
+            transport.script_partition(2, partition_body(2, 1));
+            transport.script_partition(3, unauthorized());
+            transport.script_partition(3, partition_body(3, 1));
+            let mut auth = FakeAuth::resigning();
+            let cx = Cx::for_testing();
+            let (outcome, stats) = run_statement_with_auth(
+                &cx,
+                &transport,
+                &mut auth,
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5).with_partition_concurrency(3),
+            )
+            .await;
+            let SnowflakeOutcome::Ok(done) = outcome else {
+                panic!("expected completion, got {outcome:?}");
+            };
+            assert_eq!(column_values(&done), vec!["p0", "p1", "p2", "p3"]);
+            assert_eq!(
+                auth.resigns, 1,
+                "one re-sign covers every rejection in the window"
+            );
+            assert_eq!(
+                stats.partitions_fetched, 5,
+                "3 window fetches + 2 refetches"
+            );
+            assert_eq!(
+                *transport.auth_seen.borrow(),
+                vec![
+                    "cred_gen0",
+                    "cred_gen0",
+                    "cred_gen0",
+                    "cred_gen0",
+                    "cred_gen1",
+                    "cred_gen1"
+                ],
+                "submit + window used gen0; both refetches used the re-signed gen1"
+            );
+            assert!(transport.orphan_cancels.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn partition_rejected_again_after_the_resign_is_terminal_with_an_orphan_cancel() {
+        asupersync::test_utils::run_test(|| async {
+            let transport = FakeTransport::new(Scripted::Ok(
+                StatusClass::Completed,
+                multi_partition_body(1, &[1]),
+            ));
+            transport.script_partition(1, unauthorized());
+            transport.script_partition(1, unauthorized());
+            let mut auth = FakeAuth::resigning();
+            let cx = Cx::for_testing();
+            let (outcome, stats) = run_statement_with_auth(
+                &cx,
+                &transport,
+                &mut auth,
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5),
+            )
+            .await;
+            let SnowflakeOutcome::Err(error) = outcome else {
+                panic!("expected a typed error, got {outcome:?}");
+            };
+            assert_eq!(error.code, SnowflakeErrorCode::CredentialExpired);
+            assert_eq!(auth.resigns, 1);
+            assert_eq!(stats.partitions_fetched, 2);
+            assert_eq!(transport.orphan_cancels.borrow().len(), 1);
+        });
+    }
+
+    #[test]
+    fn one_failed_fetch_in_a_window_abandons_the_statement_after_the_window_settles() {
+        asupersync::test_utils::run_test(|| async {
+            let transport = windowed_transport(1, &[1, 1, 1]);
+            transport.yield_once.set(true);
+            // Partition 2's scripted body is replaced by a transport error.
+            transport
+                .partitions
+                .borrow_mut()
+                .insert(2, VecDeque::from([Scripted::Err]));
+            let cx = Cx::for_testing();
+            let (outcome, stats) = run_statement_with_stats(
+                &cx,
+                &transport,
+                fake_auth(),
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5).with_partition_concurrency(3),
+            )
+            .await;
+            assert!(matches!(outcome, SnowflakeOutcome::Err(_)), "{outcome:?}");
+            // Every in-flight fetch of the window ran to completion (no abandoned
+            // request), then the driver cancelled the orphaned handle once.
+            assert_eq!(
+                transport.events(),
+                vec!["start1", "start2", "start3", "done1", "done2", "done3"]
+            );
+            assert_eq!(stats.partitions_fetched, 3);
+            assert_eq!(transport.orphan_cancels.borrow().len(), 1);
+        });
     }
 
     /// A provider whose descriptor fingerprint carries its generation, so the
@@ -944,8 +1471,8 @@ mod tests {
             let partition_count = partitions.len();
             // First non-inline partition answers 401 once, then every partition
             // is served in the live object form with the promised rowCount.
-            transport.partitions.borrow_mut().push(unauthorized());
-            for info in partitions.iter().skip(1) {
+            transport.script_partition(1, unauthorized());
+            for (index, info) in partitions.iter().enumerate().skip(1) {
                 let rows = info["rowCount"].as_u64().unwrap_or(0);
                 let body = format!(
                     r#"{{"data":[{}]}}"#,
@@ -954,10 +1481,10 @@ mod tests {
                         .collect::<Vec<_>>()
                         .join(",")
                 );
-                transport
-                    .partitions
-                    .borrow_mut()
-                    .push(Scripted::Ok(StatusClass::Completed, body.into_bytes()));
+                transport.script_partition(
+                    u32::try_from(index).unwrap(),
+                    Scripted::Ok(StatusClass::Completed, body.into_bytes()),
+                );
             }
             let mut auth = FakeAuth::resigning();
             let cx = Cx::for_testing();
@@ -984,6 +1511,7 @@ mod tests {
         PollPlan {
             max_polls,
             poll_interval: Duration::ZERO,
+            ..PollPlan::default()
         }
     }
 
@@ -1049,7 +1577,7 @@ mod tests {
                 StatusClass::Completed,
                 RESP_200_MULTI.to_vec(),
             ));
-            transport.partitions.borrow_mut().push(Scripted::Err);
+            transport.script_partition(1, Scripted::Err);
             let cx = Cx::for_testing();
             let (outcome, stats) = run_statement_with_stats(
                 &cx,
@@ -1057,7 +1585,7 @@ mod tests {
                 fake_auth(),
                 SubmitStatementRequest::new("select 1"),
                 SubmitQueryParams::default(),
-                fast_poll_plan(5),
+                fast_poll_plan(5).with_partition_concurrency(1),
             )
             .await;
             assert!(matches!(outcome, SnowflakeOutcome::Err(_)));
@@ -1088,6 +1616,7 @@ mod tests {
                 PollPlan {
                     max_polls: 50,
                     poll_interval: Duration::from_millis(5),
+                    ..PollPlan::default()
                 },
             )
             .await;
@@ -1122,7 +1651,7 @@ mod tests {
             // Each fetched partition must carry exactly the rowCount the metadata
             // promised; the machine refuses mismatches (integrity check). Bodies
             // use the live `{"data":[...]}` object form, not the bare array.
-            for info in partitions.iter().skip(1) {
+            for (index, info) in partitions.iter().enumerate().skip(1) {
                 let rows = info["rowCount"].as_u64().unwrap_or(0);
                 let body = format!(
                     r#"{{"data":[{}]}}"#,
@@ -1131,10 +1660,10 @@ mod tests {
                         .collect::<Vec<_>>()
                         .join(",")
                 );
-                transport
-                    .partitions
-                    .borrow_mut()
-                    .push(Scripted::Ok(StatusClass::Completed, body.into_bytes()));
+                transport.script_partition(
+                    u32::try_from(index).unwrap(),
+                    Scripted::Ok(StatusClass::Completed, body.into_bytes()),
+                );
             }
             let cx = Cx::for_testing();
             let (outcome, stats) = run_statement_with_stats(

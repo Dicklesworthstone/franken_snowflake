@@ -39,13 +39,27 @@ pub struct PollPlan {
     /// backs off on *retryable* statuses (`429`/`5xx`); a `202` returns
     /// immediately, so without this interval the poll loop would spin with no gap.
     pub poll_interval: Duration,
+    /// How many non-inline partitions the driver fetches concurrently once a
+    /// result set completes (a window; assembly stays in partition order).
+    pub partition_concurrency: usize,
+    /// Stop fetching further partitions once at least this many rows are
+    /// assembled. The statement then completes early and reports itself
+    /// partial (`CompletedStatement::is_partial`).
+    pub row_cap: Option<usize>,
 }
+
+/// Default partition fetch window.
+pub const DEFAULT_PARTITION_CONCURRENCY: usize = 4;
+/// Largest partition fetch window a caller may request.
+pub const MAX_PARTITION_CONCURRENCY: usize = 16;
 
 impl Default for PollPlan {
     fn default() -> Self {
         Self {
             max_polls: 120,
             poll_interval: Duration::from_millis(1_000),
+            partition_concurrency: DEFAULT_PARTITION_CONCURRENCY,
+            row_cap: None,
         }
     }
 }
@@ -75,6 +89,28 @@ impl PollPlan {
     pub fn effective_poll_interval(&self) -> Duration {
         self.poll_interval.max(MIN_POLL_INTERVAL)
     }
+
+    /// Set the partition fetch window, clamped to `1..=MAX_PARTITION_CONCURRENCY`.
+    #[must_use]
+    pub fn with_partition_concurrency(mut self, concurrency: usize) -> Self {
+        self.partition_concurrency = concurrency.clamp(1, MAX_PARTITION_CONCURRENCY);
+        self
+    }
+
+    /// Stop fetching partitions once `row_cap` rows are assembled (`None` fetches
+    /// every partition).
+    #[must_use]
+    pub fn with_row_cap(mut self, row_cap: Option<usize>) -> Self {
+        self.row_cap = row_cap;
+        self
+    }
+
+    /// The effective window size, never zero even if the field was set directly.
+    #[must_use]
+    pub fn effective_partition_concurrency(&self) -> usize {
+        self.partition_concurrency
+            .clamp(1, MAX_PARTITION_CONCURRENCY)
+    }
 }
 
 /// The fully-assembled result of a completed statement: the parsed terminal
@@ -86,8 +122,22 @@ pub struct CompletedStatement {
     pub statement_handle: StatementHandle,
     /// The terminal `200` result set, including column metadata.
     pub result_set: ResultSet,
-    /// All rows across every partition (`data` ++ each fetched partition).
+    /// All rows across every fetched partition (`data` ++ each fetched partition).
     pub rows: Vec<Vec<Option<String>>>,
+    /// Partitions whose rows are in `rows`, counting the inline partition 0.
+    pub fetched_partitions: u32,
+    /// Partitions the result set has in total (`partitionInfo` length, min 1).
+    pub total_partitions: u32,
+}
+
+impl CompletedStatement {
+    /// `true` when a row cap stopped the fetch before every partition was
+    /// downloaded: `rows` is a prefix and `result_set` still carries the
+    /// server-side `numRows`.
+    #[must_use]
+    pub fn is_partial(&self) -> bool {
+        self.fetched_partitions < self.total_partitions
+    }
 }
 
 /// The next step a caller should take after feeding the machine a response.
@@ -215,6 +265,52 @@ impl StatementMachine {
         self.polls_done
     }
 
+    /// While assembling: `(next partition to fetch, total partitions)`.
+    #[must_use]
+    pub fn assembling_window(&self) -> Option<(u32, u32)> {
+        match &self.phase {
+            Phase::Assembling { next, total, .. } => Some((*next, *total)),
+            Phase::Pending | Phase::Done => None,
+        }
+    }
+
+    /// Rows assembled so far (the inline partition plus every fetched partition).
+    #[must_use]
+    pub fn rows_assembled(&self) -> usize {
+        match &self.phase {
+            Phase::Assembling { rows, .. } => rows.len(),
+            Phase::Pending | Phase::Done => 0,
+        }
+    }
+
+    /// Finish with the partitions fetched so far (row-cap stop). The result is
+    /// partial: `fetched_partitions < total_partitions`, `rows` is a prefix.
+    ///
+    /// # Errors
+    /// [`LifecycleErrorCode::UnexpectedStatus`] outside the assembling phase.
+    pub fn complete_early(&mut self) -> Result<CompletedStatement, LifecycleError> {
+        let Phase::Assembling {
+            result_set,
+            handle,
+            total,
+            next,
+            rows,
+        } = std::mem::replace(&mut self.phase, Phase::Done)
+        else {
+            return Err(LifecycleError::new(
+                LifecycleErrorCode::UnexpectedStatus,
+                "early completion requested outside the assembling phase",
+            ));
+        };
+        Ok(CompletedStatement {
+            statement_handle: handle,
+            result_set,
+            rows,
+            fetched_partitions: next,
+            total_partitions: total,
+        })
+    }
+
     /// Feed the response to `POST /api/v2/statements`.
     ///
     /// # Errors
@@ -337,6 +433,8 @@ impl StatementMachine {
                 statement_handle: handle,
                 result_set,
                 rows,
+                fetched_partitions: total,
+                total_partitions: total,
             }))
         } else {
             let resume = handle.clone();
@@ -401,6 +499,8 @@ impl StatementMachine {
                 statement_handle: handle,
                 result_set,
                 rows,
+                fetched_partitions: 1,
+                total_partitions: 1,
             }))
         } else {
             let resume = handle.clone();

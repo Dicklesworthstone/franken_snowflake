@@ -142,8 +142,9 @@ lane, and both are labeled for what they prove:
   `StatementTransport`): submit → poll → partition → assemble with scripted
   status classes and bodies. Proves poll pacing/budgets, orphan cancel on
   every post-handle error, budget cancellations firing the remote cancel, the
-  `AuthProvider` re-sign on `401` (exactly one retry per step), and partition
-  row-count integrity. Every partition body is the live `{"data":[...]}`
+  `AuthProvider` re-sign on `401` (exactly one retry per step), partition
+  row-count integrity, the concurrent partition window (fetch overlap is
+  observed through the fake's start/done events), and the row-cap early stop. Every partition body is the live `{"data":[...]}`
   object form; one explicit bare-array fallback case is kept.
 - **Scripted statements under the CLI outcome layer**
   (`franken-snowflake-cli::live::test_support`, `--features live`): the
