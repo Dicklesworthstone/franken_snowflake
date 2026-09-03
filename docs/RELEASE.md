@@ -104,7 +104,7 @@ note is unbacked.
 | `x86_64-unknown-linux-gnu` | builds, tests pass | native |
 | `aarch64-unknown-linux-gnu` | builds (ELF aarch64 PIE) **and runs** under `qemu-aarch64`: `capabilities` reports `live=true, mcp=true`, `doctor` ok, `selftest` 7/7 | `cargo zigbuild`, `qemu-aarch64 -L /usr/aarch64-linux-gnu` |
 | `x86_64-pc-windows-msvc` | builds (PE32+ console exe, both binaries) | `cargo xwin build` |
-| `aarch64-pc-windows-msvc` | builds (PE32+ ARM64 console exe) from Linux via `scripts/cross-build-windows-arm64.sh`; builds natively on the Windows host through dsr (MSVC + VS 2022 clang) | `cargo xwin --cross-compiler clang` plus two workarounds baked into the script: blake3 uses its pure-Rust implementation on this target only (its NEON C path includes MSVC's `arm_neon.h`, which the clang driver cannot compile), and capitalized import-library aliases (`Kernel32.lib`) are added to cargo-xwin's clang sysroot because asupersync links `Kernel32` with a capital K. Linked, not executed: no ARM Windows machine or emulator is available. |
+| `aarch64-pc-windows-msvc` | builds (PE32+ ARM64 console exe) from Linux via `scripts/cross-build-windows-arm64.sh`, and natively on the Windows host through dsr (MSVC + VS 2022 clang; both binaries plus the installers in the zip) | `cargo xwin --cross-compiler clang` plus two workarounds baked into the script: blake3 uses its pure-Rust implementation on this target only (its NEON C path includes MSVC's `arm_neon.h`, which the clang driver cannot compile), and capitalized import-library aliases (`Kernel32.lib`) are added to cargo-xwin's clang sysroot because asupersync links `Kernel32` with a capital K. Linked, not executed: no ARM Windows machine or emulator is available. |
 | `aarch64-apple-darwin` | builds on the dsr macOS host (Mach-O arm64 PIE bundle) | `dsr build` |
 | `x86_64-apple-darwin` | builds on the dsr macOS host once the cross target is installed there (the dsr `build_cmd` now runs `rustup target add` first) | `dsr build` |
 
@@ -120,13 +120,28 @@ for every generated PowerShell script and a base64 `cmd.exe /d /s /c` wrapper
 for cmd lines). With that fix both Windows targets build natively on the
 Windows host (`cross_compile.windows/*` in the dsr registry: `host: wlap`,
 `CARGO_BUILD_TARGET`, a one-line cmd-compatible `build_cmd`), and cargo-xwin
-on the Linux host remains the fallback.
+on the Linux host remains the fallback. Three more facts the native path
+depends on, each of which cost one failed run: dsr's strict isolation strips
+the inherited `LIB`/`INCLUDE`, so the `build_cmd` initializes
+`VsDevCmd.bat -arch=amd64|arm64` itself; the host's login `PATH` is about
+7.6 K characters and VsDevCmd's additions push cmd.exe past its 8191-char
+limit ("The input line is too long"), so the `build_cmd` first resets `PATH`
+to the essentials; and rsync to a Windows receiver over a multiplexed ssh
+channel fails intermittently with `EAGAIN` (exit 12), so dsr now uses
+`--blocking-io` on a dedicated transport for Windows hosts (dsr commit
+`3e5c7bf`). A PowerShell 5.1 login shell reports any non-zero remote exit as
+`1` over OpenSSH; dsr's Windows paths rely on zero/non-zero only.
 
 **Executed on the real hosts (2026-09-03).** Both macOS archives were copied
 to the Mac host and run there: `capabilities` reports `live=true, mcp=true`,
 `selftest` 7/7, `doctor` ok, and a typed `FSNOW-2003` refusal without
 credentials, for `aarch64-apple-darwin` natively and `x86_64-apple-darwin`
-under Rosetta.
+under Rosetta. The `x86_64-pc-windows-msvc` zip built natively by dsr was
+copied to the Windows host (Windows 11, x64) and run there with the same
+four results. The `aarch64-pc-windows-msvc` zip is linked, not executed: no
+ARM Windows machine or emulator is available. The `x86_64-pc-windows-msvc`
+row above was also re-linked natively by dsr, superseding the cargo-xwin
+artifact for release purposes.
 
 `dsr build franken_snowflake` (build only, no upload) produced all five
 archives on 2026-09-03 across two runs. The first run built both Linux targets
