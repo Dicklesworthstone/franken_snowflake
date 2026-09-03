@@ -104,11 +104,28 @@ note is unbacked.
 | `aarch64-unknown-linux-gnu` | builds (ELF aarch64 PIE) **and runs** under `qemu-aarch64`: `capabilities` reports `live=true, mcp=true`, `doctor` ok, `selftest` 7/7 | `cargo zigbuild`, `qemu-aarch64 -L /usr/aarch64-linux-gnu` |
 | `x86_64-pc-windows-msvc` | builds (PE32+ console exe, both binaries) | `cargo xwin build` |
 | `aarch64-pc-windows-msvc` | **does not build** | `cargo xwin` exports clang-cl-style `/imsvc` include flags, but `ring 0.17` compiles its arm64 C sources with plain `clang`, which rejects them; overriding `CFLAGS_aarch64_pc_windows_msvc` is ignored by cargo-xwin. Needs a native Windows-on-ARM host or an upstream fix; the target is out of the release set until then (v0.0.1's arm64 asset came from a hosted Windows runner). |
-| `aarch64-apple-darwin`, `x86_64-apple-darwin` | not attempted here (no macOS SDK); built on the dsr macOS host | `dsr build` |
+| `aarch64-apple-darwin` | builds on the dsr macOS host (Mach-O arm64 PIE bundle) | `dsr build` |
+| `x86_64-apple-darwin` | builds on the dsr macOS host once the cross target is installed there (the dsr `build_cmd` now runs `rustup target add` first) | `dsr build` |
 
 The Windows binary above was produced, not executed: no Windows machine or
 emulator was available in this session, so for that row "builds" means the
 linker produced the executable, not that `capabilities` was run on it.
+
+`dsr build franken_snowflake` (build only, no upload) produced all five
+archives on 2026-09-03 across two runs. The first run built both Linux targets
+and macOS arm64, and failed macOS x86_64 (cross target not installed on the
+host) and Windows (dsr's native Windows runner emits PowerShell with its
+variable names stripped; a dsr bug, not a repository issue). The second run,
+after routing `windows/amd64` to the Linux host with `cargo xwin` through
+`cross_compile.host` and installing the cross target in `build_cmd`, built
+both remaining targets. The x86_64 Linux archive was executed here
+(`capabilities` reports `live=true, mcp=true`, `selftest` 7/7, a typed
+`FSNOW-2003` without credentials); the aarch64 Linux archive was executed
+under `qemu-aarch64` with the same result. Every archive holds
+`franken-snowflake`, `fsnow`, README, LICENSE, `install.sh`, and
+`install.ps1`. dsr quarantines a partial run's archives and writes the
+manifest only for the targets of one run, so the release build must be a
+single five-target run.
 
 ## No-Account Proof Lanes
 
