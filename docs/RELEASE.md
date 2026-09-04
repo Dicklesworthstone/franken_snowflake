@@ -158,7 +158,38 @@ under `qemu-aarch64` with the same result. Every archive holds
 manifest only for the targets of one run, so the release build must be a
 single full run.
 
-**Single full run (2026-09-03, dsr run `a33ba45c`, 3059 s, build only).**
+**v0.0.3 release run (2026-09-04, dsr run `5a13735f`, 2436 s, build +
+release).** All six targets succeeded in one clean-tree `dsr build
+franken_snowflake` from pushed main (`ef32fd76`, no `--allow-dirty`; the
+manifest records the git sha), then `dsr release franken_snowflake 0.0.3`
+uploaded the six archives with per-file `.sha256` sidecars and
+`SHA256SUMS` to the GitHub release. Built natively on each platform host:
+
+| archive | built on |
+|---|---|
+| `franken-snowflake-v0.0.3-x86_64-unknown-linux-gnu.tar.gz` | trj (native) |
+| `franken-snowflake-v0.0.3-aarch64-unknown-linux-gnu.tar.gz` | trj (native) |
+| `franken-snowflake-v0.0.3-aarch64-apple-darwin.tar.gz` | mmini (native) |
+| `franken-snowflake-v0.0.3-x86_64-apple-darwin.tar.gz` | mmini (native) |
+| `franken-snowflake-v0.0.3-x86_64-pc-windows-msvc.zip` | wlap (native MSVC) |
+| `franken-snowflake-v0.0.3-aarch64-pc-windows-msvc.zip` | wlap (native MSVC) |
+
+Executed proof on this workstation: both Linux archives report `capabilities`
+`version 0.0.3, live=true, mcp=true`, `selftest` 7/7, `doctor` ok, and a
+typed `FSNOW-2003` refusal without credentials; the aarch64 archive runs
+under `qemu-aarch64`. The installer was smoke-tested in a clean prefix:
+`install.sh --version v0.0.3 --dest <dir>` installs and the installed binary
+reports `0.0.3 / live=true / mcp=true`. The PowerShell installer was not
+exercised from Linux; the macOS and Windows archives were built natively by
+dsr on their hosts but not executed there in this session (same limitation
+as the 2026-09-03 run, stated so nothing is overstated). Pre-tag local
+proof: workspace tests, every feature-lane test, workspace + 18-lane clippy
+`-D warnings`, `cargo fmt --check`, admissibility, single-version, golden-LF
+(via `dsr quality` plus the per-lane rerun after its first-pass findings
+were fixed: a fmt violation and an unused-import in the new tui lane).
+
+**Single full run (2026-09-03, dsr run `a33ba45c`, 3059 s, build only;
+v0.0.2 history).**
 All six targets succeeded in one `dsr build franken_snowflake` and the
 manifest lists every archive with its SHA-256:
 
