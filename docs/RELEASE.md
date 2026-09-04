@@ -128,8 +128,8 @@ the inherited `LIB`/`INCLUDE`, so the `build_cmd` initializes
 limit ("The input line is too long"), so the `build_cmd` first resets `PATH`
 to the essentials; and rsync to a Windows receiver over a multiplexed ssh
 channel fails intermittently with `EAGAIN` (exit 12), so dsr now uses
-`--blocking-io` on a dedicated transport for Windows hosts (dsr commit
-`3e5c7bf`). A PowerShell 5.1 login shell reports any non-zero remote exit as
+`--blocking-io` on a dedicated transport for Windows hosts and retries a
+dropped stream up to three times (dsr commits `3e5c7bf`, `627fc95`). A PowerShell 5.1 login shell reports any non-zero remote exit as
 `1` over OpenSSH; dsr's Windows paths rely on zero/non-zero only.
 
 **Executed on the real hosts (2026-09-03).** Both macOS archives were copied
@@ -157,7 +157,30 @@ under `qemu-aarch64` with the same result. Every archive holds
 `franken-snowflake`, `fsnow`, README, LICENSE, `install.sh`, and
 `install.ps1`. dsr quarantines a partial run's archives and writes the
 manifest only for the targets of one run, so the release build must be a
-single five-target run.
+single full run.
+
+**Single full run (2026-09-03, dsr run `a33ba45c`, 3059 s, build only).**
+All six targets succeeded in one `dsr build franken_snowflake` and the
+manifest lists every archive with its SHA-256:
+
+| archive | built on |
+|---|---|
+| `franken-snowflake-v0.0.2-x86_64-unknown-linux-gnu.tar.gz` | trj |
+| `franken-snowflake-v0.0.2-aarch64-unknown-linux-gnu.tar.gz` | trj (zigbuild) |
+| `franken-snowflake-v0.0.2-aarch64-apple-darwin.tar.gz` | mmini |
+| `franken-snowflake-v0.0.2-x86_64-apple-darwin.tar.gz` | mmini |
+| `franken-snowflake-v0.0.2-x86_64-pc-windows-msvc.zip` | wlap (native MSVC) |
+| `franken-snowflake-v0.0.2-aarch64-pc-windows-msvc.zip` | wlap (native MSVC + clang) |
+
+Every archive holds `franken-snowflake`, `fsnow`, README, LICENSE,
+`install.sh`, and `install.ps1`. Two caveats, stated so the run is not
+overstated: the run was started with `--allow-dirty` (the manifest records
+no git sha), and its rsync to the Windows host dropped once before the
+retry landed in dsr, so the Windows targets were compiled from the tree the
+previous run had synced; that tree differs from HEAD only in
+`docs/RELEASE.md` and the bead journal, so the Windows binaries are built
+from identical code. The per-file `.sha256` sidecars and `SHA256SUMS` are
+produced by `dsr release`, not by `dsr build`.
 
 ## No-Account Proof Lanes
 
