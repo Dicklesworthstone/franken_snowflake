@@ -100,9 +100,17 @@ implementation first and the test/hardening pass follows in a later wave. The
 
 ---
 
-## [Unreleased] — since v0.0.2
+## [Unreleased]
 
-### Reality-check remediation (2026-09-02 → 2026-09-03)
+## [v0.0.3] — 2026-09-04
+
+Tag [`v0.0.3`](https://github.com/Dicklesworthstone/franken_snowflake/tree/v0.0.3)
+(commit range from `v0.0.2`). Binaries built by `dsr` on all six targets with
+`--features live,mcp` (`capabilities` reports `live=true, mcp=true` on every
+executed artifact); checksums published alongside; see `docs/RELEASE.md` for
+the run record and caveats.
+
+### Reality-check remediation (2026-09-02 → 2026-09-03), shipped in v0.0.3
 
 An end-to-end reality check against the README found that `v0.0.2` binaries
 shipped without `live`/`mcp`, CI had never produced a job, four crates

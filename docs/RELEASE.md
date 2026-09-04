@@ -6,12 +6,11 @@ requiring live Snowflake credentials.
 
 ## Current Release State
 
-- Package version: `0.0.2` (GitHub Release 2026-08-25). Its binaries were
-  built with the default feature set (no `live`, no `mcp`) and no Windows
-  assets, contrary to the README at the time; the next release must be built
-  with `--features live,mcp` for every target including
-  `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`, and `capabilities`
-  on each artifact must report `live=true, mcp=true` before upload.
+- Package version: `0.0.3` (GitHub Release 2026-09-04). Built by `dsr` on all
+  six targets with `--features live,mcp`; the `v0.0.2` release (2026-08-25)
+  had shipped default-feature binaries with no Windows assets, which this
+  release corrects; `capabilities` on each executed artifact reports
+  `live=true, mcp=true` before upload.
 - Publish state: workspace crates inherit `publish = false`; crates.io publish
   remains blocked until the first tagged public release intentionally chooses a
   SemVer version and flips that flag.
