@@ -41,13 +41,13 @@ use franken_snowflake_catalog::discovery::{
 };
 use franken_snowflake_catalog::model::{CatalogSnapshot, DataSourceClass};
 use franken_snowflake_core::cancel::CancelKind;
-use franken_snowflake_core::guardrails::enforce_require_live;
-use franken_snowflake_core::outcome::DataSource;
 use franken_snowflake_core::error::{SnowflakeError, SnowflakeErrorCode};
 use franken_snowflake_core::exit::ExitCode as CoreExitCode;
+use franken_snowflake_core::guardrails::enforce_require_live;
 use franken_snowflake_core::ids::{
     DatabaseName, RoleName, SchemaName, StatementHandle, WarehouseName,
 };
+use franken_snowflake_core::outcome::DataSource;
 use franken_snowflake_core::redact::redact;
 use franken_snowflake_export::{
     CopySource, ExportColumn, LocalExportInput, ResultPartition, export_csv, export_jsonl,
@@ -2817,6 +2817,7 @@ mod tests {
             "demo".to_owned(),
             "ANALYTICS".to_owned(),
             "PUBLIC".to_owned(),
+            false,
         ));
         assert_eq!(env["ok"], true, "{env}");
         assert_eq!(env["data_source"], "live");

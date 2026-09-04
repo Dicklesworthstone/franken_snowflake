@@ -959,10 +959,9 @@ mod ftui_surface {
                 self.app.logs.push(TuiLogLine {
                     event: "query_run".to_owned(),
                     outcome: "refusal".to_owned(),
-                    message:
-                        "query execution is not wired in this build (rebuild with --features \
+                    message: "query execution is not wired in this build (rebuild with --features \
                          live); use `fsnow query run`"
-                            .to_owned(),
+                        .to_owned(),
                     code: None,
                 });
                 return;
@@ -1377,7 +1376,11 @@ mod tests {
                 .iter()
                 .find(|line| line.event == "query_run")
                 .expect("executor output logged");
-            assert!(run_line.message.starts_with("ran SELECT 1"), "{}", run_line.message);
+            assert!(
+                run_line.message.starts_with("ran SELECT 1"),
+                "{}",
+                run_line.message
+            );
         }
 
         #[test]

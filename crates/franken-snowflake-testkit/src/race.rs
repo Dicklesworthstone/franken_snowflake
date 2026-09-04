@@ -9,7 +9,7 @@
 //! The suite intentionally stays at the protocol/testkit layer rather than
 //! opening an ambient Snowflake endpoint.
 
-use std::collections::{BTreeSet, BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;

@@ -5,14 +5,18 @@
 //! This test is safe in no-account CI: without `FRANKEN_SNOWFLAKE_LIVE=1` and a
 //! named profile's env handles, it records a typed skip artifact and never
 //! resolves credentials or performs network IO. With explicit opt-in it spawns
-//! the compiled binary (same feature set as the test invocation) and asserts the
-//! live envelope contract: `data_source:live`, a real statement handle, a
+//! the compiled binary (same feature set as the test invocation) and asserts
+//! the live envelope contract: `data_source:live`, a real statement handle, a
 //! 64-hex content-addressed `receipt_hash` that `receipt show` reads back, and
 //! no secret material in any captured output.
 //!
 //! Mirrors `franken-snowflake-sqlapi/tests/live_proof.rs` (driver-level lane)
 //! and `scripts/live-proof-cli.sh` (full battery); this file pins the core
 //! proof inside the crate's own test suite. Docs: `docs/live_proof.md`.
+//!
+//! Integration-test crate: panicking on an unexpected process result IS the
+//! failure mechanism, so the production panic/expect bans do not apply here.
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::env;
 use std::fs;
@@ -48,7 +52,7 @@ fn gate() -> Result<String, Gate> {
                 code: "ProfileMissing",
                 detail: format!("set {LIVE_PROFILE_ENV}=<profile> to name the live profile"),
                 missing_env: vec![LIVE_PROFILE_ENV.to_string()],
-            })
+            });
         }
     };
     let prefix = env_prefix(&profile);
@@ -70,7 +74,7 @@ fn gate() -> Result<String, Gate> {
                 code: "AuthLaneInvalid",
                 detail: format!("{} must name an auth lane", env_name(&prefix, "AUTH")),
                 missing_env: Vec::new(),
-            })
+            });
         }
         other => {
             return Err(Gate {
@@ -80,7 +84,7 @@ fn gate() -> Result<String, Gate> {
                     env_name(&prefix, "AUTH")
                 ),
                 missing_env: Vec::new(),
-            })
+            });
         }
     };
     if env_value(secret_handle.as_str()).is_none() {

@@ -16,11 +16,11 @@ use franken_snowflake_cache::CacheBackend;
 use franken_snowflake_catalog::model::CatalogSnapshot;
 use franken_snowflake_core::error::SnowflakeErrorCode;
 use franken_snowflake_core::exit::ExitCode as CoreExitCode;
-use franken_snowflake_tui::{SnowflakeTuiApp, run_terminal_with_executor};
 #[cfg(feature = "live")]
 use franken_snowflake_tui::ExecutorLine;
 #[cfg(not(feature = "live"))]
 use franken_snowflake_tui::run_terminal;
+use franken_snowflake_tui::{SnowflakeTuiApp, run_terminal_with_executor};
 
 use crate::catalog_surface::{DATA_SOURCE_CACHE, store_error, typed_error};
 use crate::local_store;
@@ -279,9 +279,7 @@ fn render_outcome_lines(outcome: Outcome) -> Vec<ExecutorLine> {
     if let Some(receipt) = get_str("receipt_hash") {
         lines.push(ExecutorLine {
             outcome: "ok".to_owned(),
-            message: format!(
-                "receipt {receipt} (fsnow receipt show {receipt})"
-            ),
+            message: format!("receipt {receipt} (fsnow receipt show {receipt})"),
         });
     }
     lines.push(ExecutorLine {
@@ -306,11 +304,13 @@ fn render_outcome_lines(outcome: Outcome) -> Vec<ExecutorLine> {
         for (index, row) in rows.iter().take(10).enumerate() {
             let cells = row
                 .as_array()
-                .map(|cells| cells
-                    .iter()
-                    .map(serde_json::Value::to_string)
-                    .collect::<Vec<_>>()
-                    .join(" | "))
+                .map(|cells| {
+                    cells
+                        .iter()
+                        .map(serde_json::Value::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                })
                 .unwrap_or_default();
             lines.push(ExecutorLine {
                 outcome: "ok".to_owned(),
