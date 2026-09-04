@@ -179,14 +179,26 @@ Executed proof on this workstation: both Linux archives report `capabilities`
 typed `FSNOW-2003` refusal without credentials; the aarch64 archive runs
 under `qemu-aarch64`. The installer was smoke-tested in a clean prefix:
 `install.sh --version v0.0.3 --dest <dir>` installs and the installed binary
-reports `0.0.3 / live=true / mcp=true`. The PowerShell installer was not
-exercised from Linux; the macOS and Windows archives were built natively by
-dsr on their hosts but not executed there in this session (same limitation
-as the 2026-09-03 run, stated so nothing is overstated). Pre-tag local
-proof: workspace tests, every feature-lane test, workspace + 18-lane clippy
-`-D warnings`, `cargo fmt --check`, admissibility, single-version, golden-LF
-(via `dsr quality` plus the per-lane rerun after its first-pass findings
-were fixed: a fmt violation and an unused-import in the new tui lane).
+reports `0.0.3 / live=true / mcp=true`.
+
+**Executed on the real hosts (2026-09-04).** Both macOS archives were
+copied to the Mac host (mmini, macOS 26.2 arm64) and run there:
+`capabilities` reports `0.0.3 / live=true / mcp=true`, `selftest` ok,
+`doctor` ok, and a typed `FSNOW-2003` refusal without credentials —
+`aarch64-apple-darwin` natively and `x86_64-apple-darwin` under Rosetta
+(Mach-O x86_64 confirmed with `file`). The `x86_64-pc-windows-msvc` zip
+was copied to the Windows host (wlap, Windows 11 x64) and run natively
+with the same four results (`capabilities`, `selftest` ok, `doctor` ok,
+`FSNOW-2003`). The `aarch64-pc-windows-msvc` zip remains linked, not
+executed: no ARM Windows machine or emulator is available. The PowerShell
+installer was not exercised; the installer archive contents were extracted
+and the executables run directly. Session temp files from the host runs
+were left in place (`/tmp/fsnow-v003-verify` on mmini, `%HOME%\fsnow-v003*`
+on wlap). Pre-tag local proof: workspace tests, every feature-lane test,
+workspace + 18-lane clippy `-D warnings`, `cargo fmt --check`,
+admissibility, single-version, golden-LF (via `dsr quality` plus the
+per-lane rerun after its first-pass findings were fixed: a fmt violation
+and an unused-import in the new tui lane).
 
 **Single full run (2026-09-03, dsr run `a33ba45c`, 3059 s, build only;
 v0.0.2 history).**
