@@ -16,11 +16,11 @@ use franken_snowflake_cache::CacheBackend;
 use franken_snowflake_catalog::model::CatalogSnapshot;
 use franken_snowflake_core::error::SnowflakeErrorCode;
 use franken_snowflake_core::exit::ExitCode as CoreExitCode;
-#[cfg(feature = "live")]
-use franken_snowflake_tui::ExecutorLine;
+use franken_snowflake_tui::SnowflakeTuiApp;
 #[cfg(not(feature = "live"))]
 use franken_snowflake_tui::run_terminal;
-use franken_snowflake_tui::{SnowflakeTuiApp, run_terminal_with_executor};
+#[cfg(feature = "live")]
+use franken_snowflake_tui::{ExecutorLine, run_terminal_with_executor};
 
 use crate::catalog_surface::{DATA_SOURCE_CACHE, store_error, typed_error};
 use crate::local_store;
