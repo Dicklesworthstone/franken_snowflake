@@ -3,9 +3,12 @@
 //! profile. Compiled only with the `tui` feature; the default build answers a
 //! typed refusal from `tui_dispatch`.
 //!
-//! What runs here is offline: browsing the persisted snapshot and planning raw
-//! SQL through the shared planner. Executing a planned query from inside the
-//! TUI is not wired (the model has no executor hook); use `query run`.
+//! What runs here is offline by default: browsing the persisted snapshot and
+//! planning raw SQL through the shared planner. With the `live` feature the
+//! launch injects an executor, so Enter on a planned query runs it through
+//! the same live path as `query run` (blocking v1: the result lines land in
+//! the log pane when the statement returns). Without `live`, submit logs a
+//! typed pointer to `fsnow query run`.
 
 use std::io::IsTerminal;
 
@@ -13,7 +16,11 @@ use franken_snowflake_cache::CacheBackend;
 use franken_snowflake_catalog::model::CatalogSnapshot;
 use franken_snowflake_core::error::SnowflakeErrorCode;
 use franken_snowflake_core::exit::ExitCode as CoreExitCode;
-use franken_snowflake_tui::{SnowflakeTuiApp, run_terminal};
+use franken_snowflake_tui::{SnowflakeTuiApp, run_terminal_with_executor};
+#[cfg(feature = "live")]
+use franken_snowflake_tui::ExecutorLine;
+#[cfg(not(feature = "live"))]
+use franken_snowflake_tui::run_terminal;
 
 use crate::catalog_surface::{DATA_SOURCE_CACHE, store_error, typed_error};
 use crate::local_store;
@@ -144,7 +151,18 @@ pub fn launch_outcome(
     let dataset_count = snapshot.datasets.len();
     let column_count = snapshot.columns.len();
     let app = SnowflakeTuiApp::from_catalog_snapshot(&snapshot);
-    if let Err(error) = run_terminal(app) {
+    let run_result = {
+        #[cfg(feature = "live")]
+        {
+            let executor = build_query_executor(profile.clone());
+            run_terminal_with_executor(app, Some(executor))
+        }
+        #[cfg(not(feature = "live"))]
+        {
+            run_terminal(app)
+        }
+    };
+    if let Err(error) = run_result {
         return typed_error(
             format,
             COMMAND_ID,
@@ -189,6 +207,118 @@ pub fn launch_outcome(
         status: CoreExitCode::Success,
         body: Body::Envelope { envelope, format },
     }
+}
+
+/// Build the host-side executor the TUI calls when the operator submits a
+/// planned query: it drives the exact same live outcome path as `query run`
+/// and renders compact result lines for the log pane.
+#[cfg(feature = "live")]
+fn build_query_executor(profile: String) -> franken_snowflake_tui::QueryExecutor {
+    Box::new(move |sql: &str| {
+        let options = crate::QueryRunOptions::default();
+        let outcome = crate::live::run_query_outcome(
+            OutputFormat::Json,
+            local_store::invocation_id("tui-query-run"),
+            profile.clone(),
+            sql,
+            &options,
+        );
+        render_outcome_lines(outcome)
+    })
+}
+
+/// Render a `query run` outcome into TUI log lines: a summary line, the typed
+/// error (if any), the statement handle and receipt hash, the row counts, and
+/// up to ten result rows.
+#[cfg(feature = "live")]
+fn render_outcome_lines(outcome: Outcome) -> Vec<ExecutorLine> {
+    let status = outcome.status.code();
+    let rendered = match &outcome.body {
+        Body::Envelope { envelope, .. } => crate::render_json(&crate::envelope_json(envelope)),
+        Body::Raw { data } => data.clone(),
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&rendered).unwrap_or(serde_json::Value::Null);
+    let ok = value
+        .get("ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let get_str = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let get_u64 = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+
+    let mut lines = vec![ExecutorLine {
+        outcome: if ok { "ok" } else { "error" }.to_owned(),
+        message: format!(
+            "query run exit={} data_source={}",
+            status,
+            get_str("data_source").unwrap_or_else(|| "unspecified".to_owned())
+        ),
+    }];
+    if !ok {
+        lines.push(ExecutorLine {
+            outcome: "error".to_owned(),
+            message: format!(
+                "{}: {}",
+                get_str("code").unwrap_or_else(|| "unknown".to_owned()),
+                get_str("message").unwrap_or_else(|| "no detail".to_owned())
+            ),
+        });
+        return lines;
+    }
+    if let Some(handle) = get_str("statement_handle") {
+        lines.push(ExecutorLine {
+            outcome: "ok".to_owned(),
+            message: format!("statement handle {handle}"),
+        });
+    }
+    if let Some(receipt) = get_str("receipt_hash") {
+        lines.push(ExecutorLine {
+            outcome: "ok".to_owned(),
+            message: format!(
+                "receipt {receipt} (fsnow receipt show {receipt})"
+            ),
+        });
+    }
+    lines.push(ExecutorLine {
+        outcome: "ok".to_owned(),
+        message: format!(
+            "rows returned={} of {} total{} partitions={}",
+            get_u64("returned_rows").map_or("?".to_owned(), |n| n.to_string()),
+            get_u64("result_row_count").map_or("?".to_owned(), |n| n.to_string()),
+            if value
+                .get("truncated")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                " (truncated)"
+            } else {
+                ""
+            },
+            get_u64("partition_count").map_or("?".to_owned(), |n| n.to_string()),
+        ),
+    });
+    if let Some(rows) = value.get("rows").and_then(serde_json::Value::as_array) {
+        for (index, row) in rows.iter().take(10).enumerate() {
+            let cells = row
+                .as_array()
+                .map(|cells| cells
+                    .iter()
+                    .map(serde_json::Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" | "))
+                .unwrap_or_default();
+            lines.push(ExecutorLine {
+                outcome: "ok".to_owned(),
+                message: format!("row {:>3} | {cells}", index.saturating_add(1)),
+            });
+        }
+    }
+    lines
 }
 
 #[cfg(test)]

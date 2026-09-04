@@ -585,7 +585,7 @@ or `%APPDATA%\franken-snowflake`); `FRANKEN_SNOWFLAKE_DATA_DIR` overrides it.
 |---|---|
 | `fsnow mcp serve --stdio` | Serve the read verbs as MCP tools over stdio (requires the `mcp` feature) |
 | `fsnow mcp serve --http <addr>` | Serve over HTTP at the given address |
-| `fsnow tui --profile <profile>` | Interactive catalog browser + query planner (FrankenTUI) over the profile's latest local snapshot; needs a build with `--features tui` and a real terminal (a non-TTY invocation refuses typed instead of hanging). Executing a planned query from inside the TUI is not wired; use `query run` |
+| `fsnow tui --profile <profile>` | Interactive catalog browser + query planner (FrankenTUI) over the profile's latest local snapshot; needs a build with `--features tui` and a real terminal (a non-TTY invocation refuses typed instead of hanging). With `--features live`, submitting a planned query executes it through the same live path as `query run` (results land in the log pane; v1 blocks the UI until the statement returns); without `live`, submit logs a typed pointer to `query run` |
 
 ```bash
 fsnow mcp serve --stdio

@@ -792,7 +792,7 @@ mod ftui_surface {
     use ftui::render::drawing::Draw;
     use ftui::{Cell, Cmd, Event, Frame, KeyCode, KeyEvent, KeyEventKind, Model, PackedRgba};
 
-    use super::{FocusPane, SnowflakeTuiApp, TuiEvent};
+    use super::{FocusPane, SnowflakeTuiApp, StatementPhase, TuiAction, TuiEvent, TuiLogLine};
 
     /// FrankenTUI message wrapper for the app model.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -919,11 +919,130 @@ mod ftui_surface {
         let mut program = ftui::Program::new(app)?;
         program.run()
     }
+
+    /// One rendered result line from an executed query.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ExecutorLine {
+        /// `"ok"`, `"error"`, or `"refusal"` — drives the progress phase.
+        pub outcome: String,
+        /// Redaction-safe display text.
+        pub message: String,
+    }
+
+    /// Host-injected executor: runs the planned SQL through the host's live
+    /// path and returns rendered lines for the log pane. The tui crate cannot
+    /// depend on the CLI, so the CLI embeds its own closure.
+    pub type QueryExecutor = Box<dyn FnMut(&str) -> Vec<ExecutorLine>>;
+
+    /// The app model plus an optional executor: identical rendering and key
+    /// handling to the bare model, except a planned query is executed through
+    /// the injected live path (blocking v1: the UI redraws when the result
+    /// lines land). Without an executor, submit logs a typed pointer to
+    /// `fsnow query run` instead of silently doing nothing.
+    pub struct ExecutorModel {
+        app: SnowflakeTuiApp,
+        executor: Option<QueryExecutor>,
+    }
+
+    impl ExecutorModel {
+        /// Wrap an app model with an optional query executor.
+        #[must_use]
+        pub fn new(app: SnowflakeTuiApp, executor: Option<QueryExecutor>) -> Self {
+            Self { app, executor }
+        }
+
+        fn execute_if_planned(&mut self, action: TuiAction) {
+            let TuiAction::PlanQuery(plan) = action else {
+                return;
+            };
+            let Some(executor) = self.executor.as_mut() else {
+                self.app.logs.push(TuiLogLine {
+                    event: "query_run".to_owned(),
+                    outcome: "refusal".to_owned(),
+                    message:
+                        "query execution is not wired in this build (rebuild with --features \
+                         live); use `fsnow query run`"
+                            .to_owned(),
+                    code: None,
+                });
+                return;
+            };
+            self.app.progress.phase = StatementPhase::Submitted;
+            let lines = executor(plan.sql.as_str());
+            let failed = lines.iter().any(|line| line.outcome != "ok");
+            for line in lines {
+                self.app.logs.push(TuiLogLine {
+                    event: "query_run".to_owned(),
+                    outcome: line.outcome,
+                    message: line.message,
+                    code: None,
+                });
+            }
+            self.app.progress.phase = if failed {
+                StatementPhase::Refused
+            } else {
+                StatementPhase::Complete
+            };
+        }
+
+        /// Read-only access to the wrapped app (test and overlay support).
+        #[cfg(test)]
+        #[must_use]
+        pub fn app(&self) -> &SnowflakeTuiApp {
+            &self.app
+        }
+    }
+
+    impl Model for ExecutorModel {
+        type Message = TuiMessage;
+
+        fn update(&mut self, msg: Self::Message) -> Cmd<Self::Message> {
+            match msg {
+                TuiMessage::App(TuiEvent::Quit) => Cmd::quit(),
+                TuiMessage::Key(key) => match event_for_key(self.app.focus, key) {
+                    Some(TuiEvent::Quit) => Cmd::quit(),
+                    Some(event) => {
+                        let action = self.app.apply_event(event);
+                        self.execute_if_planned(action);
+                        Cmd::none()
+                    }
+                    None => Cmd::none(),
+                },
+                TuiMessage::App(event) => {
+                    let action = self.app.apply_event(event);
+                    self.execute_if_planned(action);
+                    Cmd::none()
+                }
+                TuiMessage::Ignore => Cmd::none(),
+            }
+        }
+
+        fn view(&self, frame: &mut Frame) {
+            self.app.view(frame);
+        }
+    }
+
+    /// Run the interactive program loop with a host-injected query executor
+    /// (the live path when the host build links it), then restore the
+    /// terminal.
+    ///
+    /// # Errors
+    /// Any terminal setup or event-loop I/O error from FrankenTUI.
+    pub fn run_terminal_with_executor(
+        app: SnowflakeTuiApp,
+        executor: Option<QueryExecutor>,
+    ) -> std::io::Result<()> {
+        let model = ExecutorModel::new(app, executor);
+        let mut program = ftui::Program::new(model)?;
+        program.run()
+    }
 }
 
 #[cfg(feature = "tui")]
-pub use ftui_surface::{FrankenSnowflakeTuiModel, TuiMessage, run_terminal};
-
+pub use ftui_surface::{
+    ExecutorLine, FrankenSnowflakeTuiModel, QueryExecutor, TuiMessage, run_terminal,
+    run_terminal_with_executor,
+};
 #[cfg(test)]
 mod tests {
     use franken_snowflake_catalog::prelude::{
@@ -1229,6 +1348,82 @@ mod tests {
                 },
             ],
             operators: Vec::new(),
+        }
+    }
+
+    #[cfg(feature = "tui")]
+    mod executor_model {
+        use super::*;
+        use crate::ftui_surface::{ExecutorLine, ExecutorModel};
+        use ftui::Model;
+
+        fn ok_executor() -> crate::ftui_surface::QueryExecutor {
+            Box::new(|sql: &str| {
+                vec![ExecutorLine {
+                    outcome: "ok".to_owned(),
+                    message: format!("ran {sql}"),
+                }]
+            })
+        }
+
+        #[test]
+        fn submit_runs_the_planned_query_through_the_injected_executor() {
+            let mut model = ExecutorModel::new(SnowflakeTuiApp::default(), Some(ok_executor()));
+            let _ = model.update(crate::ftui_surface::TuiMessage::App(TuiEvent::QuerySubmit));
+            let app = model.app();
+            assert_eq!(app.progress.phase, StatementPhase::Complete);
+            let run_line = app
+                .logs
+                .iter()
+                .find(|line| line.event == "query_run")
+                .expect("executor output logged");
+            assert!(run_line.message.starts_with("ran SELECT 1"), "{}", run_line.message);
+        }
+
+        #[test]
+        fn executor_error_lines_flip_the_progress_phase_to_refused() {
+            let executor: crate::ftui_surface::QueryExecutor = Box::new(|sql: &str| {
+                vec![
+                    ExecutorLine {
+                        outcome: "error".to_owned(),
+                        message: format!("boom for {sql}"),
+                    },
+                    ExecutorLine {
+                        outcome: "error".to_owned(),
+                        message: "FSNOW-4001: statement failed".to_owned(),
+                    },
+                ]
+            });
+            let mut model = ExecutorModel::new(SnowflakeTuiApp::default(), Some(executor));
+            let _ = model.update(crate::ftui_surface::TuiMessage::App(TuiEvent::QuerySubmit));
+            assert_eq!(model.app().progress.phase, StatementPhase::Refused);
+            assert_eq!(
+                model
+                    .app()
+                    .logs
+                    .iter()
+                    .filter(|line| line.event == "query_run")
+                    .count(),
+                2
+            );
+        }
+
+        #[test]
+        fn without_an_executor_submit_logs_a_typed_pointer_instead_of_no_op() {
+            let mut model = ExecutorModel::new(SnowflakeTuiApp::default(), None);
+            let _ = model.update(crate::ftui_surface::TuiMessage::App(TuiEvent::QuerySubmit));
+            let app = model.app();
+            let pointer = app
+                .logs
+                .iter()
+                .find(|line| line.event == "query_run")
+                .expect("not-wired pointer logged");
+            assert_eq!(pointer.outcome, "refusal");
+            assert!(
+                pointer.message.contains("fsnow query run"),
+                "{:?}",
+                pointer.message
+            );
         }
     }
 }

@@ -157,7 +157,10 @@ several commands returned "reserved" stubs. This window closes those gaps:
   (crossterm) until the user quits, then prints a success envelope. Missing
   snapshot, missing profile, and non-interactive stdin/stdout are typed
   errors (no hang for agents). `capabilities.feature_flags.tui` now reflects
-  the build. Executing a planned query from inside the TUI is not wired yet.
+  the build. Executing a planned query from inside the TUI runs through the
+  live path when `--features live` is compiled (host-injected executor; v1
+  blocks the UI until the statement returns) and otherwise logs a typed
+  pointer to `fsnow query run`.
   The CLI body also moved to a library so `franken-snowflake` and `fsnow` are
   two thin bins over one compiled unit (no duplicate test runs).
 - **Snapshot lookup scope.** `latest_catalog_snapshot` treats a `None`
