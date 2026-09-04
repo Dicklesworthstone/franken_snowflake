@@ -419,7 +419,7 @@ handle sets per auth lane.
 
 | Command | What it does |
 |---|---|
-| `fsnow catalog scan <profile> --database <db> --schema <schema> --json` | Discover tables, views, and columns through bound `INFORMATION_SCHEMA` statements, build dataset manifests (field roles, row/byte hints), and persist the snapshot to the local store |
+| `fsnow catalog scan <profile> --database <db> --schema <schema> [--require-live] --json` | Discover tables, views, and columns through bound `INFORMATION_SCHEMA` statements, build dataset manifests (field roles, row/byte hints), and persist the snapshot to the local store; `--require-live` hard-refuses with `FSNOW-3003` unless served by the live transport |
 | `fsnow catalog graph <profile> --database <db> [--schema <schema>] [--refresh] [--json\|--toon\|--mermaid\|--svg]` | Render the lineage graph (profile > database > schema > object > column, dataset and field edges) from the local snapshot, or from a live scan with `--refresh` |
 
 Both `--database` and `--schema` are required for `catalog scan`. `catalog
@@ -462,7 +462,7 @@ fsnow dataset profile events_daily --json
 |---|---|
 | `fsnow query plan --profile <profile> --sql <sql> --json` | Validate and explain a read plan without submitting it |
 | `fsnow query plan --dataset <id> [--entity <v>] [--from <t>] [--to <t>] [--as-of <t>] [--select a,b] [--filter <json>] [--limit <n>] --json` | Dataset mode: compile pushed-down SQL with positional typed bindings, Time Travel `AT(TIMESTAMP => ...)` for `--as-of`, and an enforced limit, offline from the local snapshot |
-| `fsnow query run --profile <profile> --sql <sql> [--limit <rows>] [--role <r>] [--warehouse <w>] [--statement-timeout <s>] --json` | Submit a single read statement (SELECT / WITH / SHOW / DESCRIBE / EXPLAIN); every flag is honored or rejected, never silently ignored. Result partitions are fetched in a concurrent window and the fetch stops once `--limit` rows are assembled (`partitions_fetched` and a warning say so) |
+| `fsnow query run --profile <profile> --sql <sql> [--limit <rows>] [--role <r>] [--warehouse <w>] [--statement-timeout <s>] [--require-live] --json` | Submit a single read statement (SELECT / WITH / SHOW / DESCRIBE / EXPLAIN); every flag is honored or rejected, never silently ignored. Result partitions are fetched in a concurrent window and the fetch stops once `--limit` rows are assembled (`partitions_fetched` and a warning say so). `--require-live` hard-refuses with `FSNOW-3003` unless the envelope is backed by the live transport |
 | `fsnow query run --dataset <id> ... --json` | Dataset mode: plan as above, then execute live with the same bindings |
 | `fsnow query write --profile <profile> --sql <sql> [--dry-run \| --confirm <token>] --json` | Execute a mutation; direct once `WRITE_ENABLED` is set, with `--dry-run` as an optional preview (see [Writes](#writes)) |
 | `fsnow query --sql <sql> --profile <profile> --json` | Shorthand that maps to `query run` |

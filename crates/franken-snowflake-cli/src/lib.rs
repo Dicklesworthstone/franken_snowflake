@@ -80,6 +80,7 @@ enum Command {
         profile: String,
         database: Option<String>,
         schema: Option<String>,
+        require_live: bool,
     },
     CatalogGraph {
         profile: String,
@@ -159,6 +160,10 @@ struct QueryRunOptions {
     warehouse: Option<String>,
     /// SQL API statement timeout in seconds (else `_STATEMENT_TIMEOUT_SECONDS`, else 60).
     statement_timeout: Option<String>,
+    /// Refuse with FSNOW-3003 unless the run is backed by the live transport
+    /// (`--require-live`); success on the live paths always stamps
+    /// `data_source = "live"`, so this only fires on non-live substitution.
+    require_live: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -695,11 +700,12 @@ fn parse_catalog(
                         vec![],
                     ));
                 }
-
+                let require_live = has_flag(args, "--require-live");
                 Ok(Command::CatalogScan {
                     profile,
                     database,
                     schema,
+                    require_live,
                 })
             }
             None => Err(usage_error(
@@ -1053,6 +1059,7 @@ fn query_run_options(args: &[String]) -> QueryRunOptions {
         role: value_after(args, "--role"),
         warehouse: value_after(args, "--warehouse"),
         statement_timeout: value_after(args, "--statement-timeout"),
+        require_live: has_flag(args, "--require-live"),
     }
 }
 
@@ -1237,7 +1244,15 @@ fn dispatch(invocation: Invocation) -> Outcome {
             profile,
             database,
             schema,
-        } => catalog_scan_dispatch(invocation.output, request_id, profile, database, schema),
+            require_live,
+        } => catalog_scan_dispatch(
+            invocation.output,
+            request_id,
+            profile,
+            database,
+            schema,
+            require_live,
+        ),
         Command::CatalogGraph {
             profile,
             database,
@@ -2171,6 +2186,12 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
                 true,
                 "Snowflake schema identifier (--schema)",
             ),
+            input(
+                "require_live",
+                "boolean",
+                false,
+                "Hard-refuse (FSNOW-3003) unless served by the live transport (--require-live)",
+            ),
             OUTPUT_INPUT,
         ],
         "catalog.graph" => vec![
@@ -2282,6 +2303,12 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
                     "string",
                     false,
                     "QUERY_TAG for Snowflake query history (--query-tag)",
+                ),
+                input(
+                    "require_live",
+                    "boolean",
+                    false,
+                    "Hard-refuse (FSNOW-3003) unless served by the live transport (--require-live)",
                 ),
             ];
             inputs.extend(
@@ -3227,6 +3254,7 @@ fn query_run_dispatch(
                     ("statement_timeout", option_json(options.statement_timeout)),
                     ("bindings_env", option_json(options.bindings_env)),
                     ("query_tag", option_json(options.query_tag)),
+                    ("require_live", Json::Bool(options.require_live)),
                 ]),
             ),
             (
@@ -3696,6 +3724,7 @@ fn catalog_scan_dispatch(
     profile: String,
     database: Option<String>,
     schema: Option<String>,
+    require_live: bool,
 ) -> Outcome {
     live::run_catalog_scan_outcome(
         format,
@@ -3703,6 +3732,7 @@ fn catalog_scan_dispatch(
         profile,
         database.unwrap_or_default(),
         schema.unwrap_or_default(),
+        require_live,
     )
 }
 
@@ -3715,6 +3745,7 @@ fn catalog_scan_dispatch(
     profile: String,
     database: Option<String>,
     schema: Option<String>,
+    require_live: bool,
 ) -> Outcome {
     live_transport_required_with_data(
         format,
@@ -3725,6 +3756,7 @@ fn catalog_scan_dispatch(
         json_object(vec![
             ("requested_database", option_json(database)),
             ("requested_schema", option_json(schema)),
+            ("require_live", Json::Bool(require_live)),
             (
                 "requires",
                 json_array(vec![
@@ -4253,6 +4285,7 @@ fn known_flags() -> Vec<&'static str> {
         "--profile",
         "--query-id",
         "--query-tag",
+        "--require-live",
         "--refresh",
         "--role",
         "--schema",
@@ -6216,6 +6249,102 @@ mod tests {
             rendered.contains("catalog scan &lt;profile&gt;")
                 || rendered.contains("catalog scan <profile>")
         );
+    }
+
+    #[test]
+    fn require_live_flag_parses_for_query_run_and_catalog_scan() {
+        let invocation = parse_invocation(vec![
+            "query".to_string(),
+            "run".to_string(),
+            "--profile".to_string(),
+            "demo".to_string(),
+            "--sql".to_string(),
+            "select 1".to_string(),
+            "--require-live".to_string(),
+        ])
+        .expect("query run --require-live should parse");
+        match invocation.command {
+            Command::QueryRun { options, .. } => assert!(options.require_live),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let invocation = parse_invocation(vec![
+            "catalog".to_string(),
+            "scan".to_string(),
+            "demo".to_string(),
+            "--database".to_string(),
+            "ANALYTICS".to_string(),
+            "--schema".to_string(),
+            "PUBLIC".to_string(),
+            "--require-live".to_string(),
+        ])
+        .expect("catalog scan --require-live should parse");
+        match invocation.command {
+            Command::CatalogScan { require_live, .. } => assert!(require_live),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let invocation = parse_invocation(vec![
+            "query".to_string(),
+            "run".to_string(),
+            "--profile".to_string(),
+            "demo".to_string(),
+            "--sql".to_string(),
+            "select 1".to_string(),
+        ])
+        .expect("query run without the flag should parse");
+        match invocation.command {
+            Command::QueryRun { options, .. } => assert!(!options.require_live),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    // Default build: with the live transport absent, `query run --require-live`
+    // must hard-refuse with FSNOW-3003 (exit 2) and echo the flag, never fall
+    // back to fixture or empty data. (Under `live` the same invocation refuses
+    // with the specific credential error instead — a hard refusal either way.)
+    #[cfg(not(feature = "live"))]
+    #[test]
+    fn require_live_flag_refuses_hard_when_transport_absent() {
+        let outcome = execute(vec![
+            "query".to_string(),
+            "run".to_string(),
+            "--profile".to_string(),
+            "demo".to_string(),
+            "--sql".to_string(),
+            "select 1".to_string(),
+            "--require-live".to_string(),
+        ]);
+        assert_eq!(outcome.status.code(), 2);
+        let rendered = match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("\"require_live\":true"), "{rendered}");
+        assert!(rendered.contains("FSNOW-3003"));
+    }
+
+    // Default build: `catalog scan --require-live` refuses the same way and
+    // echoes the flag next to the requested scope.
+    #[cfg(not(feature = "live"))]
+    #[test]
+    fn catalog_scan_require_live_refuses_with_flag_echo() {
+        let outcome = execute(vec![
+            "catalog".to_string(),
+            "scan".to_string(),
+            "demo".to_string(),
+            "--database=ANALYTICS".to_string(),
+            "--schema=PUBLIC".to_string(),
+            "--require-live".to_string(),
+        ]);
+        assert_eq!(outcome.status.code(), 2);
+        let rendered = match outcome.body {
+            Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+            Body::Raw { data } => data,
+        };
+        assert!(rendered.contains("\"require_live\":true"), "{rendered}");
+        assert!(rendered.contains("\"requested_database\":\"ANALYTICS\""));
+        assert!(rendered.contains("FSNOW-3003"));
     }
 
     #[test]

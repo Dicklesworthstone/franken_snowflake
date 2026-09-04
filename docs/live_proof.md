@@ -29,6 +29,15 @@ cargo test -p franken-snowflake-sqlapi --test live_proof -- --nocapture
 Artifacts are written under
 `${FRANKEN_SNOWFLAKE_LIVE_ARTIFACTS_DIR:-$CARGO_TARGET_DIR/fsnow-live-proof}`.
 
+The crate also carries its own gated end-to-end lane next to the battery:
+`cargo test -p franken-snowflake-cli --test cli_live_proof` spawns the real
+binary (profile validate, `profile doctor --online`, `query run
+--require-live`, `receipt show`, secret scan) under the same
+`FRANKEN_SNOWFLAKE_LIVE=1` + `FRANKEN_SNOWFLAKE_LIVE_PROFILE=<profile>` opt-in
+and records a typed `franken_snowflake.cli_live_gate.v1` skip event when the
+opt-in or the profile handles are absent.
+
+
 `scripts/live-proof.sh` runs two lanes: the driver-level test above, then the
 **CLI battery** `scripts/live-proof-cli.sh`, which builds the binary with
 `--features live,mcp` (or uses `FSNOW_BIN`) and drives the wired surfaces end

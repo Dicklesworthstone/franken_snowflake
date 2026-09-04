@@ -41,6 +41,8 @@ use franken_snowflake_catalog::discovery::{
 };
 use franken_snowflake_catalog::model::{CatalogSnapshot, DataSourceClass};
 use franken_snowflake_core::cancel::CancelKind;
+use franken_snowflake_core::guardrails::enforce_require_live;
+use franken_snowflake_core::outcome::DataSource;
 use franken_snowflake_core::error::{SnowflakeError, SnowflakeErrorCode};
 use franken_snowflake_core::exit::ExitCode as CoreExitCode;
 use franken_snowflake_core::ids::{
@@ -191,6 +193,9 @@ pub fn run_query_outcome(
     };
     match execute(&conn, sql, request_options) {
         Ok(rows) => {
+            if let Err(error) = enforce_require_live(options.require_live, DataSource::Live) {
+                return fail(&error, profile);
+            }
             let (receipt_hash, warnings) = record_receipt(
                 "query.run",
                 &conn,
@@ -288,7 +293,12 @@ pub fn run_dataset_query_outcome(
         query_tag: Some(planned.plan.guardrails.query_tag.clone()),
     };
     let rows = match execute(&conn, &planned.plan.sql, request_options) {
-        Ok(rows) => rows,
+        Ok(rows) => {
+            if let Err(error) = enforce_require_live(options.require_live, DataSource::Live) {
+                return fail(&error);
+            }
+            rows
+        }
         Err(error) => return fail(&error),
     };
     let (receipt_hash, warnings) = record_receipt(
@@ -640,6 +650,7 @@ pub fn run_catalog_scan_outcome(
     profile: String,
     database: String,
     schema: String,
+    require_live: bool,
 ) -> crate::Outcome {
     let fail = |error: &SnowflakeError| {
         failure_outcome(
@@ -670,6 +681,9 @@ pub fn run_catalog_scan_outcome(
         Ok(scan) => scan,
         Err(error) => return fail(&error),
     };
+    if let Err(error) = enforce_require_live(require_live, DataSource::Live) {
+        return fail(&error);
+    }
     let (receipt_hash, mut warnings) = record_receipt(
         "catalog.scan",
         &conn,
