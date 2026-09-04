@@ -200,6 +200,26 @@ several commands returned "reserved" stubs. This window closes those gaps:
   captured for the profile's secret values, and exits non-zero on the first
   hard failure; `--selftest` proves the harness offline with a planted canary.
   Without opt-in it records a typed skip.
+- **`--require-live` hard gate.** `query run` (raw and `--dataset`) and
+  `catalog scan` accept `--require-live`, which refuses with `FSNOW-3003`
+  (exit 2) unless the envelope is backed by the live transport; success on
+  those paths is enforced through `enforce_require_live`, and the default
+  build's refusal echoes the flag next to the requested scope. The flag is in
+  `capabilities` and the known-flags validator.
+- **Gated CLI live-proof test in-crate.**
+  `crates/franken-snowflake-cli/tests/cli_live_proof.rs` mirrors the sqlapi
+  lane's opt-in pattern (`FRANKEN_SNOWFLAKE_LIVE=1` + profile handles, typed
+  skip artifact otherwise) and drives the real binary end to end: profile
+  validate, `profile doctor --online`, `query run --require-live` with
+  `data_source:live`, the 64-hex `receipt_hash` read back through
+  `receipt show`, and a secret scan over every captured envelope.
+- **In-flight-cancel DPOR scenario.** The testkit race suite gains
+  `CancelRacesPollExchange`: a third canceller task aborts the poll-exchange
+  client task via `TaskHandle::abort_with_reason` while the request is in
+  flight, so DPOR explores cancel-before-send, mid-exchange, and
+  after-response interleavings. New `no_orphan_statements` (server view) and
+  `no_obligation_leaks` (driver ledger) oracles prove the abandoned exchange
+  still fires the remote cleanup cancel on every interleaving.
 - **Cross-compile proof.** `x86_64-pc-windows-msvc` (cargo xwin) and
   `aarch64-unknown-linux-gnu` (cargo zigbuild) build with `--features
   live,mcp`; `aarch64-pc-windows-msvc` does not (ring/cargo-xwin, see

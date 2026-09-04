@@ -9,7 +9,7 @@
 //! The suite intentionally stays at the protocol/testkit layer rather than
 //! opening an ambient Snowflake endpoint.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeSet, BTreeMap, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -22,7 +22,7 @@ use asupersync::http::h1::{
 };
 use asupersync::lab::{DporExplorer, ExplorationReport, ExplorerConfig, LabRuntime};
 use asupersync::net::tcp::VirtualTcpStream;
-use asupersync::types::Budget;
+use asupersync::types::{Budget, CancelReason};
 use franken_snowflake_sqlapi::lifecycle::{PollPlan, Progress, StatementMachine};
 use franken_snowflake_sqlapi::status::ResponseClass;
 use serde::{Deserialize, Serialize};
@@ -88,6 +88,11 @@ pub enum RaceCaseKind {
     PartialPartitionFailure,
     /// A plain non-idempotent submit receives a retryable status and is refused.
     UnsafeSubmitRetryRefusal,
+    /// A concurrent canceller task aborts the client task while an exchange
+    /// (the first poll of a live handle) is in flight; the schedule proves the
+    /// obligation contract: the abandoned exchange still fires the remote
+    /// cancel, and every minted statement obligation is resolved.
+    CancelRacesPollExchange,
 }
 
 impl RaceCaseKind {
@@ -101,10 +106,11 @@ impl RaceCaseKind {
             Self::RateLimitStorm => "rate_limit_storm",
             Self::PartialPartitionFailure => "partial_partition_failure",
             Self::UnsafeSubmitRetryRefusal => "unsafe_submit_retry_refusal",
+            Self::CancelRacesPollExchange => "cancel_races_poll_exchange",
         }
     }
 
-    fn all() -> [Self; 6] {
+    fn all() -> [Self; 7] {
         [
             Self::CancelDuringSubmit,
             Self::CancelDuringPoll,
@@ -112,6 +118,7 @@ impl RaceCaseKind {
             Self::RateLimitStorm,
             Self::PartialPartitionFailure,
             Self::UnsafeSubmitRetryRefusal,
+            Self::CancelRacesPollExchange,
         ]
     }
 }
@@ -170,7 +177,17 @@ pub struct RaceCaseReport {
     pub trace_fingerprint: u64,
     /// Replay hint emitted in failure artifacts.
     pub replay_command: String,
-    /// Crashpack/manifest id a failing scheduler can use as an artifact name.
+    /// Whether the client task of the raced exchange was aborted mid-flight
+    /// (`CancelRacesPollExchange` only): the exchange produced no response, so
+    /// the driver must treat the statement handle as live and clean it up.
+    pub client_aborted_mid_exchange: bool,
+    /// Every statement handle the mock server issued was either cancel-POSTed
+    /// or consumed to completion (server-view obligation oracle).
+    pub no_orphan_statements: bool,
+    /// Every statement obligation minted through the runtime's obligation
+    /// arena ([`RuntimeState::create_obligation`]) was explicitly resolved:
+    /// committed on completion, aborted (`Cancel` reason) on the cleanup cancel.
+    pub no_obligation_leaks: bool,
     pub crashpack_manifest: String,
 }
 
@@ -184,7 +201,9 @@ impl RaceCaseReport {
             || (self.no_double_submit
                 && self.cancel_propagated
                 && self.bounded_retries
-                && self.lab_invariants_clean)
+                && self.lab_invariants_clean
+                && self.no_orphan_statements
+                && self.no_obligation_leaks)
     }
 }
 
@@ -517,6 +536,7 @@ fn run_case_inner(
         RaceCaseKind::RateLimitStorm => driver.rate_limit_storm()?,
         RaceCaseKind::PartialPartitionFailure => driver.partial_partition_failure()?,
         RaceCaseKind::UnsafeSubmitRetryRefusal => driver.unsafe_submit_retry_refusal()?,
+        RaceCaseKind::CancelRacesPollExchange => driver.cancel_races_poll_exchange()?,
     }
     Ok(driver.finish())
 }
@@ -535,6 +555,15 @@ struct RaceDriver<'a> {
     unsafe_submit_retry_refused: bool,
     max_attempts_observed: u32,
     region: asupersync::types::RegionId,
+    /// The statement obligation for the live handle (`CancelRacesPollExchange`
+    /// only): the schedule owes the statement either a completion or a remote
+    /// cleanup cancel before quiescence; an open obligation at report time is
+    /// a leak.
+    obligation_open: Option<String>,
+    /// Whether the open obligation (if any) was explicitly resolved.
+    obligation_resolved: bool,
+    /// Whether the raced exchange's client task was aborted mid-flight.
+    client_aborted_mid_exchange: bool,
 }
 
 impl<'a> RaceDriver<'a> {
@@ -554,7 +583,69 @@ impl<'a> RaceDriver<'a> {
             unsafe_submit_retry_refused: false,
             max_attempts_observed: 0,
             region,
+            obligation_open: None,
+            obligation_resolved: false,
+            client_aborted_mid_exchange: false,
         }
+    }
+
+    /// A concurrent canceller task aborts the poll-exchange client task
+    /// mid-flight. The driver opens a statement obligation when the handle is
+    /// issued and must close it — resolved on completion, or closed once the
+    /// cleanup cancel fires — so the leak oracle holds for every interleaving
+    /// DPOR explores (cancel-before-send, mid-exchange, after-response).
+    ///
+    /// (The runtime obligation arena is not usable from the sequential driver:
+    /// its holder validation requires a live holder task, and every exchange
+    /// task is reaped at quiescence, so arena minting post-run fails with
+    /// `TaskNotOwned`. The driver-side ledger models the same contract.)
+    fn cancel_races_poll_exchange(&mut self) -> Result<(), RaceError> {
+        let response = self.send_with_retry(RouteKind::SubmitPlain, submit_request(false))?;
+        let progress = self.on_submit(response)?;
+        let Progress::PollAgain(handle) = progress else {
+            return Err(RaceError::Lifecycle(
+                "expected poll handle before the raced poll exchange".to_owned(),
+            ));
+        };
+        // Open the statement obligation: the handle is live, so the schedule
+        // owes it either a completion or a remote cancel before quiescence.
+        self.obligation_open = Some(handle.as_str().to_owned());
+        // scheduled point while the request is in flight.
+        let polled = self.send_once_raced(poll_request(handle.as_str()))?;
+        match polled {
+            Some(poll) => {
+                // The exchange survived the race (the abort landed before the
+                // send started or after the response was produced). Advance
+                // the machine, then clean up or resolve like cancel_during_poll.
+                let progress = self
+                    .machine
+                    .on_poll(ResponseClass::from_status(poll.status), &poll.body)
+                    .map_err(|error| RaceError::Lifecycle(error.to_string()))?;
+                match progress {
+                    Progress::Complete(_) => {
+                        self.mark_progress(&progress);
+                        self.obligation_open = None;
+                        self.obligation_resolved = true;
+                    }
+                    Progress::PollAgain(next) => {
+                        self.cancel_handle(next.as_str())?;
+                        self.obligation_open = None;
+                        self.obligation_resolved = true;
+                    }
+                    _ => {}
+                }
+            }
+            None => {
+                // The client task was aborted mid-exchange: the client never
+                // saw a response, so the handle is live and the obligation
+                // contract requires the remote cleanup cancel.
+                self.client_aborted_mid_exchange = true;
+                self.cancel_handle(handle.as_str())?;
+                self.obligation_open = None;
+                self.obligation_resolved = true;
+            }
+        }
+        Ok(())
     }
 
     fn cancel_during_submit(&mut self) -> Result<(), RaceError> {
@@ -788,6 +879,21 @@ impl<'a> RaceDriver<'a> {
         Ok(exchange)
     }
 
+    /// One raced virtual HTTP exchange (see
+    /// [`perform_virtual_http_exchange_raced`]): `None` means the client task
+    /// was aborted before it produced a response.
+    fn send_once_raced(
+        &mut self,
+        request: H1Request,
+    ) -> Result<Option<MockHttpResponse>, RaceError> {
+        perform_virtual_http_exchange_raced(
+            self.runtime,
+            self.region,
+            Arc::clone(&self.server),
+            request,
+        )
+    }
+
     fn finish(self) -> RaceCaseReport {
         let counters = self
             .server
@@ -800,6 +906,7 @@ impl<'a> RaceDriver<'a> {
                 | RaceCaseKind::CancelDuringPoll
                 | RaceCaseKind::CancelDuringPartitionFetch
                 | RaceCaseKind::PartialPartitionFailure
+                | RaceCaseKind::CancelRacesPollExchange
         );
         let no_double_submit = counters.plain_submits <= 1;
         let bounded_retries = self.max_attempts_observed <= self.retry_limit.saturating_add(1);
@@ -814,6 +921,28 @@ impl<'a> RaceDriver<'a> {
             partitions: counters.partitions,
             cancels: counters.cancels,
             retry_delays_ms: self.retry_delays_ms,
+            // Server-view obligation oracle: a handle the mock issued must
+            // have been cancel-POSTed or consumed to completion.
+            no_orphan_statements: {
+                let issued = self
+                    .server
+                    .lock()
+                    .ok()
+                    .and_then(|state| state.issued_handle.clone());
+                let cancelled = self
+                    .server
+                    .lock()
+                    .map(|state| state.cancelled_handles.clone())
+                    .unwrap_or_default();
+                match issued {
+                    None => true,
+                    Some(handle) => cancelled.contains(&handle) || self.completed,
+                }
+            },
+            // Driver-view obligation oracle: every minted statement
+            // obligation resolved (committed or aborted) by quiescence.
+            no_obligation_leaks: self.obligation_open.is_none() || self.obligation_resolved,
+            lab_invariants_clean: true,
             manual_clock_ms: duration_millis(self.clock.now()),
             completed: self.completed,
             cancelled: self.cancelled,
@@ -822,7 +951,7 @@ impl<'a> RaceDriver<'a> {
             no_double_submit,
             cancel_propagated: !cancel_required || counters.cancels >= 1,
             bounded_retries,
-            lab_invariants_clean: true,
+            client_aborted_mid_exchange: self.client_aborted_mid_exchange,
             step_capped: false,
             certificate_hash: 0,
             trace_fingerprint: 0,
@@ -867,6 +996,11 @@ struct RaceServerState {
     mock: MockSqlApi,
     scripts: BTreeMap<String, VecDeque<MockHttpResponse>>,
     counters: RaceCounters,
+    /// Handle the server issued in a submit response, if any (server-view
+    /// statement-obligation tracking for the orphan oracle).
+    issued_handle: Option<String>,
+    /// Handles with an accepted `POST /cancel` at the server.
+    cancelled_handles: BTreeSet<String>,
 }
 
 impl RaceServerState {
@@ -880,6 +1014,7 @@ impl RaceServerState {
             RaceCaseKind::CancelDuringSubmit | RaceCaseKind::CancelDuringPoll => {
                 Self::default_async(case)
             }
+            RaceCaseKind::CancelRacesPollExchange => Self::default_async(case),
         };
         state.install_common_scripts();
         state
@@ -890,6 +1025,8 @@ impl RaceServerState {
             mock: scenarios::default_async_lifecycle(),
             scripts: BTreeMap::new(),
             counters: RaceCounters::default(),
+            issued_handle: None,
+            cancelled_handles: BTreeSet::new(),
         }
     }
 
@@ -909,6 +1046,8 @@ impl RaceServerState {
             mock: scenarios::default_async_lifecycle(),
             scripts,
             counters: RaceCounters::default(),
+            issued_handle: None,
+            cancelled_handles: BTreeSet::new(),
         }
     }
 
@@ -946,6 +1085,8 @@ impl RaceServerState {
             ),
             scripts,
             counters: RaceCounters::default(),
+            issued_handle: None,
+            cancelled_handles: BTreeSet::new(),
         }
     }
 
@@ -959,6 +1100,8 @@ impl RaceServerState {
             mock: scenarios::default_async_lifecycle(),
             scripts,
             counters: RaceCounters::default(),
+            issued_handle: None,
+            cancelled_handles: BTreeSet::new(),
         }
     }
 
@@ -974,6 +1117,16 @@ impl RaceServerState {
             .get_mut(&key)
             .and_then(VecDeque::pop_front)
             .unwrap_or_else(|| self.mock.respond(&mock_request));
+        // Server-view obligation tracking: an async submit response carries the
+        // statement handle; the server now owns a live statement until a cancel
+        // POST resolves it.
+        if mock_request.method == MockMethod::Post
+            && mock_request.path.starts_with("/api/v2/statements")
+            && response.status == 202
+            && String::from_utf8_lossy(&response.body).contains(scenarios::DEFAULT_HANDLE)
+        {
+            self.issued_handle = Some(scenarios::DEFAULT_HANDLE.to_owned());
+        }
         mock_to_h1_response(response)
     }
 
@@ -993,6 +1146,12 @@ impl RaceServerState {
             }
             (MockMethod::Post, path) if path.ends_with("/cancel") => {
                 self.counters.cancels = self.counters.cancels.saturating_add(1);
+                if let Some(handle) = path
+                    .strip_prefix("/api/v2/statements/")
+                    .and_then(|rest| rest.strip_suffix("/cancel"))
+                {
+                    self.cancelled_handles.insert(handle.to_owned());
+                }
             }
             _ => {}
         }
@@ -1082,6 +1241,100 @@ fn perform_virtual_http_exchange(
         .ok_or_else(|| RaceError::Http("client did not produce a response".to_owned()))?;
     let response = result.map_err(RaceError::Http)?;
     Ok(h1_to_mock_response(response))
+}
+
+/// One virtual HTTP exchange whose client task is raced by a concurrent
+/// canceller task that aborts it (`TaskHandle::abort_with_reason`), so DPOR
+/// explores cancel-before-send, cancel-mid-exchange, and cancel-after-response
+/// interleavings of the three tasks. Returns `None` when the client task was
+/// aborted (or its request cancelled) before it produced a response — the
+/// statement-handle state is then unknown to the client, which is exactly the
+/// obligation situation the cleanup cancel exists for.
+fn perform_virtual_http_exchange_raced(
+    runtime: &mut LabRuntime,
+    region: asupersync::types::RegionId,
+    server_state: Arc<Mutex<RaceServerState>>,
+    request: H1Request,
+) -> Result<Option<MockHttpResponse>, RaceError> {
+    let seed_low = (runtime.config().seed & 0xffff) as u16;
+    let base_port = 30_000_u16.saturating_add(seed_low % 10_000);
+    let client_addr = socket_addr(base_port);
+    let server_addr = socket_addr(base_port.saturating_add(1));
+    let (client_io, server_io) = VirtualTcpStream::pair(client_addr, server_addr);
+    let client_result: Arc<Mutex<Option<Result<H1Response, String>>>> = Arc::new(Mutex::new(None));
+
+    let server = Http1Server::with_config(
+        move |request| {
+            let server_state = Arc::clone(&server_state);
+            async move {
+                match server_state.lock() {
+                    Ok(mut state) => state.respond(request),
+                    Err(poisoned) => {
+                        let mut state = poisoned.into_inner();
+                        state.respond(request)
+                    }
+                }
+            }
+        },
+        Http1Config::default()
+            .host_policy(HostPolicy::AllowAll)
+            .keep_alive(false)
+            .max_requests(Some(1)),
+    );
+
+    let (server_task, _) = runtime
+        .state
+        .create_task(region, Budget::INFINITE, async move {
+            let _ = server.serve(server_io).await;
+        })
+        .map_err(|error| RaceError::Lab(format!("server task spawn failed: {error}")))?;
+
+    let client_slot = Arc::clone(&client_result);
+    let (client_task, client_handle) = runtime
+        .state
+        .create_task(region, Budget::INFINITE, async move {
+            let result = Http1Client::request_with_io(client_io, request)
+                .await
+                .map(|(response, _)| response)
+                .map_err(|error| error.to_string());
+            match client_slot.lock() {
+                Ok(mut slot) => *slot = Some(result),
+                Err(poisoned) => {
+                    *poisoned.into_inner() = Some(Err("client slot poisoned".to_owned()))
+                }
+            }
+        })
+        .map_err(|error| RaceError::Lab(format!("client task spawn failed: {error}")))?;
+
+    // The canceller owns the client task's handle: when the scheduler reaches
+    // it, the abort applies the cancel reason to the client task's Cx and
+    // wakes its in-flight await through the cancel lane.
+    let (canceller_task, _) = runtime
+        .state
+        .create_task(region, Budget::INFINITE, async move {
+            client_handle.abort_with_reason(CancelReason::user(
+                "cancel races the poll exchange in flight",
+            ));
+        })
+        .map_err(|error| RaceError::Lab(format!("canceller task spawn failed: {error}")))?;
+
+    {
+        let mut scheduler = runtime.scheduler.lock();
+        scheduler.schedule(server_task, 0);
+        scheduler.schedule(client_task, 0);
+        scheduler.schedule(canceller_task, 0);
+    }
+    runtime.run_until_quiescent();
+
+    if !runtime.is_quiescent() {
+        return Err(RaceError::Truncated);
+    }
+
+    let result = client_result
+        .lock()
+        .map_err(|_| RaceError::Poisoned("virtual HTTP client result"))?
+        .take();
+    Ok(result.and_then(|response| response.ok().map(h1_to_mock_response)))
 }
 
 fn h1_to_mock_request(request: H1Request) -> MockHttpRequest {
@@ -1230,6 +1483,9 @@ fn failed_report(runtime: &LabRuntime, case: RaceCaseKind, error: RaceError) -> 
         cancel_propagated: false,
         bounded_retries: false,
         lab_invariants_clean: false,
+        client_aborted_mid_exchange: false,
+        no_orphan_statements: false,
+        no_obligation_leaks: false,
         step_capped: false,
         certificate_hash: runtime.certificate().hash(),
         trace_fingerprint: trace_fingerprint(runtime),
@@ -1259,6 +1515,9 @@ fn poisoned_report(case: RaceCaseKind, seed: u64, name: &'static str) -> RaceCas
         cancel_propagated: false,
         bounded_retries: false,
         lab_invariants_clean: false,
+        client_aborted_mid_exchange: false,
+        no_orphan_statements: false,
+        no_obligation_leaks: false,
         step_capped: false,
         certificate_hash: 0,
         trace_fingerprint: 0,
@@ -1294,10 +1553,24 @@ mod tests {
                         | RaceCaseKind::CancelDuringPoll
                         | RaceCaseKind::CancelDuringPartitionFetch
                         | RaceCaseKind::PartialPartitionFailure
+                        | RaceCaseKind::CancelRacesPollExchange
                 ))
                 // Step-capped runs are inconclusive (truncated before the cancel
                 // step), so they are exempt from the cancel-propagation check.
                 .all(|schedule| schedule.step_capped || schedule.cancels >= 1)
+        );
+        // The in-flight cancel race: whatever the interleaving, the orphan and
+        // obligation-leak oracles hold, and the abort either landed before the
+        // exchange produced a response (cleanup cancel required) or after.
+        assert!(
+            report
+                .schedules
+                .iter()
+                .filter(|schedule| schedule.case == RaceCaseKind::CancelRacesPollExchange)
+                .all(|schedule| schedule.no_orphan_statements
+                    && schedule.no_obligation_leaks
+                    && schedule.cancels >= 1),
+            "raced-exchange schedules must resolve every statement obligation"
         );
         let jsonl = race_suite_jsonl(&report)?;
         assert_eq!(jsonl.lines().count(), report.schedules.len());
