@@ -112,8 +112,10 @@ the run record and caveats.
 
 ### Reality-check remediation (2026-09-02 → 2026-09-03), shipped in v0.0.3
 
-An end-to-end reality check against the README found that `v0.0.2` binaries
-shipped without `live`/`mcp`, CI had never produced a job, four crates
+Tag [`v0.0.3`](https://github.com/Dicklesworthstone/franken_snowflake/tree/v0.0.3)
+([`v0.0.2...v0.0.3`](https://github.com/Dicklesworthstone/franken_snowflake/compare/v0.0.2...v0.0.3)).
+Binaries built by `dsr` on all six targets with `--features live,mcp`; the
+previous release window left gaps where the finished library crates
 (catalog, cache, graph, export) were built but not wired into the CLI, and
 several commands returned "reserved" stubs. This window closes those gaps:
 
