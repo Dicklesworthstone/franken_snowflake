@@ -197,7 +197,14 @@ were left in place (`/tmp/fsnow-v003-verify` on mmini); the wlap session
 files (extraction, data dir, a tui-lane clippy attempt) were removed after
 the runs — that attempt found the VS installer shell hangs in hidden
 non-interactive windows on that host, so the Windows tui lane stays a
-hand-run residual. Pre-tag local proof: workspace tests, every feature-lane
+hand-run residual — CLOSED 2026-09-04: the Windows tui lane passed on wlap
+(`cargo clippy -p franken-snowflake-cli --features tui --all-targets
+--locked -- -D warnings`, EXIT=0 in 4m33s) when launched the dsr way — a
+held ssh session running an encoded-command PowerShell script that drives
+cmd.exe with its /d /s /c switches; detached hidden-window launches hang
+VsDevCmd on that host, so held-session launch is the documented mechanic.
+The macOS tui lane passed the same day on mmini (pinned nightly). Pre-tag
+local proof: workspace tests, every feature-lane
 test, workspace + 18-lane clippy `-D warnings`, `cargo fmt --check`,
 admissibility, single-version, golden-LF (via `dsr quality` plus the
 per-lane rerun after its first-pass findings were fixed: a fmt violation
