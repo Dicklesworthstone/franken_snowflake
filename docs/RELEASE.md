@@ -192,10 +192,13 @@ with the same four results (`capabilities`, `selftest` ok, `doctor` ok,
 `FSNOW-2003`). The `aarch64-pc-windows-msvc` zip remains linked, not
 executed: no ARM Windows machine or emulator is available. The PowerShell
 installer was not exercised; the installer archive contents were extracted
-and the executables run directly. Session temp files from the host runs
-were left in place (`/tmp/fsnow-v003-verify` on mmini, `%HOME%\fsnow-v003*`
-on wlap). Pre-tag local proof: workspace tests, every feature-lane test,
-workspace + 18-lane clippy `-D warnings`, `cargo fmt --check`,
+and the executables run directly. Session temp files from the macOS run
+were left in place (`/tmp/fsnow-v003-verify` on mmini); the wlap session
+files (extraction, data dir, a tui-lane clippy attempt) were removed after
+the runs — that attempt found the VS installer shell hangs in hidden
+non-interactive windows on that host, so the Windows tui lane stays a
+hand-run residual. Pre-tag local proof: workspace tests, every feature-lane
+test, workspace + 18-lane clippy `-D warnings`, `cargo fmt --check`,
 admissibility, single-version, golden-LF (via `dsr quality` plus the
 per-lane rerun after its first-pass findings were fixed: a fmt violation
 and an unused-import in the new tui lane).
