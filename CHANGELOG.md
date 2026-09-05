@@ -105,19 +105,14 @@ implementation first and the test/hardening pass follows in a later wave. The
 ## [v0.0.3] — 2026-09-04
 
 Tag [`v0.0.3`](https://github.com/Dicklesworthstone/franken_snowflake/tree/v0.0.3)
-(commit range from `v0.0.2`). Binaries built by `dsr` on all six targets with
-`--features live,mcp` (`capabilities` reports `live=true, mcp=true` on every
-executed artifact); checksums published alongside; see `docs/RELEASE.md` for
-the run record and caveats.
-
-### Reality-check remediation (2026-09-02 → 2026-09-03), shipped in v0.0.3
-
-Tag [`v0.0.3`](https://github.com/Dicklesworthstone/franken_snowflake/tree/v0.0.3)
 ([`v0.0.2...v0.0.3`](https://github.com/Dicklesworthstone/franken_snowflake/compare/v0.0.2...v0.0.3)).
-Binaries built by `dsr` on all six targets with `--features live,mcp`; the
-previous release window left gaps where the finished library crates
-(catalog, cache, graph, export) were built but not wired into the CLI, and
-several commands returned "reserved" stubs. This window closes those gaps:
+Binaries built by `dsr` on all six targets with `--features live,mcp`
+(`capabilities` reports `live=true, mcp=true` on every executed artifact);
+checksums published alongside; the run record and caveats live in
+`docs/RELEASE.md`. The previous release window left gaps where the finished
+library crates (catalog, cache, graph, export) were built but not wired
+into the CLI, and several commands returned "reserved" stubs. This window
+closes those gaps:
 
 - **GitHub Actions removed; verification is `dsr`-only.** The workflow that
   existed had never executed a job (52 runs failed at parse because of the
