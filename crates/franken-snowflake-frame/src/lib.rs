@@ -988,6 +988,62 @@ mod frankenpandas {
             );
             assert!(matches!(bad_binary, Err(FrameError::Decode { .. })));
         }
+
+        /// Pin the frame codec against the wire strings EMPIRICALLY observed
+        /// from a live Snowflake account on 2026-06-25 (the kx6 golden
+        /// `resp_200_resultset_single_partition.json`, bead
+        /// fsnow-native-snowflake-connector-w0i.13): DATE arrives as
+        /// days-since-epoch ("18262" = 2020-01-01 UTC), NUMBER(p,s) arrives
+        /// as an exact decimal string NOT scale-divided ("1.50" at scale 2),
+        /// TEXT as-is, and SQL NULL as a JSON null. These are the encodings
+        /// the June trial capture actually returned; if a future capture
+        /// (scripts/capture-jsonv2-golden.sh) disagrees, fix the codec, not
+        /// this test.
+        #[test]
+        fn decodes_the_june_2026_observed_wire_golden() -> Result<(), String> {
+            let columns = vec![
+                col("EVENT_DATE", "DATE").nullable(false),
+                col("ENTITY_ID", "TEXT").nullable(false),
+                col("VALUE", "FIXED")
+                    .with_scale(2)
+                    .with_precision(38)
+                    .nullable(true),
+            ];
+            // The literal data array from the captured response.
+            let partitions = vec![ResultPartition::new(
+                0,
+                vec![vec![
+                    Some("18262".to_owned()),
+                    Some("ENTITY123".to_owned()),
+                    Some("1.50".to_owned()),
+                ]],
+            )];
+
+            let frame = materialize_partitions(&columns, partitions).map_err(|e| e.to_string())?;
+
+            // DATE: 18262 epoch days == 2020-01-01T00:00:00Z.
+            let event_date = frame_column(&frame, "EVENT_DATE")?;
+            assert_eq!(
+                event_date.column.value(0),
+                Some(&Scalar::Datetime64(1_577_836_800_000_000_000))
+            );
+
+            // TEXT round-trips verbatim.
+            let entity = frame_column(&frame, "ENTITY_ID")?;
+            assert_eq!(
+                entity.column.value(0),
+                Some(&Scalar::Utf8("ENTITY123".to_owned()))
+            );
+
+            // FIXED with scale stays the exact decimal string (never
+            // scale-divided into 1.5 or an f64).
+            let value = frame_column(&frame, "VALUE")?;
+            assert_eq!(value.metadata.storage_kind, FrameStorageKind::DecimalString);
+            assert_eq!(value.column.dtype(), DType::Utf8);
+            assert_eq!(value.column.value(0), Some(&Scalar::Utf8("1.50".to_owned())));
+
+            Ok(())
+        }
     }
 }
 
