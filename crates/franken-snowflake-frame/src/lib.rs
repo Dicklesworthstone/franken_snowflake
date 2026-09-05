@@ -989,16 +989,16 @@ mod frankenpandas {
             assert!(matches!(bad_binary, Err(FrameError::Decode { .. })));
         }
 
-        /// Pin the frame codec against the wire strings EMPIRICALLY observed
-        /// from a live Snowflake account on 2026-06-25 (the kx6 golden
-        /// `resp_200_resultset_single_partition.json`, bead
-        /// fsnow-native-snowflake-connector-w0i.13): DATE arrives as
-        /// days-since-epoch ("18262" = 2020-01-01 UTC), NUMBER(p,s) arrives
-        /// as an exact decimal string NOT scale-divided ("1.50" at scale 2),
-        /// TEXT as-is, and SQL NULL as a JSON null. These are the encodings
-        /// the June trial capture actually returned; if a future capture
-        /// (scripts/capture-jsonv2-golden.sh) disagrees, fix the codec, not
-        /// this test.
+        /// Pin the frame codec against the kx6 protocol fixture values
+        /// (`resp_200_resultset_single_partition.json`): DATE as
+        /// days-since-epoch ("18262" = 2020-01-01 UTC), NUMBER(p,s) as an
+        /// exact decimal string NOT scale-divided ("1.50" at scale 2), TEXT
+        /// as-is, SQL NULL as a JSON null. These values are DOCUMENT-derived
+        /// (the fixture follows the Handling-responses page conventions), not
+        /// trial-account-captured; when
+        /// scripts/capture-jsonv2-golden.sh produces an empirical capture
+        /// that disagrees, fix the codec and update both this test and the
+        /// fixture (bead fsnow-native-snowflake-connector-w0i.13).
         #[test]
         fn decodes_the_june_2026_observed_wire_golden() -> Result<(), String> {
             let columns = vec![
