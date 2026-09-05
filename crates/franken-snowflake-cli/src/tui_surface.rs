@@ -12,8 +12,11 @@
 
 use std::io::IsTerminal;
 
+use std::collections::BTreeMap;
+
 use franken_snowflake_cache::CacheBackend;
 use franken_snowflake_catalog::model::CatalogSnapshot;
+use franken_snowflake_catalog::planner::TypedBinding;
 use franken_snowflake_core::error::SnowflakeErrorCode;
 use franken_snowflake_core::exit::ExitCode as CoreExitCode;
 use franken_snowflake_tui::SnowflakeTuiApp;
@@ -214,27 +217,47 @@ pub fn launch_outcome(
 /// and renders compact result lines for the log pane.
 #[cfg(feature = "live")]
 fn build_query_executor(profile: String) -> franken_snowflake_tui::QueryExecutor {
-    Box::new(move |sql: &str| {
-        let options = crate::QueryRunOptions::default();
-        let outcome = crate::live::run_query_outcome(
-            OutputFormat::Json,
-            local_store::invocation_id("tui-query-run"),
-            profile.clone(),
-            sql,
-            &options,
-        );
-        render_outcome_lines(outcome)
-    })
+    Box::new(
+        move |sql: &str, bindings: &BTreeMap<String, TypedBinding>| {
+            // The planner refuses mutations before a plan exists, and this
+            // closure re-checks the read-only shape so the executor itself stays
+            // defense-in-depth: only a single read statement can run from here.
+            if !crate::is_select_like(sql) || crate::has_multiple_statements(sql) {
+                return vec![ExecutorLine {
+                outcome: "refusal".to_owned(),
+                message: "only a single read statement can run from the TUI; use `fsnow query write` for mutations"
+                    .to_owned(),
+            }];
+            }
+            let options = crate::QueryRunOptions {
+                bindings_json: serde_json::to_string(bindings).ok(),
+                ..crate::QueryRunOptions::default()
+            };
+            let mut outcome = crate::live::run_query_outcome(
+                OutputFormat::Json,
+                local_store::invocation_id("tui-query-run"),
+                profile.clone(),
+                sql,
+                &options,
+            );
+            render_outcome_lines(&mut outcome)
+        },
+    )
 }
 
 /// Render a `query run` outcome into TUI log lines: a summary line, the typed
 /// error (if any), the statement handle and receipt hash, the row counts, and
 /// up to ten result rows.
 #[cfg(feature = "live")]
-fn render_outcome_lines(outcome: Outcome) -> Vec<ExecutorLine> {
+fn render_outcome_lines(outcome: &mut Outcome) -> Vec<ExecutorLine> {
     let status = outcome.status.code();
-    let rendered = match &outcome.body {
-        Body::Envelope { envelope, .. } => crate::render_json(&crate::envelope_json(envelope)),
+    let rendered = match &mut outcome.body {
+        // Same crate-root redaction pass the main() output path runs; the TUI
+        // log pane must never receive unsanitized envelope content.
+        Body::Envelope { envelope, .. } => {
+            crate::sanitize_envelope(envelope);
+            crate::render_json(&crate::envelope_json(envelope))
+        }
         Body::Raw { data } => data.clone(),
     };
     let value: serde_json::Value =

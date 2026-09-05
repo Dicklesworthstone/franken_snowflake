@@ -172,6 +172,7 @@ pub fn run_query_outcome(
     };
     let mut request_options = match query_request_options(
         options.bindings_env.as_deref(),
+        options.bindings_json.as_deref(),
         options.query_tag.as_deref(),
     ) {
         Ok(request_options) => request_options,
@@ -1848,15 +1849,39 @@ fn apply_query_request_options(request: &mut SubmitStatementRequest, options: Qu
 
 fn query_request_options(
     bindings_env: Option<&str>,
+    bindings_json: Option<&str>,
     query_tag: Option<&str>,
 ) -> Result<QueryRequestOptions, SnowflakeError> {
-    let bindings = bindings_env.map(parse_bindings_env).transpose()?;
+    let bindings = if let Some(encoded) = bindings_json {
+        Some(parse_bindings_payload(encoded)?)
+    } else {
+        bindings_env.map(parse_bindings_env).transpose()?
+    };
     let query_tag = query_tag.map(validate_query_tag).transpose()?;
     Ok(QueryRequestOptions {
         row_cap: None,
         bindings,
         query_tag,
     })
+}
+
+/// Parse and validate an inline typed-bindings JSON payload (the same shape
+/// `--bindings-env` carries) for embedded callers like the TUI executor.
+fn parse_bindings_payload(encoded: &str) -> Result<BTreeMap<String, Binding>, SnowflakeError> {
+    if encoded.len() > MAX_BINDINGS_JSON_BYTES {
+        return Err(SnowflakeError::new(
+            SnowflakeErrorCode::UsageError,
+            format!("bindings payload exceeds {MAX_BINDINGS_JSON_BYTES} bytes"),
+        ));
+    }
+    let bindings = serde_json::from_str::<BTreeMap<String, Binding>>(encoded).map_err(|error| {
+        SnowflakeError::new(
+            SnowflakeErrorCode::UsageError,
+            format!("bindings payload is not a typed positional binding object: {error}"),
+        )
+    })?;
+    validate_bindings(&bindings)?;
+    Ok(bindings)
 }
 
 fn parse_bindings_env(env_name: &str) -> Result<BTreeMap<String, Binding>, SnowflakeError> {

@@ -792,7 +792,10 @@ mod ftui_surface {
     use ftui::render::drawing::Draw;
     use ftui::{Cell, Cmd, Event, Frame, KeyCode, KeyEvent, KeyEventKind, Model, PackedRgba};
 
+    use std::collections::BTreeMap;
+
     use super::{FocusPane, SnowflakeTuiApp, StatementPhase, TuiAction, TuiEvent, TuiLogLine};
+    use franken_snowflake_catalog::planner::TypedBinding;
 
     /// FrankenTUI message wrapper for the app model.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -932,7 +935,8 @@ mod ftui_surface {
     /// Host-injected executor: runs the planned SQL through the host's live
     /// path and returns rendered lines for the log pane. The tui crate cannot
     /// depend on the CLI, so the CLI embeds its own closure.
-    pub type QueryExecutor = Box<dyn FnMut(&str) -> Vec<ExecutorLine>>;
+    pub type QueryExecutor =
+        Box<dyn FnMut(&str, &BTreeMap<String, TypedBinding>) -> Vec<ExecutorLine>>;
 
     /// The app model plus an optional executor: identical rendering and key
     /// handling to the bare model, except a planned query is executed through
@@ -967,7 +971,7 @@ mod ftui_surface {
                 return;
             };
             self.app.progress.phase = StatementPhase::Submitted;
-            let lines = executor(plan.sql.as_str());
+            let lines = executor(plan.sql.as_str(), &plan.bindings);
             let failed = lines.iter().any(|line| line.outcome != "ok");
             for line in lines {
                 self.app.logs.push(TuiLogLine {
@@ -1352,12 +1356,15 @@ mod tests {
 
     #[cfg(feature = "tui")]
     mod executor_model {
+        use std::collections::BTreeMap;
+
         use super::*;
         use crate::ftui_surface::{ExecutorLine, ExecutorModel};
+        use franken_snowflake_catalog::planner::TypedBinding;
         use ftui::Model;
 
         fn ok_executor() -> crate::ftui_surface::QueryExecutor {
-            Box::new(|sql: &str| {
+            Box::new(|sql: &str, _: &BTreeMap<String, TypedBinding>| {
                 vec![ExecutorLine {
                     outcome: "ok".to_owned(),
                     message: format!("ran {sql}"),
@@ -1385,18 +1392,19 @@ mod tests {
 
         #[test]
         fn executor_error_lines_flip_the_progress_phase_to_refused() {
-            let executor: crate::ftui_surface::QueryExecutor = Box::new(|sql: &str| {
-                vec![
-                    ExecutorLine {
-                        outcome: "error".to_owned(),
-                        message: format!("boom for {sql}"),
-                    },
-                    ExecutorLine {
-                        outcome: "error".to_owned(),
-                        message: "FSNOW-4001: statement failed".to_owned(),
-                    },
-                ]
-            });
+            let executor: crate::ftui_surface::QueryExecutor =
+                Box::new(|sql: &str, _: &BTreeMap<String, TypedBinding>| {
+                    vec![
+                        ExecutorLine {
+                            outcome: "error".to_owned(),
+                            message: format!("boom for {sql}"),
+                        },
+                        ExecutorLine {
+                            outcome: "error".to_owned(),
+                            message: "FSNOW-4001: statement failed".to_owned(),
+                        },
+                    ]
+                });
             let mut model = ExecutorModel::new(SnowflakeTuiApp::default(), Some(executor));
             let _ = model.update(crate::ftui_surface::TuiMessage::App(TuiEvent::QuerySubmit));
             assert_eq!(model.app().progress.phase, StatementPhase::Refused);

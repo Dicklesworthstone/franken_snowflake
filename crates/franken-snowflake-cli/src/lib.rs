@@ -164,6 +164,10 @@ struct QueryRunOptions {
     /// (`--require-live`); success on the live paths always stamps
     /// `data_source = "live"`, so this only fires on non-live substitution.
     require_live: bool,
+    /// Inline typed bindings for embedded callers (the TUI executor): the
+    /// same JSON shape `--bindings-env` carries, parsed with the same
+    /// validation. `None` keeps the env-var path.
+    bindings_json: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1060,6 +1064,7 @@ fn query_run_options(args: &[String]) -> QueryRunOptions {
         warehouse: value_after(args, "--warehouse"),
         statement_timeout: value_after(args, "--statement-timeout"),
         require_live: has_flag(args, "--require-live"),
+        bindings_json: None,
     }
 }
 
@@ -4209,6 +4214,20 @@ fn validate_known_flags(output: OutputFormat, args: &[String]) -> Result<(), Out
             .split_once('=')
             .map_or(arg.as_str(), |(name, _value)| name);
         if known_flags().iter().any(|known| known == &flag_name) {
+            if flag_name == "--require-live" && arg.contains('=') {
+                return Err(usage_error(
+                    output,
+                    "help",
+                    "fsnow.help.v1",
+                    "`--require-live` takes no value; pass it bare.",
+                    vec![
+                        "franken-snowflake capabilities --json".to_string(),
+                        "franken-snowflake query run --profile <profile> --sql <sql> --require-live --json"
+                            .to_string(),
+                    ],
+                    vec![],
+                ));
+            }
             if flag_requires_value(flag_name) && !arg.contains('=') {
                 let Some(next) = args.get(index + 1) else {
                     return Err(missing_flag_value_outcome(output, flag_name));
