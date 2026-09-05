@@ -179,7 +179,11 @@ Executed proof on this workstation: both Linux archives report `capabilities`
 typed `FSNOW-2003` refusal without credentials; the aarch64 archive runs
 under `qemu-aarch64`. The installer was smoke-tested in a clean prefix:
 `install.sh --version v0.0.3 --dest <dir>` installs and the installed binary
-reports `0.0.3 / live=true / mcp=true`.
+reports `0.0.3 / live=true / mcp=true`. The containerized canary lane
+(`dsr canary run franken_snowflake`, ubuntu:24.04) installs from the
+published release and verifies the same feature set; its PATH check
+requires adding `~/.local/bin` manually, which is installer output, not a
+defect.
 
 **Executed on the real hosts (2026-09-04).** Both macOS archives were
 copied to the Mac host (mmini, macOS 26.2 arm64) and run there:
