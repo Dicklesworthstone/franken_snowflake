@@ -102,6 +102,14 @@ implementation first and the test/hardening pass follows in a later wave. The
 
 ## [Unreleased]
 
+- **TUI executor hardening (security review).** The log pane now renders
+  envelopes through the same `sanitize_envelope` redaction pass as CLI
+  output, planner typed bindings ride into the live executor (the default
+  planned query no longer fails on its own `LIMIT ?` guardrail), the
+  executor re-checks the read-only shape at the execution boundary, and
+  `--require-live=<value>` is rejected loudly instead of being silently
+  ignored.
+
 ## [v0.0.3] — 2026-09-04
 
 Tag [`v0.0.3`](https://github.com/Dicklesworthstone/franken_snowflake/tree/v0.0.3)
