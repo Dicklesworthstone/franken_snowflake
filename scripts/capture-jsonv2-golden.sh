@@ -120,4 +120,10 @@ for c in data["columns"]:
     print("  %-24s %s" % (c["name"], c["type"]))
 PYEOF
 emit pass ',"stage":"captured"'
-echo "next: diff $ARTIFACTS/jsonv2-wire-golden.json against the kx6 fixtures and the frame wire codec, then pin it as the authoritative golden (bead w0i.13)."
+# Pin the captured golden into the frame crate so the codec-validation test
+# (crates/franken-snowflake-frame/tests/jsonv2_golden.rs) runs it in every
+# environment. Commit the copied file.
+PINNED="crates/franken-snowflake-frame/tests/captured/jsonv2-wire-golden.json"
+mkdir -p "$(dirname "$PINNED")"
+cp "$ARTIFACTS/jsonv2-wire-golden.json" "$PINNED"
+echo "next: diff $ARTIFACTS/jsonv2-wire-golden.json against the kx6 fixtures, commit $PINNED, and run the frame jsonv2_golden test (bead w0i.13)." 
