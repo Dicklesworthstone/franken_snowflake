@@ -37,6 +37,12 @@ credentials emits a typed skip/refusal, never a silent pass.
 
 - cancel-during-submit, cancel-during-poll, cancel-during-partition-fetch,
   429-storm, partial-partition-failure;
+- cancel-RAISES-the-exchange (2026-09-04): a third canceller task aborts the
+  poll-exchange client task mid-flight via `TaskHandle::abort_with_reason`,
+  so DPOR explores cancel-before-send, mid-exchange, and after-response
+  interleavings of all three tasks; `no_orphan_statements` (server view) and
+  `no_obligation_leaks` (driver ledger) prove the abandoned exchange still
+  fires the remote cleanup cancel on every interleaving;
 - each asserted by the **obligation-leak** and **quiescence** oracles (zero
   leaked connections, statements, or partition fetchers after a cancel) — run as
   CI gates, not just exploration, plus fixed-seed chaos presets;
