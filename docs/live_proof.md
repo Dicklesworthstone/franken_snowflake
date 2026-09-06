@@ -61,8 +61,11 @@ script exits non-zero on the first hard failure. `scripts/live-proof-cli.sh
 offline refusal, and a planted-canary scan (the scan must report the hit).
 
 The credentialed run of this battery is the evidence that closes bead
-`fsnow-agent-ergonomic-cli-cli-live-e2e-and-receipts-bvf`; until it exists,
-every live path stays "unverified" in the README.
+`fsnow-agent-ergonomic-cli-cli-live-e2e-and-receipts-bvf`; the offline
+scope is complete (receipts wired, `--require-live` gate, the gated
+in-crate `cli_live_proof` test), and only the credentialed evidence run —
+against a fresh Snowflake trial, since the June UA70404 trial is past its
+30-day window — remains.
 
 ## Required Opt-In
 
