@@ -840,9 +840,12 @@ confirmation required, `FSNOW-3009` DDL not opted in) with an exact next command
 - The local store is an append-only JSONL file store; the FrankenSQLite-backed
   store exists in the cache crate behind its `frankensqlite` feature but is not
   the CLI default (the locked fsqlite crates do not build on Windows yet).
-- The TUI is opt-in (`--features tui`) and offline: it browses the persisted
-  snapshot and plans raw SQL through the shared planner, but does not execute
-  queries from inside the session yet. Default builds answer a typed refusal.
+- The TUI is opt-in (`--features tui`): it browses the persisted snapshot and
+  plans raw SQL through the shared planner. Submitting a planned query from
+  inside the session executes through the live path when `--features live` is
+  compiled (blocking v1: results land in the log pane when the statement
+  returns); without `live` it logs a typed pointer to `query run`. Any
+  invocation without a real terminal answers a typed refusal.
 - The `--toon` encoding is byte-size-neutral rather than smaller for row
   payloads.
 - The CLI has no `completions` subcommand; discover commands via `capabilities`.
