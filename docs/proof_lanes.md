@@ -29,6 +29,14 @@ credentials emits a typed skip/refusal, never a silent pass.
 - Cancelled-during-connect receipt-state fixture (the TLS handshake is not
   cancel-safe — a distinct state from a submitted-then-cancelled statement).
 - `data_source` provenance fixture and a `--require-live` refusal fixture.
+- jsonv2 empirical-golden loop (bead w0i.13): `scripts/capture-jsonv2-golden.sh`
+  captures an all-wire-types response from a live account and pins it at
+  `crates/franken-snowflake-frame/tests/captured/`; the
+  `jsonv2_golden` integration test then asserts the frame codec accepts
+  every captured cell with the dtype its logical type dictates. Until a
+  capture is committed, the test records a typed skip; the codec's
+  document-derived conventions are pinned separately by
+  `decodes_the_june_2026_observed_wire_golden`.
 
 ## Lane 2 — Deterministic Cancel/Retry Races (DPOR)
 
