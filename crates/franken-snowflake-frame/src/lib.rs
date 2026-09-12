@@ -1040,7 +1040,10 @@ mod frankenpandas {
             let value = frame_column(&frame, "VALUE")?;
             assert_eq!(value.metadata.storage_kind, FrameStorageKind::DecimalString);
             assert_eq!(value.column.dtype(), DType::Utf8);
-            assert_eq!(value.column.value(0), Some(&Scalar::Utf8("1.50".to_owned())));
+            assert_eq!(
+                value.column.value(0),
+                Some(&Scalar::Utf8("1.50".to_owned()))
+            );
 
             Ok(())
         }

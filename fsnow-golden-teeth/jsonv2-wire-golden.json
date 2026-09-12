@@ -1,0 +1,21 @@
+{
+ "schema": "franken_snowflake.jsonv2_wire_golden.v1",
+ "columns": [
+  {
+   "name": "D",
+   "type": "DATE",
+   "nullable": false
+  },
+  {
+   "name": "B",
+   "type": "BOOLEAN",
+   "nullable": true
+  }
+ ],
+ "rows": [
+  [
+   "2026-09-04",
+   "true"
+  ]
+ ]
+}

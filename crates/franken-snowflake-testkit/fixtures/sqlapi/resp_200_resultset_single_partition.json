@@ -1,0 +1,25 @@
+{
+  "resultSetMetaData": {
+    "numRows": 2,
+    "format": "jsonv2",
+    "rowType": [
+      { "name": "EVENT_DATE", "type": "DATE", "nullable": false },
+      { "name": "ENTITY_ID", "type": "TEXT", "nullable": false, "length": 16, "byteLength": 64 },
+      { "name": "VALUE", "type": "FIXED", "scale": 2, "precision": 38, "nullable": true }
+    ],
+    "partitionInfo": [
+      { "rowCount": 2, "compressedSize": 256, "uncompressedSize": 512 }
+    ]
+  },
+  "data": [
+    ["18262", "ENTITY123", "1.50"],
+    ["18263", "ENTITY124", null]
+  ],
+  "code": "090001",
+  "statementHandle": "01b2c3d4-0000-0000-0000-000000000001",
+  "statementStatusUrl": "/api/v2/statements/01b2c3d4-0000-0000-0000-000000000001",
+  "sqlState": "00000",
+  "message": "Statement executed successfully.",
+  "requestId": "11111111-1111-1111-1111-111111111111",
+  "createdOn": 1700000000000
+}

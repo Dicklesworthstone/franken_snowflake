@@ -20,7 +20,7 @@ macro_rules! kx6_fixture {
     ($name:literal) => {
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../franken-snowflake-sqlapi/tests/fixtures/",
+            "/fixtures/sqlapi/",
             $name
         ))
     };
