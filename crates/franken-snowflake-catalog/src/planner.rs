@@ -1047,6 +1047,7 @@ fn executable_sql_tokens(sql: &str) -> ExecutableSqlTokens {
     let mut tokens = ExecutableSqlTokens::default();
     let mut word = String::new();
     let mut chars = sql.chars().peekable();
+    let mut comment_depth = 0usize;
     let mut state = SqlScanState::Normal;
 
     while let Some(ch) = chars.next() {
@@ -1060,6 +1061,7 @@ fn executable_sql_tokens(sql: &str) -> ExecutableSqlTokens {
                 '/' if chars.peek() == Some(&'*') => {
                     chars.next();
                     flush_word(&mut word, &mut tokens.words);
+                    comment_depth = 1;
                     state = SqlScanState::BlockComment;
                 }
                 '\'' => {
@@ -1102,9 +1104,15 @@ fn executable_sql_tokens(sql: &str) -> ExecutableSqlTokens {
                 }
             }
             SqlScanState::BlockComment => {
-                if ch == '*' && chars.peek() == Some(&'/') {
+                if ch == '/' && chars.peek() == Some(&'*') {
                     chars.next();
-                    state = SqlScanState::Normal;
+                    comment_depth += 1;
+                } else if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    comment_depth -= 1;
+                    if comment_depth == 0 {
+                        state = SqlScanState::Normal;
+                    }
                 }
             }
         }
@@ -1618,5 +1626,12 @@ mod tests {
             trace_id: "trace-fixture".to_owned(),
             redactions_applied: Vec::new(),
         }
+    }
+
+    #[test]
+    fn executable_sql_tokens_handles_nested_block_comments() {
+        let tokens = executable_sql_tokens("SELECT /* /* nested */ comment */ col FROM tbl");
+        assert_eq!(tokens.words, vec!["select", "col", "from", "tbl"]);
+        assert!(!tokens.has_semicolon);
     }
 }
