@@ -633,7 +633,7 @@ impl SnowflakeEndpoint {
                 "Snowflake endpoint is empty",
             ));
         }
-        let Some(rest) = raw.strip_prefix("https://") else {
+        let Some(rest) = strip_prefix_ignore_ascii_case(raw, "https://") else {
             return Err(TransportError::new(
                 TransportErrorCode::InvalidSnowflakeHost,
                 "Snowflake endpoint must use https://",
@@ -662,11 +662,12 @@ impl SnowflakeEndpoint {
                     "Snowflake endpoint host is missing",
                 )
             })?;
-        validate_host(host)?;
-        let base_url = format!("https://{trimmed}");
+        let host_lower = host.to_ascii_lowercase();
+        validate_host(&host_lower)?;
+        let base_url = format!("https://{host_lower}");
         Ok(Self {
             base_url,
-            host: host.to_owned(),
+            host: host_lower,
         })
     }
 
@@ -689,16 +690,25 @@ impl SnowflakeEndpoint {
     }
 }
 
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&s[prefix.len()..])
+    } else {
+        None
+    }
+}
+
 fn validate_host(host: &str) -> Result<(), TransportError> {
-    let valid = host
+    let host_lower = host.to_ascii_lowercase();
+    let valid = host_lower
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
-        && host.contains('.')
-        && !host.starts_with('.')
-        && !host.ends_with('.')
-        && !host.contains("..")
-        && host.ends_with(SNOWFLAKE_HOST_SUFFIX)
-        && host.len() > SNOWFLAKE_HOST_SUFFIX.len();
+        && host_lower.contains('.')
+        && !host_lower.starts_with('.')
+        && !host_lower.ends_with('.')
+        && !host_lower.contains("..")
+        && host_lower.ends_with(SNOWFLAKE_HOST_SUFFIX)
+        && host_lower.len() > SNOWFLAKE_HOST_SUFFIX.len();
     if valid {
         Ok(())
     } else {
@@ -2315,6 +2325,10 @@ mod tests {
         let parsed = SnowflakeEndpoint::parse("https://xy123.snowflakecomputing.com/")
             .expect("valid endpoint");
         assert_eq!(parsed.base_url(), "https://xy123.snowflakecomputing.com");
+        let parsed_upper = SnowflakeEndpoint::parse("HTTPS://XY123.SNOWFLAKECOMPUTING.COM/")
+            .expect("valid uppercase endpoint");
+        assert_eq!(parsed_upper.base_url(), "https://xy123.snowflakecomputing.com");
+        assert_eq!(parsed_upper.host(), "xy123.snowflakecomputing.com");
     }
 
     #[test]

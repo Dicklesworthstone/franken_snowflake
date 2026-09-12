@@ -2283,18 +2283,33 @@ fn env_u64(key: &str) -> Option<u64> {
     env_value(key).and_then(|value| value.parse().ok())
 }
 
-fn endpoint_url(account: &str) -> String {
-    if account.starts_with("https://") {
-        account.trim_end_matches('/').to_string()
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&s[prefix.len()..])
     } else {
-        format!(
-            "https://{}.snowflakecomputing.com",
-            account
-                .trim()
-                .trim_end_matches(".snowflakecomputing.com")
-                .trim_end_matches('/')
-        )
+        None
     }
+}
+
+fn endpoint_url(account: &str) -> String {
+    let mut s = account.trim().trim_end_matches('/');
+    if let Some(rest) = strip_prefix_ignore_ascii_case(s, "https://") {
+        s = rest;
+    } else if let Some(rest) = strip_prefix_ignore_ascii_case(s, "http://") {
+        s = rest;
+    }
+    let host = s.split('/').next().unwrap_or(s);
+    let host = host.split(':').next().unwrap_or(host);
+    let host = if let Some(idx) = host.to_ascii_lowercase().rfind(".snowflakecomputing.com") {
+        if idx + ".snowflakecomputing.com".len() == host.len() {
+            &host[..idx]
+        } else {
+            host
+        }
+    } else {
+        host
+    };
+    format!("https://{}.snowflakecomputing.com", host.to_ascii_lowercase())
 }
 
 fn now_unix_seconds() -> i64 {
