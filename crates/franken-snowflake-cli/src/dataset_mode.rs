@@ -375,7 +375,11 @@ pub fn run_command_for(spec: &DatasetQuerySpec, profile: &str) -> String {
         ("--limit", &spec.limit),
     ] {
         if let Some(value) = value {
-            command.push_str(&format!(" {flag} {value}"));
+            if value.chars().any(char::is_whitespace) {
+                command.push_str(&format!(" {flag} '{value}'"));
+            } else {
+                command.push_str(&format!(" {flag} {value}"));
+            }
         }
     }
     if !spec.select.is_empty() {
@@ -399,4 +403,34 @@ pub fn parse_select(raw: Option<&str>) -> Vec<String> {
             .collect()
     })
     .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_command_for_quotes_values_with_whitespace() {
+        let spec = DatasetQuerySpec {
+            dataset_id: "analytics_orders".to_string(),
+            entity: Some("CUSTOMER 123".to_string()),
+            as_of: Some("2026-09-04 12:34:56".to_string()),
+            limit: Some("10".to_string()),
+            ..DatasetQuerySpec::default()
+        };
+        let cmd = run_command_for(&spec, "prod");
+        assert!(cmd.contains("--entity 'CUSTOMER 123'"), "cmd: {cmd}");
+        assert!(cmd.contains("--as-of '2026-09-04 12:34:56'"), "cmd: {cmd}");
+        assert!(cmd.contains("--limit 10"), "cmd: {cmd}");
+    }
+
+    #[test]
+    fn parse_select_splits_and_trims() {
+        assert_eq!(
+            parse_select(Some("a, b, c")),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(parse_select(Some("")), Vec::<String>::new());
+        assert_eq!(parse_select(None), Vec::<String>::new());
+    }
 }
