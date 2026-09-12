@@ -1039,11 +1039,6 @@ fn validate_single_statement_sql(sql: &str) -> ExportResult<()> {
             reason: "source query is empty".to_owned(),
         });
     }
-    if trimmed.contains(';') {
-        return Err(ExportError::UnsafeCopySource {
-            reason: "source query must be one statement without semicolons".to_owned(),
-        });
-    }
     if !starts_with_keyword(trimmed, "select") && !starts_with_keyword(trimmed, "with") {
         return Err(ExportError::UnsafeCopySource {
             reason: "source query must begin with SELECT or WITH".to_owned(),
@@ -1058,6 +1053,11 @@ fn validate_wrapped_copy_source_sql(sql: &str) -> ExportResult<()> {
     let mut chars = sql.char_indices().peekable();
     while let Some((_, ch)) = chars.next() {
         match ch {
+            ';' => {
+                return Err(ExportError::UnsafeCopySource {
+                    reason: "source query must be one statement without semicolons".to_owned(),
+                });
+            }
             '\'' => scan_single_quoted_sql_string(&mut chars)?,
             '"' => scan_double_quoted_sql_identifier(&mut chars)?,
             '(' => paren_depth = paren_depth.saturating_add(1),
@@ -1406,6 +1406,31 @@ mod tests {
             },
         );
         assert!(plan.to_sql().is_ok());
+    }
+
+    #[test]
+    fn copy_into_plan_allows_semicolons_inside_string_literals() {
+        let plan = CopyIntoPlan::new(
+            "@exports/run_001",
+            CopySource::Query {
+                sql: "select 'safe;semicolon' from t".to_owned(),
+            },
+        );
+        assert!(plan.to_sql().is_ok());
+    }
+
+    #[test]
+    fn copy_into_plan_refuses_unquoted_semicolons() {
+        let plan = CopyIntoPlan::new(
+            "@exports/run_001",
+            CopySource::Query {
+                sql: "select 1; select 2".to_owned(),
+            },
+        );
+        assert!(matches!(
+            plan.to_sql(),
+            Err(ExportError::UnsafeCopySource { .. })
+        ));
     }
 
     #[test]
