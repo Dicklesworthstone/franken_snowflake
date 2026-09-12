@@ -88,3 +88,4 @@ Desktop.ini
 # Session-local build artifact dirs (rch --result-dir sync targets)
 /tui-rel-target/
 /target-tui-rel/
+/fsnow-golden-teeth/
