@@ -62,7 +62,7 @@ def wait_until_after(target_dt: datetime.datetime):
     delay = (target_dt - now).total_seconds()
     if delay > 0:
         print(f"Sleeping {delay:.1f}s until {target_dt.isoformat()}...", flush=True)
-        time.sleep(delay + 2)
+        time.sleep(delay + 15)
 
 
 def parse_rate_limit_reset(stderr_text: str) -> datetime.datetime | None:
