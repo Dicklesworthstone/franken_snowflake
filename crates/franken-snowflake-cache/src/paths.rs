@@ -78,7 +78,7 @@ fn non_empty(value: Option<String>) -> Option<String> {
 /// Pure resolution policy behind [`default_data_dir`].
 #[must_use]
 pub fn resolve_data_dir(env: &DataDirEnv, os: DataDirOs) -> Option<PathBuf> {
-    if let Some(explicit) = &env.override_dir {
+    if let Some(explicit) = env.override_dir.as_deref().filter(|s| !s.trim().is_empty()) {
         return Some(PathBuf::from(explicit));
     }
     match os {
@@ -177,8 +177,7 @@ mod tests {
             override_dir: Some("   ".to_owned()),
             ..DataDirEnv::default()
         };
-        // Blank overrides are treated as unset by `from_process`; the pure
-        // resolver trusts its input, so pin that behavior at the boundary.
-        assert_eq!(non_empty(blank.override_dir), None);
+        assert_eq!(non_empty(blank.override_dir.clone()), None);
+        assert_eq!(resolve_data_dir(&blank, DataDirOs::Unix), None);
     }
 }
