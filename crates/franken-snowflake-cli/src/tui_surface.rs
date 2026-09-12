@@ -12,10 +12,12 @@
 
 use std::io::IsTerminal;
 
+#[cfg(feature = "live")]
 use std::collections::BTreeMap;
 
 use franken_snowflake_cache::CacheBackend;
 use franken_snowflake_catalog::model::CatalogSnapshot;
+#[cfg(feature = "live")]
 use franken_snowflake_catalog::planner::TypedBinding;
 use franken_snowflake_core::error::SnowflakeErrorCode;
 use franken_snowflake_core::exit::ExitCode as CoreExitCode;
