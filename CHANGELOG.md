@@ -42,15 +42,15 @@ implementation first and the test/hardening pass follows in a later wave. The
 
 ## Version state
 
-- Package version: `0.0.3` across the workspace; all crates inherit
-  `publish = false`. There is no crates.io publish.
+- Package version: `0.0.4` across the workspace; crates configured for
+  crates.io publishing.
 - Tags/releases: `v0.0.0` (tag only, 2026-06-29), `v0.0.1` (GitHub Release,
-  2026-06-30), `v0.0.2` (GitHub Release, 2026-08-24), and `v0.0.3`
-  (GitHub Release, 2026-09-04).
+  2026-06-30), `v0.0.2` (GitHub Release, 2026-08-24), `v0.0.3`
+  (GitHub Release, 2026-09-04), and `v0.0.4` (GitHub Release, 2026-09-11).
 - Live Snowflake transport is enabled with the `live` feature (default-off) and
   is gated at runtime by credential availability. Reads (`query run`,
   `catalog scan`, `profile doctor --online`) and writes (`query write`) both run
-  through it. The v0.0.3 release binaries are built with `--features live,mcp`.
+  through it. The release binaries are built with `--features live,mcp`.
 
 ## Version Timeline
 
@@ -66,6 +66,7 @@ implementation first and the test/hardening pass follows in a later wave. The
 | 2026-06-30 → 2026-08-19 | Unreleased since `v0.0.1`: crates.io sibling resolution, typed query options, janitor docs-reorg (`RELEASE.md` → `docs/RELEASE.md`, plan → `docs/planning/`) |
 | 2026-08-24 | GitHub Release [`v0.0.2`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.2) — standalone buildability, Windows x64 via cargo-xwin, but default-feature binaries (no `live`/`mcp`) and no Windows-installer coverage |
 | 2026-09-02 → 2026-09-04 | Reality-check remediation wave: every CLI surface wired to real implementations, safe live writes, receipts + audit trail, in-flight-cancel DPOR race case, `--require-live` gate, TUI executor bridge — shipped as [`v0.0.3`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.3) (2026-09-04, six native dsr targets with `live,mcp`) |
+| 2026-09-04 → 2026-09-11 | Hardening, dependency currency, and release readiness: TUI executor typed bindings, jsonv2 golden validation loop, feature-lane clippy cleanups, library upgrades, and crates.io publishing enablement — shipped as [`v0.0.4`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.4) (2026-09-11) |
 
 ---
 
@@ -106,6 +107,13 @@ implementation first and the test/hardening pass follows in a later wave. The
 
 ## [Unreleased]
 
+## [v0.0.4] — 2026-09-11
+
+Tag [`v0.0.4`](https://github.com/Dicklesworthstone/franken_snowflake/tree/v0.0.4)
+([`v0.0.3...v0.0.4`](https://github.com/Dicklesworthstone/franken_snowflake/compare/v0.0.3...v0.0.4)).
+Binaries built by `dsr` on all six targets with `--features live,mcp`;
+checksums published alongside. Crates configured for crates.io publishing.
+
 - **TUI executor hardening (security review).** The log pane now renders
   envelopes through the same `sanitize_envelope` redaction pass as CLI
   output, planner typed bindings ride into the live executor (the default
@@ -113,6 +121,22 @@ implementation first and the test/hardening pass follows in a later wave. The
   executor re-checks the read-only shape at the execution boundary, and
   `--require-live=<value>` is rejected loudly instead of being silently
   ignored.
+- **jsonv2 golden validation loop.** Data-driven verification test
+  consumes captured wire response fixtures and asserts frame codec data
+  type mappings.
+- **Clippy & lint coverage.** Fixed non-live `dead_code` warning on
+  `QueryRunOptions.bindings_json` and cfg-gated `BTreeMap`/`TypedBinding`
+  imports in `tui_surface.rs` to keep all 18 feature lanes clean under
+  `-D warnings`.
+- **Dependency updates.** Methodically updated direct and transitive
+  dependencies across the workspace via `/library-updater` (bitflags,
+  bon, crossbeam, darling, encoding_rs, flate2, indexmap, io-uring,
+  jsonwebtoken, lru, mio, prettyplease, rustls, smallvec, syn, toml,
+  uuid, zerocopy, wasm-bindgen) while preserving the single-version
+  `asupersync = "=0.3.5"` invariant.
+- **crates.io publication readiness.** Added version requirements across
+  internal path dependencies and updated `publish = ["crates-io"]` for
+  registry distribution.
 
 ## [v0.0.3] — 2026-09-04
 

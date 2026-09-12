@@ -167,6 +167,7 @@ struct QueryRunOptions {
     /// Inline typed bindings for embedded callers (the TUI executor): the
     /// same JSON shape `--bindings-env` carries, parsed with the same
     /// validation. `None` keeps the env-var path.
+    #[allow(dead_code)]
     bindings_json: Option<String>,
 }
 

@@ -229,7 +229,7 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_snowflake
 irm https://raw.githubusercontent.com/Dicklesworthstone/franken_snowflake/main/install.ps1 | iex
 ```
 
-> `v0.0.3` ships Windows assets for both `x86_64-pc-windows-msvc` and
+> `v0.0.4` ships Windows assets for both `x86_64-pc-windows-msvc` and
 > `aarch64-pc-windows-msvc`; only the older `v0.0.2` release lacked them.
 
 The installer accepts these flags (pass after `bash -s --` for the curl form):
@@ -247,7 +247,7 @@ The installer accepts these flags (pass after `bash -s --` for the curl form):
 | `--no-gum` | Plain output with no styled prompts |
 | `--force` | Overwrite an existing install |
 
-The `v0.0.3` release binaries are built with `--features live,mcp`: they report
+The `v0.0.4` release binaries are built with `--features live,mcp`: they report
 `feature_flags.live=true, mcp=true` in `capabilities`, so downloaded binaries
 run live reads and writes out of the box. Credentials are always runtime-gated:
 a live-capable binary refuses live operations cleanly (exit 3) when the

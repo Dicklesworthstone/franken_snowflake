@@ -21,7 +21,7 @@ workspace = true
 
 [dependencies]
 asupersync = { workspace = true }
-franken-snowflake-core = { path = "../franken-snowflake-core" }
+franken-snowflake-core = { path = "../franken-snowflake-core", version = "0.0.4" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
