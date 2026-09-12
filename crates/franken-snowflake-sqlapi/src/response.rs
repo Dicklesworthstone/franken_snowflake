@@ -58,7 +58,7 @@ impl ResultSet {
     /// Number of result partitions (≥ 1; partition 0 is inline).
     #[must_use]
     pub fn partition_count(&self) -> usize {
-        self.result_set_meta_data.partition_info.len()
+        self.result_set_meta_data.partition_info.len().max(1)
     }
 
     /// True when the response fanned out into multiple sub-statements.
@@ -195,4 +195,39 @@ pub struct StatementCancelResponse {
     /// The cancelled statement's handle, when echoed.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub statement_handle: Option<StatementHandle>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partition_count_is_at_least_one() {
+        let result_empty = ResultSet {
+            result_set_meta_data: ResultSetMetaData {
+                num_rows: 0,
+                format: "jsonv2".to_owned(),
+                row_type: vec![],
+                partition_info: vec![],
+            },
+            data: vec![],
+            code: "090001".to_owned(),
+            statement_handle: StatementHandle::new("h1"),
+            statement_status_url: None,
+            statement_handles: None,
+            sql_state: None,
+            message: None,
+            request_id: None,
+            created_on: None,
+            stats: None,
+        };
+        assert_eq!(result_empty.partition_count(), 1);
+
+        let mut result_multi = result_empty;
+        result_multi.result_set_meta_data.partition_info = vec![
+            PartitionInfo { row_count: 5, uncompressed_size: Some(100), compressed_size: Some(50) },
+            PartitionInfo { row_count: 5, uncompressed_size: Some(100), compressed_size: Some(50) },
+        ];
+        assert_eq!(result_multi.partition_count(), 2);
+    }
 }

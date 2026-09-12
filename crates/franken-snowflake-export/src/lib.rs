@@ -934,19 +934,24 @@ mod local {
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum SnowflakeTypeFamily {
+    pub(super) enum SnowflakeTypeFamily {
         Boolean,
         Number,
         SemiStructured,
         Other,
     }
 
-    fn snowflake_type_family(snowflake_type: &str) -> SnowflakeTypeFamily {
-        match snowflake_type.to_ascii_uppercase().as_str() {
+    pub(super) fn snowflake_type_family(snowflake_type: &str) -> SnowflakeTypeFamily {
+        let base = snowflake_type
+            .split('(')
+            .next()
+            .unwrap_or(snowflake_type)
+            .trim();
+        match base.to_ascii_uppercase().as_str() {
             "BOOLEAN" | "BOOL" => SnowflakeTypeFamily::Boolean,
-            "NUMBER" | "DECIMAL" | "NUMERIC" | "INT" | "INTEGER" | "BIGINT" | "SMALLINT"
-            | "TINYINT" | "BYTEINT" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE"
-            | "DOUBLE PRECISION" | "REAL" => SnowflakeTypeFamily::Number,
+            "FIXED" | "NUMBER" | "DECIMAL" | "NUMERIC" | "DECFLOAT" | "INT" | "INTEGER"
+            | "BIGINT" | "SMALLINT" | "TINYINT" | "BYTEINT" | "FLOAT" | "FLOAT4" | "FLOAT8"
+            | "DOUBLE" | "DOUBLE PRECISION" | "REAL" => SnowflakeTypeFamily::Number,
             "VARIANT" | "OBJECT" | "ARRAY" => SnowflakeTypeFamily::SemiStructured,
             _ => SnowflakeTypeFamily::Other,
         }
@@ -1542,5 +1547,33 @@ mod tests {
         assert!(line.ends_with('\n'));
         assert!(line.contains("\"record_hash\""));
         assert!(line.contains("\"content_hash\""));
+    }
+
+    #[test]
+    fn snowflake_type_family_handles_fixed_and_parameterized_types() {
+        assert_eq!(
+            snowflake_type_family("FIXED"),
+            SnowflakeTypeFamily::Number
+        );
+        assert_eq!(
+            snowflake_type_family("fixed"),
+            SnowflakeTypeFamily::Number
+        );
+        assert_eq!(
+            snowflake_type_family("NUMBER(38,0)"),
+            SnowflakeTypeFamily::Number
+        );
+        assert_eq!(
+            snowflake_type_family("DECIMAL(10, 2)"),
+            SnowflakeTypeFamily::Number
+        );
+        assert_eq!(
+            snowflake_type_family("VARCHAR(255)"),
+            SnowflakeTypeFamily::Other
+        );
+        assert_eq!(
+            snowflake_type_family("BOOLEAN"),
+            SnowflakeTypeFamily::Boolean
+        );
     }
 }
