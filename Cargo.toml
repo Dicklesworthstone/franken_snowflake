@@ -31,7 +31,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 rust-version = "1.95"
 license-file = "LICENSE"
@@ -41,7 +41,7 @@ homepage = "https://github.com/Dicklesworthstone/franken_snowflake"
 description = "Clean-room, Asupersync-native Snowflake SQL API connector built for coding agents."
 keywords = ["snowflake", "sql-api", "asupersync", "agent", "connector"]
 categories = ["database", "api-bindings", "command-line-utilities"]
-publish = false
+publish = ["crates-io"]
 
 # Workspace lint policy. Crates opt in with `[lints] workspace = true`.
 #

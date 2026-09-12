@@ -20,7 +20,7 @@ workspace = true
 [dependencies]
 fnx-algorithms = { version = "0.2.0" }
 fnx-classes = { version = "0.2.0" }
-franken-snowflake-catalog = { path = "../franken-snowflake-catalog" }
+franken-snowflake-catalog = { path = "../franken-snowflake-catalog", version = "0.0.4" }
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
