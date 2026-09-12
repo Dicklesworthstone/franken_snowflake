@@ -606,20 +606,236 @@ fn refused(
 }
 
 fn looks_like_copy_into_stage(sql: &str) -> bool {
-    sql.to_ascii_lowercase().contains("copy into @")
+    let mut chars = sql.chars().peekable();
+    let mut state = SqlScanState::Normal;
+    let mut comment_depth = 0usize;
+    let mut word = String::new();
+    let mut saw_copy = false;
+
+    while let Some(ch) = chars.next() {
+        match state {
+            SqlScanState::Normal => match ch {
+                '-' if chars.peek() == Some(&'-') => {
+                    chars.next();
+                    flush_keyword(&mut word, &mut saw_copy);
+                    state = SqlScanState::LineComment;
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    flush_keyword(&mut word, &mut saw_copy);
+                    comment_depth = 1;
+                    state = SqlScanState::BlockComment;
+                }
+                '\'' => {
+                    flush_keyword(&mut word, &mut saw_copy);
+                    state = SqlScanState::SingleQuoted;
+                }
+                '"' => {
+                    flush_keyword(&mut word, &mut saw_copy);
+                    state = SqlScanState::DoubleQuoted;
+                }
+                _ if ch.is_ascii_alphanumeric() || ch == '_' => {
+                    word.push(ch.to_ascii_lowercase());
+                }
+                _ => {
+                    if !word.is_empty() {
+                        let w = std::mem::take(&mut word);
+                        if !saw_copy {
+                            if w == "copy" {
+                                saw_copy = true;
+                            }
+                        } else if w == "into" {
+                            return next_non_comment_char(ch, &mut chars) == Some('@');
+                        } else {
+                            saw_copy = false;
+                        }
+                    }
+                }
+            },
+            SqlScanState::SingleQuoted => match ch {
+                '\\' => {
+                    chars.next();
+                }
+                '\'' if chars.peek() == Some(&'\'') => {
+                    chars.next();
+                }
+                '\'' => state = SqlScanState::Normal,
+                _ => {}
+            },
+            SqlScanState::DoubleQuoted => match ch {
+                '"' if chars.peek() == Some(&'"') => {
+                    chars.next();
+                }
+                '"' => state = SqlScanState::Normal,
+                _ => {}
+            },
+            SqlScanState::LineComment => {
+                if matches!(ch, '\n' | '\r') {
+                    state = SqlScanState::Normal;
+                }
+            }
+            SqlScanState::BlockComment => {
+                if ch == '/' && chars.peek() == Some(&'*') {
+                    chars.next();
+                    comment_depth += 1;
+                } else if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    comment_depth -= 1;
+                    if comment_depth == 0 {
+                        state = SqlScanState::Normal;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn flush_keyword(word: &mut String, saw_copy: &mut bool) {
+    if !word.is_empty() {
+        let w = std::mem::take(word);
+        if !*saw_copy {
+            if w == "copy" {
+                *saw_copy = true;
+            }
+        } else {
+            *saw_copy = false;
+        }
+    }
+}
+
+fn next_non_comment_char<I: Iterator<Item = char>>(
+    current: char,
+    chars: &mut std::iter::Peekable<I>,
+) -> Option<char> {
+    if !current.is_whitespace() {
+        return Some(current);
+    }
+    let mut comment_depth = 0usize;
+    let mut in_line_comment = false;
+
+    while let Some(ch) = chars.next() {
+        if in_line_comment {
+            if matches!(ch, '\n' | '\r') {
+                in_line_comment = false;
+            }
+            continue;
+        }
+        if comment_depth > 0 {
+            if ch == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                comment_depth += 1;
+            } else if ch == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                comment_depth -= 1;
+            }
+            continue;
+        }
+        if ch == '-' && chars.peek() == Some(&'-') {
+            chars.next();
+            in_line_comment = true;
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            comment_depth = 1;
+            continue;
+        }
+        if !ch.is_whitespace() {
+            return Some(ch);
+        }
+    }
+    None
 }
 
 fn sql_words(sql: &str) -> Vec<String> {
-    sql.lines()
-        .map(|line| line.split_once("--").map_or(line, |(before, _)| before))
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim_start()
-        .trim_start_matches(';')
-        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-        .filter(|part| !part.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect()
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut chars = sql.chars().peekable();
+    let mut comment_depth = 0usize;
+    let mut state = SqlScanState::Normal;
+
+    while let Some(ch) = chars.next() {
+        match state {
+            SqlScanState::Normal => match ch {
+                '-' if chars.peek() == Some(&'-') => {
+                    chars.next();
+                    flush_word(&mut word, &mut words);
+                    state = SqlScanState::LineComment;
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    flush_word(&mut word, &mut words);
+                    comment_depth = 1;
+                    state = SqlScanState::BlockComment;
+                }
+                '\'' => {
+                    flush_word(&mut word, &mut words);
+                    state = SqlScanState::SingleQuoted;
+                }
+                '"' => {
+                    flush_word(&mut word, &mut words);
+                    state = SqlScanState::DoubleQuoted;
+                }
+                _ if ch.is_ascii_alphanumeric() || ch == '_' => {
+                    word.push(ch.to_ascii_lowercase());
+                }
+                _ => flush_word(&mut word, &mut words),
+            },
+            SqlScanState::SingleQuoted => match ch {
+                '\\' => {
+                    chars.next();
+                }
+                '\'' if chars.peek() == Some(&'\'') => {
+                    chars.next();
+                }
+                '\'' => state = SqlScanState::Normal,
+                _ => {}
+            },
+            SqlScanState::DoubleQuoted => match ch {
+                '"' if chars.peek() == Some(&'"') => {
+                    chars.next();
+                }
+                '"' => state = SqlScanState::Normal,
+                _ => {}
+            },
+            SqlScanState::LineComment => {
+                if matches!(ch, '\n' | '\r') {
+                    state = SqlScanState::Normal;
+                }
+            }
+            SqlScanState::BlockComment => {
+                if ch == '/' && chars.peek() == Some(&'*') {
+                    chars.next();
+                    comment_depth += 1;
+                } else if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    comment_depth -= 1;
+                    if comment_depth == 0 {
+                        state = SqlScanState::Normal;
+                    }
+                }
+            }
+        }
+    }
+
+    flush_word(&mut word, &mut words);
+    words
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SqlScanState {
+    Normal,
+    SingleQuoted,
+    DoubleQuoted,
+    LineComment,
+    BlockComment,
+}
+
+fn flush_word(word: &mut String, words: &mut Vec<String>) {
+    if !word.is_empty() {
+        words.push(std::mem::take(word));
+    }
 }
 
 #[cfg(test)]
@@ -875,5 +1091,45 @@ mod tests {
             "insert into t values ('AKIAEXAMPLE0001')",
         );
         assert!(!req.redacted_sql_preview.contains("AKIAEXAMPLE0001"));
+    }
+
+    #[test]
+    fn classify_handles_block_comments_and_nested_comments() {
+        assert_eq!(
+            classify_write_statement("/* dbt query tag */ INSERT INTO t VALUES (1)"),
+            WriteStatementKind::Insert
+        );
+        assert_eq!(
+            classify_write_statement("/* /* nested comment */ */ UPDATE t SET x = 1"),
+            WriteStatementKind::Update
+        );
+        assert_eq!(
+            classify_write_statement("-- line comment\nDELETE FROM t WHERE id = 1"),
+            WriteStatementKind::Delete
+        );
+        assert_eq!(
+            classify_write_statement("SELECT '-- not a comment' FROM t"),
+            WriteStatementKind::Unknown
+        );
+    }
+
+    #[test]
+    fn classify_copy_into_stage_vs_table() {
+        assert_eq!(
+            classify_write_statement("COPY INTO @my_stage/data/ FROM t"),
+            WriteStatementKind::CopyIntoStage
+        );
+        assert_eq!(
+            classify_write_statement("/* comment */ COPY INTO\n  @my_stage/data/\n  FROM t"),
+            WriteStatementKind::CopyIntoStage
+        );
+        assert_eq!(
+            classify_write_statement("COPY INTO target_table FROM @my_stage"),
+            WriteStatementKind::CopyIntoTable
+        );
+        assert_eq!(
+            classify_write_statement("COPY INTO \"target_table\" FROM @my_stage"),
+            WriteStatementKind::CopyIntoTable
+        );
     }
 }
