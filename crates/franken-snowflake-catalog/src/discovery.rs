@@ -544,17 +544,23 @@ fn column_entry(
 }
 
 fn dtype_class(snowflake_type: &str) -> DtypeClass {
-    let normalized = snowflake_type.to_ascii_uppercase();
+    let base = snowflake_type
+        .split('(')
+        .next()
+        .unwrap_or(snowflake_type)
+        .trim();
+    let normalized = base.to_ascii_uppercase();
     match normalized.as_str() {
         "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER" | "STRING" => DtypeClass::String,
-        "FIXED" | "NUMBER" | "NUMERIC" | "DECIMAL" | "REAL" | "FLOAT" | "DOUBLE" | "DECFLOAT" => {
-            DtypeClass::Number
-        }
-        "BOOLEAN" => DtypeClass::Boolean,
+        "FIXED" | "NUMBER" | "NUMERIC" | "DECIMAL" | "REAL" | "FLOAT" | "DOUBLE" | "DECFLOAT"
+        | "INT" | "INTEGER" | "BIGINT" | "SMALLINT" | "TINYINT" | "BYTEINT" => DtypeClass::Number,
+        "BOOLEAN" | "BOOL" => DtypeClass::Boolean,
         "DATE" => DtypeClass::Date,
         "TIME" => DtypeClass::Time,
-        "TIMESTAMP" | "TIMESTAMP_NTZ" | "TIMESTAMP_LTZ" | "TIMESTAMP_TZ" => DtypeClass::Timestamp,
-        "BINARY" => DtypeClass::Binary,
+        "TIMESTAMP" | "TIMESTAMP_NTZ" | "TIMESTAMP_LTZ" | "TIMESTAMP_TZ" | "DATETIME" => {
+            DtypeClass::Timestamp
+        }
+        "BINARY" | "VARBINARY" => DtypeClass::Binary,
         "VARIANT" | "OBJECT" | "ARRAY" => DtypeClass::Variant,
         _ => DtypeClass::Unknown,
     }
@@ -1223,5 +1229,18 @@ mod tests {
             table: None,
             collation: None,
         }
+    }
+
+    #[test]
+    fn dtype_class_handles_parameters_and_aliases() {
+        assert_eq!(dtype_class("NUMBER(38,0)"), DtypeClass::Number);
+        assert_eq!(dtype_class("DECIMAL(10, 2)"), DtypeClass::Number);
+        assert_eq!(dtype_class("INT"), DtypeClass::Number);
+        assert_eq!(dtype_class("BIGINT"), DtypeClass::Number);
+        assert_eq!(dtype_class("VARCHAR(255)"), DtypeClass::String);
+        assert_eq!(dtype_class("BOOL"), DtypeClass::Boolean);
+        assert_eq!(dtype_class("DATETIME"), DtypeClass::Timestamp);
+        assert_eq!(dtype_class("TIMESTAMP_NTZ(9)"), DtypeClass::Timestamp);
+        assert_eq!(dtype_class("VARBINARY"), DtypeClass::Binary);
     }
 }

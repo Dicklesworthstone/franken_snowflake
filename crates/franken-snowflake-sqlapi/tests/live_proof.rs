@@ -763,12 +763,10 @@ fn endpoint_url(account: &str) -> String {
     }
     let host = s.split('/').next().unwrap_or(s);
     let host = host.split(':').next().unwrap_or(host);
-    let host = if let Some(idx) = host.to_ascii_lowercase().rfind(".snowflakecomputing.com") {
-        if idx + ".snowflakecomputing.com".len() == host.len() {
-            &host[..idx]
-        } else {
-            host
-        }
+    let host = if let Some(idx) = host.to_ascii_lowercase().rfind(".snowflakecomputing.com")
+        && idx + ".snowflakecomputing.com".len() == host.len()
+    {
+        &host[..idx]
     } else {
         host
     };
