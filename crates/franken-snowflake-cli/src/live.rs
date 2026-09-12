@@ -2322,6 +2322,8 @@ fn now_unix_seconds() -> i64 {
 /// SQL API idempotency contract, so a stable id would return the cached original
 /// statement on a re-run; a unique nonce keeps each CLI run independent.
 fn unique_request_id() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos() as u64)
@@ -2329,7 +2331,7 @@ fn unique_request_id() -> String {
     format!(
         "{:08x}-0000-4000-8000-{:012x}",
         (nanos & 0xffff_ffff) as u32,
-        (nanos >> 16) & 0xffff_ffff_ffff
+        ((nanos >> 16) ^ seq) & 0xffff_ffff_ffff
     )
 }
 
@@ -3057,5 +3059,14 @@ mod tests {
             Some(64),
             "{env}"
         );
+    }
+
+    #[test]
+    fn unique_request_id_produces_distinct_values() {
+        let id1 = unique_request_id();
+        let id2 = unique_request_id();
+        assert_ne!(id1, id2);
+        assert_eq!(id1.len(), 36);
+        assert_eq!(id2.len(), 36);
     }
 }
