@@ -185,7 +185,8 @@ mod frankenpandas {
 
     impl SnowflakeLogicalType {
         fn from_snowflake_type(value: &str) -> Self {
-            match value.to_ascii_uppercase().as_str() {
+            let base = value.split('(').next().unwrap_or(value).trim();
+            match base.to_ascii_uppercase().as_str() {
                 "FIXED" | "NUMBER" | "DECIMAL" | "NUMERIC" | "INT" | "INTEGER" | "BIGINT"
                 | "SMALLINT" | "TINYINT" | "BYTEINT" => Self::Fixed,
                 "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION"
@@ -1046,6 +1047,30 @@ mod frankenpandas {
             );
 
             Ok(())
+        }
+
+        #[test]
+        fn from_snowflake_type_handles_parameterized_types() {
+            assert_eq!(
+                SnowflakeLogicalType::from_snowflake_type("NUMBER(38,0)"),
+                SnowflakeLogicalType::Fixed
+            );
+            assert_eq!(
+                SnowflakeLogicalType::from_snowflake_type("DECIMAL(10, 2)"),
+                SnowflakeLogicalType::Fixed
+            );
+            assert_eq!(
+                SnowflakeLogicalType::from_snowflake_type("VARCHAR(255)"),
+                SnowflakeLogicalType::Text
+            );
+            assert_eq!(
+                SnowflakeLogicalType::from_snowflake_type("TIMESTAMP_NTZ(9)"),
+                SnowflakeLogicalType::TimestampNtz
+            );
+            assert_eq!(
+                SnowflakeLogicalType::from_snowflake_type("FLOAT(53)"),
+                SnowflakeLogicalType::Real
+            );
         }
     }
 }

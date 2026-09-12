@@ -1572,10 +1572,10 @@ fn account_identifier_input(account: &str) -> &str {
     }
     let host = s.split('/').next().unwrap_or(s);
     let host = host.split(':').next().unwrap_or(host);
-    if let Some(idx) = host.to_ascii_lowercase().rfind(".snowflakecomputing.com") {
-        if idx + ".snowflakecomputing.com".len() == host.len() {
-            return &host[..idx];
-        }
+    if let Some(idx) = host.to_ascii_lowercase().rfind(".snowflakecomputing.com")
+        && idx + ".snowflakecomputing.com".len() == host.len()
+    {
+        return &host[..idx];
     }
     host
 }
