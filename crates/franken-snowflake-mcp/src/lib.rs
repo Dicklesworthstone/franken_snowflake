@@ -213,6 +213,11 @@ mod fastmcp_surface {
                         ),
                         ParamSpec::string("database", "Snowflake database name.", true),
                         ParamSpec::string("schema", "Snowflake schema name.", true),
+                        ParamSpec::boolean(
+                            "require_live",
+                            "Set true to enforce a hard refusal if live transport is unavailable.",
+                            false,
+                        ),
                     ],
                     tags: &["catalog", "snowflake"],
                 },
@@ -369,26 +374,33 @@ mod fastmcp_surface {
                     vec![required_string(arguments, "profile")?],
                 )),
                 Self::ProfileDoctor => {
-                    let mut args = json_args_with(
-                        &["profile", "doctor"],
-                        vec![required_string(arguments, "profile")?],
-                    );
+                    let mut args = vec![
+                        "profile".to_string(),
+                        "doctor".to_string(),
+                        required_string(arguments, "profile")?,
+                    ];
                     if optional_bool(arguments, "online")?.unwrap_or(false) {
                         args.push("--online".to_string());
                     }
                     args.push("--json".to_string());
                     Ok(args)
                 }
-                Self::CatalogScan => Ok(vec![
-                    "catalog".to_string(),
-                    "scan".to_string(),
-                    required_string(arguments, "profile")?,
-                    "--database".to_string(),
-                    required_string(arguments, "database")?,
-                    "--schema".to_string(),
-                    required_string(arguments, "schema")?,
-                    "--json".to_string(),
-                ]),
+                Self::CatalogScan => {
+                    let mut args = vec![
+                        "catalog".to_string(),
+                        "scan".to_string(),
+                        required_string(arguments, "profile")?,
+                        "--database".to_string(),
+                        required_string(arguments, "database")?,
+                        "--schema".to_string(),
+                        required_string(arguments, "schema")?,
+                    ];
+                    if optional_bool(arguments, "require_live")?.unwrap_or(false) {
+                        args.push("--require-live".to_string());
+                    }
+                    args.push("--json".to_string());
+                    Ok(args)
+                }
                 Self::CatalogGraph => {
                     let mut args = vec![
                         "catalog".to_string(),
@@ -541,6 +553,11 @@ mod fastmcp_surface {
                     "Env var name holding positional typed bindings as JSON (raw mode).",
                     false,
                 ),
+                ParamSpec::boolean(
+                    "require_live",
+                    "Set true to enforce a hard refusal if live transport is unavailable.",
+                    false,
+                ),
             ]);
         }
         params
@@ -603,6 +620,9 @@ mod fastmcp_surface {
                     args.push(flag.to_string());
                     args.push(value);
                 }
+            }
+            if optional_bool(arguments, "require_live")?.unwrap_or(false) {
+                args.push("--require-live".to_string());
             }
         }
         args.push("--json".to_string());
@@ -1196,6 +1216,34 @@ mod fastmcp_surface {
                     .map(str::to_string)
                     .collect::<Vec<_>>()
             );
+
+            let profile_doc = ReadVerb::ProfileDoctor
+                .cli_args(&json!({"profile": "demo", "online": true}))
+                .expect("profile doctor args");
+            assert_eq!(
+                profile_doc,
+                vec!["profile", "doctor", "demo", "--online", "--json"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            );
+
+            let cat_scan = ReadVerb::CatalogScan
+                .cli_args(&json!({"profile": "demo", "database": "DB", "schema": "SCH", "require_live": true}))
+                .expect("catalog scan args");
+            assert_eq!(
+                cat_scan,
+                vec!["catalog", "scan", "demo", "--database", "DB", "--schema", "SCH", "--require-live", "--json"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            );
+
+            let query_live = ReadVerb::QueryRun
+                .cli_args(&json!({"profile": "demo", "sql": "select 1", "require_live": true}))
+                .expect("query run require_live args");
+            assert!(query_live.contains(&"--require-live".to_string()));
+            assert_eq!(query_live.iter().filter(|a| *a == "--json").count(), 1);
         }
 
         #[test]
