@@ -18,8 +18,8 @@
 
 use std::path::{Path, PathBuf};
 
-use franken_snowflake_frame::{FrankenPandasFrame, ResultPartition, SnowflakeColumn};
 use fp_types::DType;
+use franken_snowflake_frame::{FrankenPandasFrame, ResultPartition, SnowflakeColumn};
 use serde_json::Value;
 
 const GOLDEN_SCHEMA: &str = "franken_snowflake.jsonv2_wire_golden.v1";
@@ -41,11 +41,13 @@ fn golden_path() -> Option<PathBuf> {
 /// DecimalString.
 fn required_dtype(snowflake_type: &str) -> Option<DType> {
     match snowflake_type.to_ascii_uppercase().as_str() {
-        "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION"
-        | "DECFLOAT" => Some(DType::Float64),
+        "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "DECFLOAT" => {
+            Some(DType::Float64)
+        }
         "BOOLEAN" | "BOOL" => Some(DType::Bool),
-        "DATE" | "TIME" | "TIMESTAMP_NTZ" | "DATETIME" | "TIMESTAMP_LTZ"
-        | "TIMESTAMP_TZ" => Some(DType::Datetime64),
+        "DATE" | "TIME" | "TIMESTAMP_NTZ" | "DATETIME" | "TIMESTAMP_LTZ" | "TIMESTAMP_TZ" => {
+            Some(DType::Datetime64)
+        }
         _ => None,
     }
 }
@@ -137,8 +139,7 @@ fn captured_wire_golden_decodes_through_the_frame_codec() {
             let dtype_str = format!("{dtype:?}");
             let actual_str = format!("{actual:?}");
             assert!(
-                actual_str == dtype_str
-                    || actual_str == format!("{dtype_str}Nullable"),
+                actual_str == dtype_str || actual_str == format!("{dtype_str}Nullable"),
                 "column {} ({}) decoded to the wrong dtype: {actual_str:?} (expected {dtype_str:?} or its Nullable variant)",
                 column.name,
                 column.snowflake_type
