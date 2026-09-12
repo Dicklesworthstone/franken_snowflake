@@ -428,6 +428,7 @@ impl StatementProgress {
             .partitions_total
             .is_some_and(|total| total == self.partitions_fetched)
             && self.phase != StatementPhase::Cancelled
+            && self.phase != StatementPhase::Refused
         {
             self.phase = StatementPhase::Complete;
         }
@@ -1207,6 +1208,29 @@ mod tests {
         assert_eq!(app.apply_event(TuiEvent::Progress(tick)), TuiAction::None);
         assert_eq!(app.progress.partitions_fetched, 2);
         assert_eq!(app.progress.phase, StatementPhase::FetchingPartitions);
+    }
+
+    #[test]
+    fn progress_tick_preserves_refused_phase() {
+        let mut app = SnowflakeTuiApp {
+            progress: StatementProgress {
+                statement_handle: Some("01abc".to_owned()),
+                phase: StatementPhase::Refused,
+                ..StatementProgress::default()
+            },
+            ..SnowflakeTuiApp::default()
+        };
+        let budget = query_budget(None, 10, None, 100);
+        let tick = ProgressTick {
+            statement_handle: Some("01abc".to_owned()),
+            partitions_total: Some(2),
+            partitions_fetched_delta: 2,
+            rows_delta: 0,
+            budget: ProgressBudget::from_budget(&budget),
+        };
+
+        assert_eq!(app.apply_event(TuiEvent::Progress(tick)), TuiAction::None);
+        assert_eq!(app.progress.phase, StatementPhase::Refused);
     }
 
     #[test]
