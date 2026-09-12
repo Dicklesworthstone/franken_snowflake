@@ -4461,7 +4461,7 @@ fn has_multiple_statements(sql: &str) -> bool {
     let mut in_single_quote = false;
     let mut in_double_quote = false;
     let mut in_line_comment = false;
-    let mut in_block_comment = false;
+    let mut block_comment_depth = 0usize;
     let mut separator_seen = false;
 
     while cursor < bytes.len() {
@@ -4470,9 +4470,12 @@ fn has_multiple_statements(sql: &str) -> bool {
             cursor += 1;
             continue;
         }
-        if in_block_comment {
-            if bytes[cursor] == b'*' && bytes.get(cursor + 1) == Some(&b'/') {
-                in_block_comment = false;
+        if block_comment_depth > 0 {
+            if bytes[cursor] == b'/' && bytes.get(cursor + 1) == Some(&b'*') {
+                block_comment_depth += 1;
+                cursor += 2;
+            } else if bytes[cursor] == b'*' && bytes.get(cursor + 1) == Some(&b'/') {
+                block_comment_depth -= 1;
                 cursor += 2;
             } else {
                 cursor += 1;
@@ -4480,7 +4483,9 @@ fn has_multiple_statements(sql: &str) -> bool {
             continue;
         }
         if in_single_quote {
-            if bytes[cursor] == b'\'' {
+            if bytes[cursor] == b'\\' {
+                cursor = (cursor + 2).min(bytes.len());
+            } else if bytes[cursor] == b'\'' {
                 if bytes.get(cursor + 1) == Some(&b'\'') {
                     cursor += 2;
                 } else {
@@ -4519,7 +4524,7 @@ fn has_multiple_statements(sql: &str) -> bool {
                 cursor += 2;
             }
             b'/' if bytes.get(cursor + 1) == Some(&b'*') => {
-                in_block_comment = true;
+                block_comment_depth = 1;
                 cursor += 2;
             }
             b';' => {
@@ -4705,7 +4710,7 @@ fn skip_balanced_sql_parens(sql: &str, index: usize) -> Option<usize> {
     let mut in_single_quote = false;
     let mut in_double_quote = false;
     let mut in_line_comment = false;
-    let mut in_block_comment = false;
+    let mut block_comment_depth = 0usize;
 
     while cursor < bytes.len() {
         if in_line_comment {
@@ -4714,9 +4719,12 @@ fn skip_balanced_sql_parens(sql: &str, index: usize) -> Option<usize> {
             continue;
         }
 
-        if in_block_comment {
-            if bytes[cursor] == b'*' && bytes.get(cursor + 1) == Some(&b'/') {
-                in_block_comment = false;
+        if block_comment_depth > 0 {
+            if bytes[cursor] == b'/' && bytes.get(cursor + 1) == Some(&b'*') {
+                block_comment_depth += 1;
+                cursor += 2;
+            } else if bytes[cursor] == b'*' && bytes.get(cursor + 1) == Some(&b'/') {
+                block_comment_depth -= 1;
                 cursor += 2;
             } else {
                 cursor += 1;
@@ -4725,7 +4733,9 @@ fn skip_balanced_sql_parens(sql: &str, index: usize) -> Option<usize> {
         }
 
         if in_single_quote {
-            if bytes[cursor] == b'\'' {
+            if bytes[cursor] == b'\\' {
+                cursor = (cursor + 2).min(bytes.len());
+            } else if bytes[cursor] == b'\'' {
                 if bytes.get(cursor + 1) == Some(&b'\'') {
                     cursor += 2;
                 } else {
@@ -4766,7 +4776,7 @@ fn skip_balanced_sql_parens(sql: &str, index: usize) -> Option<usize> {
                 cursor += 2;
             }
             b'/' if bytes.get(cursor + 1) == Some(&b'*') => {
-                in_block_comment = true;
+                block_comment_depth = 1;
                 cursor += 2;
             }
             b'(' => {
@@ -5794,6 +5804,9 @@ mod tests {
             "where name = 'a;b'",
             "select 1 -- trailing; comment",
             "select /* a; b */ 1",
+            "select /* /* inner; */ outer */ 1",
+            "select /* /* inner */ ; outer */ 1",
+            "select 'don\\'t; do that' from t",
             "select 1; -- trailing comment only",
             "select \"weird;col\" from t",
         ] {
@@ -5815,6 +5828,12 @@ mod tests {
                 "multiple statements not detected: {sql:?}"
             );
         }
+    }
+
+    #[test]
+    fn skip_balanced_sql_parens_handles_nested_comments_and_escapes() {
+        let sql = "(a, /* /* inner */ outer */ b, 'don\\'t', c)";
+        assert_eq!(skip_balanced_sql_parens(sql, 0), Some(sql.len()));
     }
 
     #[cfg(feature = "toon")]
