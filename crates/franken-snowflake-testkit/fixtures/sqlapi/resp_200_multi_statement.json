@@ -1,0 +1,14 @@
+{
+  "resultSetMetaData": {
+    "numRows": 0,
+    "format": "jsonv2",
+    "rowType": []
+  },
+  "data": [],
+  "code": "090001",
+  "statementHandle": "01b2c3d4-0000-0000-0000-000000000020",
+  "statementHandles": [
+    "01b2c3d4-0000-0000-0000-000000000021",
+    "01b2c3d4-0000-0000-0000-000000000022"
+  ]
+}
