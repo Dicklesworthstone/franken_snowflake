@@ -946,10 +946,11 @@ fn truncate_label(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_owned();
     }
-    let mut output = value
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>();
+    if max_chars <= 3 {
+        return value.chars().take(max_chars).collect();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let mut output = value.chars().take(keep).collect::<String>();
     output.push_str("...");
     output
 }
@@ -1295,5 +1296,16 @@ mod tests {
         assert_eq!(evidence.node_count, graph.node_count());
         assert_eq!(evidence.ancestors, graph.ancestors(&object));
         assert_eq!(evidence.descendants, graph.descendants(&object));
+    }
+
+    #[test]
+    fn truncate_label_strictly_bounds_character_count() {
+        assert_eq!(truncate_label("hello world", 10), "hello w...");
+        assert!(truncate_label("hello world", 10).chars().count() <= 10);
+        assert_eq!(truncate_label("hello world", 5), "he...");
+        assert!(truncate_label("hello world", 5).chars().count() <= 5);
+        assert_eq!(truncate_label("hello", 5), "hello");
+        assert_eq!(truncate_label("hello", 3), "hel");
+        assert_eq!(truncate_label("hello", 0), "");
     }
 }
