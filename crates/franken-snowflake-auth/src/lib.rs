@@ -1555,13 +1555,29 @@ fn validate_secret_source_handle(source_kind: &'static str, handle: &str) -> Res
     Ok(())
 }
 
-fn account_identifier_input(account: &str) -> &str {
-    let account = account.trim().trim_end_matches('/');
-    if let Some(rest) = account.strip_prefix("https://") {
-        let host = rest.split('/').next().unwrap_or(rest);
-        return host.trim_end_matches(".snowflakecomputing.com");
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&s[prefix.len()..])
+    } else {
+        None
     }
-    account
+}
+
+fn account_identifier_input(account: &str) -> &str {
+    let mut s = account.trim().trim_end_matches('/');
+    if let Some(rest) = strip_prefix_ignore_ascii_case(s, "https://") {
+        s = rest;
+    } else if let Some(rest) = strip_prefix_ignore_ascii_case(s, "http://") {
+        s = rest;
+    }
+    let host = s.split('/').next().unwrap_or(s);
+    let host = host.split(':').next().unwrap_or(host);
+    if let Some(idx) = host.to_ascii_lowercase().rfind(".snowflakecomputing.com") {
+        if idx + ".snowflakecomputing.com".len() == host.len() {
+            return &host[..idx];
+        }
+    }
+    host
 }
 
 /// Drop a `<region>[.<cloud>]` suffix from an account **locator** form
@@ -1600,10 +1616,10 @@ fn export_env_next_command(name: &str) -> String {
 }
 
 fn ceil_div_i64(value: i64, divisor: i64) -> i64 {
-    if value <= 0 {
+    if value <= 0 || divisor <= 0 {
         0
     } else {
-        (value + divisor - 1) / divisor
+        value.saturating_add(divisor).saturating_sub(1) / divisor
     }
 }
 
@@ -1785,6 +1801,40 @@ mod tests {
         );
         assert_eq!(normalize_account_for_jwt("xy12345.west-europe")?, "XY12345");
         assert_eq!(normalize_account_for_jwt("xy12345")?, "XY12345");
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_account_from_various_url_and_host_formats()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Without scheme
+        assert_eq!(
+            normalize_account_for_jwt("myorg-myaccount.snowflakecomputing.com")?,
+            "MYORG-MYACCOUNT"
+        );
+        assert_eq!(
+            normalize_account_for_jwt("xy12345.us-east-1.snowflakecomputing.com")?,
+            "XY12345"
+        );
+        // With http://
+        assert_eq!(
+            normalize_account_for_jwt("http://myorg-myaccount.snowflakecomputing.com")?,
+            "MYORG-MYACCOUNT"
+        );
+        // Uppercase scheme and domain
+        assert_eq!(
+            normalize_account_for_jwt("HTTPS://MYORG-MYACCOUNT.SNOWFLAKECOMPUTING.COM/")?,
+            "MYORG-MYACCOUNT"
+        );
+        assert_eq!(
+            normalize_account_for_jwt("MYORG-MYACCOUNT.SNOWFLAKECOMPUTING.COM")?,
+            "MYORG-MYACCOUNT"
+        );
+        // With port
+        assert_eq!(
+            normalize_account_for_jwt("myorg-myaccount.snowflakecomputing.com:443")?,
+            "MYORG-MYACCOUNT"
+        );
         Ok(())
     }
 
