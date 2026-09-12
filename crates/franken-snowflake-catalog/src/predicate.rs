@@ -319,12 +319,16 @@ fn levenshtein(left: &str, right: &str) -> usize {
 #[must_use]
 pub fn did_you_mean_operators(input: &str, operators: &[OperatorCatalogEntry]) -> Vec<String> {
     let needle = input.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
     let mut candidates = BTreeMap::<String, usize>::new();
     for operator in operators {
         let op_id = operator.id.to_ascii_lowercase();
         let distance = levenshtein(&needle, &op_id);
-        let plausible = op_id.contains(&needle) || needle.contains(&op_id) || distance <= 3;
-        if plausible {
+        if op_id.starts_with(&needle) {
+            candidates.insert(operator.id.clone(), op_id.len().saturating_sub(needle.len()));
+        } else if distance <= 2 {
             candidates.insert(operator.id.clone(), distance);
         }
     }
