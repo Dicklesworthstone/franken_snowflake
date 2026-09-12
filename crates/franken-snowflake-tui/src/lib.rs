@@ -413,8 +413,16 @@ impl StatementProgress {
         }
         self.rows_streamed = self.rows_streamed.saturating_add(tick.rows_delta);
         self.budget = tick.budget;
-        if self.phase == StatementPhase::Idle || self.phase == StatementPhase::Planned {
+        if self.phase == StatementPhase::Idle
+            || self.phase == StatementPhase::Planned
+            || self.phase == StatementPhase::Submitted
+        {
             self.phase = StatementPhase::Polling;
+        }
+        if self.partitions_fetched > 0
+            && (self.phase == StatementPhase::Polling || self.phase == StatementPhase::Submitted)
+        {
+            self.phase = StatementPhase::FetchingPartitions;
         }
         if self
             .partitions_total
@@ -1182,6 +1190,23 @@ mod tests {
         assert_eq!(app.progress.budget.poll_quota, 7);
         assert_eq!(app.progress.budget.cost_quota, Some(55));
         assert_eq!(app.progress.budget.priority, 200);
+    }
+
+    #[test]
+    fn progress_tick_transitions_to_fetching_partitions() {
+        let mut app = SnowflakeTuiApp::default();
+        let budget = query_budget(None, 10, None, 100);
+        let tick = ProgressTick {
+            statement_handle: Some("01abc".to_owned()),
+            partitions_total: Some(5),
+            partitions_fetched_delta: 2,
+            rows_delta: 100,
+            budget: ProgressBudget::from_budget(&budget),
+        };
+
+        assert_eq!(app.apply_event(TuiEvent::Progress(tick)), TuiAction::None);
+        assert_eq!(app.progress.partitions_fetched, 2);
+        assert_eq!(app.progress.phase, StatementPhase::FetchingPartitions);
     }
 
     #[test]
