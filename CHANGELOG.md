@@ -694,4 +694,3 @@ and `publish = false` is flipped deliberately.
 [Unreleased]: https://github.com/Dicklesworthstone/franken_snowflake/compare/v0.0.1...HEAD
 [0.0.1]: https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.1
 [0.0.0]: https://github.com/Dicklesworthstone/franken_snowflake/tree/v0.0.0
-</content>

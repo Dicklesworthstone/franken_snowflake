@@ -928,5 +928,3 @@ sanity.
 ## License
 
 MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE).
-</content>
-</invoke>
