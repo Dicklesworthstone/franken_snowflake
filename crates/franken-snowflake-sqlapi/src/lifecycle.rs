@@ -582,7 +582,7 @@ fn validate_partition_row_count(
             format!("partition {partition} rowCount is negative"),
         ));
     }
-    if actual_rows as i64 != expected {
+    if i64::try_from(actual_rows).ok() != Some(expected) {
         return Err(LifecycleError::new(
             LifecycleErrorCode::PartitionRowMismatch,
             format!("partition {partition} returned {actual_rows} rows but rowCount is {expected}"),
@@ -598,7 +598,7 @@ fn validate_total_row_count(actual_rows: usize, expected: i64) -> Result<(), Lif
             "numRows is negative",
         ));
     }
-    if actual_rows as i64 != expected {
+    if i64::try_from(actual_rows).ok() != Some(expected) {
         return Err(LifecycleError::new(
             LifecycleErrorCode::PartitionRowMismatch,
             format!("assembled {actual_rows} rows but numRows is {expected}"),

@@ -110,7 +110,14 @@ pub fn decode_cell(raw: Option<&str>, column: &ColumnType) -> Result<CellValue, 
         reason,
     };
 
-    match column.column_type.to_ascii_uppercase().as_str() {
+    let base_type = column
+        .column_type
+        .split('(')
+        .next()
+        .unwrap_or(&column.column_type)
+        .trim();
+
+    match base_type.to_ascii_uppercase().as_str() {
         "FIXED" | "NUMBER" | "DECIMAL" | "NUMERIC" | "DECFLOAT" | "INT" | "INTEGER" | "BIGINT"
         | "SMALLINT" | "TINYINT" | "BYTEINT" => Ok(CellValue::Number(text.to_owned())),
 
@@ -448,6 +455,23 @@ mod tests {
         assert_eq!(
             decode_cell(Some("hello"), &col("GEOGRAPHY")).map_err(|e| e.to_string())?,
             CellValue::Text("hello".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parameterized_types_decode_correctly() -> Result<(), String> {
+        assert_eq!(
+            decode_cell(Some("42"), &col("NUMBER(38,0)")).map_err(|e| e.to_string())?,
+            CellValue::Number("42".to_owned())
+        );
+        assert_eq!(
+            decode_cell(Some("3.14"), &col("DECIMAL(10, 2)")).map_err(|e| e.to_string())?,
+            CellValue::Number("3.14".to_owned())
+        );
+        assert_eq!(
+            decode_cell(Some("test"), &col("VARCHAR(255)")).map_err(|e| e.to_string())?,
+            CellValue::Text("test".to_owned())
         );
         Ok(())
     }
