@@ -444,87 +444,142 @@ pub fn scan_canary_outputs(outputs: &[(OutputChannel, &str)]) -> Vec<CanaryLeakF
 /// Classify a SQL string enough to enforce read-only by default.
 #[must_use]
 pub fn classify_sql_operation(sql: &str) -> SqlOperationClass {
-    let first = first_sql_keyword(sql);
-    match first.as_deref() {
-        Some(
-            "alter" | "call" | "copy" | "create" | "delete" | "drop" | "execute" | "grant"
-            | "insert" | "merge" | "put" | "remove" | "revoke" | "truncate" | "undrop" | "update"
-            | "use",
-        ) => SqlOperationClass::Mutating,
+    let words = executable_sql_words(sql);
+    let first = words.first().map(String::as_str);
+    match first {
+        Some(kw) if is_mutating_keyword(kw) => SqlOperationClass::Mutating,
+        Some("with") => {
+            // A common table expression (CTE) statement may be a SELECT (read), or
+            // may drive a DML statement (INSERT/UPDATE/DELETE/MERGE). If any executable
+            // token outside comments/literals is a mutating keyword, classify as mutating.
+            if words.iter().any(|word| is_mutating_keyword(word.as_str())) {
+                SqlOperationClass::Mutating
+            } else {
+                SqlOperationClass::Read
+            }
+        }
         _ => SqlOperationClass::Read,
     }
 }
 
-fn first_sql_keyword(sql: &str) -> Option<String> {
-    let mut index = 0usize;
-    loop {
-        index = skip_sql_ws(sql, index);
-        if sql[index..].starts_with("--") {
-            let line_end = sql[index..].find('\n')?;
-            index += line_end + 1;
-            continue;
-        }
-        if sql[index..].starts_with("/*") {
-            // Snowflake supports *nested* block comments, so a first-match scan for
-            // `*/` would close the outer comment early and leave the real statement
-            // keyword hidden behind a stray `*/`, classifying e.g.
-            // `/* /* */ */ delete ...` as `Read` (a fail-open in the read-only
-            // guard). Track nesting depth so the whole comment is consumed.
-            let mut depth = 1usize;
-            let mut scan = index + 2;
-            while depth > 0 {
-                let rest = &sql[scan..];
-                let close = rest.find("*/")?;
-                match rest.find("/*") {
-                    Some(open) if open < close => {
-                        depth += 1;
-                        scan += open + 2;
-                    }
-                    _ => {
-                        depth -= 1;
-                        scan += close + 2;
+fn is_mutating_keyword(kw: &str) -> bool {
+    matches!(
+        kw,
+        "alter"
+            | "call"
+            | "copy"
+            | "create"
+            | "delete"
+            | "drop"
+            | "execute"
+            | "grant"
+            | "insert"
+            | "merge"
+            | "put"
+            | "remove"
+            | "revoke"
+            | "truncate"
+            | "undrop"
+            | "update"
+            | "use"
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SqlTokenScanState {
+    Normal,
+    SingleQuoted,
+    DoubleQuoted,
+    LineComment,
+    BlockComment,
+}
+
+fn flush_token_word(word: &mut String, words: &mut Vec<String>) {
+    if !word.is_empty() {
+        words.push(std::mem::take(word));
+    }
+}
+
+fn executable_sql_words(sql: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut chars = sql.chars().peekable();
+    let mut comment_depth = 0usize;
+    let mut state = SqlTokenScanState::Normal;
+
+    while let Some(ch) = chars.next() {
+        match state {
+            SqlTokenScanState::Normal => match ch {
+                '-' if chars.peek() == Some(&'-') => {
+                    chars.next();
+                    flush_token_word(&mut word, &mut words);
+                    state = SqlTokenScanState::LineComment;
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    flush_token_word(&mut word, &mut words);
+                    comment_depth = 1;
+                    state = SqlTokenScanState::BlockComment;
+                }
+                '\'' => {
+                    flush_token_word(&mut word, &mut words);
+                    state = SqlTokenScanState::SingleQuoted;
+                }
+                '"' => {
+                    flush_token_word(&mut word, &mut words);
+                    state = SqlTokenScanState::DoubleQuoted;
+                }
+                _ if ch.is_ascii_alphanumeric() || ch == '_' => {
+                    word.push(ch.to_ascii_lowercase());
+                }
+                _ => flush_token_word(&mut word, &mut words),
+            },
+            SqlTokenScanState::SingleQuoted => match ch {
+                '\\' => {
+                    chars.next();
+                }
+                '\'' if chars.peek() == Some(&'\'') => {
+                    chars.next();
+                }
+                '\'' => state = SqlTokenScanState::Normal,
+                _ => {}
+            },
+            SqlTokenScanState::DoubleQuoted => match ch {
+                '"' if chars.peek() == Some(&'"') => {
+                    chars.next();
+                }
+                '"' => state = SqlTokenScanState::Normal,
+                _ => {}
+            },
+            SqlTokenScanState::LineComment => {
+                if matches!(ch, '\n' | '\r') {
+                    state = SqlTokenScanState::Normal;
+                }
+            }
+            SqlTokenScanState::BlockComment => {
+                if ch == '/' && chars.peek() == Some(&'*') {
+                    chars.next();
+                    comment_depth += 1;
+                } else if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    comment_depth -= 1;
+                    if comment_depth == 0 {
+                        state = SqlTokenScanState::Normal;
                     }
                 }
             }
-            index = scan;
-            continue;
         }
-        break;
     }
-
-    let mut keyword = String::new();
-    for ch in sql[index..].chars() {
-        if !ch.is_ascii_alphabetic() {
-            break;
-        }
-        keyword.push(ch.to_ascii_lowercase());
-    }
-    (!keyword.is_empty()).then_some(keyword)
-}
-
-fn skip_sql_ws(sql: &str, mut index: usize) -> usize {
-    while let Some(ch) = sql[index..].chars().next() {
-        if !ch.is_whitespace() {
-            break;
-        }
-        index += ch.len_utf8();
-    }
-    index
+    flush_token_word(&mut word, &mut words);
+    words
 }
 
 fn looks_unconstrained(sql: &str) -> bool {
-    let lowered = sql.to_ascii_lowercase();
-    lowered.contains("select")
-        && !contains_word(&lowered, "limit")
-        && !contains_word(&lowered, "where")
-        && !contains_word(&lowered, "qualify")
-        && !contains_word(&lowered, "fetch")
-}
-
-fn contains_word(haystack: &str, needle: &str) -> bool {
-    haystack
-        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-        .any(|part| part == needle)
+    let words = executable_sql_words(sql);
+    words.iter().any(|w| w == "select")
+        && !words
+            .iter()
+            .any(|w| matches!(w.as_str(), "limit" | "where" | "qualify" | "fetch"))
 }
 
 fn normalize_label(label: &str) -> String {
@@ -657,6 +712,55 @@ mod tests {
         }
         // A plain SELECT stays a read.
         assert_eq!(classify_sql_operation("select 1"), SqlOperationClass::Read);
+    }
+
+    #[test]
+    fn parenthesized_and_cte_queries_are_classified_correctly() {
+        // Parenthesized mutations must not bypass the read-only guardrail.
+        assert_eq!(
+            classify_sql_operation("(delete from table_x)"),
+            SqlOperationClass::Mutating
+        );
+        assert_eq!(
+            classify_sql_operation("((drop table table_x))"),
+            SqlOperationClass::Mutating
+        );
+        assert_eq!(
+            classify_sql_operation(" ( ( truncate table table_x ) ) "),
+            SqlOperationClass::Mutating
+        );
+        assert_eq!(
+            classify_sql_operation("(select 1)"),
+            SqlOperationClass::Read
+        );
+
+        // CTE queries driving DML must classify as mutating.
+        assert_eq!(
+            classify_sql_operation("WITH cte AS (SELECT 1) DELETE FROM table_x"),
+            SqlOperationClass::Mutating
+        );
+        assert_eq!(
+            classify_sql_operation("WITH cte AS (SELECT 1) INSERT INTO table_x SELECT * FROM cte"),
+            SqlOperationClass::Mutating
+        );
+        assert_eq!(
+            classify_sql_operation("WITH cte AS (SELECT 1) UPDATE table_x SET a = 1"),
+            SqlOperationClass::Mutating
+        );
+
+        // Read CTE queries stay Read even with string literals or aliases containing keywords.
+        assert_eq!(
+            classify_sql_operation("WITH cte AS (SELECT 1) SELECT * FROM cte"),
+            SqlOperationClass::Read
+        );
+        assert_eq!(
+            classify_sql_operation("WITH cte AS (SELECT 'delete' AS action FROM t) SELECT * FROM cte"),
+            SqlOperationClass::Read
+        );
+        assert_eq!(
+            classify_sql_operation("WITH cte AS (SELECT \"delete\" FROM t) SELECT * FROM cte"),
+            SqlOperationClass::Read
+        );
     }
 
     #[test]
