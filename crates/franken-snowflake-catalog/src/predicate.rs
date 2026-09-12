@@ -128,7 +128,7 @@ fn validate_leaf(
             message: format!("unknown operator {:?}", leaf.op),
             column: Some(leaf.column.clone()),
             operator: Some(leaf.op.clone()),
-            did_you_mean: Vec::new(),
+            did_you_mean: did_you_mean_operators(&leaf.op, operators),
         });
     }
 
@@ -313,4 +313,54 @@ fn levenshtein(left: &str, right: &str) -> usize {
     }
 
     previous[right_chars.len()]
+}
+
+/// Suggest exact catalog operators based on edit distance.
+#[must_use]
+pub fn did_you_mean_operators(input: &str, operators: &[OperatorCatalogEntry]) -> Vec<String> {
+    let needle = input.trim().to_ascii_lowercase();
+    let mut candidates = BTreeMap::<String, usize>::new();
+    for operator in operators {
+        let op_id = operator.id.to_ascii_lowercase();
+        let distance = levenshtein(&needle, &op_id);
+        let plausible = op_id.contains(&needle) || needle.contains(&op_id) || distance <= 3;
+        if plausible {
+            candidates.insert(operator.id.clone(), distance);
+        }
+    }
+    let mut ranked = candidates.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    ranked.into_iter().take(3).map(|(op, _)| op).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operator::built_in_operator_catalog;
+
+    #[test]
+    fn did_you_mean_operators_suggests_close_matches() {
+        let operators = built_in_operator_catalog();
+        let suggestions = did_you_mean_operators("betwen", &operators);
+        assert_eq!(suggestions, vec!["between"]);
+
+        let suggestions = did_you_mean_operators("cont", &operators);
+        assert!(suggestions.contains(&"contains".to_string()));
+    }
+
+    #[test]
+    fn validate_predicate_suggests_operators_on_unknown_op() {
+        let operators = built_in_operator_catalog();
+        let leaf = LeafPredicate::new("id", "betwen", serde_json::json!([1, 10]));
+        let mut refusals = Vec::new();
+        validate_leaf(&leaf, &[], &operators, &mut refusals);
+        let op_refusal = refusals
+            .iter()
+            .find(|r| r.code == PredicateRefusalCode::OperatorUnknown);
+        assert!(op_refusal.is_some());
+        assert_eq!(
+            op_refusal.unwrap().did_you_mean,
+            vec!["between".to_string()]
+        );
+    }
 }
