@@ -362,7 +362,14 @@ async fn drive<T: StatementTransport, A: AuthProvider>(
                         return cancel_locally(cx, client, &auth, &handle, reason).await;
                     }
                     SnowflakeOutcome::Panicked(payload) => {
-                        return SnowflakeOutcome::panicked(payload);
+                        return abandon_with_outcome(
+                            cx,
+                            client,
+                            &auth,
+                            &handle,
+                            SnowflakeOutcome::panicked(payload),
+                        )
+                        .await;
                     }
                 };
                 if response.status == StatusClass::Unauthorized {
@@ -446,7 +453,14 @@ async fn drive<T: StatementTransport, A: AuthProvider>(
                             return cancel_locally(cx, client, &auth, &handle, reason).await;
                         }
                         SnowflakeOutcome::Panicked(payload) => {
-                            return SnowflakeOutcome::panicked(payload);
+                            return abandon_with_outcome(
+                                cx,
+                                client,
+                                &auth,
+                                &handle,
+                                SnowflakeOutcome::panicked(payload),
+                            )
+                            .await;
                         }
                     };
                     if response.status == StatusClass::Unauthorized {
@@ -501,7 +515,14 @@ async fn drive<T: StatementTransport, A: AuthProvider>(
                                 return cancel_locally(cx, client, &auth, &handle, reason).await;
                             }
                             SnowflakeOutcome::Panicked(payload) => {
-                                return SnowflakeOutcome::panicked(payload);
+                                return abandon_with_outcome(
+                                    cx,
+                                    client,
+                                    &auth,
+                                    &handle,
+                                    SnowflakeOutcome::panicked(payload),
+                                )
+                                .await;
                             }
                         };
                     }
@@ -623,10 +644,23 @@ async fn abandon_with_error<T: StatementTransport>(
     handle: &StatementHandle,
     error: SnowflakeError,
 ) -> StatementOutcome {
+    abandon_with_outcome(cx, client, auth, handle, SnowflakeOutcome::err(error)).await
+}
+
+/// Drain the same handle obligation for errors and returned panic outcomes.
+/// Cleanup failure cannot replace the original outcome or its panic payload.
+/// This handles `Panicked` values, not an unwinding transport future.
+async fn abandon_with_outcome<T: StatementTransport>(
+    cx: &Cx,
+    client: &T,
+    auth: &AuthorizationDescriptor,
+    handle: &StatementHandle,
+    outcome: StatementOutcome,
+) -> StatementOutcome {
     let _ = client
         .cancel_orphaned_statement(cx, auth.clone(), handle.clone())
         .await;
-    SnowflakeOutcome::err(error)
+    outcome
 }
 
 /// Fire the SQL API cancel endpoint through the transport's masked cleanup path,
@@ -722,7 +756,7 @@ const fn response_class(status: StatusClass) -> ResponseClass {
 mod tests {
     use super::*;
     use crate::response::QueryFailureStatus;
-    use asupersync::{Budget, CancelKind, Time};
+    use asupersync::{Budget, CancelKind, PanicPayload, Time};
     use franken_snowflake_core::outcome::{OutcomeKind, SnowflakeOutcomeExt};
     use franken_snowflake_http::{
         CompressionEvidence, ContentEncoding, SnowflakeAuthTokenType, TransportError,
@@ -737,11 +771,13 @@ mod tests {
     const RESP_200_SINGLE: &[u8] =
         include_bytes!("../tests/fixtures/resp_200_resultset_single_partition.json");
 
-    /// What the fake answers on each route; `Err` produces a transport error.
+    /// What the fake answers on each route. `Panicked` is a caught outcome,
+    /// not an unwind of the driver future.
     #[derive(Clone)]
     enum Scripted {
         Ok(StatusClass, Vec<u8>),
         Err,
+        Panicked(&'static str),
     }
 
     /// A scripted transport recording every cancel the driver issues.
@@ -755,13 +791,16 @@ mod tests {
         partitions: RefCell<BTreeMap<u32, VecDeque<Scripted>>>,
         cancels_after_local: RefCell<Vec<(StatementHandle, CancelKind)>>,
         orphan_cancels: RefCell<Vec<StatementHandle>>,
+        orphan_cancel_auth: RefCell<Vec<String>>,
+        orphan_cancel_result: Scripted,
+        orphan_cleanup_finished: Cell<bool>,
         /// Credential fingerprint attached to every submit/poll/partition, in order.
         auth_seen: RefCell<Vec<String>>,
         /// `("start", p)` when a partition fetch is first polled and `("done", p)`
         /// when it resolves: proves whether fetches overlapped.
         partition_events: RefCell<Vec<(&'static str, u32)>>,
-        /// When set, every partition fetch stays pending for one poll so that
-        /// concurrent fetches interleave observably.
+        /// When set, partition fetches and orphan cleanup stay pending for one
+        /// poll so that draining and concurrent fetches interleave observably.
         yield_once: Cell<bool>,
     }
 
@@ -774,6 +813,9 @@ mod tests {
                 partitions: RefCell::new(BTreeMap::new()),
                 cancels_after_local: RefCell::new(Vec::new()),
                 orphan_cancels: RefCell::new(Vec::new()),
+                orphan_cancel_auth: RefCell::new(Vec::new()),
+                orphan_cancel_result: Scripted::Ok(StatusClass::Completed, Vec::new()),
+                orphan_cleanup_finished: Cell::new(false),
                 auth_seen: RefCell::new(Vec::new()),
                 partition_events: RefCell::new(Vec::new()),
                 yield_once: Cell::new(false),
@@ -821,6 +863,9 @@ mod tests {
                     TransportOutcome::ok(SubmitHttpResponse { status, body })
                 }
                 Scripted::Err => TransportOutcome::err(Self::transport_error()),
+                Scripted::Panicked(message) => {
+                    TransportOutcome::panicked(PanicPayload::new(message))
+                }
             }
         }
 
@@ -838,6 +883,9 @@ mod tests {
                     TransportOutcome::ok(PollHttpResponse { status, body })
                 }
                 Scripted::Err => TransportOutcome::err(Self::transport_error()),
+                Scripted::Panicked(message) => {
+                    TransportOutcome::panicked(PanicPayload::new(message))
+                }
             }
         }
 
@@ -874,6 +922,9 @@ mod tests {
                     body,
                 }),
                 Some(Scripted::Err) | None => TransportOutcome::err(Self::transport_error()),
+                Some(Scripted::Panicked(message)) => {
+                    TransportOutcome::panicked(PanicPayload::new(message))
+                }
             }
         }
 
@@ -893,14 +944,27 @@ mod tests {
         async fn cancel_orphaned_statement(
             &self,
             _cx: &Cx,
-            _auth: AuthorizationDescriptor,
+            auth: AuthorizationDescriptor,
             statement_handle: StatementHandle,
         ) -> TransportOutcome<CancelHttpResponse> {
             self.orphan_cancels.borrow_mut().push(statement_handle);
-            TransportOutcome::ok(CancelHttpResponse {
-                status: StatusClass::Completed,
-                body: Vec::new(),
-            })
+            self.orphan_cancel_auth
+                .borrow_mut()
+                .push(auth.redacted_fingerprint().to_owned());
+            if self.yield_once.get() {
+                YieldOnce { yielded: false }.await;
+            }
+            self.orphan_cleanup_finished.set(true);
+            match &self.orphan_cancel_result {
+                Scripted::Ok(status, body) => TransportOutcome::ok(CancelHttpResponse {
+                    status: *status,
+                    body: body.clone(),
+                }),
+                Scripted::Err => TransportOutcome::err(Self::transport_error()),
+                Scripted::Panicked(message) => {
+                    TransportOutcome::panicked(PanicPayload::new(*message))
+                }
+            }
         }
     }
 
@@ -1517,6 +1581,165 @@ mod tests {
 
     fn fixture_handle() -> StatementHandle {
         StatementHandle::new("01b2c3d4-0000-0000-0000-000000000002")
+    }
+
+    #[test]
+    fn submit_panic_without_a_handle_does_not_attempt_cleanup() {
+        asupersync::test_utils::run_test(|| async {
+            let transport = FakeTransport::new(Scripted::Panicked("submit panic"));
+            let cx = Cx::current().expect("native test runtime must install its context");
+            let (outcome, stats) = run_statement_with_stats(
+                &cx,
+                &transport,
+                fake_auth(),
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5),
+            )
+            .await;
+            let SnowflakeOutcome::Panicked(payload) = outcome else {
+                panic!("expected the submit panic, got {outcome:?}");
+            };
+            assert_eq!(payload.message(), "submit panic");
+            assert_eq!(stats, DriverStats::default());
+            assert!(transport.orphan_cancels.borrow().is_empty());
+            assert!(transport.cancels_after_local.borrow().is_empty());
+            assert!(!transport.orphan_cleanup_finished.get());
+        });
+    }
+
+    #[test]
+    fn poll_panic_awaits_cleanup_and_preserves_the_original_payload() {
+        asupersync::test_utils::run_test(|| async {
+            for cleanup in [
+                Scripted::Ok(StatusClass::Completed, Vec::new()),
+                Scripted::Err,
+                Scripted::Panicked("secondary cleanup panic"),
+            ] {
+                let mut transport =
+                    FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+                transport.orphan_cancel_result = cleanup;
+                transport.yield_once.set(true);
+                transport
+                    .polls
+                    .borrow_mut()
+                    .push(Scripted::Panicked("poll panic"));
+                let cx = Cx::current().expect("native test runtime must install its context");
+                let (outcome, stats) = run_statement_with_stats(
+                    &cx,
+                    &transport,
+                    fake_auth(),
+                    SubmitStatementRequest::new("select 1"),
+                    SubmitQueryParams::default(),
+                    fast_poll_plan(5),
+                )
+                .await;
+                let SnowflakeOutcome::Panicked(payload) = outcome else {
+                    panic!("expected the original poll panic, got {outcome:?}");
+                };
+                assert_eq!(payload.message(), "poll panic");
+                assert_eq!(stats.polls, 1);
+                assert_eq!(
+                    transport.orphan_cancels.borrow().as_slice(),
+                    &[fixture_handle()]
+                );
+                assert_eq!(
+                    transport.orphan_cancel_auth.borrow().as_slice(),
+                    &["cred_test"]
+                );
+                assert!(transport.orphan_cleanup_finished.get());
+                assert!(transport.cancels_after_local.borrow().is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn partition_panic_drains_the_window_and_yielding_cleanup_before_returning() {
+        let transport = windowed_transport(1, &[1, 1, 1]);
+        transport.yield_once.set(true);
+        transport
+            .partitions
+            .borrow_mut()
+            .insert(2, VecDeque::from([Scripted::Panicked("partition panic")]));
+        let cx = Cx::for_testing();
+        let mut driver = std::pin::pin!(run_statement_with_stats(
+            &cx,
+            &transport,
+            fake_auth(),
+            SubmitStatementRequest::new("select 1"),
+            SubmitQueryParams::default(),
+            fast_poll_plan(5).with_partition_concurrency(3),
+        ));
+        let mut context = Context::from_waker(std::task::Waker::noop());
+
+        assert!(driver.as_mut().poll(&mut context).is_pending());
+        assert_eq!(transport.events(), vec!["start1", "start2", "start3"]);
+        assert!(transport.orphan_cancels.borrow().is_empty());
+
+        // The failed partition does not abandon its sibling. Cleanup starts
+        // only after all three fetches settle, and itself needs another poll.
+        assert!(driver.as_mut().poll(&mut context).is_pending());
+        assert_eq!(
+            transport.events(),
+            vec!["start1", "start2", "start3", "done1", "done2", "done3"]
+        );
+        assert_eq!(
+            transport.orphan_cancels.borrow().as_slice(),
+            &[fixture_handle()]
+        );
+        assert!(!transport.orphan_cleanup_finished.get());
+
+        let Poll::Ready((outcome, stats)) = driver.as_mut().poll(&mut context) else {
+            panic!("driver did not return after cleanup completed");
+        };
+        let SnowflakeOutcome::Panicked(payload) = outcome else {
+            panic!("expected the partition panic, got {outcome:?}");
+        };
+        assert_eq!(payload.message(), "partition panic");
+        assert_eq!(stats.partitions_fetched, 3);
+        assert_eq!(transport.orphan_cancels.borrow().len(), 1);
+        assert!(transport.orphan_cleanup_finished.get());
+        assert!(transport.cancels_after_local.borrow().is_empty());
+    }
+
+    #[test]
+    fn partition_retry_panic_cleans_up_with_the_refreshed_credential() {
+        asupersync::test_utils::run_test(|| async {
+            let transport = FakeTransport::new(Scripted::Ok(
+                StatusClass::Completed,
+                multi_partition_body(1, &[1]),
+            ));
+            transport.yield_once.set(true);
+            transport.script_partition(1, unauthorized());
+            transport.script_partition(1, Scripted::Panicked("retry panic"));
+            let mut auth = FakeAuth::resigning();
+            let cx = Cx::current().expect("native test runtime must install its context");
+            let (outcome, stats) = run_statement_with_auth(
+                &cx,
+                &transport,
+                &mut auth,
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5),
+            )
+            .await;
+            let SnowflakeOutcome::Panicked(payload) = outcome else {
+                panic!("expected the retry panic, got {outcome:?}");
+            };
+            assert_eq!(payload.message(), "retry panic");
+            assert_eq!(stats.partitions_fetched, 2);
+            assert_eq!(auth.resigns, 1);
+            assert_eq!(
+                transport.orphan_cancels.borrow().as_slice(),
+                &[fixture_handle()]
+            );
+            assert_eq!(
+                transport.orphan_cancel_auth.borrow().as_slice(),
+                &["cred_gen1"]
+            );
+            assert!(transport.orphan_cleanup_finished.get());
+            assert!(transport.cancels_after_local.borrow().is_empty());
+        });
     }
 
     #[test]
