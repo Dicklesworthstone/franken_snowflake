@@ -576,7 +576,7 @@ pub fn classify_write_statement(sql: &str) -> WriteStatementKind {
         Some("revoke") => WriteStatementKind::Revoke,
         Some("call") => WriteStatementKind::Call,
         Some("put") => WriteStatementKind::Put,
-        Some("remove") => WriteStatementKind::Remove,
+        Some("remove" | "rm") => WriteStatementKind::Remove,
         Some("use") => WriteStatementKind::Use,
         _ => WriteStatementKind::Unknown,
     }
@@ -1130,6 +1130,14 @@ mod tests {
         assert_eq!(
             classify_write_statement("COPY INTO \"target_table\" FROM @my_stage"),
             WriteStatementKind::CopyIntoTable
+        );
+        assert_eq!(
+            classify_write_statement("remove @my_stage/file.csv"),
+            WriteStatementKind::Remove
+        );
+        assert_eq!(
+            classify_write_statement("rm @my_stage/file.csv"),
+            WriteStatementKind::Remove
         );
     }
 }

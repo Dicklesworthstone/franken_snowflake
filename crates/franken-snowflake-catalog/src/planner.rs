@@ -557,8 +557,8 @@ fn normalize_raw_select(sql: &str) -> Result<String, PlanRefusal> {
         return Err(raw_sql_refusal("raw SQL dry-run accepts SELECT only"));
     }
     for keyword in [
-        "alter", "call", "copy", "create", "delete", "drop", "grant", "insert", "merge", "put",
-        "remove", "revoke", "truncate", "update", "use",
+        "alter", "call", "copy", "create", "delete", "drop", "execute", "grant", "insert", "merge",
+        "put", "remove", "revoke", "rm", "truncate", "undrop", "update", "use",
     ] {
         if contains_word(without_trailing_semicolon, keyword) {
             return Err(raw_sql_refusal(
@@ -1427,6 +1427,19 @@ mod tests {
             chained,
             Err(refusals) if refusals[0].code == "FSNOW_RAW_SQL_UNSAFE"
         ));
+
+        for forbidden in [
+            "select * from (execute immediate 'delete from x')",
+            "select * from events_daily where id in (rm @stage/x)",
+            "select * from events_daily where id in (undrop table x)",
+        ] {
+            request.sql = forbidden.to_owned();
+            let refused = plan_raw_sql_dry_run(&request);
+            assert!(matches!(
+                refused,
+                Err(refusals) if refusals[0].code == "FSNOW_RAW_SQL_UNSAFE"
+            ));
+        }
     }
 
     #[test]

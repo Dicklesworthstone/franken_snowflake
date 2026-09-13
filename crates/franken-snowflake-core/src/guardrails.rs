@@ -478,6 +478,7 @@ fn is_mutating_keyword(kw: &str) -> bool {
             | "put"
             | "remove"
             | "revoke"
+            | "rm"
             | "truncate"
             | "undrop"
             | "update"
@@ -703,6 +704,7 @@ mod tests {
             "execute immediate 'delete from secrets'",
             "EXECUTE TASK my_task",
             "undrop table dropped_t",
+            "rm @stage/file.csv",
         ] {
             assert_eq!(
                 classify_sql_operation(sql),
