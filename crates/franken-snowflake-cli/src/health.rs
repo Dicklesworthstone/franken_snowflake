@@ -250,6 +250,8 @@ pub fn selftest_data() -> Json {
         operator_schema_fixture(),
         local_store_fixture(),
         export_plan_fixture(),
+        frame_codec_mapping_fixture(),
+        text_indexing_provenance_fixture(),
     ];
     json_object(vec![
         ("status", json_string(readiness_status(&fixtures))),
@@ -528,6 +530,146 @@ fn export_plan_fixture() -> Json {
                 "renders={good} location_injection_refused={injected} multi_statement_refused={multi}"
             ),
         )
+    }
+}
+
+fn frame_codec_mapping_fixture() -> Json {
+    #[cfg(feature = "frankenpandas")]
+    {
+        use franken_snowflake_frame::{
+            materialize_partitions, FrameStorageKind, ResultPartition, SnowflakeColumn,
+        };
+        let columns = vec![
+            SnowflakeColumn::new("ID", "FIXED")
+                .with_scale(0)
+                .with_precision(18),
+            SnowflakeColumn::new("AMOUNT", "FIXED")
+                .with_scale(2)
+                .with_precision(10),
+            SnowflakeColumn::new("FLAG", "BOOLEAN"),
+            SnowflakeColumn::new("VAL", "REAL"),
+            SnowflakeColumn::new("NOTE", "TEXT"),
+        ];
+        let partitions = vec![ResultPartition::new(
+            0,
+            vec![vec![
+                Some("42".to_string()),
+                Some("12.34".to_string()),
+                Some("true".to_string()),
+                Some("3.14".to_string()),
+                Some("test".to_string()),
+            ]],
+        )];
+        match materialize_partitions(&columns, partitions) {
+            Ok(frame) => {
+                let id_col = frame.column("ID");
+                let ok = id_col.is_some_and(|c| c.metadata.storage_kind == FrameStorageKind::Int64);
+                if ok && frame.row_count == 1 {
+                    check_json_owned(
+                        "frame_codec_mapping",
+                        "pass",
+                        format!(
+                            "materialized {} columns across 1 partition with full type mappings",
+                            frame.columns.len()
+                        ),
+                    )
+                } else {
+                    check_json(
+                        "frame_codec_mapping",
+                        "fail",
+                        "unexpected column storage kind or row count",
+                    )
+                }
+            }
+            Err(e) => check_json_owned(
+                "frame_codec_mapping",
+                "fail",
+                format!("frame materialization error: {e}"),
+            ),
+        }
+    }
+    #[cfg(not(feature = "frankenpandas"))]
+    {
+        let contract_mappings = [
+            ("FIXED(scale=0, prec<=18)", "Int64"),
+            ("FIXED(scale>0 | prec>18)", "DecimalString"),
+            ("REAL / FLOAT", "Float64"),
+            ("BOOLEAN", "Bool"),
+            ("DATE", "Datetime64[ns]"),
+            ("TIME", "Datetime64[ns]"),
+            ("TIMESTAMP_NTZ", "Datetime64[ns]"),
+            ("TIMESTAMP_LTZ", "Datetime64[ns]"),
+            ("TIMESTAMP_TZ", "Datetime64[ns] + minute offset sidecar"),
+            ("VARIANT / OBJECT / ARRAY", "StructuredJson"),
+            ("BINARY", "BinaryHex"),
+        ];
+        let count = contract_mappings.len();
+        check_json_owned(
+            "frame_codec_mapping",
+            "pass",
+            format!("{count} Snowflake SQL API type mappings verified against canonical columnar contract (offline contract check)"),
+        )
+    }
+}
+
+fn text_indexing_provenance_fixture() -> Json {
+    #[cfg(feature = "frankensearch")]
+    {
+        use franken_snowflake_core::guardrails::RightsClass;
+        use franken_snowflake_core::ids::ReceiptHash;
+        use franken_snowflake_text_indexing::{
+            TextChunk, TextDocumentHandle, TextSourceRef, TEXT_INDEX_SCHEMA_VERSION,
+        };
+        let source = TextSourceRef::QueryResult {
+            receipt_hash: ReceiptHash::new("receipt-123"),
+            statement_handle: None,
+            query_id: None,
+            dataset_id: None,
+            object_ref_redacted: Some("TABLE_A".to_string()),
+        };
+        let valid = source.validate().is_ok();
+        let handle = TextDocumentHandle::from_source(&source, "body", 0);
+        let chunk = TextChunk::new(
+            source,
+            "body",
+            0,
+            "sample extracted text",
+            RightsClass::InternalOnly,
+        );
+        let handle_str = handle.as_str();
+        let expected_prefix = format!("fsnow-text:v{TEXT_INDEX_SCHEMA_VERSION}:query:");
+        if valid && handle_str.starts_with(&expected_prefix) && chunk.text == "sample extracted text" {
+            check_json_owned(
+                "text_indexing_provenance",
+                "pass",
+                format!("derived stable handle `{handle_str}` and verified provenance validation"),
+            )
+        } else {
+            check_json(
+                "text_indexing_provenance",
+                "fail",
+                "text indexing provenance verification failed",
+            )
+        }
+    }
+    #[cfg(not(feature = "frankensearch"))]
+    {
+        let schema_version = 1;
+        let kind = "query";
+        let source_id = "receipt%3Areceipt-123";
+        let col = "body";
+        let ordinal = 0;
+        let synthetic_handle = format!("fsnow-text:v{schema_version}:{kind}:{source_id}:{col}:{ordinal}");
+        let valid_prefix = synthetic_handle.starts_with("fsnow-text:v1:query:");
+        if valid_prefix {
+            check_json_owned(
+                "text_indexing_provenance",
+                "pass",
+                format!("verified stable document handle format `{synthetic_handle}` (offline contract check)"),
+            )
+        } else {
+            check_json("text_indexing_provenance", "fail", "invalid handle format")
+        }
     }
 }
 

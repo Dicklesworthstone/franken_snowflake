@@ -478,9 +478,9 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "export.run",
-        invocation: "franken-snowflake export run --profile <profile> --sql <select> --format csv|jsonl --out <path> --json",
+        invocation: "franken-snowflake export run --profile <profile> --sql <select> --format csv|jsonl|frame --out <path> --json",
         output_contract_id: "fsnow.export.run.v1",
-        description: "Run a read statement live and write a content-addressed local CSV/JSONL artifact (live feature).",
+        description: "Run a read statement live and write a content-addressed local CSV/JSONL/frame artifact (live feature).",
         read_only: true,
         provider_network: true,
         mutates_local_state: true,
@@ -2437,7 +2437,7 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
                 "format",
                 "string",
                 false,
-                "csv (default) or jsonl (--format)",
+                "csv (default), jsonl, or frame (--format)",
             ),
             input(
                 "out",
@@ -6517,6 +6517,8 @@ mod tests {
             "operator_json_schemas",
             "local_store_round_trip",
             "export_plan_hardening",
+            "frame_codec_mapping",
+            "text_indexing_provenance",
         ] {
             assert!(
                 rendered.contains(&format!("\"name\":\"{fixture}\"")),
