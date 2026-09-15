@@ -1576,14 +1576,8 @@ mod tests {
 
     #[test]
     fn snowflake_type_family_handles_fixed_and_parameterized_types() {
-        assert_eq!(
-            snowflake_type_family("FIXED"),
-            SnowflakeTypeFamily::Number
-        );
-        assert_eq!(
-            snowflake_type_family("fixed"),
-            SnowflakeTypeFamily::Number
-        );
+        assert_eq!(snowflake_type_family("FIXED"), SnowflakeTypeFamily::Number);
+        assert_eq!(snowflake_type_family("fixed"), SnowflakeTypeFamily::Number);
         assert_eq!(
             snowflake_type_family("NUMBER(38,0)"),
             SnowflakeTypeFamily::Number

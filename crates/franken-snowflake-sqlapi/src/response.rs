@@ -225,8 +225,16 @@ mod tests {
 
         let mut result_multi = result_empty;
         result_multi.result_set_meta_data.partition_info = vec![
-            PartitionInfo { row_count: 5, uncompressed_size: Some(100), compressed_size: Some(50) },
-            PartitionInfo { row_count: 5, uncompressed_size: Some(100), compressed_size: Some(50) },
+            PartitionInfo {
+                row_count: 5,
+                uncompressed_size: Some(100),
+                compressed_size: Some(50),
+            },
+            PartitionInfo {
+                row_count: 5,
+                uncompressed_size: Some(100),
+                compressed_size: Some(50),
+            },
         ];
         assert_eq!(result_multi.partition_count(), 2);
     }

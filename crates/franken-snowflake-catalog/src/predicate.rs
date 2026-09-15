@@ -327,7 +327,10 @@ pub fn did_you_mean_operators(input: &str, operators: &[OperatorCatalogEntry]) -
         let op_id = operator.id.to_ascii_lowercase();
         let distance = levenshtein(&needle, &op_id);
         if op_id.starts_with(&needle) {
-            candidates.insert(operator.id.clone(), op_id.len().saturating_sub(needle.len()));
+            candidates.insert(
+                operator.id.clone(),
+                op_id.len().saturating_sub(needle.len()),
+            );
         } else if distance <= 2 {
             candidates.insert(operator.id.clone(), distance);
         }

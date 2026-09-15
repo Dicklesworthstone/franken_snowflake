@@ -205,8 +205,14 @@ fn discovery_commands_run_offline_with_exit_zero() {
     );
     let selftest = h.run(&["selftest", "--json"]).json();
     let fixtures = selftest["data"]["fixtures"].as_array().unwrap();
-    assert!(fixtures.len() >= 7);
+    assert!(fixtures.len() >= 9);
     assert!(fixtures.iter().all(|f| f["status"] == "pass"), "{selftest}");
+    assert!(fixtures.iter().any(|f| f["name"] == "frame_codec_mapping"));
+    assert!(
+        fixtures
+            .iter()
+            .any(|f| f["name"] == "text_indexing_provenance")
+    );
 }
 
 #[test]
@@ -254,6 +260,8 @@ fn capabilities_registry_documents_every_command_with_input_schemas() {
     assert_eq!(flags["live"], cfg!(feature = "live"));
     assert_eq!(flags["mcp"], cfg!(feature = "mcp"));
     assert_eq!(flags["tui"], cfg!(feature = "tui"));
+    assert_eq!(flags["frankenpandas"], cfg!(feature = "frankenpandas"));
+    assert_eq!(flags["frankensearch"], cfg!(feature = "frankensearch"));
 
     // TOON is an alternate encoding of the same envelope.
     let toon = h.run(&["capabilities", "--toon"]);
@@ -492,6 +500,24 @@ fn live_surfaces_refuse_cleanly_without_transport_or_before_any_socket() {
             3,
         ),
         (
+            vec![
+                "export",
+                "run",
+                "--profile",
+                "e2e",
+                "--sql",
+                "select 1",
+                "--format",
+                "frame",
+                "--out",
+                "x.ipc",
+                "--json",
+            ],
+            "export.run",
+            2,
+            3,
+        ),
+        (
             vec!["profile", "doctor", "e2e", "--online", "--json"],
             "profile.doctor",
             1,
@@ -581,6 +607,25 @@ fn export_plan_renders_copy_into_and_hands_off_to_query_write() {
             .unwrap()
             .starts_with("franken-snowflake query write --profile e2e --sql")
     );
+
+    let run_csv = h.run(&[
+        "export",
+        "plan",
+        "--profile",
+        "e2e",
+        "--sql",
+        "select * from events",
+        "--location",
+        "@my_stage/exports/run_002",
+        "--format",
+        "csv",
+        "--json",
+    ]);
+    assert_eq!(run_csv.exit, 0, "{}", run_csv.stderr);
+    let value_csv = assert_envelope(&run_csv, "export.plan");
+    let sql_csv = value_csv["data"]["plan_sql"].as_str().unwrap();
+    assert!(sql_csv.starts_with("COPY INTO @my_stage/exports/run_002 FROM (select * from events)"));
+    assert!(sql_csv.contains("TYPE = CSV"));
 
     let injected = h.run(&[
         "export",

@@ -756,7 +756,9 @@ mod tests {
             SqlOperationClass::Read
         );
         assert_eq!(
-            classify_sql_operation("WITH cte AS (SELECT 'delete' AS action FROM t) SELECT * FROM cte"),
+            classify_sql_operation(
+                "WITH cte AS (SELECT 'delete' AS action FROM t) SELECT * FROM cte"
+            ),
             SqlOperationClass::Read
         );
         assert_eq!(
