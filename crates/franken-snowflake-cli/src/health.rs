@@ -537,7 +537,7 @@ fn frame_codec_mapping_fixture() -> Json {
     #[cfg(feature = "frankenpandas")]
     {
         use franken_snowflake_frame::{
-            materialize_partitions, FrameStorageKind, ResultPartition, SnowflakeColumn,
+            FrameStorageKind, ResultPartition, SnowflakeColumn, materialize_partitions,
         };
         let columns = vec![
             SnowflakeColumn::new("ID", "FIXED")
@@ -607,7 +607,9 @@ fn frame_codec_mapping_fixture() -> Json {
         check_json_owned(
             "frame_codec_mapping",
             "pass",
-            format!("{count} Snowflake SQL API type mappings verified against canonical columnar contract (offline contract check)"),
+            format!(
+                "{count} Snowflake SQL API type mappings verified against canonical columnar contract (offline contract check)"
+            ),
         )
     }
 }
@@ -618,7 +620,7 @@ fn text_indexing_provenance_fixture() -> Json {
         use franken_snowflake_core::guardrails::RightsClass;
         use franken_snowflake_core::ids::ReceiptHash;
         use franken_snowflake_text_indexing::{
-            TextChunk, TextDocumentHandle, TextSourceRef, TEXT_INDEX_SCHEMA_VERSION,
+            TEXT_INDEX_SCHEMA_VERSION, TextChunk, TextDocumentHandle, TextSourceRef,
         };
         let source = TextSourceRef::QueryResult {
             receipt_hash: ReceiptHash::new("receipt-123"),
@@ -634,11 +636,14 @@ fn text_indexing_provenance_fixture() -> Json {
             "body",
             0,
             "sample extracted text",
-            RightsClass::InternalOnly,
+            RightsClass::Internal,
         );
         let handle_str = handle.as_str();
         let expected_prefix = format!("fsnow-text:v{TEXT_INDEX_SCHEMA_VERSION}:query:");
-        if valid && handle_str.starts_with(&expected_prefix) && chunk.text == "sample extracted text" {
+        if valid
+            && handle_str.starts_with(&expected_prefix)
+            && chunk.text == "sample extracted text"
+        {
             check_json_owned(
                 "text_indexing_provenance",
                 "pass",
@@ -659,13 +664,16 @@ fn text_indexing_provenance_fixture() -> Json {
         let source_id = "receipt%3Areceipt-123";
         let col = "body";
         let ordinal = 0;
-        let synthetic_handle = format!("fsnow-text:v{schema_version}:{kind}:{source_id}:{col}:{ordinal}");
+        let synthetic_handle =
+            format!("fsnow-text:v{schema_version}:{kind}:{source_id}:{col}:{ordinal}");
         let valid_prefix = synthetic_handle.starts_with("fsnow-text:v1:query:");
         if valid_prefix {
             check_json_owned(
                 "text_indexing_provenance",
                 "pass",
-                format!("verified stable document handle format `{synthetic_handle}` (offline contract check)"),
+                format!(
+                    "verified stable document handle format `{synthetic_handle}` (offline contract check)"
+                ),
             )
         } else {
             check_json("text_indexing_provenance", "fail", "invalid handle format")

@@ -1215,9 +1215,12 @@ pub fn export_run_outcome(
                         .nullable(column.nullable)
                     })
                     .collect();
-                let frame_partitions =
-                    vec![franken_snowflake_frame::ResultPartition::new(0, rows.rows.clone())];
-                match franken_snowflake_frame::materialize_partitions(&frame_cols, frame_partitions) {
+                let frame_partitions = vec![franken_snowflake_frame::ResultPartition::new(
+                    0,
+                    rows.rows.clone(),
+                )];
+                match franken_snowflake_frame::materialize_partitions(&frame_cols, frame_partitions)
+                {
                     Ok(frame) => match serde_json::to_vec_pretty(&frame) {
                         Ok(bytes) => {
                             let content_address =
@@ -2369,7 +2372,10 @@ fn endpoint_url(account: &str) -> String {
     } else {
         host
     };
-    format!("https://{}.snowflakecomputing.com", host.to_ascii_lowercase())
+    format!(
+        "https://{}.snowflakecomputing.com",
+        host.to_ascii_lowercase()
+    )
 }
 
 fn now_unix_seconds() -> i64 {

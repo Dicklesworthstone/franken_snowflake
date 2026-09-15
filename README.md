@@ -286,7 +286,7 @@ cargo install --path crates/franken-snowflake-cli
 ```
 
 The default build compiles the deterministic agent surface with the `toon`
-output mode on; the `mcp` and `live` features are off. Turn them on by feature:
+output mode on; the `mcp`, `live`, `frankenpandas`, and `frankensearch` features are off. Turn them on by feature:
 
 ```bash
 # Add the MCP server surface.
@@ -295,8 +295,14 @@ cargo build --release -p franken-snowflake-cli --features mcp
 # Add live Snowflake SQL API transport for reads and writes (credential-gated at runtime).
 cargo build --release -p franken-snowflake-cli --features live
 
+# Add FrankenPandas columnar frame materialization for result partitions.
+cargo build --release -p franken-snowflake-cli --features frankenpandas
+
+# Add Frankensearch hash and lexical text indexing.
+cargo build --release -p franken-snowflake-cli --features frankensearch
+
 # Everything.
-cargo build --release -p franken-snowflake-cli --features mcp,live
+cargo build --release -p franken-snowflake-cli --features mcp,live,frankenpandas,frankensearch
 ```
 
 Both binary names install from the same crate: `franken-snowflake` is canonical
@@ -563,7 +569,7 @@ that live transport and credentials are required); it never fakes an execution.
 |---|---|
 | `fsnow receipt show <receipt-hash> --json` | Look up a content-addressed query receipt, its partition evidence, and the audit events that reference it |
 | `fsnow export plan --profile <p> --sql <select>\|--query-id <id> --location @stage/path [--format csv\|jsonl] [--compression gzip] [--header false] [--overwrite] [--single] [--max-file-size <bytes>] --json` | Build a content-addressed `COPY INTO <stage>` plan (Snowflake-side unload) and the exact `query write` command that executes it |
-| `fsnow export run --profile <p> --sql <select> --format csv\|jsonl --out <path> --json` | Run a read live and write a content-addressed local CSV/JSONL artifact (live feature) |
+| `fsnow export run --profile <p> --sql <select> --format csv\|jsonl\|frame --out <path> --json` | Run a read live and write a content-addressed local CSV/JSONL/frame artifact (live feature; frame requires `--features frankenpandas`) |
 
 ```bash
 fsnow export plan --profile demo-prod --sql "select * from events" --location @my_stage/exports/run_001 --format jsonl --json
@@ -736,10 +742,11 @@ statement handle.
    sqlapi (submit · poll · partition stream · cancel · jsonv2 wire codec)
               |
               v
-   catalog (info-schema discovery · manifests · operator catalog · dataset planner · predicate AST)
-   graph (lineage · Mermaid/SVG) · export (COPY INTO plans + local CSV/JSONL writers)
-   cache (local store: append-only JSONL by default; FrankenSQLite backend opt-in)
-   library-only today: frame (fp-columnar/fp-types) · text-indexing (frankensearch hash/lexical) · tui
+    catalog (info-schema discovery · manifests · operator catalog · dataset planner · predicate AST)
+    graph (lineage · Mermaid/SVG) · export (COPY INTO plans + local CSV/JSONL/frame writers)
+    cache (local store: append-only JSONL by default; FrankenSQLite backend opt-in)
+    frame (fp-columnar/fp-types via --features frankenpandas) · text-indexing (frankensearch via --features frankensearch)
+    interactive surface: tui (FrankenTUI via --features tui)
               |
               v
         Snowflake SQL API  (HTTPS)
@@ -803,6 +810,7 @@ fsnow mcp serve --stdio
 | `query write` refuses with `FSNOW-3009` | The statement is DDL and DDL is not opted in | `export FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ALLOW_DDL=true` |
 | `query write` returns a "live transport required" envelope | The binary was built without the `live` feature | Rebuild with `--features live`, then export the profile's credential handles |
 | `mcp serve` reports the feature is unavailable | The binary was built without the `mcp` feature | Rebuild with `--features mcp` |
+| `export run --format frame` reports format unavailable | The binary was built without the `frankenpandas` feature | Rebuild with `--features frankenpandas` |
 
 Exit codes are stable and coarse: `0` success (including empty results), `1`
 findings or warnings, `2` safety refusal, `3` credential or profile error, `4`
