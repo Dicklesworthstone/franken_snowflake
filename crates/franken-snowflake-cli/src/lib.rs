@@ -5094,6 +5094,8 @@ fn feature_flags_json() -> Json {
         ("mcp", Json::Bool(mcp_surface_available())),
         ("tui", Json::Bool(cfg!(feature = "tui"))),
         ("toon", Json::Bool(toon_output_available())),
+        ("frankenpandas", Json::Bool(cfg!(feature = "frankenpandas"))),
+        ("frankensearch", Json::Bool(cfg!(feature = "frankensearch"))),
     ])
 }
 
@@ -5473,6 +5475,8 @@ mod tests {
         expect("tui", cfg!(feature = "tui"));
         expect("mcp", cfg!(feature = "mcp"));
         expect("toon", cfg!(feature = "toon"));
+        expect("frankenpandas", cfg!(feature = "frankenpandas"));
+        expect("frankensearch", cfg!(feature = "frankensearch"));
     }
 
     // Regression for the short-alias surface: capabilities advertises the

@@ -34,13 +34,16 @@ pub fn doctor_data() -> Json {
             "binary",
             "pass",
             format!(
-                "franken-snowflake {} on {}/{}; features: live={} mcp={} toon={}",
+                "franken-snowflake {} on {}/{}; features: live={} mcp={} toon={} tui={} frankenpandas={} frankensearch={}",
                 env!("CARGO_PKG_VERSION"),
                 std::env::consts::OS,
                 std::env::consts::ARCH,
                 crate::live_transport_available(),
                 crate::mcp_surface_available(),
-                crate::toon_output_available()
+                crate::toon_output_available(),
+                cfg!(feature = "tui"),
+                cfg!(feature = "frankenpandas"),
+                cfg!(feature = "frankensearch"),
             ),
         ),
         contract_check(),
@@ -79,6 +82,32 @@ pub fn doctor_data() -> Json {
                 "mcp_surface",
                 "not_checked",
                 "not compiled into this binary; rebuild with --features mcp for mcp serve",
+            )
+        },
+        if cfg!(feature = "frankenpandas") {
+            check_json(
+                "frame_materialization",
+                "pass",
+                "FrankenPandas columnar frame materialization compiled in (--features frankenpandas)",
+            )
+        } else {
+            check_json(
+                "frame_materialization",
+                "not_checked",
+                "not compiled into this binary; rebuild with --features frankenpandas for columnar frame materialization",
+            )
+        },
+        if cfg!(feature = "frankensearch") {
+            check_json(
+                "text_indexing",
+                "pass",
+                "Frankensearch hash+lexical text indexing compiled in (--features frankensearch)",
+            )
+        } else {
+            check_json(
+                "text_indexing",
+                "not_checked",
+                "not compiled into this binary; rebuild with --features frankensearch for text indexing",
             )
         },
     ];

@@ -40,6 +40,17 @@ mcp = ["dep:franken-snowflake-mcp", "franken-snowflake-mcp/mcp"]
 # surfaces, and a non-TTY invocation refuses typed instead of hanging.
 tui = ["dep:franken-snowflake-tui", "franken-snowflake-tui/tui"]
 toon = ["dep:toon"]
+# Opt-in columnar frame materialization (FrankenPandas fp-columnar + fp-types)
+# for result partitions.
+frankenpandas = [
+    "dep:franken-snowflake-frame",
+    "franken-snowflake-frame/frankenpandas",
+]
+# Opt-in text indexing contracts and Frankensearch hash+lexical indexing.
+frankensearch = [
+    "dep:franken-snowflake-text-indexing",
+    "franken-snowflake-text-indexing/frankensearch",
+]
 # Opt-in live SQL API transport for `query run` / `catalog scan` / `profile
 # doctor --online`. Default-off so the agent CLI stays a no-account slice (no
 # transport, no asupersync) until live use is explicitly requested. Runtime-gated
@@ -61,6 +72,8 @@ franken-snowflake-catalog = { path = "../franken-snowflake-catalog", version = "
 franken-snowflake-cache = { path = "../franken-snowflake-cache", version = "0.0.4" }
 franken-snowflake-graph = { path = "../franken-snowflake-graph", version = "0.0.4" }
 franken-snowflake-export = { path = "../franken-snowflake-export", features = ["export"], version = "0.0.4" }
+franken-snowflake-frame = { path = "../franken-snowflake-frame", optional = true, version = "0.0.4" }
+franken-snowflake-text-indexing = { path = "../franken-snowflake-text-indexing", optional = true, version = "0.0.4" }
 franken-snowflake-mcp = { path = "../franken-snowflake-mcp", optional = true, version = "0.0.4" }
 franken-snowflake-tui = { path = "../franken-snowflake-tui", optional = true, version = "0.0.4" }
 franken-snowflake-sqlapi = { path = "../franken-snowflake-sqlapi", optional = true, version = "0.0.4" }
