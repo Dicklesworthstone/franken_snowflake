@@ -643,7 +643,16 @@ mod fastmcp_surface {
                 "Snowflake query id to export via RESULT_SCAN. Mutually exclusive with sql.",
                 false,
             ),
-            ParamSpec::string_enum("format", "Output format.", false, &["csv", "jsonl"]),
+            if plan {
+                ParamSpec::string_enum("format", "Output format.", false, &["csv", "jsonl"])
+            } else {
+                ParamSpec::string_enum(
+                    "format",
+                    "Output format (csv, jsonl, or frame).",
+                    false,
+                    &["csv", "jsonl", "frame"],
+                )
+            },
         ];
         if plan {
             params.extend([
@@ -1183,6 +1192,28 @@ mod fastmcp_surface {
                 .map(str::to_string)
                 .collect::<Vec<_>>()
             );
+            let run_frame = ReadVerb::ExportRun
+                .cli_args(&json!({"profile": "demo", "sql": "select 1", "format": "frame", "out": "events.json"}))
+                .expect("export run frame args");
+            assert_eq!(
+                run_frame,
+                vec![
+                    "export",
+                    "run",
+                    "--profile",
+                    "demo",
+                    "--sql",
+                    "select 1",
+                    "--format",
+                    "frame",
+                    "--out",
+                    "events.json",
+                    "--json",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+            );
             let missing_location = ReadVerb::ExportPlan
                 .cli_args(&json!({"profile": "demo", "sql": "select 1"}))
                 .expect_err("export plan needs a stage location");
@@ -1233,10 +1264,20 @@ mod fastmcp_surface {
                 .expect("catalog scan args");
             assert_eq!(
                 cat_scan,
-                vec!["catalog", "scan", "demo", "--database", "DB", "--schema", "SCH", "--require-live", "--json"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
+                vec![
+                    "catalog",
+                    "scan",
+                    "demo",
+                    "--database",
+                    "DB",
+                    "--schema",
+                    "SCH",
+                    "--require-live",
+                    "--json"
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
             );
 
             let query_live = ReadVerb::QueryRun
