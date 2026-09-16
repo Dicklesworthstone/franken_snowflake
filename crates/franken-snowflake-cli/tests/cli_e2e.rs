@@ -575,6 +575,21 @@ fn store_backed_lookups_are_typed_misses_on_a_fresh_store() {
         assert_eq!(graph.exit, 7, "{}", graph.stdout);
         assert!(graph.stdout.contains("catalog scan e2e --database DB"));
     }
+    let graph_mermaid = h.run(&["catalog", "graph", "e2e", "--database", "DB", "--mermaid"]);
+    if cfg!(feature = "live") {
+        assert_eq!(
+            graph_mermaid.exit, 3,
+            "live build falls through to a scan: {}",
+            graph_mermaid.stdout
+        );
+    } else {
+        assert_eq!(graph_mermaid.exit, 7, "{}", graph_mermaid.stdout);
+        assert!(
+            graph_mermaid
+                .stdout
+                .contains("catalog scan e2e --database DB")
+        );
+    }
 }
 
 #[test]
@@ -655,6 +670,24 @@ fn unknown_commands_and_flags_are_usage_errors_with_suggestions() {
     let flag = h.run(&["capabilities", "--jsno"]);
     assert_eq!(flag.exit, 64);
     assert_eq!(flag.json()["error"]["code"], "FSNOW-1002");
+
+    let graph_conflict = h.run(&[
+        "catalog",
+        "graph",
+        "e2e",
+        "--database",
+        "DB",
+        "--json",
+        "--mermaid",
+    ]);
+    assert_eq!(graph_conflict.exit, 64);
+    assert_eq!(graph_conflict.json()["error"]["code"], "FSNOW-1002");
+    assert!(
+        graph_conflict.json()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Conflicting catalog graph output formats")
+    );
 
     // Without the feature `tui` is a typed feature refusal; with it, a profile
     // that was never scanned is a typed metadata error that names the scan.
