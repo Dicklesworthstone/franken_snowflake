@@ -31,8 +31,13 @@ python3 scripts/check-golden-lf.py
 cargo test --workspace --locked
 cargo test --locked -p franken-snowflake-cli --features live,mcp
 cargo test --locked -p franken-snowflake-cli --features tui
+cargo test --locked -p franken-snowflake-cli --features frankenpandas
+cargo test --locked -p franken-snowflake-cli --features frankensearch
 cargo test --locked -p franken-snowflake-cache --features frankensqlite
+cargo test --locked -p franken-snowflake-export --features export
 cargo test --locked -p franken-snowflake-frame --features frankenpandas
+cargo test --locked -p franken-snowflake-graph --features graph
+cargo test --locked -p franken-snowflake-http --features compression
 cargo test --locked -p franken-snowflake-tui --features tui
 cargo test --locked -p franken-snowflake-text-indexing --features frankensearch
 cargo clippy --workspace --all-targets --locked -- -D warnings
