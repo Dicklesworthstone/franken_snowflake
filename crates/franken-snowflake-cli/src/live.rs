@@ -2358,24 +2358,29 @@ fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a st
 
 fn endpoint_url(account: &str) -> String {
     let mut s = account.trim().trim_end_matches('/');
+    let has_scheme = strip_prefix_ignore_ascii_case(s, "https://").is_some()
+        || strip_prefix_ignore_ascii_case(s, "http://").is_some();
     if let Some(rest) = strip_prefix_ignore_ascii_case(s, "https://") {
         s = rest;
     } else if let Some(rest) = strip_prefix_ignore_ascii_case(s, "http://") {
         s = rest;
     }
-    let host = s.split('/').next().unwrap_or(s);
-    let host = host.split(':').next().unwrap_or(host);
-    let host = if let Some(idx) = host.to_ascii_lowercase().rfind(".snowflakecomputing.com")
-        && idx + ".snowflakecomputing.com".len() == host.len()
-    {
-        &host[..idx]
+    let host_with_port = s.split('/').next().unwrap_or(s);
+    let host_only = host_with_port.split(':').next().unwrap_or(host_with_port);
+
+    let is_ip_or_loopback = host_only.parse::<std::net::IpAddr>().is_ok()
+        || host_only.eq_ignore_ascii_case("localhost")
+        || host_with_port.contains(':');
+
+    let lower = host_only.to_ascii_lowercase();
+    if lower.ends_with(".snowflakecomputing.com") {
+        let account_part = &lower[..lower.len() - ".snowflakecomputing.com".len()];
+        format!("https://{account_part}.snowflakecomputing.com")
+    } else if has_scheme || is_ip_or_loopback {
+        format!("https://{host_with_port}")
     } else {
-        host
-    };
-    format!(
-        "https://{}.snowflakecomputing.com",
-        host.to_ascii_lowercase()
-    )
+        format!("https://{lower}.snowflakecomputing.com")
+    }
 }
 
 fn now_unix_seconds() -> i64 {

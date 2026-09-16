@@ -516,7 +516,11 @@ fn live_surfaces_refuse_cleanly_without_transport_or_before_any_socket() {
             ],
             "export.run",
             2,
-            3,
+            if cfg!(feature = "frankenpandas") {
+                3
+            } else {
+                64
+            },
         ),
         (
             vec![
@@ -556,6 +560,9 @@ fn live_surfaces_refuse_cleanly_without_transport_or_before_any_socket() {
             // The loopback account is rejected as a non-canonical Snowflake host
             // before any network I/O; nothing was submitted.
             assert_eq!(value["error"]["code"], "FSNOW-2002", "{}", run.stdout);
+        }
+        if live && expected == 64 {
+            assert_eq!(value["error"]["code"], "FSNOW-1002", "{}", run.stdout);
         }
         assert_ne!(
             value["data_source"], "live",

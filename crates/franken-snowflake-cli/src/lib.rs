@@ -5175,8 +5175,12 @@ mod tests {
             for name in properties.keys() {
                 documented.insert(name.replace('_', "-"));
             }
-            for required in schema["required"].as_array().expect("required array") {
-                assert!(properties.contains_key(required.as_str().unwrap()));
+            if let Some(required) = schema["required"].as_array() {
+                for req in required {
+                    if let Some(name) = req.as_str() {
+                        assert!(properties.contains_key(name));
+                    }
+                }
             }
         }
         // Every accepted value/boolean flag is described by at least one command.

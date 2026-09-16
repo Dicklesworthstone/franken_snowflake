@@ -343,14 +343,15 @@ mod tests {
 
     #[cfg(feature = "live")]
     #[test]
-    fn record_execution_writes_receipt_partitions_and_audit_event() {
+    fn record_execution_writes_receipt_partitions_and_audit_event()
+    -> Result<(), Box<dyn std::error::Error>> {
         let dir = std::env::temp_dir().join(format!(
             "fsnow-receipt-test-{}-{}",
             std::process::id(),
             now_unix_ms()
         ));
         let store = Store {
-            cache: FileCache::open(&dir).expect("open temp store"),
+            cache: FileCache::open(&dir)?,
             dir: dir.clone(),
         };
         let partitions = [
@@ -377,33 +378,33 @@ mod tests {
             event_kind: "statement_executed",
             extra: serde_json::json!({"note": "unit"}),
         };
-        let hash = record_execution(&store, &facts).expect("receipt recorded");
+        let hash =
+            record_execution(&store, &facts).map_err(|e| format!("receipt recorded: {e}"))?;
         assert_eq!(hash.len(), 64, "blake3 hex digest");
 
         let receipt = store
             .cache
-            .query_receipt(&hash)
-            .expect("lookup")
-            .expect("receipt stored under its content hash");
+            .query_receipt(&hash)?
+            .ok_or("receipt stored under its content hash")?;
         assert_eq!(receipt.statement_handle.as_deref(), Some("01aa-handle"));
         assert_eq!(receipt.row_count, Some(5));
         assert_eq!(receipt.receipt.address.digest_hex, hash);
-        let body: serde_json::Value =
-            serde_json::from_str(&receipt.receipt.canonical).expect("canonical json");
+        let body: serde_json::Value = serde_json::from_str(&receipt.receipt.canonical)?;
         assert_eq!(body["budget_consumed"]["polls"], 2);
         assert_eq!(body["session"]["warehouse"], "WH");
-        assert_eq!(store.cache.partitions_for_receipt(&hash).unwrap().len(), 2);
-        let events = store.cache.audit_events().unwrap();
+        assert_eq!(store.cache.partitions_for_receipt(&hash)?.len(), 2);
+        let events = store.cache.audit_events()?;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].receipt_id.as_deref(), Some(hash.as_str()));
         assert_eq!(events[0].event_kind, "statement_executed");
         // The plan record links back through the same plan id.
-        assert!(store.cache.query_plan(&receipt.plan_id).unwrap().is_some());
+        assert!(store.cache.query_plan(&receipt.plan_id)?.is_some());
         // Re-recording identical facts yields a different receipt only through
         // created_at_ms; the ledger keeps both (append-only).
-        let again = record_execution(&store, &facts).expect("second receipt");
-        assert!(store.cache.query_receipt(&again).unwrap().is_some());
+        let again = record_execution(&store, &facts).map_err(|e| format!("second receipt: {e}"))?;
+        assert!(store.cache.query_receipt(&again)?.is_some());
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[test]
