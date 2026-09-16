@@ -770,7 +770,10 @@ fn endpoint_url(account: &str) -> String {
     } else {
         host
     };
-    format!("https://{}.snowflakecomputing.com", host.to_ascii_lowercase())
+    format!(
+        "https://{}.snowflakecomputing.com",
+        host.to_ascii_lowercase()
+    )
 }
 
 fn artifacts_root() -> PathBuf {

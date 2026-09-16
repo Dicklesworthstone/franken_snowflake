@@ -2327,7 +2327,10 @@ mod tests {
         assert_eq!(parsed.base_url(), "https://xy123.snowflakecomputing.com");
         let parsed_upper = SnowflakeEndpoint::parse("HTTPS://XY123.SNOWFLAKECOMPUTING.COM/")
             .expect("valid uppercase endpoint");
-        assert_eq!(parsed_upper.base_url(), "https://xy123.snowflakecomputing.com");
+        assert_eq!(
+            parsed_upper.base_url(),
+            "https://xy123.snowflakecomputing.com"
+        );
         assert_eq!(parsed_upper.host(), "xy123.snowflakecomputing.com");
     }
 

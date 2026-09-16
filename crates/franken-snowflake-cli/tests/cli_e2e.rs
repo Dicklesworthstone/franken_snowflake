@@ -205,8 +205,14 @@ fn discovery_commands_run_offline_with_exit_zero() {
     );
     let selftest = h.run(&["selftest", "--json"]).json();
     let fixtures = selftest["data"]["fixtures"].as_array().unwrap();
-    assert!(fixtures.len() >= 7);
+    assert!(fixtures.len() >= 9);
     assert!(fixtures.iter().all(|f| f["status"] == "pass"), "{selftest}");
+    assert!(fixtures.iter().any(|f| f["name"] == "frame_codec_mapping"));
+    assert!(
+        fixtures
+            .iter()
+            .any(|f| f["name"] == "text_indexing_provenance")
+    );
 }
 
 #[test]
@@ -254,6 +260,8 @@ fn capabilities_registry_documents_every_command_with_input_schemas() {
     assert_eq!(flags["live"], cfg!(feature = "live"));
     assert_eq!(flags["mcp"], cfg!(feature = "mcp"));
     assert_eq!(flags["tui"], cfg!(feature = "tui"));
+    assert_eq!(flags["frankenpandas"], cfg!(feature = "frankenpandas"));
+    assert_eq!(flags["frankensearch"], cfg!(feature = "frankensearch"));
 
     // TOON is an alternate encoding of the same envelope.
     let toon = h.run(&["capabilities", "--toon"]);
@@ -492,6 +500,42 @@ fn live_surfaces_refuse_cleanly_without_transport_or_before_any_socket() {
             3,
         ),
         (
+            vec![
+                "export",
+                "run",
+                "--profile",
+                "e2e",
+                "--sql",
+                "select 1",
+                "--format",
+                "frame",
+                "--out",
+                "x.ipc",
+                "--json",
+            ],
+            "export.run",
+            2,
+            3,
+        ),
+        (
+            vec![
+                "export",
+                "run",
+                "--profile",
+                "e2e",
+                "--sql",
+                "select 1",
+                "--format",
+                "jsonl",
+                "--out",
+                "x.jsonl",
+                "--json",
+            ],
+            "export.run",
+            2,
+            3,
+        ),
+        (
             vec!["profile", "doctor", "e2e", "--online", "--json"],
             "profile.doctor",
             1,
@@ -549,6 +593,21 @@ fn store_backed_lookups_are_typed_misses_on_a_fresh_store() {
         assert_eq!(graph.exit, 7, "{}", graph.stdout);
         assert!(graph.stdout.contains("catalog scan e2e --database DB"));
     }
+    let graph_mermaid = h.run(&["catalog", "graph", "e2e", "--database", "DB", "--mermaid"]);
+    if cfg!(feature = "live") {
+        assert_eq!(
+            graph_mermaid.exit, 3,
+            "live build falls through to a scan: {}",
+            graph_mermaid.stdout
+        );
+    } else {
+        assert_eq!(graph_mermaid.exit, 7, "{}", graph_mermaid.stdout);
+        assert!(
+            graph_mermaid
+                .stdout
+                .contains("catalog scan e2e --database DB")
+        );
+    }
 }
 
 #[test]
@@ -582,6 +641,25 @@ fn export_plan_renders_copy_into_and_hands_off_to_query_write() {
             .starts_with("franken-snowflake query write --profile e2e --sql")
     );
 
+    let run_csv = h.run(&[
+        "export",
+        "plan",
+        "--profile",
+        "e2e",
+        "--sql",
+        "select * from events",
+        "--location",
+        "@my_stage/exports/run_002",
+        "--format",
+        "csv",
+        "--json",
+    ]);
+    assert_eq!(run_csv.exit, 0, "{}", run_csv.stderr);
+    let value_csv = assert_envelope(&run_csv, "export.plan");
+    let sql_csv = value_csv["data"]["plan_sql"].as_str().unwrap();
+    assert!(sql_csv.starts_with("COPY INTO @my_stage/exports/run_002 FROM (select * from events)"));
+    assert!(sql_csv.contains("TYPE = CSV"));
+
     let injected = h.run(&[
         "export",
         "plan",
@@ -611,6 +689,24 @@ fn unknown_commands_and_flags_are_usage_errors_with_suggestions() {
     assert_eq!(flag.exit, 64);
     assert_eq!(flag.json()["error"]["code"], "FSNOW-1002");
 
+    let graph_conflict = h.run(&[
+        "catalog",
+        "graph",
+        "e2e",
+        "--database",
+        "DB",
+        "--json",
+        "--mermaid",
+    ]);
+    assert_eq!(graph_conflict.exit, 64);
+    assert_eq!(graph_conflict.json()["error"]["code"], "FSNOW-1002");
+    assert!(
+        graph_conflict.json()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Conflicting catalog graph output formats")
+    );
+
     // Without the feature `tui` is a typed feature refusal; with it, a profile
     // that was never scanned is a typed metadata error that names the scan.
     // Either way the child exits instead of waiting for keys.
@@ -631,6 +727,38 @@ fn unknown_commands_and_flags_are_usage_errors_with_suggestions() {
         assert_eq!(tui.exit, 64);
         assert_eq!(tui.json()["error"]["code"], "FSNOW-1002");
     }
+
+    let mcp_no_sub = h.run(&["mcp"]);
+    assert_eq!(mcp_no_sub.exit, 64);
+    assert_eq!(mcp_no_sub.json()["command_id"], "mcp.serve");
+    assert!(
+        mcp_no_sub.json()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Expected `franken-snowflake mcp serve")
+    );
+
+    let mcp_typo = h.run(&["mcp", "servve"]);
+    assert_eq!(mcp_typo.exit, 64);
+    assert_eq!(mcp_typo.json()["did_you_mean"][0], "serve");
+
+    let mcp_conflict = h.run(&["mcp", "serve", "--stdio", "--http", "127.0.0.1:3000"]);
+    assert_eq!(mcp_conflict.exit, 64);
+    assert!(
+        mcp_conflict.json()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Conflicting MCP serve modes")
+    );
+
+    let mcp_missing_addr = h.run(&["mcp", "serve", "--http"]);
+    assert_eq!(mcp_missing_addr.exit, 64);
+    assert!(
+        mcp_missing_addr.json()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Missing address for `mcp serve --http`")
+    );
 
     if !cfg!(feature = "mcp") {
         let mcp = h.run(&["mcp", "serve", "--stdio"]);

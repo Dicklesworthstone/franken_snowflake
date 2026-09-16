@@ -462,6 +462,8 @@ pub enum ExportKind {
     LocalCsv,
     /// Local JSONL writer.
     LocalJsonl,
+    /// Local columnar frame artifact.
+    LocalFrame,
 }
 
 /// Content-addressed export record.
@@ -1515,6 +1517,7 @@ fn export_kind_to_str(value: &ExportKind) -> &'static str {
         ExportKind::CopyInto => "copy_into",
         ExportKind::LocalCsv => "local_csv",
         ExportKind::LocalJsonl => "local_jsonl",
+        ExportKind::LocalFrame => "local_frame",
     }
 }
 
@@ -1524,6 +1527,7 @@ fn export_kind_from_str(value: &str) -> CacheResult<ExportKind> {
         "copy_into" => Ok(ExportKind::CopyInto),
         "local_csv" => Ok(ExportKind::LocalCsv),
         "local_jsonl" => Ok(ExportKind::LocalJsonl),
+        "local_frame" => Ok(ExportKind::LocalFrame),
         _ => Err(CacheError::InvalidRow {
             field: "export_kind",
             message: format!("unknown export kind {value}"),

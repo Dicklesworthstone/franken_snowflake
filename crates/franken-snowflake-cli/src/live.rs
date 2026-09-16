@@ -1166,12 +1166,19 @@ pub fn export_run_outcome(
     {
         None | Some("csv") => "csv",
         Some("jsonl") | Some("json") => "jsonl",
+        Some("frame") => "frame",
         Some(other) => {
             return fail(&usage(&format!(
-                "Unknown --format `{other}`; use csv or jsonl."
+                "Unknown --format `{other}`; use csv, jsonl, or frame."
             )));
         }
     };
+    if export_format == "frame" && !cfg!(feature = "frankenpandas") {
+        return fail(&SnowflakeError::new(
+            SnowflakeErrorCode::UsageError,
+            "format `frame` requires rebuild with --features frankenpandas",
+        ));
+    }
     let conn = match LiveConn::resolve(&profile, &SessionOverrides::default()) {
         Ok(conn) => conn,
         Err(error) => return fail(&error),
@@ -1194,6 +1201,62 @@ pub fn export_run_outcome(
     let target_label = redact(&out_path).into_owned();
     let artifact = match export_format {
         "csv" => export_csv(&input, target_label.clone(), created_at_ms),
+        "frame" => {
+            #[cfg(feature = "frankenpandas")]
+            {
+                let frame_cols: Vec<franken_snowflake_frame::SnowflakeColumn> = rows
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        franken_snowflake_frame::SnowflakeColumn::new(
+                            column.name.clone(),
+                            column.type_name.clone(),
+                        )
+                        .nullable(column.nullable)
+                    })
+                    .collect();
+                let frame_partitions = vec![franken_snowflake_frame::ResultPartition::new(
+                    0,
+                    rows.rows.clone(),
+                )];
+                match franken_snowflake_frame::materialize_partitions(&frame_cols, frame_partitions)
+                {
+                    Ok(frame) => match serde_json::to_vec_pretty(&frame) {
+                        Ok(bytes) => {
+                            let content_address =
+                                franken_snowflake_export::ContentAddress::blake3(&bytes);
+                            let receipt = franken_snowflake_export::ExportReceipt::new(
+                                franken_snowflake_export::ExportReceiptKind::LocalJsonl,
+                                Some(franken_snowflake_export::ExportFormat::Jsonl),
+                                target_label.clone(),
+                                content_address,
+                                Some(frame.row_count as u64),
+                                None,
+                                None,
+                                created_at_ms,
+                                vec!["format:frame".to_string()],
+                            );
+                            let log_line = serde_json::to_string(&receipt).unwrap_or_default();
+                            Ok(franken_snowflake_export::LocalExportArtifact {
+                                bytes,
+                                receipt,
+                                log_line,
+                            })
+                        }
+                        Err(err) => Err(franken_snowflake_export::ExportError::Json {
+                            message: err.to_string(),
+                        }),
+                    },
+                    Err(err) => Err(franken_snowflake_export::ExportError::Json {
+                        message: err.to_string(),
+                    }),
+                }
+            }
+            #[cfg(not(feature = "frankenpandas"))]
+            {
+                unreachable!("guarded above");
+            }
+        }
         _ => export_jsonl(&input, target_label.clone(), created_at_ms),
     };
     let artifact = match artifact {
@@ -1231,6 +1294,8 @@ pub fn export_run_outcome(
             receipt_id: receipt_id.clone(),
             export_kind: if export_format == "csv" {
                 ExportKind::LocalCsv
+            } else if export_format == "frame" {
+                ExportKind::LocalFrame
             } else {
                 ExportKind::LocalJsonl
             },
@@ -2307,7 +2372,10 @@ fn endpoint_url(account: &str) -> String {
     } else {
         host
     };
-    format!("https://{}.snowflakecomputing.com", host.to_ascii_lowercase())
+    format!(
+        "https://{}.snowflakecomputing.com",
+        host.to_ascii_lowercase()
+    )
 }
 
 fn now_unix_seconds() -> i64 {

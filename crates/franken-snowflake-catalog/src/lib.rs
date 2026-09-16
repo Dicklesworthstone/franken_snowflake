@@ -41,7 +41,7 @@ pub mod prelude {
         plan_raw_sql_dry_run, plan_refusal_log_line, plan_success_log_line,
     };
     pub use crate::predicate::{
-        LeafPredicate, PredicateAst, PredicateRefusal, PredicateRefusalCode, did_you_mean_operators,
-        validate_predicate,
+        LeafPredicate, PredicateAst, PredicateRefusal, PredicateRefusalCode,
+        did_you_mean_operators, validate_predicate,
     };
 }
