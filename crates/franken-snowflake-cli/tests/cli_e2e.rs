@@ -518,6 +518,24 @@ fn live_surfaces_refuse_cleanly_without_transport_or_before_any_socket() {
             3,
         ),
         (
+            vec![
+                "export",
+                "run",
+                "--profile",
+                "e2e",
+                "--sql",
+                "select 1",
+                "--format",
+                "jsonl",
+                "--out",
+                "x.jsonl",
+                "--json",
+            ],
+            "export.run",
+            2,
+            3,
+        ),
+        (
             vec!["profile", "doctor", "e2e", "--online", "--json"],
             "profile.doctor",
             1,
@@ -709,6 +727,38 @@ fn unknown_commands_and_flags_are_usage_errors_with_suggestions() {
         assert_eq!(tui.exit, 64);
         assert_eq!(tui.json()["error"]["code"], "FSNOW-1002");
     }
+
+    let mcp_no_sub = h.run(&["mcp"]);
+    assert_eq!(mcp_no_sub.exit, 64);
+    assert_eq!(mcp_no_sub.json()["command_id"], "mcp.serve");
+    assert!(
+        mcp_no_sub.json()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Expected `franken-snowflake mcp serve")
+    );
+
+    let mcp_typo = h.run(&["mcp", "servve"]);
+    assert_eq!(mcp_typo.exit, 64);
+    assert_eq!(mcp_typo.json()["did_you_mean"][0], "serve");
+
+    let mcp_conflict = h.run(&["mcp", "serve", "--stdio", "--http", "127.0.0.1:3000"]);
+    assert_eq!(mcp_conflict.exit, 64);
+    assert!(
+        mcp_conflict.json()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Conflicting MCP serve modes")
+    );
+
+    let mcp_missing_addr = h.run(&["mcp", "serve", "--http"]);
+    assert_eq!(mcp_missing_addr.exit, 64);
+    assert!(
+        mcp_missing_addr.json()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Missing address for `mcp serve --http`")
+    );
 
     if !cfg!(feature = "mcp") {
         let mcp = h.run(&["mcp", "serve", "--stdio"]);

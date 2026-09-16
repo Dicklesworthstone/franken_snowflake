@@ -490,7 +490,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         id: "tui",
         invocation: "franken-snowflake tui --profile <profile>",
         output_contract_id: "fsnow.tui.launch.v1",
-        description: "Interactive TUI; not compiled into this binary yet (tracked as an open bead).",
+        description: "Interactive catalog browser and query planner TUI (feature-gated behind --features tui).",
         read_only: true,
         provider_network: false,
         mutates_local_state: false,
