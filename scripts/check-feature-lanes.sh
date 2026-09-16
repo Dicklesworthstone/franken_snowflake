@@ -21,6 +21,8 @@ LANES=(
   "-p franken-snowflake-cli|mcp"
   "-p franken-snowflake-cli|tui"
   "-p franken-snowflake-cli|toon"
+  "-p franken-snowflake-cli|frankenpandas"
+  "-p franken-snowflake-cli|frankensearch"
   "-p franken-snowflake-mcp|mcp"
   "-p franken-snowflake-tui|tui"
   "-p franken-snowflake-frame|frankenpandas"
