@@ -364,10 +364,9 @@ mod tests {
         let op_refusal = refusals
             .iter()
             .find(|r| r.code == PredicateRefusalCode::OperatorUnknown);
-        assert!(op_refusal.is_some());
         assert_eq!(
-            op_refusal.unwrap().did_you_mean,
-            vec!["between".to_string()]
+            op_refusal.map(|r| r.did_you_mean.as_slice()),
+            Some(&["between".to_string()][..])
         );
     }
 }
