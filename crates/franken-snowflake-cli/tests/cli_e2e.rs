@@ -20,6 +20,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const BIN: &str = env!("CARGO_BIN_EXE_franken-snowflake");
+const FSNOW_BIN: &str = env!("CARGO_BIN_EXE_fsnow");
 
 /// Planted secret values. Every one must be absent from all output.
 const CANARY_PAT: &str = "sfpat_e2eCanaryPatValue0123456789";
@@ -764,4 +765,16 @@ fn unknown_commands_and_flags_are_usage_errors_with_suggestions() {
         let mcp = h.run(&["mcp", "serve", "--stdio"]);
         assert_eq!(mcp.exit, 64);
     }
+}
+
+#[test]
+fn fsnow_alias_binary_runs_and_shares_contract() {
+    let output = Command::new(FSNOW_BIN)
+        .args(["capabilities", "--json"])
+        .output()
+        .expect("run fsnow");
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    assert_eq!(value["command_id"], "capabilities");
+    assert_eq!(value["ok"], true);
 }
