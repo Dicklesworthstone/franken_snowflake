@@ -45,3 +45,35 @@ pub fn query_budget(
 pub fn partition_child_budget(parent: Budget, child: Budget) -> Budget {
     parent.meet(child)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_budget_construction() {
+        let budget = query_budget(None, 50, Some(10_000), 128);
+        assert_eq!(budget.poll_quota, 50);
+        assert_eq!(budget.priority, 128);
+        assert_eq!(budget.cost_quota, Some(10_000));
+        assert!(budget.deadline.is_none());
+
+        let now = Time::from_nanos(1_000_000_000);
+        let timed_budget = query_budget(Some(now), 10, None, 200);
+        assert_eq!(timed_budget.poll_quota, 10);
+        assert_eq!(timed_budget.priority, 200);
+        assert_eq!(timed_budget.deadline, Some(now));
+        assert!(timed_budget.cost_quota.is_none());
+    }
+
+    #[test]
+    fn partition_child_budget_monotone_narrowing() {
+        let parent = query_budget(None, 100, Some(50_000), 100);
+        let tighter_child = query_budget(None, 20, Some(10_000), 150);
+
+        let effective = partition_child_budget(parent, tighter_child);
+        // meet() selects the minimum quota
+        assert_eq!(effective.poll_quota, 20);
+        assert_eq!(effective.cost_quota, Some(10_000));
+    }
+}

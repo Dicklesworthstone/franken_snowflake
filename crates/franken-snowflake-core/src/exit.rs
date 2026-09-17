@@ -49,3 +49,41 @@ impl From<ExitCode> for i32 {
         value.code()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_codes_have_stable_numeric_values() {
+        assert_eq!(ExitCode::Success.code(), 0);
+        assert_eq!(ExitCode::Findings.code(), 1);
+        assert_eq!(ExitCode::SafetyRefusal.code(), 2);
+        assert_eq!(ExitCode::CredentialError.code(), 3);
+        assert_eq!(ExitCode::UpstreamError.code(), 4);
+        assert_eq!(ExitCode::NetworkBudgetExhausted.code(), 5);
+        assert_eq!(ExitCode::QueryStillRunning.code(), 6);
+        assert_eq!(ExitCode::LocalCacheError.code(), 7);
+        assert_eq!(ExitCode::Usage.code(), 64);
+        assert_eq!(ExitCode::Io.code(), 74);
+    }
+
+    #[test]
+    fn exit_code_success_predicate_and_into_i32() {
+        assert!(ExitCode::Success.is_success());
+        assert!(!ExitCode::Findings.is_success());
+        assert!(!ExitCode::SafetyRefusal.is_success());
+        assert!(!ExitCode::CredentialError.is_success());
+        assert!(!ExitCode::UpstreamError.is_success());
+        assert!(!ExitCode::NetworkBudgetExhausted.is_success());
+        assert!(!ExitCode::QueryStillRunning.is_success());
+        assert!(!ExitCode::LocalCacheError.is_success());
+        assert!(!ExitCode::Usage.is_success());
+        assert!(!ExitCode::Io.is_success());
+
+        let code_i32: i32 = ExitCode::Usage.into();
+        assert_eq!(code_i32, 64);
+        let success_i32: i32 = ExitCode::Success.into();
+        assert_eq!(success_i32, 0);
+    }
+}

@@ -121,4 +121,100 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn cancel_outcome_kind_maps_timeouts_and_cancellations() {
+        assert_eq!(
+            cancel_outcome_kind(CancelKind::Deadline),
+            OutcomeKind::Timeout
+        );
+        assert_eq!(
+            cancel_outcome_kind(CancelKind::Timeout),
+            OutcomeKind::Timeout
+        );
+
+        for other_kind in [
+            CancelKind::CostBudget,
+            CancelKind::PollQuota,
+            CancelKind::User,
+            CancelKind::Shutdown,
+            CancelKind::ResourceUnavailable,
+            CancelKind::FailFast,
+            CancelKind::RaceLost,
+            CancelKind::ParentCancelled,
+            CancelKind::LinkedExit,
+        ] {
+            assert_eq!(
+                cancel_outcome_kind(other_kind),
+                OutcomeKind::Cancelled,
+                "{other_kind:?} must map to OutcomeKind::Cancelled"
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_exit_codes_distinguish_cost_safety_and_user_requests() {
+        // Cost budget breach is a distinct safety boundary (SafetyRefusal = 2)
+        assert_eq!(
+            cancel_exit_code(CancelKind::CostBudget),
+            ExitCode::SafetyRefusal
+        );
+
+        // User-initiated cancel is success (0)
+        assert_eq!(cancel_exit_code(CancelKind::User), ExitCode::Success);
+
+        // Network/budget/timeout exhaustions map to NetworkBudgetExhausted (5)
+        assert_eq!(
+            cancel_exit_code(CancelKind::Deadline),
+            ExitCode::NetworkBudgetExhausted
+        );
+        assert_eq!(
+            cancel_exit_code(CancelKind::Timeout),
+            ExitCode::NetworkBudgetExhausted
+        );
+        assert_eq!(
+            cancel_exit_code(CancelKind::PollQuota),
+            ExitCode::NetworkBudgetExhausted
+        );
+        assert_eq!(
+            cancel_exit_code(CancelKind::Shutdown),
+            ExitCode::NetworkBudgetExhausted
+        );
+        assert_eq!(
+            cancel_exit_code(CancelKind::FailFast),
+            ExitCode::NetworkBudgetExhausted
+        );
+    }
+
+    #[test]
+    fn cancel_policy_mappings() {
+        assert_eq!(
+            cancel_policy(CancelKind::User),
+            CancelPolicy::RemoteCancelAndReceipt
+        );
+        assert_eq!(
+            cancel_policy(CancelKind::Deadline),
+            CancelPolicy::RetryOrDegrade
+        );
+        assert_eq!(
+            cancel_policy(CancelKind::CostBudget),
+            CancelPolicy::RetryOrDegrade
+        );
+        assert_eq!(
+            cancel_policy(CancelKind::Shutdown),
+            CancelPolicy::BoundedDrain
+        );
+        assert_eq!(
+            cancel_policy(CancelKind::ResourceUnavailable),
+            CancelPolicy::BoundedDrain
+        );
+        assert_eq!(
+            cancel_policy(CancelKind::RaceLost),
+            CancelPolicy::QuietDrain
+        );
+        assert_eq!(
+            cancel_policy(CancelKind::ParentCancelled),
+            CancelPolicy::QuietDrain
+        );
+    }
 }

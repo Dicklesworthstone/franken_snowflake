@@ -133,3 +133,43 @@ id_newtype! {
     /// the receipt crate).
     ReceiptHash
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn id_newtype_accessors_and_conversions() {
+        let stmt = StatementHandle::new("stmt-12345");
+        assert_eq!(stmt.as_str(), "stmt-12345");
+        assert_eq!(stmt.as_ref(), "stmt-12345");
+        assert_eq!(format!("{stmt}"), "stmt-12345");
+        assert!(!stmt.is_empty());
+
+        let empty = StatementHandle::new("");
+        assert!(empty.is_empty());
+
+        let inner = stmt.into_inner();
+        assert_eq!(inner, "stmt-12345");
+
+        let from_str: RoleName = "ANALYST".into();
+        assert_eq!(from_str.as_str(), "ANALYST");
+
+        let from_string: DatabaseName = String::from("PROD_DB").into();
+        assert_eq!(from_string.as_str(), "PROD_DB");
+    }
+
+    #[test]
+    fn id_newtypes_serde_transparent() -> Result<(), serde_json::Error> {
+        let wh = WarehouseName::new("COMPUTE_WH");
+        let json = serde_json::to_string(&wh)?;
+        assert_eq!(json, r#""COMPUTE_WH""#);
+
+        let roundtrip: WarehouseName = serde_json::from_str(&json)?;
+        assert_eq!(roundtrip, wh);
+
+        let req_id = RequestId::new("req-abc-xyz");
+        assert_eq!(serde_json::to_string(&req_id)?, r#""req-abc-xyz""#);
+        Ok(())
+    }
+}
