@@ -433,12 +433,20 @@ mod tests {
 
         let reopened = FileCache::open(&dir)?;
         assert_eq!(reopened.skipped_lines(), 0);
-        let r1 = reopened.query_receipt("r1")?.expect("r1 persisted");
+        let r1 = reopened
+            .query_receipt("r1")?
+            .ok_or_else(|| CacheError::NotFound {
+                entity: "query_receipt",
+                id: "r1".to_owned(),
+            })?;
         assert_eq!(r1.outcome_kind, "ok", "first write wins across reopen");
         assert_eq!(r1.created_at_ms, 10);
         let latest = reopened
             .latest_successful_receipt("plan-a")?
-            .expect("latest receipt");
+            .ok_or_else(|| CacheError::NotFound {
+                entity: "query_receipt",
+                id: "plan-a".to_owned(),
+            })?;
         assert_eq!(latest.receipt_id, "r2");
         let events = reopened.audit_events()?;
         assert_eq!(
@@ -449,7 +457,12 @@ mod tests {
             vec!["e1", "e2"],
             "audit events replay in chronological order"
         );
-        let manifest = reopened.dataset_manifest("ds")?.expect("manifest");
+        let manifest = reopened
+            .dataset_manifest("ds")?
+            .ok_or_else(|| CacheError::NotFound {
+                entity: "dataset_manifest",
+                id: "ds".to_owned(),
+            })?;
         assert_eq!(
             manifest.snapshot_id.as_deref(),
             Some("snap2"),
@@ -457,7 +470,9 @@ mod tests {
         );
         assert_eq!(reopened.query_receipt("missing")?, None);
 
-        let audit_log = fs::read_to_string(dir.join("query_audit_log.jsonl")).expect("audit file");
+        let audit_path = dir.join("query_audit_log.jsonl");
+        let audit_log = fs::read_to_string(&audit_path)
+            .map_err(|e| io_error("read audit log", &audit_path, &e))?;
         assert_eq!(audit_log.lines().count(), 2, "one line per appended event");
 
         fs::remove_dir_all(&dir).ok();
@@ -472,9 +487,12 @@ mod tests {
             cache.append_query_receipt(receipt("good", "plan", "ok", 1))?;
         }
         let path = dir.join("query_receipts.jsonl");
-        let mut file = OpenOptions::new().append(true).open(&path).expect("append");
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .map_err(|e| io_error("open query receipts", &path, &e))?;
         file.write_all(b"{this is not json}\n{\"v\":99,\"r\":{}}\n")
-            .expect("write junk");
+            .map_err(|e| io_error("write junk receipts", &path, &e))?;
         drop(file);
 
         let reopened = FileCache::open(&dir)?;

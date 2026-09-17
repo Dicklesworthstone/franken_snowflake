@@ -2582,7 +2582,10 @@ mod frankensqlite_tests {
             created_at_ms: 1,
             updated_at_ms: 2,
         })?;
-        let stored = cache.profile("demo")?.expect("profile stored");
+        let stored = cache.profile("demo")?.ok_or_else(|| CacheError::NotFound {
+            entity: "profile",
+            id: "demo".to_owned(),
+        })?;
         assert_eq!(stored.default_database.as_deref(), Some("DB"));
         assert_eq!(cache.profiles()?.len(), 1);
         assert_eq!(cache.profile("nope")?, None);
@@ -2597,17 +2600,31 @@ mod frankensqlite_tests {
         // INSERT OR IGNORE keeps the first write for a reused id.
         cache.append_query_receipt(receipt("r1", "error", 30))?;
 
-        let r1 = cache.query_receipt("r1")?.expect("r1");
+        let r1 = cache
+            .query_receipt("r1")?
+            .ok_or_else(|| CacheError::NotFound {
+                entity: "query_receipt",
+                id: "r1".to_owned(),
+            })?;
         assert_eq!(r1.outcome_kind, "ok");
         assert_eq!(r1.created_at_ms, 10);
         assert_eq!(r1.row_count, Some(7));
         assert_eq!(cache.query_receipt("missing")?, None);
 
-        let latest = cache.latest_successful_receipt("plan-1")?.expect("latest");
+        let latest =
+            cache
+                .latest_successful_receipt("plan-1")?
+                .ok_or_else(|| CacheError::NotFound {
+                    entity: "query_receipt",
+                    id: "plan-1".to_owned(),
+                })?;
         assert_eq!(latest.receipt_id, "r2");
         let by_qid = cache
             .receipt_by_snowflake_query_id("demo", "qid-r2")?
-            .expect("by query id");
+            .ok_or_else(|| CacheError::NotFound {
+                entity: "query_receipt",
+                id: "qid-r2".to_owned(),
+            })?;
         assert_eq!(by_qid.receipt_id, "r2");
 
         let mut tampered = receipt("r3", "ok", 40);
