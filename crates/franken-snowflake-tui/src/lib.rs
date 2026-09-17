@@ -1470,7 +1470,8 @@ mod tests {
         }
 
         #[test]
-        fn without_an_executor_submit_logs_a_typed_pointer_instead_of_no_op() -> Result<(), String> {
+        fn without_an_executor_submit_logs_a_typed_pointer_instead_of_no_op() -> Result<(), String>
+        {
             let mut model = ExecutorModel::new(SnowflakeTuiApp::default(), None);
             let _ = model.update(crate::ftui_surface::TuiMessage::App(TuiEvent::QuerySubmit));
             let app = model.app();

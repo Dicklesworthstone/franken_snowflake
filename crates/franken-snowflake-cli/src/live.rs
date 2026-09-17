@@ -2577,25 +2577,26 @@ mod test_support {
         if let Ok(Progress::Complete(done)) = machine.on_submit(ResponseClass::Completed, &bytes) {
             return done;
         }
-        let result_set = serde_json::from_slice::<franken_snowflake_sqlapi::response::ResultSet>(&bytes)
-            .unwrap_or_else(|_| franken_snowflake_sqlapi::response::ResultSet {
-                result_set_meta_data: franken_snowflake_sqlapi::response::ResultSetMetaData {
-                    num_rows: rows.len() as i64,
-                    format: "jsonv2".to_owned(),
-                    row_type: Vec::new(),
-                    partition_info: Vec::new(),
-                },
-                data: Vec::new(),
-                code: "090001".to_owned(),
-                statement_handle: StatementHandle::new(handle),
-                statement_status_url: None,
-                statement_handles: None,
-                sql_state: None,
-                message: None,
-                request_id: None,
-                created_on: None,
-                stats: None,
-            });
+        let result_set =
+            serde_json::from_slice::<franken_snowflake_sqlapi::response::ResultSet>(&bytes)
+                .unwrap_or_else(|_| franken_snowflake_sqlapi::response::ResultSet {
+                    result_set_meta_data: franken_snowflake_sqlapi::response::ResultSetMetaData {
+                        num_rows: rows.len() as i64,
+                        format: "jsonv2".to_owned(),
+                        row_type: Vec::new(),
+                        partition_info: Vec::new(),
+                    },
+                    data: Vec::new(),
+                    code: "090001".to_owned(),
+                    statement_handle: StatementHandle::new(handle),
+                    statement_status_url: None,
+                    statement_handles: None,
+                    sql_state: None,
+                    message: None,
+                    request_id: None,
+                    created_on: None,
+                    stats: None,
+                });
         let string_rows = rows
             .iter()
             .map(|r| r.iter().map(|c| c.map(str::to_owned)).collect())
@@ -2716,11 +2717,9 @@ mod tests {
                 serde_json::from_str(&crate::render_json(&crate::envelope_json(&envelope)))
                     .unwrap_or_default()
             }
-            crate::Body::Raw { data } => {
-                serde_json::from_str(&data).unwrap_or(serde_json::json!({
-                    "raw": data,
-                }))
-            }
+            crate::Body::Raw { data } => serde_json::from_str(&data).unwrap_or(serde_json::json!({
+                "raw": data,
+            })),
         }
     }
 
