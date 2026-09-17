@@ -5327,7 +5327,8 @@ mod tests {
     }
 
     #[test]
-    fn dataset_mode_plans_pushed_down_sql_with_typed_bindings_from_the_store() -> Result<(), String> {
+    fn dataset_mode_plans_pushed_down_sql_with_typed_bindings_from_the_store() -> Result<(), String>
+    {
         let dataset_id = "db_public_events_b3_plantest";
         seed_fixture_dataset(dataset_id)?;
 

@@ -358,11 +358,9 @@ mod tests {
                 serde_json::from_str(&crate::render_json(&crate::envelope_json(&envelope)))
                     .unwrap_or_default()
             }
-            Body::Raw { data } => {
-                serde_json::from_str(&data).unwrap_or(serde_json::json!({
-                    "raw": data,
-                }))
-            }
+            Body::Raw { data } => serde_json::from_str(&data).unwrap_or(serde_json::json!({
+                "raw": data,
+            })),
         }
     }
 

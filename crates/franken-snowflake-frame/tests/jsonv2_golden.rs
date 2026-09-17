@@ -61,10 +61,10 @@ fn captured_wire_golden_decodes_through_the_frame_codec() -> Result<(), String> 
         );
         return Ok(());
     };
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| format!("golden file read failed: {e}"))?;
-    let golden: Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("golden parses as JSON failed: {e}"))?;
+    let raw =
+        std::fs::read_to_string(&path).map_err(|e| format!("golden file read failed: {e}"))?;
+    let golden: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("golden parses as JSON failed: {e}"))?;
     assert_eq!(
         golden.get("schema").and_then(Value::as_str),
         Some(GOLDEN_SCHEMA),
