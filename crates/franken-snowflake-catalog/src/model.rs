@@ -376,3 +376,227 @@ pub fn normalize_identifier(value: &str) -> String {
 pub fn same_identifier(left: &str, right: &str) -> bool {
     normalize_identifier(left) == normalize_identifier(right)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_provenance() -> Provenance {
+        Provenance {
+            source: ProvenanceSource::Fixture,
+            data_source: DataSourceClass::Fixture,
+            snapshot_id: "snap-1".to_string(),
+            discovered_at: "2026-09-17T00:00:00Z".to_string(),
+            profile_fingerprint: "prof-fp".to_string(),
+            object_fingerprint: "obj-fp".to_string(),
+            command_id: "cmd-1".to_string(),
+            trace_id: "trace-1".to_string(),
+            redactions_applied: vec![],
+        }
+    }
+
+    #[test]
+    fn rights_class_fails_closed_on_unknown_input() -> Result<(), serde_json::Error> {
+        assert_eq!(
+            serde_json::from_str::<RightsClass>(r#""public""#)?,
+            RightsClass::Public
+        );
+        assert_eq!(
+            serde_json::from_str::<RightsClass>(r#""INTERNAL""#)?,
+            RightsClass::Internal
+        );
+        assert_eq!(
+            serde_json::from_str::<RightsClass>(r#""Private""#)?,
+            RightsClass::Private
+        );
+        assert_eq!(
+            serde_json::from_str::<RightsClass>(r#""restricted""#)?,
+            RightsClass::Restricted
+        );
+        // Fail-closed fallback: unknown or misspelled values MUST default to Restricted
+        assert_eq!(
+            serde_json::from_str::<RightsClass>(r#""confidential""#)?,
+            RightsClass::Restricted
+        );
+        assert_eq!(
+            serde_json::from_str::<RightsClass>(r#""unknown_secret_level""#)?,
+            RightsClass::Restricted
+        );
+        assert_eq!(
+            serde_json::from_str::<RightsClass>(r#""""#)?,
+            RightsClass::Restricted
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn identifier_normalization_and_comparison() {
+        assert_eq!(normalize_identifier("USER_ID"), "userid");
+        assert_eq!(normalize_identifier("user-id"), "userid");
+        assert_eq!(normalize_identifier("  User_Id  "), "userid");
+        assert_eq!(normalize_identifier("CREATED_AT_UTC"), "createdatutc");
+
+        assert!(same_identifier("EVENT_DATE", "event_date"));
+        assert!(same_identifier("event-date", "EVENT_DATE"));
+        assert!(same_identifier("EventDate", "event_date"));
+        assert!(!same_identifier("event_date", "created_date"));
+    }
+
+    #[test]
+    fn dtype_class_scalar_and_default_bindings() {
+        assert!(DtypeClass::String.is_known_scalar());
+        assert!(DtypeClass::Number.is_known_scalar());
+        assert!(DtypeClass::Boolean.is_known_scalar());
+        assert!(DtypeClass::Date.is_known_scalar());
+        assert!(DtypeClass::Time.is_known_scalar());
+        assert!(DtypeClass::Timestamp.is_known_scalar());
+        assert!(DtypeClass::Binary.is_known_scalar());
+        assert!(!DtypeClass::Variant.is_known_scalar());
+        assert!(!DtypeClass::Unknown.is_known_scalar());
+
+        assert_eq!(DtypeClass::String.default_binding_type(), "TEXT");
+        assert_eq!(DtypeClass::Number.default_binding_type(), "FIXED");
+        assert_eq!(DtypeClass::Boolean.default_binding_type(), "BOOLEAN");
+        assert_eq!(DtypeClass::Date.default_binding_type(), "DATE");
+        assert_eq!(DtypeClass::Time.default_binding_type(), "TIME");
+        assert_eq!(
+            DtypeClass::Timestamp.default_binding_type(),
+            "TIMESTAMP_NTZ"
+        );
+        assert_eq!(DtypeClass::Binary.default_binding_type(), "BINARY");
+        assert_eq!(DtypeClass::Variant.default_binding_type(), "VARIANT");
+        assert_eq!(DtypeClass::Unknown.default_binding_type(), "TEXT");
+    }
+
+    #[test]
+    fn dataset_manifest_field_lookups() {
+        let manifest = DatasetManifest {
+            id: "analytics.users".to_string(),
+            profile: "default".to_string(),
+            database: "ANALYTICS".to_string(),
+            schema: "PUBLIC".to_string(),
+            object: "USERS".to_string(),
+            kind: DatasetKind::Table,
+            rights_class: RightsClass::Internal,
+            default_limit: 100,
+            max_rows_without_export: 10_000,
+            approx_row_count: Some(500),
+            bytes: Some(10240),
+            description: Some("Users table".to_string()),
+            provenance: sample_provenance(),
+            fields: vec![
+                DatasetField {
+                    column: "USER_ID".to_string(),
+                    role: FieldRole::EntityKey,
+                    dtype: DtypeClass::String,
+                    required: true,
+                    role_confidence: RoleConfidence::Confirmed,
+                },
+                DatasetField {
+                    column: "CREATED_AT".to_string(),
+                    role: FieldRole::TimeIndex,
+                    dtype: DtypeClass::Timestamp,
+                    required: true,
+                    role_confidence: RoleConfidence::Confirmed,
+                },
+            ],
+        };
+
+        assert!(manifest.has_field("user_id"));
+        assert!(manifest.has_field("USER-ID"));
+        assert!(manifest.has_field("created_at"));
+        assert!(!manifest.has_field("deleted_at"));
+
+        let entity_field = manifest.field_by_role(FieldRole::EntityKey);
+        assert!(entity_field.is_some());
+        assert_eq!(entity_field.map(|f| f.column.as_str()), Some("USER_ID"));
+
+        let time_field = manifest.field_by_role(FieldRole::TimeIndex);
+        assert!(time_field.is_some());
+        assert_eq!(time_field.map(|f| f.column.as_str()), Some("CREATED_AT"));
+
+        assert!(manifest.field_by_role(FieldRole::Feature).is_none());
+    }
+
+    #[test]
+    fn catalog_snapshot_columns_for_dataset_sorted_by_ordinal() {
+        let mut snapshot = CatalogSnapshot::empty(sample_provenance());
+        assert_eq!(snapshot.schema_version, SCHEMA_VERSION);
+        assert!(snapshot.dataset("any").is_none());
+
+        snapshot.columns = vec![
+            ColumnCatalogEntry {
+                dataset_id: "ds1".to_string(),
+                database: "DB".to_string(),
+                schema: "SCHEMA".to_string(),
+                object: "OBJ".to_string(),
+                column: "COL_B".to_string(),
+                ordinal: 2,
+                snowflake_type: "TEXT".to_string(),
+                dtype_class: DtypeClass::String,
+                nullable: true,
+                precision: None,
+                scale: None,
+                length: Some(100),
+                aliases: vec!["col-b".to_string()],
+                comment: None,
+                tags: vec![],
+                provenance: None,
+            },
+            ColumnCatalogEntry {
+                dataset_id: "ds2".to_string(),
+                database: "DB".to_string(),
+                schema: "SCHEMA".to_string(),
+                object: "OBJ2".to_string(),
+                column: "OTHER_COL".to_string(),
+                ordinal: 1,
+                snowflake_type: "TEXT".to_string(),
+                dtype_class: DtypeClass::String,
+                nullable: true,
+                precision: None,
+                scale: None,
+                length: None,
+                aliases: vec![],
+                comment: None,
+                tags: vec![],
+                provenance: None,
+            },
+            ColumnCatalogEntry {
+                dataset_id: "ds1".to_string(),
+                database: "DB".to_string(),
+                schema: "SCHEMA".to_string(),
+                object: "OBJ".to_string(),
+                column: "COL_A".to_string(),
+                ordinal: 1,
+                snowflake_type: "FIXED".to_string(),
+                dtype_class: DtypeClass::Number,
+                nullable: false,
+                precision: Some(38),
+                scale: Some(0),
+                length: None,
+                aliases: vec!["col-a".to_string()],
+                comment: None,
+                tags: vec![],
+                provenance: None,
+            },
+        ];
+
+        let ds1_cols = snapshot.columns_for_dataset("ds1");
+        assert_eq!(ds1_cols.len(), 2);
+        assert_eq!(ds1_cols[0].column, "COL_A");
+        assert_eq!(ds1_cols[0].ordinal, 1);
+        assert_eq!(ds1_cols[1].column, "COL_B");
+        assert_eq!(ds1_cols[1].ordinal, 2);
+
+        assert!(ds1_cols[0].matches_column("col_a"));
+        assert!(ds1_cols[0].has_alias("col-a"));
+        assert!(!ds1_cols[0].has_alias("nonexistent"));
+
+        let ds2_cols = snapshot.columns_for_dataset("ds2");
+        assert_eq!(ds2_cols.len(), 1);
+        assert_eq!(ds2_cols[0].column, "OTHER_COL");
+
+        let ds3_cols = snapshot.columns_for_dataset("ds3");
+        assert!(ds3_cols.is_empty());
+    }
+}
