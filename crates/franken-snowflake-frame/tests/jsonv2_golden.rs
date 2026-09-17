@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 
 use fp_types::DType;
-use franken_snowflake_frame::{FrankenPandasFrame, ResultPartition, SnowflakeColumn};
+use franken_snowflake_frame::{ResultPartition, SnowflakeColumn};
 use serde_json::Value;
 
 const GOLDEN_SCHEMA: &str = "franken_snowflake.jsonv2_wire_golden.v1";
@@ -53,16 +53,18 @@ fn required_dtype(snowflake_type: &str) -> Option<DType> {
 }
 
 #[test]
-fn captured_wire_golden_decodes_through_the_frame_codec() {
+fn captured_wire_golden_decodes_through_the_frame_codec() -> Result<(), String> {
     let Some(path) = golden_path() else {
         println!(
             "skip: no captured golden at crates/franken-snowflake-frame/tests/captured/ — \
              run scripts/capture-jsonv2-golden.sh against a live account and commit the result"
         );
-        return;
+        return Ok(());
     };
-    let raw = std::fs::read_to_string(&path).expect("golden file reads");
-    let golden: Value = serde_json::from_str(&raw).expect("golden parses as JSON");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("golden file read failed: {e}"))?;
+    let golden: Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("golden parses as JSON failed: {e}"))?;
     assert_eq!(
         golden.get("schema").and_then(Value::as_str),
         Some(GOLDEN_SCHEMA),
@@ -72,11 +74,11 @@ fn captured_wire_golden_decodes_through_the_frame_codec() {
     let columns = golden
         .get("columns")
         .and_then(Value::as_array)
-        .expect("columns array");
+        .ok_or_else(|| "missing columns array".to_string())?;
     let rows = golden
         .get("rows")
         .and_then(Value::as_array)
-        .expect("rows array");
+        .ok_or_else(|| "missing rows array".to_string())?;
     assert!(!columns.is_empty(), "golden has columns");
     assert!(!rows.is_empty(), "golden has rows");
 
@@ -102,29 +104,29 @@ fn captured_wire_golden_decodes_through_the_frame_codec() {
         })
         .collect();
 
-    let partitions: Vec<Vec<Option<String>>> = rows
-        .iter()
-        .map(|row| {
-            row.as_array()
-                .expect("row is an array")
+    let mut partitions = Vec::with_capacity(rows.len());
+    for row in rows {
+        let row_array = row
+            .as_array()
+            .ok_or_else(|| "row is not an array".to_string())?;
+        partitions.push(
+            row_array
                 .iter()
                 .map(|cell| cell.as_str().map(str::to_owned))
-                .collect()
-        })
-        .collect();
+                .collect(),
+        );
+    }
 
     // The golden's `rows` are the rows of partition 0 (the capture is a
     // single-partition response).
     let partitions = vec![ResultPartition::new(0, partitions)];
-    let materialized: Result<FrankenPandasFrame, _> =
-        franken_snowflake_frame::materialize_partitions(&snowflake_columns, partitions);
-    let frame = match materialized {
-        Ok(frame) => frame,
-        Err(error) => panic!(
-            "FINDING: the frame codec rejected the empirical capture ({error}); \
-             the codec's encoding assumptions disagree with the wire"
-        ),
-    };
+    let frame = franken_snowflake_frame::materialize_partitions(&snowflake_columns, partitions)
+        .map_err(|error| {
+            format!(
+                "FINDING: the frame codec rejected the empirical capture ({error}); \
+                 the codec's encoding assumptions disagree with the wire"
+            )
+        })?;
     assert_eq!(frame.row_count, rows.len(), "all captured rows materialize");
 
     for column in &snowflake_columns {
@@ -132,7 +134,7 @@ fn captured_wire_golden_decodes_through_the_frame_codec() {
             .columns
             .iter()
             .find(|candidate| candidate.metadata.name == column.name)
-            .unwrap_or_else(|| panic!("column {} missing from the frame", column.name));
+            .ok_or_else(|| format!("column {} missing from the frame", column.name))?;
         if let Some(dtype) = required_dtype(&column.snowflake_type) {
             // Nullable columns land in the Nullable variant of the dtype.
             let actual = frame_column.column.dtype();
@@ -151,4 +153,5 @@ fn captured_wire_golden_decodes_through_the_frame_codec() {
         snowflake_columns.len(),
         rows.len()
     );
+    Ok(())
 }
