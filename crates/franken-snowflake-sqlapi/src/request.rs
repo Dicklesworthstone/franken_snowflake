@@ -164,3 +164,112 @@ impl SubmitQueryParams {
         pairs
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submit_request_minimal_serializes_cleanly() -> Result<(), serde_json::Error> {
+        let req = SubmitStatementRequest::new("SELECT 1");
+        let json = serde_json::to_string(&req)?;
+        assert_eq!(json, r#"{"statement":"SELECT 1"}"#);
+
+        let roundtrip: SubmitStatementRequest = serde_json::from_str(&json)?;
+        assert_eq!(roundtrip, req);
+        Ok(())
+    }
+
+    #[test]
+    fn submit_request_all_fields_roundtrip() -> Result<(), serde_json::Error> {
+        let mut bindings = BTreeMap::new();
+        bindings.insert("1".to_string(), Binding::new(bind_type::FIXED, "42"));
+        bindings.insert("2".to_string(), Binding::new(bind_type::TEXT, "hello"));
+
+        let mut parameters = BTreeMap::new();
+        parameters.insert("MULTI_STATEMENT_COUNT".to_string(), "1".to_string());
+        parameters.insert("TIMEZONE".to_string(), "UTC".to_string());
+
+        let req = SubmitStatementRequest {
+            statement: "SELECT ? as id, ? as greeting".to_string(),
+            timeout: Some(30),
+            database: Some(DatabaseName::new("MY_DB")),
+            schema: Some(SchemaName::new("PUBLIC")),
+            warehouse: Some(WarehouseName::new("COMPUTE_WH")),
+            role: Some(RoleName::new("ANALYST")),
+            bindings: Some(bindings),
+            parameters: Some(parameters),
+        };
+
+        let json = serde_json::to_string(&req)?;
+        assert!(json.contains(r#""statement":"SELECT ? as id, ? as greeting""#));
+        assert!(json.contains(r#""timeout":30"#));
+        assert!(json.contains(r#""database":"MY_DB""#));
+        assert!(json.contains(r#""schema":"PUBLIC""#));
+        assert!(json.contains(r#""warehouse":"COMPUTE_WH""#));
+        assert!(json.contains(r#""role":"ANALYST""#));
+        assert!(json.contains(
+            r#""bindings":{"1":{"type":"FIXED","value":"42"},"2":{"type":"TEXT","value":"hello"}}"#
+        ));
+        assert!(json.contains(r#""parameters":{"MULTI_STATEMENT_COUNT":"1","TIMEZONE":"UTC"}"#));
+
+        let roundtrip: SubmitStatementRequest = serde_json::from_str(&json)?;
+        assert_eq!(roundtrip, req);
+        Ok(())
+    }
+
+    #[test]
+    fn binding_constructors_and_types() -> Result<(), serde_json::Error> {
+        let b = Binding::new(bind_type::BOOLEAN, "true");
+        assert_eq!(b.value_type, "BOOLEAN");
+        assert_eq!(b.value, "true");
+
+        let json = serde_json::to_string(&b)?;
+        assert_eq!(json, r#"{"type":"BOOLEAN","value":"true"}"#);
+        let roundtrip: Binding = serde_json::from_str(&json)?;
+        assert_eq!(roundtrip, b);
+
+        assert_eq!(bind_type::TEXT, "TEXT");
+        assert_eq!(bind_type::FIXED, "FIXED");
+        assert_eq!(bind_type::REAL, "REAL");
+        assert_eq!(bind_type::DATE, "DATE");
+        assert_eq!(bind_type::TIME, "TIME");
+        assert_eq!(bind_type::TIMESTAMP_NTZ, "TIMESTAMP_NTZ");
+        assert_eq!(bind_type::TIMESTAMP_LTZ, "TIMESTAMP_LTZ");
+        assert_eq!(bind_type::TIMESTAMP_TZ, "TIMESTAMP_TZ");
+        assert_eq!(bind_type::BINARY, "BINARY");
+        Ok(())
+    }
+
+    #[test]
+    fn submit_query_params_pairs() {
+        let empty = SubmitQueryParams::default();
+        assert!(empty.to_query_pairs().is_empty());
+
+        let params = SubmitQueryParams {
+            request_id: Some("uuid-123".to_string()),
+            retry: true,
+            asynchronous: true,
+            nullable: Some(false),
+        };
+        let pairs = params.to_query_pairs();
+        assert_eq!(
+            pairs,
+            vec![
+                ("requestId", "uuid-123".to_string()),
+                ("retry", "true".to_string()),
+                ("async", "true".to_string()),
+                ("nullable", "false".to_string()),
+            ]
+        );
+
+        let nullable_true = SubmitQueryParams {
+            nullable: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            nullable_true.to_query_pairs(),
+            vec![("nullable", "true".to_string())]
+        );
+    }
+}

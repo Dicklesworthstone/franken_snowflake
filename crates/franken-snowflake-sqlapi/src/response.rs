@@ -238,4 +238,220 @@ mod tests {
         ];
         assert_eq!(result_multi.partition_count(), 2);
     }
+
+    #[test]
+    fn result_set_helpers_and_flags() {
+        let mut rs = ResultSet {
+            result_set_meta_data: ResultSetMetaData {
+                num_rows: 42,
+                format: "jsonv2".to_owned(),
+                row_type: vec![ColumnType {
+                    name: "ID".to_owned(),
+                    column_type: "FIXED".to_owned(),
+                    scale: Some(0),
+                    precision: Some(38),
+                    nullable: false,
+                    length: None,
+                    byte_length: None,
+                    database: None,
+                    schema: None,
+                    table: None,
+                    collation: None,
+                }],
+                partition_info: vec![],
+            },
+            data: vec![],
+            code: "090001".to_owned(),
+            statement_handle: StatementHandle::new("h1"),
+            statement_status_url: None,
+            statement_handles: None,
+            sql_state: None,
+            message: None,
+            request_id: None,
+            created_on: None,
+            stats: None,
+        };
+
+        assert_eq!(rs.total_rows(), 42);
+        assert!(!rs.is_multi_statement());
+
+        rs.statement_handles = Some(vec![]);
+        assert!(!rs.is_multi_statement());
+
+        rs.statement_handles = Some(vec![
+            StatementHandle::new("sub-1"),
+            StatementHandle::new("sub-2"),
+        ]);
+        assert!(rs.is_multi_statement());
+    }
+
+    #[test]
+    fn partition_info_serde_matrix() -> Result<(), serde_json::Error> {
+        // Minimal: rowCount only
+        let minimal_json = r#"{"rowCount":100}"#;
+        let p1: PartitionInfo = serde_json::from_str(minimal_json)?;
+        assert_eq!(p1.row_count, 100);
+        assert_eq!(p1.compressed_size, None);
+        assert_eq!(p1.uncompressed_size, None);
+
+        // Partition 0 inline pattern: rowCount + uncompressedSize (missing compressedSize)
+        let inline_json = r#"{"rowCount":50,"uncompressedSize":2048}"#;
+        let p2: PartitionInfo = serde_json::from_str(inline_json)?;
+        assert_eq!(p2.row_count, 50);
+        assert_eq!(p2.uncompressed_size, Some(2048));
+        assert_eq!(p2.compressed_size, None);
+
+        // Both sizes present
+        let full_json = r#"{"rowCount":50,"compressedSize":512,"uncompressedSize":2048}"#;
+        let p3: PartitionInfo = serde_json::from_str(full_json)?;
+        assert_eq!(p3.row_count, 50);
+        assert_eq!(p3.compressed_size, Some(512));
+        assert_eq!(p3.uncompressed_size, Some(2048));
+
+        let reserialized = serde_json::to_string(&p3)?;
+        let roundtrip: PartitionInfo = serde_json::from_str(&reserialized)?;
+        assert_eq!(roundtrip, p3);
+        Ok(())
+    }
+
+    #[test]
+    fn query_status_serde_roundtrip() -> Result<(), serde_json::Error> {
+        let json = r#"{
+            "code": "333334",
+            "message": "Asynchronous execution in progress.",
+            "statementHandle": "01b5a2e4-0000-0123-0000-000000000001",
+            "statementStatusUrl": "/api/v2/statements/01b5a2e4-0000-0123-0000-000000000001",
+            "sqlState": "00000"
+        }"#;
+        let qs: QueryStatus = serde_json::from_str(json)?;
+        assert_eq!(qs.code, "333334");
+        assert_eq!(
+            qs.statement_handle.as_str(),
+            "01b5a2e4-0000-0123-0000-000000000001"
+        );
+        assert_eq!(
+            qs.statement_status_url.as_deref(),
+            Some("/api/v2/statements/01b5a2e4-0000-0123-0000-000000000001")
+        );
+        assert_eq!(qs.sql_state.as_deref(), Some("00000"));
+        assert_eq!(
+            qs.message.as_deref(),
+            Some("Asynchronous execution in progress.")
+        );
+
+        let reserialized = serde_json::to_string(&qs)?;
+        let roundtrip: QueryStatus = serde_json::from_str(&reserialized)?;
+        assert_eq!(roundtrip, qs);
+        Ok(())
+    }
+
+    #[test]
+    fn query_failure_status_serde_roundtrip() -> Result<(), serde_json::Error> {
+        let json = r#"{
+            "code": "002003",
+            "sqlState": "42S02",
+            "message": "SQL compilation error: Table 'DOES_NOT_EXIST' does not exist",
+            "statementHandle": "01b5a2e4-0000-0123-0000-000000000002"
+        }"#;
+        let failure: QueryFailureStatus = serde_json::from_str(json)?;
+        assert_eq!(failure.code, "002003");
+        assert_eq!(failure.sql_state.as_deref(), Some("42S02"));
+        assert_eq!(
+            failure.statement_handle.as_ref().map(|h| h.as_str()),
+            Some("01b5a2e4-0000-0123-0000-000000000002")
+        );
+
+        let reserialized = serde_json::to_string(&failure)?;
+        let roundtrip: QueryFailureStatus = serde_json::from_str(&reserialized)?;
+        assert_eq!(roundtrip, failure);
+        Ok(())
+    }
+
+    #[test]
+    fn statement_cancel_response_serde_roundtrip() -> Result<(), serde_json::Error> {
+        let json = r#"{
+            "code": "090001",
+            "message": "Statement cancelled successfully.",
+            "statementHandle": "01b5a2e4-0000-0123-0000-000000000003"
+        }"#;
+        let cancel: StatementCancelResponse = serde_json::from_str(json)?;
+        assert_eq!(cancel.code, "090001");
+        assert_eq!(
+            cancel.message.as_deref(),
+            Some("Statement cancelled successfully.")
+        );
+        assert_eq!(
+            cancel.statement_handle.as_ref().map(|h| h.as_str()),
+            Some("01b5a2e4-0000-0123-0000-000000000003")
+        );
+
+        let reserialized = serde_json::to_string(&cancel)?;
+        let roundtrip: StatementCancelResponse = serde_json::from_str(&reserialized)?;
+        assert_eq!(roundtrip, cancel);
+        Ok(())
+    }
+
+    #[test]
+    fn full_result_set_serde_roundtrip() -> Result<(), serde_json::Error> {
+        let json = r#"{
+            "resultSetMetaData": {
+                "numRows": 2,
+                "format": "jsonv2",
+                "rowType": [
+                    {
+                        "name": "ID",
+                        "type": "FIXED",
+                        "scale": 0,
+                        "precision": 38,
+                        "nullable": false,
+                        "database": "TEST_DB",
+                        "schema": "PUBLIC",
+                        "table": "USERS"
+                    },
+                    {
+                        "name": "NAME",
+                        "type": "TEXT",
+                        "nullable": true,
+                        "length": 16777216,
+                        "byteLength": 16777216,
+                        "collation": "en-ci"
+                    }
+                ],
+                "partitionInfo": [
+                    {"rowCount": 2, "uncompressedSize": 128}
+                ]
+            },
+            "data": [
+                ["1", "Alice"],
+                ["2", null]
+            ],
+            "code": "090001",
+            "statementHandle": "stmt-abc",
+            "statementStatusUrl": "/api/v2/statements/stmt-abc",
+            "statementHandles": ["stmt-abc"],
+            "sqlState": "00000",
+            "message": "Statement executed successfully.",
+            "requestId": "req-xyz",
+            "createdOn": 1700000000000,
+            "stats": {"scanBytes": 1024}
+        }"#;
+
+        let rs: ResultSet = serde_json::from_str(json)?;
+        assert_eq!(rs.total_rows(), 2);
+        assert_eq!(rs.partition_count(), 1);
+        assert!(rs.is_multi_statement());
+        assert_eq!(rs.data.len(), 2);
+        assert_eq!(
+            rs.data[0],
+            vec![Some("1".to_owned()), Some("Alice".to_owned())]
+        );
+        assert_eq!(rs.data[1], vec![Some("2".to_owned()), None]);
+        assert_eq!(rs.created_on, Some(1700000000000));
+        assert!(rs.stats.is_some());
+
+        let reserialized = serde_json::to_string(&rs)?;
+        let roundtrip: ResultSet = serde_json::from_str(&reserialized)?;
+        assert_eq!(roundtrip, rs);
+        Ok(())
+    }
 }
