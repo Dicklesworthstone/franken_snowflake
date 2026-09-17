@@ -1046,10 +1046,10 @@ mod fastmcp_surface {
         }
 
         #[test]
-        fn query_cancel_routes_to_the_cli_cancel_contract() {
+        fn query_cancel_routes_to_the_cli_cancel_contract() -> Result<(), String> {
             let args = ReadVerb::QueryCancel
                 .cli_args(&json!({"statement_handle": "01bcaafe-0000"}))
-                .expect("query_cancel cli args");
+                .map_err(|e| format!("{e:?}"))?;
             assert_eq!(
                 args,
                 vec![
@@ -1059,10 +1059,12 @@ mod fastmcp_surface {
                     "--json".to_string()
                 ]
             );
+            Ok(())
         }
 
         #[test]
-        fn query_tools_map_dataset_mode_and_session_flags_to_the_cli_contract() {
+        fn query_tools_map_dataset_mode_and_session_flags_to_the_cli_contract() -> Result<(), String>
+        {
             let args = ReadVerb::QueryRun
                 .cli_args(&json!({
                     "dataset_id": "analytics_public_events_b3_abc",
@@ -1074,7 +1076,7 @@ mod fastmcp_surface {
                     "role": "ANALYST",
                     "statement_timeout": "120"
                 }))
-                .expect("dataset-mode run args");
+                .map_err(|e| format!("{e:?}"))?;
             assert_eq!(
                 args,
                 vec![
@@ -1104,7 +1106,7 @@ mod fastmcp_surface {
             );
             let plan = ReadVerb::QueryPlan
                 .cli_args(&json!({"profile": "demo", "sql": "select 1", "role": "IGNORED_ON_PLAN"}))
-                .expect("raw plan args");
+                .map_err(|e| format!("{e:?}"))?;
             assert_eq!(
                 plan,
                 vec![
@@ -1120,18 +1122,26 @@ mod fastmcp_surface {
                 .map(str::to_string)
                 .collect::<Vec<_>>()
             );
-            let both = ReadVerb::QueryRun
-                .cli_args(&json!({"sql": "select 1", "dataset_id": "x"}))
-                .expect_err("sql and dataset_id together must be refused");
+            let both =
+                match ReadVerb::QueryRun.cli_args(&json!({"sql": "select 1", "dataset_id": "x"})) {
+                    Err(err) => err,
+                    Ok(_) => {
+                        return Err("sql and dataset_id together must be refused".to_owned());
+                    }
+                };
             assert_eq!(both.code, McpErrorCode::InvalidParams);
-            let neither = ReadVerb::QueryPlan
-                .cli_args(&json!({"profile": "demo"}))
-                .expect_err("neither sql nor dataset_id must be refused");
+            let neither = match ReadVerb::QueryPlan.cli_args(&json!({"profile": "demo"})) {
+                Err(err) => err,
+                Ok(_) => {
+                    return Err("neither sql nor dataset_id must be refused".to_owned());
+                }
+            };
             assert_eq!(neither.code, McpErrorCode::InvalidParams);
+            Ok(())
         }
 
         #[test]
-        fn export_tools_map_to_the_cli_contract() {
+        fn export_tools_map_to_the_cli_contract() -> Result<(), String> {
             let plan = ReadVerb::ExportPlan
                 .cli_args(&json!({
                     "profile": "demo",
@@ -1144,7 +1154,7 @@ mod fastmcp_surface {
                     "single": true,
                     "max_file_size": "1000000"
                 }))
-                .expect("export plan args");
+                .map_err(|e| format!("{e:?}"))?;
             assert_eq!(
                 plan,
                 vec![
@@ -1174,7 +1184,7 @@ mod fastmcp_surface {
             );
             let run = ReadVerb::ExportRun
                 .cli_args(&json!({"profile": "demo", "query_id": "01b2-qid", "out": "events.csv"}))
-                .expect("export run args");
+                .map_err(|e| format!("{e:?}"))?;
             assert_eq!(
                 run,
                 vec![
@@ -1194,7 +1204,7 @@ mod fastmcp_surface {
             );
             let run_frame = ReadVerb::ExportRun
                 .cli_args(&json!({"profile": "demo", "sql": "select 1", "format": "frame", "out": "events.json"}))
-                .expect("export run frame args");
+                .map_err(|e| format!("{e:?}"))?;
             assert_eq!(
                 run_frame,
                 vec![
@@ -1214,22 +1224,28 @@ mod fastmcp_surface {
                 .map(str::to_string)
                 .collect::<Vec<_>>()
             );
-            let missing_location = ReadVerb::ExportPlan
+            let missing_location = match ReadVerb::ExportPlan
                 .cli_args(&json!({"profile": "demo", "sql": "select 1"}))
-                .expect_err("export plan needs a stage location");
+            {
+                Err(err) => err,
+                Ok(_) => {
+                    return Err("export plan needs a stage location".to_owned());
+                }
+            };
             assert_eq!(missing_location.code, McpErrorCode::InvalidParams);
+            Ok(())
         }
 
         #[test]
-        fn graph_profile_and_cancel_tools_forward_their_new_flags() {
+        fn graph_profile_and_cancel_tools_forward_their_new_flags() -> Result<(), String> {
             let graph = ReadVerb::CatalogGraph
                 .cli_args(&json!({"profile": "demo", "database": "DB", "refresh": true, "format": "mermaid"}))
-                .expect("graph args");
+                .map_err(|e| format!("{e:?}"))?;
             assert!(graph.contains(&"--refresh".to_string()));
             assert!(graph.contains(&"--mermaid".to_string()));
             let profile = ReadVerb::DatasetProfile
                 .cli_args(&json!({"dataset_id": "ds", "execute": true}))
-                .expect("profile args");
+                .map_err(|e| format!("{e:?}"))?;
             assert_eq!(
                 profile,
                 vec!["dataset", "profile", "ds", "--execute", "--json"]
@@ -1239,7 +1255,7 @@ mod fastmcp_surface {
             );
             let cancel = ReadVerb::QueryCancel
                 .cli_args(&json!({"statement_handle": "01bc", "profile": "demo"}))
-                .expect("cancel args");
+                .map_err(|e| format!("{e:?}"))?;
             assert_eq!(
                 cancel,
                 vec!["query", "cancel", "01bc", "--profile", "demo", "--json"]
@@ -1250,7 +1266,7 @@ mod fastmcp_surface {
 
             let profile_doc = ReadVerb::ProfileDoctor
                 .cli_args(&json!({"profile": "demo", "online": true}))
-                .expect("profile doctor args");
+                .map_err(|e| format!("{e:?}"))?;
             assert_eq!(
                 profile_doc,
                 vec!["profile", "doctor", "demo", "--online", "--json"]
@@ -1261,7 +1277,7 @@ mod fastmcp_surface {
 
             let cat_scan = ReadVerb::CatalogScan
                 .cli_args(&json!({"profile": "demo", "database": "DB", "schema": "SCH", "require_live": true}))
-                .expect("catalog scan args");
+                .map_err(|e| format!("{e:?}"))?;
             assert_eq!(
                 cat_scan,
                 vec![
@@ -1282,37 +1298,44 @@ mod fastmcp_surface {
 
             let query_live = ReadVerb::QueryRun
                 .cli_args(&json!({"profile": "demo", "sql": "select 1", "require_live": true}))
-                .expect("query run require_live args");
+                .map_err(|e| format!("{e:?}"))?;
             assert!(query_live.contains(&"--require-live".to_string()));
             assert_eq!(query_live.iter().filter(|a| *a == "--json").count(), 1);
+            Ok(())
         }
 
         #[test]
-        fn tool_schema_json_is_stable_json() {
+        fn tool_schema_json_is_stable_json() -> Result<(), String> {
             let schemas = mcp_tool_schema_json(fake_runner)
-                .unwrap_or_else(|err| panic!("tool schemas serialize: {err}"));
+                .map_err(|err| format!("tool schemas serialize: {err}"))?;
             assert!(schemas.contains("\"name\":\"capabilities\""));
             assert!(schemas.contains("\"name\":\"profile_validate\""));
             assert!(schemas.contains("\"inputSchema\""));
+            Ok(())
         }
 
         #[test]
-        fn cli_refusals_become_mcp_tool_errors_with_cli_envelope() {
+        fn cli_refusals_become_mcp_tool_errors_with_cli_envelope() -> Result<(), String> {
             let stdout = "{\"ok\":false,\"error\":{\"code\":\"FSNOW-3001\"}}".to_string();
             let stderr = "FSNOW-3001: mutation refused".to_string();
 
-            let Err(err) = cli_output_to_mcp_result(CliContractOutput {
+            let err = match cli_output_to_mcp_result(CliContractOutput {
                 exit_code: 2,
                 stdout: stdout.clone(),
                 stderr: Some(stderr.clone()),
-            }) else {
-                panic!("CLI refusal must not be returned as successful MCP content");
+            }) {
+                Err(err) => err,
+                Ok(_) => {
+                    return Err(
+                        "CLI refusal must not be returned as successful MCP content".to_owned()
+                    );
+                }
             };
 
             assert_eq!(err.code, McpErrorCode::ToolExecutionError);
             assert_eq!(err.message, stdout);
             let Some(Value::Object(data)) = err.data else {
-                panic!("tool error should carry CLI parity data");
+                return Err("tool error should carry CLI parity data".to_owned());
             };
             assert_eq!(data.get("exit_code").and_then(Value::as_i64), Some(2));
             assert_eq!(
@@ -1323,39 +1346,47 @@ mod fastmcp_surface {
                 data.get("stderr").and_then(Value::as_str),
                 Some(stderr.as_str())
             );
+            Ok(())
         }
 
         #[test]
-        fn cli_findings_remain_successful_mcp_content() {
+        fn cli_findings_remain_successful_mcp_content() -> Result<(), String> {
             let content = cli_output_to_mcp_result(CliContractOutput {
                 exit_code: 1,
                 stdout: "{\"ok\":true,\"outcome_kind\":\"partial_success\"}".to_string(),
                 stderr: None,
             })
-            .unwrap_or_else(|err| {
-                panic!("CLI findings are ok=true and should stay successful: {err:?}")
-            });
+            .map_err(|err| {
+                format!("CLI findings are ok=true and should stay successful: {err:?}")
+            })?;
 
             assert_eq!(content.len(), 1);
+            Ok(())
         }
 
         #[test]
-        fn invalid_params_redacts_secret_shaped_argument_values() {
+        fn invalid_params_redacts_secret_shaped_argument_values() -> Result<(), String> {
             let raw_secret = "sfpat_mcpBadFormat001";
             // `database` is now required for catalog_graph and is validated before
             // `format`; supply it so the unsupported-format (secret-shaped) value is
             // the failure under test.
-            let Err(err) = ReadVerb::CatalogGraph
+            let err = match ReadVerb::CatalogGraph
                 .cli_args(&json!({"profile": "demo", "database": "DB", "format": raw_secret}))
-            else {
-                panic!("secret-shaped unsupported graph format should be rejected");
+            {
+                Err(err) => err,
+                Ok(_) => {
+                    return Err(
+                        "secret-shaped unsupported graph format should be rejected".to_owned()
+                    );
+                }
             };
 
             assert_eq!(err.code, McpErrorCode::InvalidParams);
             assert!(!err.message.contains(raw_secret));
             assert!(err.message.contains("[REDACTED]"));
-            let data = serde_json::to_string(&err.data).expect("MCP error data serializes");
+            let data = serde_json::to_string(&err.data).map_err(|e| e.to_string())?;
             assert!(!data.contains(raw_secret));
+            Ok(())
         }
     }
 }
