@@ -723,7 +723,7 @@ mod tests {
     use crate::model::{DatasetKind, FieldRole};
 
     #[test]
-    fn discovery_requests_are_scoped_and_stable() {
+    fn discovery_requests_are_scoped_and_stable() -> Result<(), String> {
         let mut input = fixture_input();
         input.object = Some("EVENTS\\' OR 1=1 --".to_owned());
 
@@ -760,7 +760,7 @@ mod tests {
         let bindings = columns
             .bindings
             .as_ref()
-            .expect("columns scan has bound filters");
+            .ok_or_else(|| "columns scan has bound filters".to_owned())?;
         // database, schema, object bind 1-based in placeholder order.
         assert_eq!(bindings.get("1").map(|b| b.value.as_str()), Some("DB"));
         assert_eq!(bindings.get("2").map(|b| b.value.as_str()), Some("PUBLIC"));
@@ -777,6 +777,7 @@ mod tests {
                 .statement
                 .ends_with("ORDER BY TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION")
         );
+        Ok(())
     }
 
     #[test]
@@ -1026,7 +1027,8 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_builds_without_database_and_schema_listings_and_carries_size_hints() {
+    fn snapshot_builds_without_database_and_schema_listings_and_carries_size_hints()
+    -> Result<(), String> {
         let input = fixture_input();
         let mut tables = fixture_tables();
         tables.databases = None;
@@ -1056,8 +1058,10 @@ mod tests {
         assert_eq!(snapshot.datasets.len(), 1);
         assert_eq!(snapshot.datasets[0].approx_row_count, Some(12_345));
         assert_eq!(snapshot.datasets[0].bytes, Some(67_890));
-        let json = serde_json::to_string(&snapshot.datasets[0]).expect("serialize");
+        let json = serde_json::to_string(&snapshot.datasets[0])
+            .map_err(|e| format!("serialize failed: {e}"))?;
         assert!(json.contains("\"approx_row_count\":12345"));
+        Ok(())
     }
 
     fn fixture_tables() -> CatalogDiscoveryTables {
