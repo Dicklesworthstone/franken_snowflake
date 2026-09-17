@@ -205,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_partition_fixture_is_the_live_object_form() {
+    fn canonical_partition_fixture_is_the_live_object_form() -> Result<(), String> {
         // Planted-negative guard for the object branch of
         // `parse_partition_rows`: the canonical fixture must be the object
         // form, and the gzip packet must decompress to exactly it.
@@ -217,8 +217,9 @@ mod tests {
         decompressor
             .decompress(PARTITION_1_GZIP, &mut plain)
             .and_then(|()| decompressor.finish(&mut plain))
-            .expect("gzip packet decodes");
+            .map_err(|e| format!("gzip packet decodes: {e}"))?;
         assert_eq!(plain.as_slice(), PARTITION_1_PLAIN);
+        Ok(())
     }
 
     #[test]

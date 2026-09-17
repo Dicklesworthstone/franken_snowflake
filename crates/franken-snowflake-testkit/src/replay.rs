@@ -323,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_packets_redact_recorded_paths_headers_and_text_bodies() {
+    fn replay_packets_redact_recorded_paths_headers_and_text_bodies() -> Result<(), String> {
         let request =
             MockHttpRequest::get("/api/v2/statements?requestId=sfpat_replay_path_secret_123");
         let response =
@@ -332,8 +332,10 @@ mod tests {
                 .with_header("Content-Length", "40");
 
         let packet = ProtocolPacket::from_exchange("secret-probe", &request, &response);
-        let body = String::from_utf8(unhex(&packet.body_hex)).expect("body utf8");
-        let wire = String::from_utf8(unhex(&packet.wire_hex)).expect("wire utf8");
+        let body = String::from_utf8(unhex(&packet.body_hex))
+            .map_err(|e| format!("body utf8 failed: {e}"))?;
+        let wire = String::from_utf8(unhex(&packet.wire_hex))
+            .map_err(|e| format!("wire utf8 failed: {e}"))?;
 
         assert!(!packet.request_path.contains("sfpat_replay_path_secret_123"));
         assert!(packet.request_path.contains("[REDACTED]"));
@@ -348,5 +350,6 @@ mod tests {
                 .iter()
                 .all(|(_, value)| !value.contains("ghp_replay_header_secret_123"))
         );
+        Ok(())
     }
 }
