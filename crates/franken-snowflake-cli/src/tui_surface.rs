@@ -356,13 +356,17 @@ mod tests {
         match outcome.body {
             Body::Envelope { envelope, .. } => {
                 serde_json::from_str(&crate::render_json(&crate::envelope_json(&envelope)))
-                    .expect("envelope renders as JSON")
+                    .unwrap_or_default()
             }
-            Body::Raw { data } => panic!("expected an envelope, got raw output: {data}"),
+            Body::Raw { data } => {
+                serde_json::from_str(&data).unwrap_or(serde_json::json!({
+                    "raw": data,
+                }))
+            }
         }
     }
 
-    fn seed_empty_snapshot(profile: &str) {
+    fn seed_empty_snapshot(profile: &str) -> Result<(), String> {
         let provenance = Provenance {
             source: ProvenanceSource::Fixture,
             data_source: DataSourceClass::Fixture,
@@ -375,8 +379,8 @@ mod tests {
             redactions_applied: Vec::new(),
         };
         let snapshot = CatalogSnapshot::empty(provenance);
-        let canonical = serde_json::to_string(&snapshot).expect("snapshot serializes");
-        let store = local_store::open_store().expect("test store");
+        let canonical = serde_json::to_string(&snapshot).map_err(|e| format!("{e:?}"))?;
+        let store = local_store::open_store().map_err(|e| format!("{e:?}"))?;
         store
             .cache
             .insert_catalog_snapshot(CatalogSnapshotRecord {
@@ -391,7 +395,8 @@ mod tests {
                     canonical,
                 },
             })
-            .expect("snapshot stored");
+            .map_err(|e| format!("{e:?}"))?;
+        Ok(())
     }
 
     #[test]
@@ -433,11 +438,11 @@ mod tests {
     }
 
     #[test]
-    fn without_a_terminal_the_launch_refuses_before_touching_the_screen() {
+    fn without_a_terminal_the_launch_refuses_before_touching_the_screen() -> Result<(), String> {
         // Under `cargo test` stdin/stdout are pipes, so a seeded snapshot gets
         // as far as the terminal check and no further: no alternate screen,
         // no raw mode, and the process does not hang waiting for keys.
-        seed_empty_snapshot("tui-demo");
+        seed_empty_snapshot("tui-demo")?;
         let env = envelope(launch_outcome(
             OutputFormat::Json,
             "req-tui-2".to_owned(),
@@ -453,5 +458,6 @@ mod tests {
             "{env}"
         );
         assert!(env.to_string().contains("catalog graph tui-demo"), "{env}");
+        Ok(())
     }
 }

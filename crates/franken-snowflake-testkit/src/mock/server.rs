@@ -355,14 +355,18 @@ mod tests {
     }
 
     #[test]
-    fn request_path_is_recorded_redacted() {
+    fn request_path_is_recorded_redacted() -> Result<(), String> {
         let mut mock = scenarios::default_async_lifecycle();
         mock.respond(&MockHttpRequest::get(
             "/api/v2/statements/abc-123?token=sfpat_SECRET123",
         ));
-        let recorded = mock.requests().first().expect("request should be recorded");
+        let recorded = mock
+            .requests()
+            .first()
+            .ok_or_else(|| "request should be recorded".to_string())?;
         assert!(recorded.path.contains("[REDACTED]"));
         assert!(!recorded.path.contains("sfpat_SECRET123"));
+        Ok(())
     }
 
     #[test]

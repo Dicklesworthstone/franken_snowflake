@@ -768,14 +768,15 @@ mod tests {
     }
 
     #[test]
-    fn query_without_bounds_is_auto_bounded_and_warned() {
+    fn query_without_bounds_is_auto_bounded_and_warned() -> Result<(), String> {
         let limits = QuerySafetyLimits {
             allowed_warehouses: vec!["SNOWFLAKE_XS".to_string()],
             ..QuerySafetyLimits::default()
         };
         let mut plan = QueryPlanGuard::new("select * from events");
         plan.warehouse = Some("snowflake_xs".to_string());
-        let bounded = enforce_query_safety(plan, &limits).expect("query should be auto-bounded");
+        let bounded = enforce_query_safety(plan, &limits)
+            .map_err(|e| format!("query should be auto-bounded: {e}"))?;
         assert_eq!(
             bounded.statement_timeout_seconds,
             DEFAULT_STATEMENT_TIMEOUT_SECONDS
@@ -789,6 +790,7 @@ mod tests {
                 .iter()
                 .any(|w| w.code == "unconstrained_query")
         );
+        Ok(())
     }
 
     #[test]

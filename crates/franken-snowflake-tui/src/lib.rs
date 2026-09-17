@@ -1422,7 +1422,7 @@ mod tests {
         }
 
         #[test]
-        fn submit_runs_the_planned_query_through_the_injected_executor() {
+        fn submit_runs_the_planned_query_through_the_injected_executor() -> Result<(), String> {
             let mut model = ExecutorModel::new(SnowflakeTuiApp::default(), Some(ok_executor()));
             let _ = model.update(crate::ftui_surface::TuiMessage::App(TuiEvent::QuerySubmit));
             let app = model.app();
@@ -1431,12 +1431,13 @@ mod tests {
                 .logs
                 .iter()
                 .find(|line| line.event == "query_run")
-                .expect("executor output logged");
+                .ok_or_else(|| "executor output logged".to_string())?;
             assert!(
                 run_line.message.starts_with("ran SELECT 1"),
                 "{}",
                 run_line.message
             );
+            Ok(())
         }
 
         #[test]
@@ -1469,7 +1470,7 @@ mod tests {
         }
 
         #[test]
-        fn without_an_executor_submit_logs_a_typed_pointer_instead_of_no_op() {
+        fn without_an_executor_submit_logs_a_typed_pointer_instead_of_no_op() -> Result<(), String> {
             let mut model = ExecutorModel::new(SnowflakeTuiApp::default(), None);
             let _ = model.update(crate::ftui_surface::TuiMessage::App(TuiEvent::QuerySubmit));
             let app = model.app();
@@ -1477,13 +1478,14 @@ mod tests {
                 .logs
                 .iter()
                 .find(|line| line.event == "query_run")
-                .expect("not-wired pointer logged");
+                .ok_or_else(|| "not-wired pointer logged".to_string())?;
             assert_eq!(pointer.outcome, "refusal");
             assert!(
                 pointer.message.contains("fsnow query run"),
                 "{:?}",
                 pointer.message
             );
+            Ok(())
         }
     }
 }

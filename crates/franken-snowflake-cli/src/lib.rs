@@ -5152,12 +5152,13 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_input_schemas_describe_every_command_and_flag() {
+    fn capabilities_input_schemas_describe_every_command_and_flag() -> Result<(), String> {
         let rendered = render_json(&envelope_for(&["capabilities", "--json"]));
-        let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rendered).map_err(|e| e.to_string())?;
         let commands = parsed["data"]["commands"]
             .as_array()
-            .expect("commands array");
+            .ok_or_else(|| "commands array missing".to_string())?;
         assert_eq!(commands.len(), COMMAND_SPECS.len());
         let mut documented = std::collections::BTreeSet::new();
         for command in commands {
@@ -5166,7 +5167,9 @@ mod tests {
                 schema["$schema"],
                 "https://json-schema.org/draft/2020-12/schema"
             );
-            let properties = schema["properties"].as_object().expect("properties object");
+            let properties = schema["properties"]
+                .as_object()
+                .ok_or_else(|| "properties object missing".to_string())?;
             assert!(
                 !properties.is_empty(),
                 "{} has an empty input schema",
@@ -5202,11 +5205,12 @@ mod tests {
                 "flag {flag} is accepted but undocumented in capabilities"
             );
         }
+        Ok(())
     }
 
     /// Persist a small fixture snapshot (one dataset, three columns) into the
     /// per-process test store so dataset-mode commands can resolve it.
-    fn seed_fixture_dataset(dataset_id: &str) {
+    fn seed_fixture_dataset(dataset_id: &str) -> Result<(), String> {
         use franken_snowflake_cache::CacheBackend;
         use franken_snowflake_catalog::model::{
             CatalogSnapshot, ColumnCatalogEntry, DataSourceClass, DatasetField, DatasetKind,
@@ -5280,8 +5284,8 @@ mod tests {
             column("VALUE", 3, "FIXED", DtypeClass::Number),
         ];
         snapshot.operators = built_in_operator_catalog();
-        let store = local_store::open_store().expect("test store");
-        let canonical = serde_json::to_string(&snapshot).expect("snapshot json");
+        let store = local_store::open_store().map_err(|e| format!("{e:?}"))?;
+        let canonical = serde_json::to_string(&snapshot).map_err(|e| format!("{e:?}"))?;
         store
             .cache
             .insert_catalog_snapshot(franken_snowflake_cache::CatalogSnapshotRecord {
@@ -5296,8 +5300,8 @@ mod tests {
                     canonical,
                 },
             })
-            .expect("snapshot stored");
-        let manifest_json = serde_json::to_string(&manifest).expect("manifest json");
+            .map_err(|e| format!("{e:?}"))?;
+        let manifest_json = serde_json::to_string(&manifest).map_err(|e| format!("{e:?}"))?;
         store
             .cache
             .upsert_dataset_manifest(franken_snowflake_cache::DatasetManifestRecord {
@@ -5318,13 +5322,14 @@ mod tests {
                 },
                 created_at_ms: 1,
             })
-            .expect("manifest stored");
+            .map_err(|e| format!("{e:?}"))?;
+        Ok(())
     }
 
     #[test]
-    fn dataset_mode_plans_pushed_down_sql_with_typed_bindings_from_the_store() {
+    fn dataset_mode_plans_pushed_down_sql_with_typed_bindings_from_the_store() -> Result<(), String> {
         let dataset_id = "db_public_events_b3_plantest";
-        seed_fixture_dataset(dataset_id);
+        seed_fixture_dataset(dataset_id)?;
 
         // dataset inspect resolves what catalog scan persisted.
         let inspect = execute(vec![
@@ -5428,6 +5433,7 @@ mod tests {
             let outcome = execute(args.iter().map(|a| (*a).to_string()).collect());
             assert_eq!(outcome.status.code(), 64, "{args:?}");
         }
+        Ok(())
     }
 
     #[test]
@@ -5859,7 +5865,7 @@ mod tests {
 
     #[cfg(feature = "toon")]
     #[test]
-    fn toon_output_round_trips_to_same_logical_envelope() {
+    fn toon_output_round_trips_to_same_logical_envelope() -> Result<(), String> {
         let envelope = envelope_for(&["capabilities", "--json"]);
         let rendered = render_toon(&envelope);
         let decoded = toon::try_decode(
@@ -5870,8 +5876,9 @@ mod tests {
                 expand_paths: None,
             }),
         )
-        .expect("toon decodes");
+        .map_err(|e| format!("{e:?}"))?;
         assert_eq!(decoded, toon_json_value(&envelope));
+        Ok(())
     }
 
     #[test]
@@ -6043,10 +6050,16 @@ mod tests {
             "--mermaid".to_string(),
         ]);
         assert_eq!(toon_mermaid.status.code(), 64);
-        match toon_mermaid.body {
-            Body::Envelope { format, .. } => assert_eq!(format, OutputFormat::Toon),
-            Body::Raw { .. } => panic!("conflicting graph output must return an envelope"),
-        }
+        assert!(
+            matches!(
+                toon_mermaid.body,
+                Body::Envelope {
+                    format: OutputFormat::Toon,
+                    ..
+                }
+            ),
+            "conflicting graph output must return an envelope, got {toon_mermaid:?}"
+        );
     }
 
     // No-account build: `query run` reaches the local-safety-check stub. Under the
@@ -6071,7 +6084,7 @@ mod tests {
     }
 
     #[test]
-    fn query_run_parses_binding_env_and_query_tag_without_exposing_values() {
+    fn query_run_parses_binding_env_and_query_tag_without_exposing_values() -> Result<(), String> {
         let invocation = parse_invocation(vec![
             "query".to_owned(),
             "run".to_owned(),
@@ -6084,7 +6097,7 @@ mod tests {
             "--query-tag".to_owned(),
             "hfdt.trace.123".to_owned(),
         ])
-        .expect("query run flags should parse");
+        .map_err(|e| format!("{e:?}"))?;
 
         match invocation.command {
             Command::QueryRun { options, .. } => {
@@ -6094,8 +6107,14 @@ mod tests {
                 );
                 assert_eq!(options.query_tag.as_deref(), Some("hfdt.trace.123"));
             }
-            other => panic!("unexpected command: {other:?}"),
+            other => {
+                assert!(
+                    matches!(other, Command::QueryRun { .. }),
+                    "unexpected command: {other:?}"
+                );
+            }
         }
+        Ok(())
     }
 
     // Live build, credential-less profile: `query` shorthand still maps to the run
@@ -6299,7 +6318,7 @@ mod tests {
     }
 
     #[test]
-    fn require_live_flag_parses_for_query_run_and_catalog_scan() {
+    fn require_live_flag_parses_for_query_run_and_catalog_scan() -> Result<(), String> {
         let invocation = parse_invocation(vec![
             "query".to_string(),
             "run".to_string(),
@@ -6309,10 +6328,15 @@ mod tests {
             "select 1".to_string(),
             "--require-live".to_string(),
         ])
-        .expect("query run --require-live should parse");
+        .map_err(|e| format!("{e:?}"))?;
         match invocation.command {
             Command::QueryRun { options, .. } => assert!(options.require_live),
-            other => panic!("unexpected command: {other:?}"),
+            other => {
+                assert!(
+                    matches!(other, Command::QueryRun { .. }),
+                    "unexpected command: {other:?}"
+                );
+            }
         }
 
         let invocation = parse_invocation(vec![
@@ -6325,10 +6349,15 @@ mod tests {
             "PUBLIC".to_string(),
             "--require-live".to_string(),
         ])
-        .expect("catalog scan --require-live should parse");
+        .map_err(|e| format!("{e:?}"))?;
         match invocation.command {
             Command::CatalogScan { require_live, .. } => assert!(require_live),
-            other => panic!("unexpected command: {other:?}"),
+            other => {
+                assert!(
+                    matches!(other, Command::CatalogScan { .. }),
+                    "unexpected command: {other:?}"
+                );
+            }
         }
 
         let invocation = parse_invocation(vec![
@@ -6339,11 +6368,17 @@ mod tests {
             "--sql".to_string(),
             "select 1".to_string(),
         ])
-        .expect("query run without the flag should parse");
+        .map_err(|e| format!("{e:?}"))?;
         match invocation.command {
             Command::QueryRun { options, .. } => assert!(!options.require_live),
-            other => panic!("unexpected command: {other:?}"),
+            other => {
+                assert!(
+                    matches!(other, Command::QueryRun { .. }),
+                    "unexpected command: {other:?}"
+                );
+            }
         }
+        Ok(())
     }
 
     // Default build: with the live transport absent, `query run --require-live`
@@ -6636,10 +6671,12 @@ mod tests {
     }
 
     #[test]
-    fn cli_error_codes_resolve_against_core_registry() {
+    fn cli_error_codes_resolve_against_core_registry() -> Result<(), String> {
         let emitted_codes = [
-            error_code_for(&["capabilties"]).expect("unknown command emits error"),
-            error_code_for(&["capabilities", "--jsno"]).expect("unknown flag emits error"),
+            error_code_for(&["capabilties"])
+                .ok_or_else(|| "unknown command emits error".to_string())?,
+            error_code_for(&["capabilities", "--jsno"])
+                .ok_or_else(|| "unknown flag emits error".to_string())?,
             error_code_for(&[
                 "query",
                 "plan",
@@ -6648,9 +6685,9 @@ mod tests {
                 "--sql",
                 "select 1; select 2",
             ])
-            .expect("multi-statement refusal emits error"),
+            .ok_or_else(|| "multi-statement refusal emits error".to_string())?,
             error_code_for(&["dataset", "describe-operator", "bogus"])
-                .expect("unknown operator emits error"),
+                .ok_or_else(|| "unknown operator emits error".to_string())?,
         ];
 
         for code in emitted_codes {
@@ -6666,6 +6703,7 @@ mod tests {
                 "{code} from CLI registry did not resolve against core registry"
             );
         }
+        Ok(())
     }
 
     fn render_outcome(outcome: Outcome) -> String {
@@ -6690,7 +6728,7 @@ mod tests {
         }
     }
 
-    fn dry_run_insert_plan() -> WriteIntentPlan {
+    fn dry_run_insert_plan() -> Result<WriteIntentPlan, String> {
         let policy = enabled_write_policy(WriteStatementKind::Insert, true);
         let mut req =
             WriteIntentRequest::new(WriteIntentMode::PlanDryRun, "insert into t values (1)");
@@ -6698,12 +6736,12 @@ mod tests {
         req.allowlist_id = Some(cli_allowlist_id(WriteStatementKind::Insert));
         req.request_id = Some(RequestId::new("plan-req"));
         match evaluate_write_intent(&req, &policy) {
-            WriteIntentDecision::DryRunPlanned { plan } => plan,
-            other => panic!("expected a dry-run plan, got {other:?}"),
+            WriteIntentDecision::DryRunPlanned { plan } => Ok(plan),
+            other => Err(format!("expected a dry-run plan, got {other:?}")),
         }
     }
 
-    fn authorized_insert_plan() -> WriteIntentPlan {
+    fn authorized_insert_plan() -> Result<WriteIntentPlan, String> {
         let policy = enabled_write_policy(WriteStatementKind::Insert, false);
         let mut req = WriteIntentRequest::new(
             WriteIntentMode::PrepareExecution,
@@ -6713,8 +6751,8 @@ mod tests {
         req.allowlist_id = Some(cli_allowlist_id(WriteStatementKind::Insert));
         req.request_id = Some(RequestId::new("exec-req"));
         match evaluate_write_intent(&req, &policy) {
-            WriteIntentDecision::ExecutionAuthorized { plan } => plan,
-            other => panic!("expected execution authorization, got {other:?}"),
+            WriteIntentDecision::ExecutionAuthorized { plan } => Ok(plan),
+            other => Err(format!("expected execution authorization, got {other:?}")),
         }
     }
 
@@ -6924,8 +6962,8 @@ mod tests {
     }
 
     #[test]
-    fn write_plan_outcome_emits_confirmation_token_and_executes_nothing() {
-        let plan = dry_run_insert_plan();
+    fn write_plan_outcome_emits_confirmation_token_and_executes_nothing() -> Result<(), String> {
+        let plan = dry_run_insert_plan()?;
         let token = plan.required_confirmation_token.as_str().to_string();
         let outcome = write_plan_outcome(
             OutputFormat::Json,
@@ -6943,6 +6981,7 @@ mod tests {
         assert!(rendered.contains("\"required_confirmation_token\""));
         assert!(rendered.contains(&token));
         assert!(rendered.contains("--confirm"));
+        Ok(())
     }
 
     // No-account build: an authorized write has nothing to run it, so it refuses
@@ -6950,8 +6989,8 @@ mod tests {
     // execute or emitting fixture data.
     #[cfg(not(feature = "live"))]
     #[test]
-    fn authorized_write_without_live_transport_refuses_cleanly() {
-        let plan = authorized_insert_plan();
+    fn authorized_write_without_live_transport_refuses_cleanly() -> Result<(), String> {
+        let plan = authorized_insert_plan()?;
         let outcome = query_write_execute_dispatch(
             OutputFormat::Json,
             "req-test".to_string(),
@@ -6966,6 +7005,7 @@ mod tests {
         assert!(rendered.contains("live SQL API transport"));
         assert!(rendered.contains("\"write_intent_authorized\":true"));
         assert!(!rendered.contains("\"data_source\":\"live\""));
+        Ok(())
     }
 
     // Live build, credential-less profile: the executor IS reachable behind the
@@ -6973,8 +7013,8 @@ mod tests {
     // claim live data. Credential resolution fails before any network I/O.
     #[cfg(feature = "live")]
     #[test]
-    fn authorized_write_without_credentials_refuses_cleanly_live() {
-        let plan = authorized_insert_plan();
+    fn authorized_write_without_credentials_refuses_cleanly_live() -> Result<(), String> {
+        let plan = authorized_insert_plan()?;
         let outcome = query_write_execute_dispatch(
             OutputFormat::Json,
             "req-test".to_string(),
@@ -6994,6 +7034,7 @@ mod tests {
             !rendered.contains("\"data_source\":\"live\""),
             "must never claim live data without credentials"
         );
+        Ok(())
     }
 
     #[test]
