@@ -2295,8 +2295,10 @@ mod tests {
     use std::collections::VecDeque;
 
     fn endpoint() -> SnowflakeEndpoint {
-        SnowflakeEndpoint::parse("https://xy12345.us-east-1.snowflakecomputing.com")
-            .expect("valid endpoint")
+        SnowflakeEndpoint {
+            base_url: "https://xy12345.us-east-1.snowflakecomputing.com".to_string(),
+            host: "xy12345.us-east-1.snowflakecomputing.com".to_string(),
+        }
     }
 
     fn auth() -> AuthorizationDescriptor {
@@ -2316,22 +2318,23 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_requires_https_and_rejects_credentials() {
+    fn endpoint_requires_https_and_rejects_credentials() -> Result<(), String> {
         assert!(SnowflakeEndpoint::parse("http://xy123.snowflakecomputing.com").is_err());
         assert!(SnowflakeEndpoint::parse("https://user@xy123.snowflakecomputing.com").is_err());
         assert!(SnowflakeEndpoint::parse("https://xy123.snowflakecomputing.com?role=x").is_err());
         assert!(SnowflakeEndpoint::parse("https://xy123.snowflakecomputing.com/proxy").is_err());
         assert!(SnowflakeEndpoint::parse("https://attacker.example.com").is_err());
         let parsed = SnowflakeEndpoint::parse("https://xy123.snowflakecomputing.com/")
-            .expect("valid endpoint");
+            .map_err(|e| format!("valid endpoint failed: {e}"))?;
         assert_eq!(parsed.base_url(), "https://xy123.snowflakecomputing.com");
         let parsed_upper = SnowflakeEndpoint::parse("HTTPS://XY123.SNOWFLAKECOMPUTING.COM/")
-            .expect("valid uppercase endpoint");
+            .map_err(|e| format!("valid uppercase endpoint failed: {e}"))?;
         assert_eq!(
             parsed_upper.base_url(),
             "https://xy123.snowflakecomputing.com"
         );
         assert_eq!(parsed_upper.host(), "xy123.snowflakecomputing.com");
+        Ok(())
     }
 
     #[test]
@@ -2397,8 +2400,10 @@ mod tests {
     }
 
     #[test]
-    fn auth_headers_wire_token_type_without_logging_secret() {
-        let headers = auth().wire_headers().expect("headers");
+    fn auth_headers_wire_token_type_without_logging_secret() -> Result<(), String> {
+        let headers = auth()
+            .wire_headers()
+            .map_err(|e| format!("wire_headers failed: {e}"))?;
         assert!(
             headers
                 .iter()
@@ -2409,10 +2414,11 @@ mod tests {
                 .iter()
                 .any(|h| { h.name == HEADER_TOKEN_TYPE && h.value == "PROGRAMMATIC_ACCESS_TOKEN" })
         );
+        Ok(())
     }
 
     #[test]
-    fn wire_request_and_header_debug_redact_authorization_bearer() {
+    fn wire_request_and_header_debug_redact_authorization_bearer() -> Result<(), String> {
         let token = "sfpat_http_debug_secret_123";
         let client = SnowflakeHttpClient::new(
             TransportConfig::new(endpoint()),
@@ -2424,12 +2430,14 @@ mod tests {
             body: b"{}".to_vec(),
             retry_resubmit: false,
         };
-        let plan = client.submit_plan(&request).expect("submit plan");
+        let plan = client
+            .submit_plan(&request)
+            .map_err(|e| format!("submit plan failed: {e}"))?;
         let authorization = plan
             .headers
             .iter()
             .find(|header| header.name == HEADER_AUTHORIZATION)
-            .expect("authorization header");
+            .ok_or_else(|| "authorization header not found".to_string())?;
 
         assert_eq!(authorization.value, format!("Bearer {token}"));
 
@@ -2437,7 +2445,8 @@ mod tests {
             format!("{authorization:?}"),
             format!("{:?}", plan.headers),
             format!("{plan:?}"),
-            serde_json::to_string(authorization).expect("header json"),
+            serde_json::to_string(authorization)
+                .map_err(|e| format!("header json serialization failed: {e}"))?,
         ] {
             assert!(
                 !rendered.contains(token),
@@ -2445,6 +2454,7 @@ mod tests {
             );
             assert!(rendered.contains(REDACTION_PLACEHOLDER));
         }
+        Ok(())
     }
 
     #[test]
@@ -2527,7 +2537,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_error_constructor_redacts_secret_shaped_messages() {
+    fn transport_error_constructor_redacts_secret_shaped_messages() -> Result<(), String> {
         let token = "ghp_httpTransportSecret0123";
         let error = TransportError::new(
             TransportErrorCode::NetworkError,
@@ -2537,7 +2547,7 @@ mod tests {
         for rendered in [
             error.message.clone(),
             error.to_string(),
-            serde_json::to_string(&error).expect("error json"),
+            serde_json::to_string(&error).map_err(|e| format!("error json failed: {e}"))?,
             format!("{error:?}"),
         ] {
             assert!(
@@ -2546,6 +2556,7 @@ mod tests {
             );
             assert!(rendered.contains(REDACTION_PLACEHOLDER));
         }
+        Ok(())
     }
 
     #[test]
@@ -2571,7 +2582,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_wins_before_exponential_jitter() {
+    fn retry_after_wins_before_exponential_jitter() -> Result<(), String> {
         let policy = RetryPolicy::default();
         let request_id = RequestId::new("req-123");
         assert_eq!(
@@ -2580,9 +2591,10 @@ mod tests {
         );
         let exponential = policy
             .delay_for(Some(&request_id), TransportRouteKind::Poll, 2, None, 0)
-            .expect("delay");
+            .ok_or_else(|| "expected exponential delay".to_string())?;
         assert!(exponential >= Duration::from_millis(200));
         assert!(exponential <= Duration::from_millis(230));
+        Ok(())
     }
 
     #[test]
@@ -2607,7 +2619,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_http_date_is_measured_against_absolute_wall_clock() {
+    fn retry_after_http_date_is_measured_against_absolute_wall_clock() -> Result<(), String> {
         // Regression: an HTTP-date `Retry-After` must be differenced against
         // absolute Unix time, not asupersync's process-relative `wall_now()`. A
         // date already in the past yields a zero delay. Under the old
@@ -2627,11 +2639,12 @@ mod tests {
         // saturated-to-zero past case, confirming the sign of the difference is
         // correct.
         let delay = retry_after_ms(&header("Retry-After", "Fri, 31 Dec 2100 23:59:59 GMT"))
-            .expect("future date delay");
+            .ok_or_else(|| "expected future date delay".to_string())?;
         assert!(
             delay > 0,
             "future date must yield a positive delay, got {delay}"
         );
+        Ok(())
     }
 
     #[test]
@@ -2647,7 +2660,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_decision_charges_each_delay_once() {
+    fn retry_decision_charges_each_delay_once() -> Result<(), String> {
         let policy = RetryPolicy {
             max_attempts: 4,
             base_delay_ms: 25,
@@ -2658,7 +2671,7 @@ mod tests {
         };
         let first = policy
             .next_retry(None, TransportRouteKind::Poll, 1, None, 0)
-            .expect("first retry");
+            .ok_or_else(|| "expected first retry".to_string())?;
         assert_eq!(first.delay, Duration::from_millis(25));
         assert_eq!(first.spent_after_ms, 25);
 
@@ -2670,7 +2683,7 @@ mod tests {
                 None,
                 first.spent_after_ms,
             )
-            .expect("second retry");
+            .ok_or_else(|| "expected second retry".to_string())?;
         assert_eq!(second.delay, Duration::from_millis(50));
         assert_eq!(second.spent_after_ms, 75);
 
@@ -2684,6 +2697,7 @@ mod tests {
             ),
             None
         );
+        Ok(())
     }
 
     #[test]
@@ -2733,7 +2747,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_budget_drives_timeout_and_exhaustion_reason() {
+    fn effective_budget_drives_timeout_and_exhaustion_reason() -> Result<(), String> {
         let now = Time::from_secs(10);
         let bounded = Budget::new().with_deadline(Time::from_secs(12));
         assert_eq!(
@@ -2742,19 +2756,20 @@ mod tests {
         );
         assert!(
             budget_exhaustion_reason_at(Budget::new().with_deadline(Time::from_secs(10)), now)
-                .expect("deadline exhausted")
+                .ok_or_else(|| "expected deadline exhausted reason".to_string())?
                 .is_kind(CancelKind::Deadline)
         );
         assert!(
             budget_exhaustion_reason_at(Budget::new().with_poll_quota(0), now)
-                .expect("poll quota exhausted")
+                .ok_or_else(|| "expected poll quota exhausted reason".to_string())?
                 .is_kind(CancelKind::PollQuota)
         );
         assert!(
             budget_exhaustion_reason_at(Budget::new().with_cost_quota(0), now)
-                .expect("cost budget exhausted")
+                .ok_or_else(|| "expected cost budget exhausted reason".to_string())?
                 .is_kind(CancelKind::CostBudget)
         );
+        Ok(())
     }
 
     #[test]
@@ -2791,16 +2806,17 @@ mod tests {
     }
 
     #[test]
-    fn content_encoding_fails_closed() {
+    fn content_encoding_fails_closed() -> Result<(), String> {
         assert_eq!(
-            ContentEncoding::parse(None).expect("identity"),
+            ContentEncoding::parse(None).map_err(|e| format!("identity parse failed: {e}"))?,
             ContentEncoding::Identity
         );
         assert_eq!(
-            ContentEncoding::parse(Some("gzip")).expect("gzip"),
+            ContentEncoding::parse(Some("gzip")).map_err(|e| format!("gzip parse failed: {e}"))?,
             ContentEncoding::Gzip
         );
         assert!(ContentEncoding::parse(Some("br")).is_err());
+        Ok(())
     }
 
     #[test]
@@ -2854,7 +2870,7 @@ mod tests {
     }
 
     #[test]
-    fn wire_plan_adds_json_headers() {
+    fn wire_plan_adds_json_headers() -> Result<(), String> {
         let client = SnowflakeHttpClient::new(
             TransportConfig::new(endpoint()),
             AsupersyncHttpClient::new(),
@@ -2865,14 +2881,17 @@ mod tests {
             body: b"{}".to_vec(),
             retry_resubmit: false,
         };
-        let plan = client.submit_plan(&request).expect("submit plan");
+        let plan = client
+            .submit_plan(&request)
+            .map_err(|e| format!("submit plan failed: {e}"))?;
         assert_eq!(plan.method, Method::Post);
         assert!(plan.headers.iter().any(|h| h.name == HEADER_ACCEPT));
         assert!(plan.headers.iter().any(|h| h.name == HEADER_CONTENT_TYPE));
+        Ok(())
     }
 
     #[test]
-    fn partition_wire_plan_advertises_gzip() {
+    fn partition_wire_plan_advertises_gzip() -> Result<(), String> {
         let client = SnowflakeHttpClient::new(
             TransportConfig::new(endpoint()),
             AsupersyncHttpClient::new(),
@@ -2882,29 +2901,34 @@ mod tests {
             statement_handle: StatementHandle::new("stmt-1"),
             partition: 2,
         };
-        let plan = client.partition_plan(&request).expect("partition plan");
+        let plan = client
+            .partition_plan(&request)
+            .map_err(|e| format!("partition plan failed: {e}"))?;
         assert!(
             plan.headers
                 .iter()
                 .any(|h| h.name == HEADER_ACCEPT_ENCODING && h.value == PARTITION_ACCEPT_ENCODING)
         );
+        Ok(())
     }
 
     #[test]
-    fn gzip_partition_response_is_decoded_with_evidence() {
+    fn gzip_partition_response_is_decoded_with_evidence() -> Result<(), String> {
         use asupersync::http::compress::{Compressor, GzipCompressor};
 
         let mut compressed = Vec::new();
         let mut compressor = GzipCompressor::new();
         compressor
             .compress(br#"{"data":[["one"]]}"#, &mut compressed)
-            .expect("compress");
-        compressor.finish(&mut compressed).expect("finish");
+            .map_err(|e| format!("compress failed: {e}"))?;
+        compressor
+            .finish(&mut compressed)
+            .map_err(|e| format!("finish failed: {e}"))?;
 
         let response =
             Response::new(200, "OK", compressed.clone()).with_header("content-encoding", "gzip");
-        let body =
-            PartitionBody::from_response(response, BodyLimits::default(), Some(1)).expect("decode");
+        let body = PartitionBody::from_response(response, BodyLimits::default(), Some(1))
+            .map_err(|e| format!("decode failed: {e}"))?;
         assert_eq!(body.body, br#"{"data":[["one"]]}"#);
         assert_eq!(body.compression.content_encoding, ContentEncoding::Gzip);
         assert_eq!(body.compression.compressed_bytes, compressed.len() as u64);
@@ -2912,6 +2936,7 @@ mod tests {
             body.compression.uncompressed_bytes,
             br#"{"data":[["one"]]}"#.len() as u64
         );
+        Ok(())
     }
 
     #[test]
@@ -3058,8 +3083,15 @@ mod tests {
             let outcome = client
                 .submit_statement(&cx, retry_submit("req-idem-1"))
                 .await;
-            let TransportOutcome::Ok(response) = outcome else {
-                panic!("expected a submit response, got {outcome:?}");
+            let response = match outcome {
+                TransportOutcome::Ok(response) => response,
+                other => {
+                    assert!(
+                        matches!(other, TransportOutcome::Ok(_)),
+                        "expected a submit response, got {other:?}"
+                    );
+                    return;
+                }
             };
             assert_eq!(response.status, StatusClass::Running);
             let requests = client.client.requests();
@@ -3106,8 +3138,15 @@ mod tests {
                     },
                 )
                 .await;
-            let TransportOutcome::Err(error) = outcome else {
-                panic!("expected a typed refusal, got {outcome:?}");
+            let error = match outcome {
+                TransportOutcome::Err(error) => error,
+                other => {
+                    assert!(
+                        matches!(other, TransportOutcome::Err(_)),
+                        "expected a typed refusal, got {other:?}"
+                    );
+                    return;
+                }
             };
             assert!(
                 error.message.contains("requestId plus retry=true"),
@@ -3136,8 +3175,15 @@ mod tests {
             );
             let cx = Cx::for_testing();
             let outcome = client.poll_statement(&cx, poll_request()).await;
-            let TransportOutcome::Err(error) = outcome else {
-                panic!("expected retry exhaustion, got {outcome:?}");
+            let error = match outcome {
+                TransportOutcome::Err(error) => error,
+                other => {
+                    assert!(
+                        matches!(other, TransportOutcome::Err(_)),
+                        "expected retry exhaustion, got {other:?}"
+                    );
+                    return;
+                }
             };
             assert!(
                 error
@@ -3162,8 +3208,15 @@ mod tests {
             );
             let cx = Cx::for_testing();
             let outcome = client.poll_statement(&cx, poll_request()).await;
-            let TransportOutcome::Ok(response) = outcome else {
-                panic!("expected a poll response, got {outcome:?}");
+            let response = match outcome {
+                TransportOutcome::Ok(response) => response,
+                other => {
+                    assert!(
+                        matches!(other, TransportOutcome::Ok(_)),
+                        "expected a poll response, got {other:?}"
+                    );
+                    return;
+                }
             };
             assert_eq!(response.status, StatusClass::Running);
             let requests = client.client.requests();
@@ -3183,8 +3236,15 @@ mod tests {
             let client = scripted_client(4, vec![Err(AsupersyncClientError::DeadlineExceeded)]);
             let cx = Cx::for_testing();
             let outcome = client.poll_statement(&cx, poll_request()).await;
-            let TransportOutcome::Cancelled(reason) = outcome else {
-                panic!("expected a deadline cancel, got {outcome:?}");
+            let reason = match outcome {
+                TransportOutcome::Cancelled(reason) => reason,
+                other => {
+                    assert!(
+                        matches!(other, TransportOutcome::Cancelled(_)),
+                        "expected a deadline cancel, got {other:?}"
+                    );
+                    return;
+                }
             };
             assert_eq!(reason.kind, CancelKind::Deadline);
             assert_eq!(client.client.requests().len(), 1);
@@ -3193,7 +3253,7 @@ mod tests {
 
     #[test]
     fn execute_reports_an_in_flight_user_cancel_and_the_masked_cleanup_still_sends_the_remote_cancel()
-     {
+    {
         asupersync::test_utils::run_test(|| async {
             let cx = Cx::for_testing();
             let mut raw = ScriptedRaw::new(vec![
@@ -3204,8 +3264,15 @@ mod tests {
             let client = SnowflakeHttpClient::new(fast_retry_config(4), raw);
 
             let outcome = client.poll_statement(&cx, poll_request()).await;
-            let TransportOutcome::Cancelled(reason) = outcome else {
-                panic!("expected a cancellation, got {outcome:?}");
+            let reason = match outcome {
+                TransportOutcome::Cancelled(reason) => reason,
+                other => {
+                    assert!(
+                        matches!(other, TransportOutcome::Cancelled(_)),
+                        "expected a cancellation, got {other:?}"
+                    );
+                    return;
+                }
             };
             assert_eq!(reason.kind, CancelKind::User);
 
@@ -3258,10 +3325,10 @@ mod tests {
             let plain = br#"{"data":[["1","alpha"]]}"#;
             let mut compressed = Vec::new();
             let mut compressor = GzipCompressor::new();
-            compressor
-                .compress(plain, &mut compressed)
-                .expect("compress");
-            compressor.finish(&mut compressed).expect("finish");
+            let compress_res = compressor.compress(plain, &mut compressed);
+            assert!(compress_res.is_ok(), "compress failed: {compress_res:?}");
+            let finish_res = compressor.finish(&mut compressed);
+            assert!(finish_res.is_ok(), "finish failed: {finish_res:?}");
             let client = scripted_client(
                 4,
                 vec![Ok(Response::new(200, "OK", compressed.clone())
@@ -3278,8 +3345,15 @@ mod tests {
                     },
                 )
                 .await;
-            let TransportOutcome::Ok(body) = outcome else {
-                panic!("expected a decoded partition, got {outcome:?}");
+            let body = match outcome {
+                TransportOutcome::Ok(body) => body,
+                other => {
+                    assert!(
+                        matches!(other, TransportOutcome::Ok(_)),
+                        "expected a decoded partition, got {other:?}"
+                    );
+                    return;
+                }
             };
             assert_eq!(body.body, plain);
             assert_eq!(body.compression.content_encoding, ContentEncoding::Gzip);
@@ -3339,8 +3413,11 @@ mod tests {
 
         match outcome {
             TransportOutcome::Cancelled(actual) => assert_eq!(actual.kind, reason.kind),
-            TransportOutcome::Ok(_) | TransportOutcome::Err(_) | TransportOutcome::Panicked(_) => {
-                panic!("cancelled stream cleanup must not report success")
+            other => {
+                assert!(
+                    matches!(other, TransportOutcome::Cancelled(_)),
+                    "cancelled stream cleanup must not report success, got {other:?}"
+                );
             }
         }
     }
@@ -3406,7 +3483,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_stream_plan_validates_concurrency() {
+    fn partition_stream_plan_validates_concurrency() -> Result<(), String> {
         let request = PartitionStreamRequest {
             auth: auth(),
             statement_handle: StatementHandle::new("stmt-1"),
@@ -3417,17 +3494,24 @@ mod tests {
             remote_cancel_on_local_cancel: true,
             seed_partitions: Vec::new(),
         };
-        assert_eq!(request.plan().expect("plan").planned_partitions, 2);
+        assert_eq!(
+            request
+                .plan()
+                .map_err(|e| format!("plan failed: {e}"))?
+                .planned_partitions,
+            2
+        );
 
         let invalid = PartitionStreamRequest {
             max_concurrent_fetches: 0,
             ..request
         };
         assert!(invalid.plan().is_err());
+        Ok(())
     }
 
     #[test]
-    fn partition_stream_plan_rejects_seed_overlap_and_reordering() {
+    fn partition_stream_plan_rejects_seed_overlap_and_reordering() -> Result<(), String> {
         let request = PartitionStreamRequest {
             auth: auth(),
             statement_handle: StatementHandle::new("stmt-1"),
@@ -3438,7 +3522,9 @@ mod tests {
             remote_cancel_on_local_cancel: true,
             seed_partitions: vec![decoded_partition(0), decoded_partition(1)],
         };
-        let summary = request.plan().expect("valid seeds before fetch range");
+        let summary = request
+            .plan()
+            .map_err(|e| format!("valid seeds before fetch range failed: {e}"))?;
         assert_eq!(summary.accepted_seed_partitions, 2);
 
         let overlaps = PartitionStreamRequest {
@@ -3459,6 +3545,7 @@ mod tests {
             ..request
         };
         assert!(out_of_order.plan().is_err());
+        Ok(())
     }
 
     fn decoded_partition(partition: u32) -> DecodedPartition {
