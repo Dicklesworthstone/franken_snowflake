@@ -226,16 +226,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exact_one_operator_schema_accepts_scalar_or_single_value_array() {
+    fn exact_one_operator_schema_accepts_scalar_or_single_value_array() -> Result<(), String> {
         let operator = built_in_operator_catalog()
             .into_iter()
             .find(|operator| operator.id == "eq")
-            .expect("eq operator exists");
+            .ok_or_else(|| "eq operator exists".to_string())?;
 
         let schema = describe_operator_json_schema(&operator);
         let value_schema = &schema["allOf"][0]["properties"]["value"];
         assert_eq!(value_schema["oneOf"][0], scalar_value_schema());
         assert_eq!(value_schema["oneOf"][1], single_value_array_schema());
+        Ok(())
     }
 
     #[test]
@@ -247,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn value_bearing_operator_schema_admits_the_value_property() {
+    fn value_bearing_operator_schema_admits_the_value_property() -> Result<(), String> {
         // `value` is contributed by the `allOf` sub-schema. With the old
         // `additionalProperties: false`, a 2020-12 validator would reject the
         // canonical `{column, op, value}` instance because `additionalProperties`
@@ -256,7 +257,7 @@ mod tests {
         let operator = built_in_operator_catalog()
             .into_iter()
             .find(|operator| operator.id == "eq")
-            .expect("eq operator exists");
+            .ok_or_else(|| "eq operator exists".to_string())?;
         let schema = describe_operator_json_schema(&operator);
 
         assert_eq!(schema["unevaluatedProperties"], json!(false));
@@ -266,5 +267,112 @@ mod tests {
         );
         // `value` is still constrained by the `allOf` branch (required there).
         assert_eq!(schema["allOf"][0]["required"], json!(["value"]));
+        Ok(())
+    }
+
+    #[test]
+    fn operator_arity_accepts_and_label() {
+        let exact_zero = OperatorArity::Exact { count: 0 };
+        assert!(exact_zero.accepts(0));
+        assert!(!exact_zero.accepts(1));
+        assert_eq!(exact_zero.label(), "0");
+
+        let exact_two = OperatorArity::Exact { count: 2 };
+        assert!(exact_two.accepts(2));
+        assert!(!exact_two.accepts(1));
+        assert!(!exact_two.accepts(3));
+        assert_eq!(exact_two.label(), "2");
+
+        let variadic = OperatorArity::Variadic { min: 1, max: 100 };
+        assert!(!variadic.accepts(0));
+        assert!(variadic.accepts(1));
+        assert!(variadic.accepts(50));
+        assert!(variadic.accepts(100));
+        assert!(!variadic.accepts(101));
+        assert_eq!(variadic.label(), "1..=100");
+    }
+
+    #[test]
+    fn operator_catalog_entry_accepts_dtype() -> Result<(), String> {
+        let catalog = built_in_operator_catalog();
+
+        let eq = catalog
+            .iter()
+            .find(|op| op.id == "eq")
+            .ok_or_else(|| "eq operator exists".to_string())?;
+        assert!(eq.accepts_dtype(DtypeClass::String));
+        assert!(eq.accepts_dtype(DtypeClass::Number));
+        assert!(eq.accepts_dtype(DtypeClass::Boolean));
+        assert!(!eq.accepts_dtype(DtypeClass::Variant));
+
+        let contains = catalog
+            .iter()
+            .find(|op| op.id == "contains")
+            .ok_or_else(|| "contains operator exists".to_string())?;
+        assert!(contains.accepts_dtype(DtypeClass::String));
+        assert!(!contains.accepts_dtype(DtypeClass::Number));
+
+        let is_null = catalog
+            .iter()
+            .find(|op| op.id == "is_null")
+            .ok_or_else(|| "is_null operator exists".to_string())?;
+        assert!(is_null.accepts_dtype(DtypeClass::Variant));
+        assert!(is_null.accepts_dtype(DtypeClass::Unknown));
+        assert!(is_null.accepts_dtype(DtypeClass::String));
+        Ok(())
+    }
+
+    #[test]
+    fn zero_arity_operator_schema_forbids_value_property() -> Result<(), String> {
+        let operator = built_in_operator_catalog()
+            .into_iter()
+            .find(|operator| operator.id == "is_null")
+            .ok_or_else(|| "is_null operator exists".to_string())?;
+
+        let schema = describe_operator_json_schema(&operator);
+        assert_eq!(schema["allOf"][0]["not"]["required"], json!(["value"]));
+        Ok(())
+    }
+
+    #[test]
+    fn multi_value_and_variadic_operator_schemas() -> Result<(), String> {
+        let catalog = built_in_operator_catalog();
+
+        let between = catalog
+            .iter()
+            .find(|op| op.id == "between")
+            .ok_or_else(|| "between operator exists".to_string())?;
+        let between_schema = describe_operator_json_schema(between);
+        assert_eq!(
+            between_schema["allOf"][0]["properties"]["value"]["type"],
+            json!("array")
+        );
+        assert_eq!(
+            between_schema["allOf"][0]["properties"]["value"]["minItems"],
+            json!(2)
+        );
+        assert_eq!(
+            between_schema["allOf"][0]["properties"]["value"]["maxItems"],
+            json!(2)
+        );
+
+        let in_op = catalog
+            .iter()
+            .find(|op| op.id == "in")
+            .ok_or_else(|| "in operator exists".to_string())?;
+        let in_schema = describe_operator_json_schema(in_op);
+        assert_eq!(
+            in_schema["allOf"][0]["properties"]["value"]["type"],
+            json!("array")
+        );
+        assert_eq!(
+            in_schema["allOf"][0]["properties"]["value"]["minItems"],
+            json!(1)
+        );
+        assert_eq!(
+            in_schema["allOf"][0]["properties"]["value"]["maxItems"],
+            json!(100)
+        );
+        Ok(())
     }
 }
