@@ -738,12 +738,75 @@ mod tests {
         assert_eq!(event.data_source, TextIndexDataSource::Offline);
     }
 
+    #[test]
+    fn text_index_error_display() {
+        assert_eq!(
+            TextIndexError::EmptyText {
+                handle: "h1".to_owned()
+            }
+            .to_string(),
+            "text chunk is empty: h1"
+        );
+        assert_eq!(
+            TextIndexError::TopKExceeded {
+                requested: 100,
+                max: 50
+            }
+            .to_string(),
+            "rerank top_k 100 exceeds maximum 50"
+        );
+        assert_eq!(
+            TextIndexError::MissingField {
+                field: "receipt_hash"
+            }
+            .to_string(),
+            "missing text-index field: receipt_hash"
+        );
+    }
+
+    #[test]
+    fn text_source_kind_handle_components() {
+        assert_eq!(TextSourceKind::QueryResult.as_handle_component(), "query");
+        assert_eq!(
+            TextSourceKind::StagedDocument.as_handle_component(),
+            "stage"
+        );
+    }
+
+    #[test]
+    fn text_indexing_feature_report_current() {
+        let report = TextIndexingFeatureReport::current();
+        assert_eq!(report.schema_version, TEXT_INDEX_SCHEMA_VERSION);
+        assert_eq!(
+            report.allowed_tiers,
+            vec![TextRetrievalTier::Hash, TextRetrievalTier::Lexical]
+        );
+        assert_eq!(
+            report.frankensearch_enabled,
+            cfg!(feature = "frankensearch")
+        );
+        assert_eq!(report.rerank_feature_enabled, cfg!(feature = "rerank"));
+    }
+
+    #[test]
+    fn text_chunk_with_title_and_sensitivity_tags() {
+        let chunk = TextChunk::new(query_source(), "body", 0, "text", RightsClass::Internal)
+            .with_title("sample title")
+            .with_sensitivity_tags(vec!["pii".to_owned(), "confidential".to_owned()]);
+
+        assert_eq!(chunk.title.as_deref(), Some("sample title"));
+        assert_eq!(
+            chunk.sensitivity_tags,
+            vec!["pii".to_owned(), "confidential".to_owned()]
+        );
+    }
+
     #[cfg(feature = "frankensearch")]
     #[test]
-    fn frankensearch_fixture_docs_build_and_query() {
+    fn frankensearch_fixture_docs_build_and_query() -> Result<(), String> {
         use crate::frankensearch_adapter::{build_hash_lexical_index, query_hash_lexical_index};
 
-        let dir = tempfile::tempdir().expect("temp dir should be available");
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
         let index_path = dir.path().to_path_buf();
         let chunks = vec![
             TextChunk::new(
@@ -773,14 +836,15 @@ mod tests {
                     .is_ok_and(|(results, _)| !results.is_empty())
             );
         });
+        Ok(())
     }
 
     #[cfg(feature = "frankensearch")]
     #[test]
-    fn frankensearch_builder_refuses_empty_chunks() {
+    fn frankensearch_builder_refuses_empty_chunks() -> Result<(), String> {
         use crate::frankensearch_adapter::build_hash_lexical_index;
 
-        let dir = tempfile::tempdir().expect("temp dir should be available");
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
         let index_path = dir.path().to_path_buf();
         let chunks = vec![TextChunk::new(
             query_source(),
@@ -797,5 +861,6 @@ mod tests {
                 Err(frankensearch::SearchError::InvalidConfig { .. })
             ));
         });
+        Ok(())
     }
 }
