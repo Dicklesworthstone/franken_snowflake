@@ -1486,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    fn jsonl_variant_cells_preserve_key_order_and_large_integers() {
+    fn jsonl_variant_cells_preserve_key_order_and_large_integers() -> Result<(), String> {
         // VARIANT/OBJECT/ARRAY cells must be emitted verbatim. Round-tripping
         // through `serde_json::Value` (no `arbitrary_precision`/`preserve_order`)
         // would reorder the keys and collapse the `NUMBER(38,0)` `big` value
@@ -1496,9 +1496,11 @@ mod tests {
             vec![ExportColumn::new("v", "VARIANT")],
             vec![ResultPartition::new(0, vec![vec![Some(raw.to_owned())]])],
         );
-        let artifact = export_jsonl(&input, "artifacts/variant.jsonl", 1).expect("export");
-        let line = String::from_utf8(artifact.bytes).expect("utf8 export bytes");
+        let artifact =
+            export_jsonl(&input, "artifacts/variant.jsonl", 1).map_err(|e| e.to_string())?;
+        let line = String::from_utf8(artifact.bytes).map_err(|e| e.to_string())?;
         assert_eq!(line, format!("{{\"v\":{raw}}}\n"));
+        Ok(())
     }
 
     #[test]
@@ -1593,6 +1595,280 @@ mod tests {
         assert_eq!(
             snowflake_type_family("BOOLEAN"),
             SnowflakeTypeFamily::Boolean
+        );
+    }
+
+    #[test]
+    fn copy_into_plan_renders_deterministic_jsonl_gzip_sql() -> Result<(), String> {
+        let options = CopyIntoOptions {
+            format: ExportFormat::Jsonl,
+            compression: CopyCompression::Gzip,
+            header: false,
+            overwrite: true,
+            single: true,
+            max_file_size: None,
+        };
+        let plan = CopyIntoPlan::new(
+            "@exports/run_jsonl",
+            CopySource::ResultScan {
+                query_id: "01bcaafe-0000-0000-0000-000000000001".to_owned(),
+            },
+        )
+        .with_options(options)
+        .with_profile_ref_redacted("secret_profile_123");
+
+        let sql = plan.to_sql().map_err(|e| e.to_string())?;
+        assert_eq!(
+            sql,
+            "COPY INTO @exports/run_jsonl FROM (SELECT * FROM TABLE(RESULT_SCAN('01bcaafe-0000-0000-0000-000000000001'))) FILE_FORMAT = (TYPE = JSON COMPRESSION = GZIP) OVERWRITE = TRUE SINGLE = TRUE"
+        );
+        let address = plan.plan_address().map_err(|e| e.to_string())?;
+        assert_eq!(address.algorithm, "blake3");
+        assert!(address.verify(sql.as_bytes()).is_ok());
+
+        let receipt = plan.plan_receipt(555).map_err(|e| e.to_string())?;
+        assert_eq!(receipt.kind, ExportReceiptKind::CopyIntoPlan);
+        assert_eq!(receipt.format, Some(ExportFormat::Jsonl));
+        assert_eq!(receipt.created_at_ms, 555);
+        assert_eq!(
+            receipt.plan_hash,
+            Some(plan.plan_hash().map_err(|e| e.to_string())?)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_export_refuses_empty_schema() {
+        let empty_input = LocalExportInput::new(Vec::new(), Vec::new());
+        assert_eq!(
+            export_csv(&empty_input, "artifacts/empty.csv", 100),
+            Err(ExportError::EmptySchema)
+        );
+        assert_eq!(
+            export_jsonl(&empty_input, "artifacts/empty.jsonl", 100),
+            Err(ExportError::EmptySchema)
+        );
+    }
+
+    #[test]
+    fn local_export_refuses_duplicate_columns() {
+        let dup_input = LocalExportInput::new(
+            vec![
+                ExportColumn::new("user_id", "NUMBER"),
+                ExportColumn::new("user_id", "TEXT"),
+            ],
+            Vec::new(),
+        );
+        let expected_err = ExportError::DuplicateColumn {
+            name: "user_id".to_owned(),
+        };
+        assert_eq!(
+            export_csv(&dup_input, "artifacts/dup.csv", 100),
+            Err(expected_err.clone())
+        );
+        assert_eq!(
+            export_jsonl(&dup_input, "artifacts/dup.jsonl", 100),
+            Err(expected_err)
+        );
+    }
+
+    #[test]
+    fn local_export_refuses_out_of_order_partitions() {
+        let out_of_order = LocalExportInput::new(
+            vec![ExportColumn::new("col", "TEXT")],
+            vec![
+                ResultPartition::new(1, vec![vec![Some("val1".to_owned())]]),
+                ResultPartition::new(0, vec![vec![Some("val0".to_owned())]]),
+            ],
+        );
+        assert_eq!(
+            export_csv(&out_of_order, "artifacts/order.csv", 100),
+            Err(ExportError::PartitionOrder {
+                previous: 1,
+                next: 0,
+            })
+        );
+
+        let duplicate_partition = LocalExportInput::new(
+            vec![ExportColumn::new("col", "TEXT")],
+            vec![
+                ResultPartition::new(1, vec![vec![Some("val1".to_owned())]]),
+                ResultPartition::new(1, vec![vec![Some("val2".to_owned())]]),
+            ],
+        );
+        assert_eq!(
+            export_jsonl(&duplicate_partition, "artifacts/dup_part.jsonl", 100),
+            Err(ExportError::PartitionOrder {
+                previous: 1,
+                next: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn local_export_refuses_row_width_mismatch() {
+        let cols = vec![
+            ExportColumn::new("c1", "TEXT"),
+            ExportColumn::new("c2", "TEXT"),
+        ];
+        let too_short = LocalExportInput::new(
+            cols.clone(),
+            vec![ResultPartition::new(
+                0,
+                vec![vec![Some("only_one".to_owned())]],
+            )],
+        );
+        assert_eq!(
+            export_csv(&too_short, "artifacts/short.csv", 100),
+            Err(ExportError::RowWidthMismatch {
+                partition_index: 0,
+                row_index: 0,
+                expected: 2,
+                actual: 1,
+            })
+        );
+
+        let too_wide = LocalExportInput::new(
+            cols,
+            vec![ResultPartition::new(
+                0,
+                vec![vec![
+                    Some("one".to_owned()),
+                    Some("two".to_owned()),
+                    Some("three".to_owned()),
+                ]],
+            )],
+        );
+        assert_eq!(
+            export_jsonl(&too_wide, "artifacts/wide.jsonl", 100),
+            Err(ExportError::RowWidthMismatch {
+                partition_index: 0,
+                row_index: 0,
+                expected: 2,
+                actual: 3,
+            })
+        );
+    }
+
+    struct FailingSink;
+    impl ExportByteSink for FailingSink {
+        fn write_chunk(&mut self, _chunk: &[u8]) -> ExportResult<()> {
+            Err(ExportError::Sink {
+                message: "disk full".to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn failing_sink_propagates_sink_error() {
+        let input = fixture_input();
+        let mut sink = FailingSink;
+        let res = write_csv_stream(&input.columns, input.partitions.iter(), &mut sink);
+        assert_eq!(
+            res,
+            Err(ExportError::Sink {
+                message: "disk full".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn content_address_unsupported_algorithm() {
+        let addr = ContentAddress {
+            algorithm: "sha256".to_owned(),
+            digest_hex: "abcd".to_owned(),
+            byte_len: 4,
+        };
+        assert_eq!(
+            addr.verify(b"test"),
+            Err(ExportError::UnsupportedAddressAlgorithm {
+                algorithm: "sha256".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn export_error_display_formatting() {
+        assert_eq!(
+            ExportError::EmptySchema.to_string(),
+            "local export requires at least one column"
+        );
+        assert_eq!(
+            ExportError::DuplicateColumn {
+                name: "col".to_owned()
+            }
+            .to_string(),
+            "local export column name is duplicated: col"
+        );
+        assert_eq!(
+            ExportError::PartitionOrder {
+                previous: 1,
+                next: 0
+            }
+            .to_string(),
+            "result partitions must be streamed in increasing order: 0 followed 1"
+        );
+        assert_eq!(
+            ExportError::RowWidthMismatch {
+                partition_index: 1,
+                row_index: 2,
+                expected: 3,
+                actual: 4,
+            }
+            .to_string(),
+            "row width mismatch in partition 1, row 2: expected 3, got 4"
+        );
+        assert_eq!(
+            ExportError::InvalidCopyLocation {
+                location: "@loc".to_owned(),
+                reason: "bad".to_owned(),
+            }
+            .to_string(),
+            "invalid COPY INTO location \"@loc\": bad"
+        );
+        assert_eq!(
+            ExportError::UnsafeCopySource {
+                reason: "semicolon".to_owned()
+            }
+            .to_string(),
+            "unsafe COPY INTO source: semicolon"
+        );
+        assert_eq!(
+            ExportError::ByteLengthMismatch {
+                expected: 10,
+                actual: 20
+            }
+            .to_string(),
+            "content byte length mismatch: expected 10, got 20"
+        );
+        assert_eq!(
+            ExportError::HashMismatch {
+                expected: "a".to_owned(),
+                actual: "b".to_owned()
+            }
+            .to_string(),
+            "content hash mismatch: expected a, got b"
+        );
+        assert_eq!(
+            ExportError::UnsupportedAddressAlgorithm {
+                algorithm: "md5".to_owned()
+            }
+            .to_string(),
+            "unsupported content-address algorithm \"md5\"; only blake3 is verifiable"
+        );
+        assert_eq!(
+            ExportError::Sink {
+                message: "io failure".to_owned()
+            }
+            .to_string(),
+            "export sink rejected bytes: io failure"
+        );
+        assert_eq!(
+            ExportError::Json {
+                message: "syntax error".to_owned()
+            }
+            .to_string(),
+            "export JSON serialization failed: syntax error"
         );
     }
 }
