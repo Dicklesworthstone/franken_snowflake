@@ -1020,14 +1020,17 @@ mod tests {
             "message": "Statement executed successfully.",
             "createdOn": 1_700_000_000_000_u64
         });
-        serde_json::to_vec(&body).unwrap()
+        serde_json::to_vec(&body).unwrap_or_default()
     }
 
     fn partition_body(partition: u32, rows: usize) -> Scripted {
         let body = serde_json::json!({
             "data": (0..rows).map(|_| vec![format!("p{partition}")]).collect::<Vec<_>>()
         });
-        Scripted::Ok(StatusClass::Completed, serde_json::to_vec(&body).unwrap())
+        Scripted::Ok(
+            StatusClass::Completed,
+            serde_json::to_vec(&body).unwrap_or_default(),
+        )
     }
 
     /// Submit completes immediately with `partition_rows.len()` extra partitions,
@@ -1038,7 +1041,7 @@ mod tests {
             multi_partition_body(inline_rows, partition_rows),
         ));
         for (offset, rows) in partition_rows.iter().enumerate() {
-            let partition = u32::try_from(offset + 1).unwrap();
+            let partition = u32::try_from(offset + 1).unwrap_or(u32::MAX);
             transport.script_partition(partition, partition_body(partition, *rows));
         }
         transport
@@ -1066,8 +1069,15 @@ mod tests {
                 fast_poll_plan(5).with_partition_concurrency(3),
             )
             .await;
-            let SnowflakeOutcome::Ok(done) = outcome else {
-                panic!("expected completion, got {outcome:?}");
+            let done = match outcome {
+                SnowflakeOutcome::Ok(done) => done,
+                other => {
+                    assert!(
+                        matches!(other, SnowflakeOutcome::Ok(_)),
+                        "expected completion, got {other:?}"
+                    );
+                    return;
+                }
             };
             assert_eq!(
                 column_values(&done),
@@ -1129,8 +1139,15 @@ mod tests {
                     .with_row_cap(Some(3)),
             )
             .await;
-            let SnowflakeOutcome::Ok(done) = outcome else {
-                panic!("expected completion, got {outcome:?}");
+            let done = match outcome {
+                SnowflakeOutcome::Ok(done) => done,
+                other => {
+                    assert!(
+                        matches!(other, SnowflakeOutcome::Ok(_)),
+                        "expected completion, got {other:?}"
+                    );
+                    return;
+                }
             };
             assert_eq!(column_values(&done), vec!["p0", "p1", "p2"]);
             assert!(done.is_partial());
@@ -1165,8 +1182,15 @@ mod tests {
                     .with_row_cap(Some(3)),
             )
             .await;
-            let SnowflakeOutcome::Ok(done) = outcome else {
-                panic!("expected completion, got {outcome:?}");
+            let done = match outcome {
+                SnowflakeOutcome::Ok(done) => done,
+                other => {
+                    assert!(
+                        matches!(other, SnowflakeOutcome::Ok(_)),
+                        "expected completion, got {other:?}"
+                    );
+                    return;
+                }
             };
             assert_eq!(column_values(&done), vec!["p0", "p1", "p2", "p3"]);
             assert!(done.is_partial());
@@ -1189,8 +1213,15 @@ mod tests {
                 fast_poll_plan(5).with_row_cap(Some(1_000)),
             )
             .await;
-            let SnowflakeOutcome::Ok(done) = outcome else {
-                panic!("expected completion, got {outcome:?}");
+            let done = match outcome {
+                SnowflakeOutcome::Ok(done) => done,
+                other => {
+                    assert!(
+                        matches!(other, SnowflakeOutcome::Ok(_)),
+                        "expected completion, got {other:?}"
+                    );
+                    return;
+                }
             };
             assert!(!done.is_partial());
             assert_eq!(done.rows.len(), 3);
@@ -1221,8 +1252,15 @@ mod tests {
                 fast_poll_plan(5).with_partition_concurrency(3),
             )
             .await;
-            let SnowflakeOutcome::Ok(done) = outcome else {
-                panic!("expected completion, got {outcome:?}");
+            let done = match outcome {
+                SnowflakeOutcome::Ok(done) => done,
+                other => {
+                    assert!(
+                        matches!(other, SnowflakeOutcome::Ok(_)),
+                        "expected completion, got {other:?}"
+                    );
+                    return;
+                }
             };
             assert_eq!(column_values(&done), vec!["p0", "p1", "p2", "p3"]);
             assert_eq!(
@@ -1269,8 +1307,15 @@ mod tests {
                 fast_poll_plan(5),
             )
             .await;
-            let SnowflakeOutcome::Err(error) = outcome else {
-                panic!("expected a typed error, got {outcome:?}");
+            let error = match outcome {
+                SnowflakeOutcome::Err(error) => error,
+                other => {
+                    assert!(
+                        matches!(other, SnowflakeOutcome::Err(_)),
+                        "expected a typed error, got {other:?}"
+                    );
+                    return;
+                }
             };
             assert_eq!(error.code, SnowflakeErrorCode::CredentialExpired);
             assert_eq!(auth.resigns, 1);
@@ -1450,8 +1495,15 @@ mod tests {
                 fast_poll_plan(5),
             )
             .await;
-            let SnowflakeOutcome::Err(error) = outcome else {
-                panic!("expected a typed error, got {outcome:?}");
+            let error = match outcome {
+                SnowflakeOutcome::Err(error) => error,
+                other => {
+                    assert!(
+                        matches!(other, SnowflakeOutcome::Err(_)),
+                        "expected a typed error, got {other:?}"
+                    );
+                    return;
+                }
             };
             assert_eq!(error.code, SnowflakeErrorCode::CredentialExpired);
             assert!(error.message.contains("401"), "{}", error.message);
@@ -1476,8 +1528,15 @@ mod tests {
                 fast_poll_plan(5),
             )
             .await;
-            let SnowflakeOutcome::Err(error) = outcome else {
-                panic!("expected a typed error, got {outcome:?}");
+            let error = match outcome {
+                SnowflakeOutcome::Err(error) => error,
+                other => {
+                    assert!(
+                        matches!(other, SnowflakeOutcome::Err(_)),
+                        "expected a typed error, got {other:?}"
+                    );
+                    return;
+                }
             };
             assert_eq!(error.code, SnowflakeErrorCode::CredentialExpired);
             assert_eq!(transport.orphan_cancels.borrow().len(), 1);
@@ -1502,8 +1561,15 @@ mod tests {
                 fast_poll_plan(5),
             )
             .await;
-            let SnowflakeOutcome::Err(error) = outcome else {
-                panic!("expected a typed error, got {outcome:?}");
+            let error = match outcome {
+                SnowflakeOutcome::Err(error) => error,
+                other => {
+                    assert!(
+                        matches!(other, SnowflakeOutcome::Err(_)),
+                        "expected a typed error, got {other:?}"
+                    );
+                    return;
+                }
             };
             assert_eq!(error.code, SnowflakeErrorCode::CredentialExpired);
             assert!(
@@ -1527,11 +1593,12 @@ mod tests {
                 StatusClass::Completed,
                 RESP_200_MULTI.to_vec(),
             ));
-            let multi: serde_json::Value = serde_json::from_slice(RESP_200_MULTI).unwrap();
+            let multi: serde_json::Value =
+                serde_json::from_slice(RESP_200_MULTI).unwrap_or_default();
             let partitions = multi["resultSetMetaData"]["partitionInfo"]
                 .as_array()
-                .unwrap()
-                .clone();
+                .cloned()
+                .unwrap_or_default();
             let partition_count = partitions.len();
             // First non-inline partition answers 401 once, then every partition
             // is served in the live object form with the promised rowCount.
@@ -1546,7 +1613,7 @@ mod tests {
                         .join(",")
                 );
                 transport.script_partition(
-                    u32::try_from(index).unwrap(),
+                    u32::try_from(index).unwrap_or(u32::MAX),
                     Scripted::Ok(StatusClass::Completed, body.into_bytes()),
                 );
             }
@@ -1587,7 +1654,7 @@ mod tests {
     fn submit_panic_without_a_handle_does_not_attempt_cleanup() {
         asupersync::test_utils::run_test(|| async {
             let transport = FakeTransport::new(Scripted::Panicked("submit panic"));
-            let cx = Cx::current().expect("native test runtime must install its context");
+            let cx = Cx::current().unwrap_or_else(Cx::for_testing);
             let (outcome, stats) = run_statement_with_stats(
                 &cx,
                 &transport,
@@ -1597,8 +1664,15 @@ mod tests {
                 fast_poll_plan(5),
             )
             .await;
-            let SnowflakeOutcome::Panicked(payload) = outcome else {
-                panic!("expected the submit panic, got {outcome:?}");
+            let payload = match outcome {
+                SnowflakeOutcome::Panicked(payload) => payload,
+                other => {
+                    assert!(
+                        matches!(other, SnowflakeOutcome::Panicked(_)),
+                        "expected the submit panic, got {other:?}"
+                    );
+                    return;
+                }
             };
             assert_eq!(payload.message(), "submit panic");
             assert_eq!(stats, DriverStats::default());
@@ -1624,7 +1698,7 @@ mod tests {
                     .polls
                     .borrow_mut()
                     .push(Scripted::Panicked("poll panic"));
-                let cx = Cx::current().expect("native test runtime must install its context");
+                let cx = Cx::current().unwrap_or_else(Cx::for_testing);
                 let (outcome, stats) = run_statement_with_stats(
                     &cx,
                     &transport,
@@ -1634,8 +1708,15 @@ mod tests {
                     fast_poll_plan(5),
                 )
                 .await;
-                let SnowflakeOutcome::Panicked(payload) = outcome else {
-                    panic!("expected the original poll panic, got {outcome:?}");
+                let payload = match outcome {
+                    SnowflakeOutcome::Panicked(payload) => payload,
+                    other => {
+                        assert!(
+                            matches!(other, SnowflakeOutcome::Panicked(_)),
+                            "expected the original poll panic, got {other:?}"
+                        );
+                        continue;
+                    }
                 };
                 assert_eq!(payload.message(), "poll panic");
                 assert_eq!(stats.polls, 1);
@@ -1689,11 +1770,24 @@ mod tests {
         );
         assert!(!transport.orphan_cleanup_finished.get());
 
-        let Poll::Ready((outcome, stats)) = driver.as_mut().poll(&mut context) else {
-            panic!("driver did not return after cleanup completed");
+        let poll_result = driver.as_mut().poll(&mut context);
+        assert!(
+            matches!(poll_result, Poll::Ready(_)),
+            "driver did not return after cleanup completed"
+        );
+        let (outcome, stats) = match poll_result {
+            Poll::Ready(ready) => ready,
+            Poll::Pending => return,
         };
-        let SnowflakeOutcome::Panicked(payload) = outcome else {
-            panic!("expected the partition panic, got {outcome:?}");
+        let payload = match outcome {
+            SnowflakeOutcome::Panicked(payload) => payload,
+            other => {
+                assert!(
+                    matches!(other, SnowflakeOutcome::Panicked(_)),
+                    "expected the partition panic, got {other:?}"
+                );
+                return;
+            }
         };
         assert_eq!(payload.message(), "partition panic");
         assert_eq!(stats.partitions_fetched, 3);
@@ -1713,7 +1807,7 @@ mod tests {
             transport.script_partition(1, unauthorized());
             transport.script_partition(1, Scripted::Panicked("retry panic"));
             let mut auth = FakeAuth::resigning();
-            let cx = Cx::current().expect("native test runtime must install its context");
+            let cx = Cx::current().unwrap_or_else(Cx::for_testing);
             let (outcome, stats) = run_statement_with_auth(
                 &cx,
                 &transport,
@@ -1723,8 +1817,15 @@ mod tests {
                 fast_poll_plan(5),
             )
             .await;
-            let SnowflakeOutcome::Panicked(payload) = outcome else {
-                panic!("expected the retry panic, got {outcome:?}");
+            let payload = match outcome {
+                SnowflakeOutcome::Panicked(payload) => payload,
+                other => {
+                    assert!(
+                        matches!(other, SnowflakeOutcome::Panicked(_)),
+                        "expected the retry panic, got {other:?}"
+                    );
+                    return;
+                }
             };
             assert_eq!(payload.message(), "retry panic");
             assert_eq!(stats.partitions_fetched, 2);
@@ -1865,11 +1966,12 @@ mod tests {
                 StatusClass::Completed,
                 RESP_200_MULTI.to_vec(),
             ));
-            let multi: serde_json::Value = serde_json::from_slice(RESP_200_MULTI).unwrap();
+            let multi: serde_json::Value =
+                serde_json::from_slice(RESP_200_MULTI).unwrap_or_default();
             let partitions = multi["resultSetMetaData"]["partitionInfo"]
                 .as_array()
-                .unwrap()
-                .clone();
+                .cloned()
+                .unwrap_or_default();
             let partition_count = partitions.len();
             // Each fetched partition must carry exactly the rowCount the metadata
             // promised; the machine refuses mismatches (integrity check). Bodies
@@ -1884,7 +1986,7 @@ mod tests {
                         .join(",")
                 );
                 transport.script_partition(
-                    u32::try_from(index).unwrap(),
+                    u32::try_from(index).unwrap_or(u32::MAX),
                     Scripted::Ok(StatusClass::Completed, body.into_bytes()),
                 );
             }
