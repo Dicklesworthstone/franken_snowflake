@@ -3253,7 +3253,7 @@ mod tests {
 
     #[test]
     fn execute_reports_an_in_flight_user_cancel_and_the_masked_cleanup_still_sends_the_remote_cancel()
-    {
+     {
         asupersync::test_utils::run_test(|| async {
             let cx = Cx::for_testing();
             let mut raw = ScriptedRaw::new(vec![
