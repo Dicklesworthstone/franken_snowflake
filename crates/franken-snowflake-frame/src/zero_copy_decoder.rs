@@ -330,7 +330,7 @@ impl ValidityBuilder {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            words: Vec::with_capacity(capacity.div_ceil(64)),
+            words: vec![0_u64; capacity.div_ceil(64)],
             len: 0,
             all_valid: true,
         }
@@ -339,11 +339,12 @@ impl ValidityBuilder {
     /// Record a valid (non-null) row slot.
     #[inline(always)]
     pub fn push_valid(&mut self) {
-        let bit = self.len % 64;
-        if bit == 0 {
-            self.words.push(1_u64);
-        } else if let Some(last) = self.words.last_mut() {
-            *last |= 1_u64 << bit;
+        let word_idx = self.len >> 6;
+        let bit_idx = self.len & 63;
+        if word_idx < self.words.len() {
+            self.words[word_idx] |= 1_u64 << bit_idx;
+        } else {
+            self.words.push(1_u64 << bit_idx);
         }
         self.len += 1;
     }
@@ -351,9 +352,9 @@ impl ValidityBuilder {
     /// Record a null (invalid) row slot.
     #[inline(always)]
     pub fn push_null(&mut self) {
-        let bit = self.len % 64;
-        if bit == 0 {
-            self.words.push(0_u64);
+        let word_idx = self.len >> 6;
+        if word_idx >= self.words.len() {
+            self.words.push(0);
         }
         self.all_valid = false;
         self.len += 1;
@@ -361,13 +362,14 @@ impl ValidityBuilder {
 
     /// Finish building and construct the `fp_columnar::ValidityMask`.
     #[must_use]
-    pub fn finish(self) -> ValidityMask {
+    pub fn finish(mut self) -> ValidityMask {
         if self.len == 0 {
             return ValidityMask::all_valid(0);
         }
         if self.all_valid {
             ValidityMask::all_valid(self.len)
         } else {
+            self.words.truncate(self.len.div_ceil(64));
             ValidityMask::from_words(self.words, self.len)
         }
     }
@@ -667,8 +669,8 @@ where
     let partition_list: Vec<(u32, &'a [u8])> = partitions.into_iter().collect();
     let total_bytes: usize = partition_list.iter().map(|(_, b)| b.len()).sum();
     let min_bytes_per_row = (columns.len().max(1) * 3).max(6);
-    let estimated_rows = (total_bytes / min_bytes_per_row).clamp(64, 2_000_000);
-    let estimated_utf8_bytes = (total_bytes / columns.len().max(1)).clamp(1024, total_bytes);
+    let estimated_rows = (total_bytes / min_bytes_per_row).clamp(1, 2_000_000);
+    let estimated_utf8_bytes = (total_bytes / columns.len().max(1)).max(64);
 
     let mut builders = metadata
         .iter()
