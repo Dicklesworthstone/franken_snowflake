@@ -12,7 +12,7 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(feature = "frankenpandas")]
-mod frankenpandas {
+pub(crate) mod frankenpandas {
     use std::error::Error;
     use std::fmt;
 
@@ -147,7 +147,7 @@ mod frankenpandas {
     }
 
     impl FrameColumnMeta {
-        fn from_snowflake(column: &SnowflakeColumn) -> Self {
+        pub(crate) fn from_snowflake(column: &SnowflakeColumn) -> Self {
             let logical_type = SnowflakeLogicalType::from_snowflake_type(&column.snowflake_type);
             let storage_kind =
                 FrameStorageKind::from_logical(logical_type, column.scale, column.precision);
@@ -527,7 +527,7 @@ mod frankenpandas {
         })
     }
 
-    fn decode_error(source: &SnowflakeColumn, reason: &'static str) -> FrameError {
+    pub(crate) fn decode_error(source: &SnowflakeColumn, reason: &'static str) -> FrameError {
         FrameError::Decode {
             column: source.name.clone(),
             snowflake_type: source.snowflake_type.clone(),
@@ -539,7 +539,7 @@ mod frankenpandas {
         precision.is_none_or(|precision| precision <= 18)
     }
 
-    fn parse_scale0_int(text: &str) -> Option<i64> {
+    pub(crate) fn parse_scale0_int(text: &str) -> Option<i64> {
         if let Some((int_part, frac_part)) = text.split_once('.') {
             if frac_part.bytes().all(|byte| byte == b'0') {
                 return int_part.parse::<i64>().ok();
@@ -549,7 +549,7 @@ mod frankenpandas {
         text.parse::<i64>().ok()
     }
 
-    fn is_fixed_decimal(text: &str, scale: Option<i32>) -> bool {
+    pub(crate) fn is_fixed_decimal(text: &str, scale: Option<i32>) -> bool {
         if scale.unwrap_or(0) == 0 {
             return is_integer_decimal_with_optional_zero_fraction(text);
         }
@@ -581,7 +581,7 @@ mod frankenpandas {
         !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
     }
 
-    fn parse_fractional_seconds(text: &str) -> Option<(i64, u32)> {
+    pub(crate) fn parse_fractional_seconds(text: &str) -> Option<(i64, u32)> {
         let negative = text.starts_with('-');
         let (int_str, frac_nanos) = match text.split_once('.') {
             Some((int_str, frac)) => (int_str, frac_to_nanos(frac)?),
@@ -607,21 +607,21 @@ mod frankenpandas {
         nanos.parse::<u32>().ok()
     }
 
-    fn days_to_nanos(days: i64, source: &SnowflakeColumn) -> FrameResult<i64> {
+    pub(crate) fn days_to_nanos(days: i64, source: &SnowflakeColumn) -> FrameResult<i64> {
         checked_i128_to_i64(
             i128::from(days) * SECONDS_PER_DAY * NANOS_PER_SECOND,
             source,
         )
     }
 
-    fn seconds_to_nanos(seconds: i64, nanos: u32, source: &SnowflakeColumn) -> FrameResult<i64> {
+    pub(crate) fn seconds_to_nanos(seconds: i64, nanos: u32, source: &SnowflakeColumn) -> FrameResult<i64> {
         checked_i128_to_i64(
             i128::from(seconds) * NANOS_PER_SECOND + i128::from(nanos),
             source,
         )
     }
 
-    fn checked_i128_to_i64(value: i128, source: &SnowflakeColumn) -> FrameResult<i64> {
+    pub(crate) fn checked_i128_to_i64(value: i128, source: &SnowflakeColumn) -> FrameResult<i64> {
         let value = i64::try_from(value).map_err(|_| FrameError::TimestampOutOfRange {
             column: source.name.clone(),
         })?;
@@ -633,7 +633,7 @@ mod frankenpandas {
         Ok(value)
     }
 
-    fn is_even_hex(text: &str) -> bool {
+    pub(crate) fn is_even_hex(text: &str) -> bool {
         text.len().is_multiple_of(2) && text.bytes().all(|byte| byte.is_ascii_hexdigit())
     }
 
@@ -1077,3 +1077,8 @@ mod frankenpandas {
 
 #[cfg(feature = "frankenpandas")]
 pub use frankenpandas::*;
+
+#[cfg(feature = "frankenpandas")]
+pub mod zero_copy_decoder;
+#[cfg(feature = "frankenpandas")]
+pub use zero_copy_decoder::*;
