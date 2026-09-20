@@ -644,13 +644,13 @@ mod fastmcp_surface {
                 false,
             ),
             if plan {
-                ParamSpec::string_enum("format", "Output format.", false, &["csv", "jsonl"])
+                ParamSpec::string_enum("format", "Output format.", false, &["csv", "jsonl", "parquet"])
             } else {
                 ParamSpec::string_enum(
                     "format",
-                    "Output format (csv, jsonl, or frame).",
+                    "Output format (csv, jsonl, parquet, or frame).",
                     false,
-                    &["csv", "jsonl", "frame"],
+                    &["csv", "jsonl", "parquet", "frame"],
                 )
             },
         ];

@@ -2437,7 +2437,7 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
                 "format",
                 "string",
                 false,
-                "csv (default), jsonl, or frame (--format)",
+                "csv (default), jsonl, parquet, or frame (--format)",
             ),
             input(
                 "out",
