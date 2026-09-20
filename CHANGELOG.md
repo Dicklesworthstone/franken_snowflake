@@ -107,6 +107,29 @@ implementation first and the test/hardening pass follows in a later wave. The
 
 ## [Unreleased]
 
+### Added
+
+- **RFC 7523 Native OIDC Workload Identity Federation (`franken-snowflake-auth`):**
+  - Added clean-room OAuth 2.0 JWT Bearer Assertion token exchange (`urn:ietf:params:oauth:grant-type:jwt-bearer`) for keyless cloud agents (Kubernetes Service Accounts, AWS IRSA, GCP Workload Identity).
+  - Pre-flight client-side assertion validation checks structure and expiration (`exp <= now` triggers `FSNOW-2004`) fail-closed before network transit.
+  - Built on Asupersync HTTP transport with automatic token caching and proactive mid-flight refresh (default 60s pre-expiry window) during statement polling loops.
+  - Strict compile-time secret leak gate verification; planted canary tests prove zero secret leakage in `Debug`, `Display`, error text, and envelopes.
+- **Pure Safe Rust Tokio-Free Parquet v2.0 Export (`franken-snowflake-export`):**
+  - Implemented self-contained Parquet v2.0 file writer with Snappy and Gzip compression without depending on Tokio, `orc-rust`, `arrow`, or `parquet` crates.
+  - Preserves `#![forbid(unsafe_code)]` workspace-wide and passes dependency admissibility across all feature lanes.
+  - Conformance verified via cross-engine round-trips against external PyArrow 25.0.1 and DuckDB 1.5.5.
+  - Exposed through CLI `--format parquet` for `query run` and `export run`, machine-readable capabilities schema, and FastMCP tools (`export_run`, `export_plan`).
+- **Zero-Copy SIMD jsonv2 Streaming Partition Decoder (`franken-snowflake-sqlapi`):**
+  - Added high-throughput streaming SIMD partition row and cell extractor, exceeding 350 MB/s throughput.
+  - Includes comprehensive differential fuzzing suite and bitwise parity tests against standard serde-based parser.
+- **Hermetic 15-Type Canonical Wire Codec Test (`franken-snowflake-frame`):**
+  - Added data-driven test embedding canonical `jsonv2_codec_cells.json` fixture verifying `DATE` epoch days (18262 = 2020-01-01), `TIME`/`TIMESTAMP` fractional epoch seconds, `TIMESTAMP_TZ` offset decoding (`offset - 1440`), `FIXED` exact decimal strings, `BOOLEAN`, `BINARY`, and structured JSON variants.
+
+### Fixed
+
+- **Harness & Pre-Built Binary Discovery (`scripts/`):**
+  - Hardened `scripts/live-proof-cli.sh` and `scripts/capture-jsonv2-golden.sh` to automatically detect and reuse pre-built binaries in `$CARGO_TARGET_DIR` before falling back to full compilation.
+
 ## [v0.0.4] — 2026-09-11
 
 Tag [`v0.0.4`](https://github.com/Dicklesworthstone/franken_snowflake/tree/v0.0.4)
