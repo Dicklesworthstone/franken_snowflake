@@ -148,6 +148,8 @@ pub enum AuthLane {
     KeyPairJwt,
     /// OAuth bearer lane.
     OAuthBearer,
+    /// Workload identity federation lane.
+    WorkloadIdentityFederation,
 }
 
 /// Secret reference kind. The cache stores references, never raw values.
@@ -1475,6 +1477,7 @@ fn auth_lane_to_str(value: &AuthLane) -> &'static str {
         AuthLane::ProgrammaticAccessToken => "pat",
         AuthLane::KeyPairJwt => "key_pair_jwt",
         AuthLane::OAuthBearer => "oauth",
+        AuthLane::WorkloadIdentityFederation => "workload_identity",
     }
 }
 
@@ -1484,6 +1487,9 @@ fn auth_lane_from_str(value: &str) -> CacheResult<AuthLane> {
         "pat" => Ok(AuthLane::ProgrammaticAccessToken),
         "key_pair_jwt" => Ok(AuthLane::KeyPairJwt),
         "oauth" => Ok(AuthLane::OAuthBearer),
+        "workload_identity" | "workload_identity_federation" | "oidc" => {
+            Ok(AuthLane::WorkloadIdentityFederation)
+        }
         _ => Err(CacheError::InvalidRow {
             field: "auth_lane",
             message: format!("unknown auth lane {value}"),

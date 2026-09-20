@@ -176,6 +176,8 @@ pub enum AuthLaneContract {
     KeyPairJwt,
     /// OAuth bearer.
     OAuthBearer,
+    /// Workload Identity Federation.
+    WorkloadIdentityFederation,
 }
 
 /// Credential reference kind.

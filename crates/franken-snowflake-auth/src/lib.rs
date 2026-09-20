@@ -42,6 +42,14 @@ pub use redaction_policy::{
     SECRET_VALUE_NEEDLE_PREFIXES,
 };
 
+pub mod workload_identity;
+pub use workload_identity::{
+    DEFAULT_OIDC_SCOPE, DEFAULT_PRE_EXPIRY_REFRESH_SECONDS, OidcAssertionClaims, OidcHttpExchange,
+    OidcTokenSource, RFC7523_JWT_BEARER_GRANT_TYPE, SNOWFLAKE_OAUTH_TOKEN_REQUEST_PATH,
+    SnowflakeSessionToken, WorkloadIdentityAuth, format_rfc7523_form_body,
+    parse_and_validate_oidc_assertion, parse_rfc7523_token_response,
+};
+
 /// Crate version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -102,6 +110,38 @@ pub enum AuthError {
     RsaKeyTooSmall { bits: usize },
     JwtSigning { reason: String },
     InvalidValiditySeconds,
+    OidcAssertionExpired {
+        expires_at_unix_seconds: i64,
+        now_unix_seconds: i64,
+        remediation: String,
+    },
+    OidcAssertionMalformed {
+        reason: String,
+        remediation: String,
+    },
+    OidcTokenExchangeFailed {
+        status_code: u16,
+        reason: String,
+    },
+    OidcAssertionIo {
+        path: String,
+        reason: String,
+    },
+}
+
+impl AuthError {
+    #[must_use]
+    pub fn stable_code(&self) -> &'static str {
+        match self {
+            Self::OidcAssertionExpired { .. } => "FSNOW-2004",
+            Self::EmptySecretValue
+            | Self::MissingEnvVar { .. }
+            | Self::OidcAssertionMalformed { .. }
+            | Self::OidcTokenExchangeFailed { .. }
+            | Self::OidcAssertionIo { .. } => "FSNOW-2003",
+            _ => "FSNOW-2002",
+        }
+    }
 }
 
 impl fmt::Display for AuthError {
@@ -147,6 +187,40 @@ impl fmt::Display for AuthError {
             Self::JwtSigning { reason } => write!(f, "RS256 JWT signing failed: {reason}"),
             Self::InvalidValiditySeconds => {
                 f.write_str("JWT validity must be greater than zero seconds")
+            }
+            Self::OidcAssertionExpired {
+                expires_at_unix_seconds,
+                now_unix_seconds,
+                remediation,
+            } => {
+                write!(
+                    f,
+                    "FSNOW-2004: OIDC assertion token expired at {expires_at_unix_seconds} (current time {now_unix_seconds}); {remediation}"
+                )
+            }
+            Self::OidcAssertionMalformed {
+                reason,
+                remediation,
+            } => {
+                write!(
+                    f,
+                    "FSNOW-2003: OIDC assertion is malformed: {reason}; {remediation}"
+                )
+            }
+            Self::OidcTokenExchangeFailed {
+                status_code,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "FSNOW-2003: OIDC token exchange failed (HTTP {status_code}): {reason}"
+                )
+            }
+            Self::OidcAssertionIo { path, reason } => {
+                write!(
+                    f,
+                    "FSNOW-2003: failed to read OIDC token file `{path}`: {reason}"
+                )
             }
         }
     }
@@ -914,7 +988,11 @@ pub enum AuthProfile {
         expires_at_unix_seconds: Option<i64>,
     },
     WorkloadIdentityFederation {
-        provider: String,
+        token_source: OidcTokenSource,
+        token_url: Option<String>,
+        scope: Option<String>,
+        client_id: Option<String>,
+        refresh_before_expiry_seconds: Option<u64>,
     },
 }
 
@@ -951,6 +1029,17 @@ impl AuthProfile {
     }
 
     #[must_use]
+    pub fn workload_identity_federation(token_source: OidcTokenSource) -> Self {
+        Self::WorkloadIdentityFederation {
+            token_source,
+            token_url: None,
+            scope: None,
+            client_id: None,
+            refresh_before_expiry_seconds: None,
+        }
+    }
+
+    #[must_use]
     pub fn lane(&self) -> AuthLane {
         match self {
             Self::Pat { .. } => AuthLane::ProgrammaticAccessToken,
@@ -977,7 +1066,14 @@ impl AuthProfile {
                 }
                 statuses
             }
-            Self::WorkloadIdentityFederation { .. } => Vec::new(),
+            Self::WorkloadIdentityFederation { token_source, .. } => {
+                let (source_kind, presence) = token_source.probe_offline(resolver);
+                vec![SecretSourceStatus {
+                    source_kind,
+                    credential_handle: token_source.credential_handle(),
+                    presence,
+                }]
+            }
         }
     }
 
@@ -1023,9 +1119,24 @@ impl AuthProfile {
                 *expires_at_unix_seconds,
             )
             .map(AuthMechanism::OAuthBearer),
-            Self::WorkloadIdentityFederation { .. } => Err(AuthError::UnsupportedAuthLane {
-                lane: AuthLane::WorkloadIdentityFederation,
-            }),
+            Self::WorkloadIdentityFederation {
+                token_source,
+                token_url,
+                scope,
+                client_id,
+                refresh_before_expiry_seconds,
+            } => {
+                let auth = WorkloadIdentityAuth::new(
+                    account,
+                    user,
+                    token_source.clone(),
+                    token_url.clone(),
+                    scope.clone(),
+                    client_id.clone(),
+                    *refresh_before_expiry_seconds,
+                )?;
+                Ok(AuthMechanism::WorkloadIdentityFederation(Box::new(auth)))
+            }
         }
     }
 }
@@ -1066,9 +1177,22 @@ impl fmt::Debug for AuthProfile {
                 .field("issued_at_unix_seconds", issued_at_unix_seconds)
                 .field("expires_at_unix_seconds", expires_at_unix_seconds)
                 .finish(),
-            Self::WorkloadIdentityFederation { provider } => f
+            Self::WorkloadIdentityFederation {
+                token_source,
+                token_url,
+                scope,
+                client_id,
+                refresh_before_expiry_seconds,
+            } => f
                 .debug_struct("AuthProfile::WorkloadIdentityFederation")
-                .field("provider", provider)
+                .field("token_source", token_source)
+                .field("token_url", token_url)
+                .field("scope", scope)
+                .field("client_id", client_id)
+                .field(
+                    "refresh_before_expiry_seconds",
+                    refresh_before_expiry_seconds,
+                )
                 .finish(),
         }
     }
@@ -1120,6 +1244,7 @@ pub enum AuthMechanism {
     // secret key off the stack. Match arms auto-deref through the `Box`.
     KeyPairJwt(Box<KeyPairJwtAuth>),
     OAuthBearer(OAuthBearerAuth),
+    WorkloadIdentityFederation(Box<WorkloadIdentityAuth>),
 }
 
 impl SnowflakeAuth for AuthMechanism {
@@ -1128,6 +1253,7 @@ impl SnowflakeAuth for AuthMechanism {
             Self::ProgrammaticAccessToken(auth) => auth.lane(),
             Self::KeyPairJwt(auth) => auth.lane(),
             Self::OAuthBearer(auth) => auth.lane(),
+            Self::WorkloadIdentityFederation(auth) => auth.lane(),
         }
     }
 
@@ -1136,6 +1262,7 @@ impl SnowflakeAuth for AuthMechanism {
             Self::ProgrammaticAccessToken(auth) => auth.credential_handle(),
             Self::KeyPairJwt(auth) => auth.credential_handle(),
             Self::OAuthBearer(auth) => auth.credential_handle(),
+            Self::WorkloadIdentityFederation(auth) => auth.credential_handle(),
         }
     }
 
@@ -1144,6 +1271,7 @@ impl SnowflakeAuth for AuthMechanism {
             Self::ProgrammaticAccessToken(auth) => auth.headers_at(now_unix_seconds),
             Self::KeyPairJwt(auth) => auth.headers_at(now_unix_seconds),
             Self::OAuthBearer(auth) => auth.headers_at(now_unix_seconds),
+            Self::WorkloadIdentityFederation(auth) => auth.headers_at(now_unix_seconds),
         }
     }
 
@@ -1152,6 +1280,7 @@ impl SnowflakeAuth for AuthMechanism {
             Self::ProgrammaticAccessToken(auth) => auth.lifetime(),
             Self::KeyPairJwt(auth) => auth.lifetime(),
             Self::OAuthBearer(auth) => auth.lifetime(),
+            Self::WorkloadIdentityFederation(auth) => auth.lifetime(),
         }
     }
 
@@ -1160,6 +1289,7 @@ impl SnowflakeAuth for AuthMechanism {
             Self::ProgrammaticAccessToken(auth) => auth.on_unauthorized_mid_poll(now_unix_seconds),
             Self::KeyPairJwt(auth) => auth.on_unauthorized_mid_poll(now_unix_seconds),
             Self::OAuthBearer(auth) => auth.on_unauthorized_mid_poll(now_unix_seconds),
+            Self::WorkloadIdentityFederation(auth) => auth.on_unauthorized_mid_poll(now_unix_seconds),
         }
     }
 }
@@ -1177,6 +1307,10 @@ impl fmt::Debug for AuthMechanism {
                 .finish(),
             Self::OAuthBearer(auth) => f
                 .debug_tuple("AuthMechanism::OAuthBearer")
+                .field(auth)
+                .finish(),
+            Self::WorkloadIdentityFederation(auth) => f
+                .debug_tuple("AuthMechanism::WorkloadIdentityFederation")
                 .field(auth)
                 .finish(),
         }

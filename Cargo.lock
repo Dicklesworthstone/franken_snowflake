@@ -1604,6 +1604,7 @@ dependencies = [
 name = "franken-snowflake-auth"
 version = "0.0.4"
 dependencies = [
+ "asupersync",
  "base64",
  "jsonwebtoken",
  "rand 0.8.7",
@@ -1611,6 +1612,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
 ]
 
 [[package]]

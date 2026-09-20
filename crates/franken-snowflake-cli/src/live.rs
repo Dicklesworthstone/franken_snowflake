@@ -27,7 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
 use franken_snowflake_auth::{
-    AuthMechanism, AuthProfile, KEYPAIR_JWT_TOKEN_TYPE, OAUTH_TOKEN_TYPE,
+    AuthMechanism, AuthProfile, KEYPAIR_JWT_TOKEN_TYPE, OAUTH_TOKEN_TYPE, OidcTokenSource,
     PROGRAMMATIC_ACCESS_TOKEN_TYPE, ProcessSecretResolver, ReauthDecision, SecretSource,
     SnowflakeAuth,
 };
@@ -1541,7 +1541,7 @@ impl LiveConn {
         if secret_env.is_none() {
             return Err(SnowflakeError::new(
                 SnowflakeErrorCode::ProfileInvalid,
-                format!("auth lane must be one of pat, oauth_bearer, or key_pair_jwt (got {lane})"),
+                format!("auth lane must be one of pat, oauth_bearer, key_pair_jwt, or workload_identity (got {lane})"),
             ));
         }
 
@@ -1695,12 +1695,33 @@ where
             TransportConfig::new(conn.endpoint.clone()),
             &cx,
         );
-        let mechanism = conn
+        let mut mechanism = conn
             .auth_profile
             .resolve(&ProcessSecretResolver, &conn.account, &conn.user)
             .map_err(|error| {
-                SnowflakeError::new(SnowflakeErrorCode::CredentialMissing, error.to_string())
+                let code = match error.stable_code() {
+                    "FSNOW-2004" => SnowflakeErrorCode::CredentialExpired,
+                    _ => SnowflakeErrorCode::CredentialMissing,
+                };
+                SnowflakeError::new(code, error.to_string())
             })?;
+        if let AuthMechanism::WorkloadIdentityFederation(ref mut wif) = mechanism {
+            let http_client = asupersync::http::Client::default_for_runtime(&cx);
+            wif.token_for_poll_at(
+                &cx,
+                &http_client,
+                &ProcessSecretResolver,
+                now_unix_seconds(),
+            )
+            .await
+            .map_err(|error| {
+                let code = match error.stable_code() {
+                    "FSNOW-2004" => SnowflakeErrorCode::CredentialExpired,
+                    _ => SnowflakeErrorCode::CredentialMissing,
+                };
+                SnowflakeError::new(code, error.to_string())
+            })?;
+        }
         let mut auth = MechanismAuth { mechanism };
         // Resolve once up front so a missing/invalid credential fails before
         // any request is built, with the same typed error as before.
@@ -1863,6 +1884,13 @@ fn secret_env_for_lane(prefix: &str, lane: &str) -> Option<String> {
         "pat" | "programmatic_access_token" => Some(name(prefix, "PAT")),
         "oauth" | "oauth_bearer" | "oauth_bearer_token" => Some(name(prefix, "OAUTH_BEARER")),
         "key_pair_jwt" | "jwt" => Some(name(prefix, "PRIVATE_KEY_PEM")),
+        "workload_identity" | "workload_identity_federation" | "oidc" => {
+            if env_value(&name(prefix, "OIDC_TOKEN_FILE")).is_some() {
+                Some(name(prefix, "OIDC_TOKEN_FILE"))
+            } else {
+                Some(name(prefix, "OIDC_TOKEN"))
+            }
+        }
         _ => None,
     }
 }
@@ -1888,9 +1916,37 @@ fn build_auth_profile(prefix: &str, lane: &str) -> Result<AuthProfile, Snowflake
                 .map_err(|error| credential(error.to_string()))?,
             env_u64(&name(prefix, "JWT_VALIDITY_SECONDS")).unwrap_or(3600),
         )),
+        "workload_identity" | "workload_identity_federation" | "oidc" => {
+            let token_source = if let Some(path) = env_value(&name(prefix, "OIDC_TOKEN_FILE")) {
+                OidcTokenSource::file(path)
+            } else if env_value(&name(prefix, "OIDC_TOKEN")).is_some() {
+                OidcTokenSource::env_var(name(prefix, "OIDC_TOKEN"))
+            } else {
+                return Err(SnowflakeError::new(
+                    SnowflakeErrorCode::CredentialMissing,
+                    format!(
+                        "either {}_OIDC_TOKEN_FILE or {}_OIDC_TOKEN must be set",
+                        prefix, prefix
+                    ),
+                ));
+            };
+            let token_url = env_value(&name(prefix, "OIDC_TOKEN_URL"))
+                .or_else(|| env_value(&name(prefix, "TOKEN_URL")));
+            let scope = env_value(&name(prefix, "OIDC_SCOPE"));
+            let client_id = env_value(&name(prefix, "OIDC_CLIENT_ID"));
+            let refresh_before_expiry_seconds =
+                env_u64(&name(prefix, "OIDC_REFRESH_BEFORE_EXPIRY_SECONDS"));
+            Ok(AuthProfile::WorkloadIdentityFederation {
+                token_source,
+                token_url,
+                scope,
+                client_id,
+                refresh_before_expiry_seconds,
+            })
+        }
         other => Err(SnowflakeError::new(
             SnowflakeErrorCode::ProfileInvalid,
-            format!("auth lane must be one of pat, oauth_bearer, or key_pair_jwt (got {other})"),
+            format!("auth lane must be one of pat, oauth_bearer, key_pair_jwt, or workload_identity (got {other})"),
         )),
     }
 }
