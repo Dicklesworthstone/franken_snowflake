@@ -1166,10 +1166,11 @@ pub fn export_run_outcome(
     {
         None | Some("csv") => "csv",
         Some("jsonl") | Some("json") => "jsonl",
+        Some("parquet") => "parquet",
         Some("frame") => "frame",
         Some(other) => {
             return fail(&usage(&format!(
-                "Unknown --format `{other}`; use csv, jsonl, or frame."
+                "Unknown --format `{other}`; use csv, jsonl, parquet, or frame."
             )));
         }
     };
@@ -1201,6 +1202,7 @@ pub fn export_run_outcome(
     let target_label = redact(&out_path).into_owned();
     let artifact = match export_format {
         "csv" => export_csv(&input, target_label.clone(), created_at_ms),
+        "parquet" => franken_snowflake_export::export_parquet(&input, target_label.clone(), created_at_ms, None),
         "frame" => {
             #[cfg(feature = "frankenpandas")]
             {
@@ -1294,6 +1296,8 @@ pub fn export_run_outcome(
             receipt_id: receipt_id.clone(),
             export_kind: if export_format == "csv" {
                 ExportKind::LocalCsv
+            } else if export_format == "parquet" {
+                ExportKind::LocalParquet
             } else if export_format == "frame" {
                 ExportKind::LocalFrame
             } else {

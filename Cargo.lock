@@ -1672,10 +1672,12 @@ dependencies = [
 name = "franken-snowflake-export"
 version = "0.0.4"
 dependencies = [
+ "asupersync",
  "blake3",
  "franken-snowflake-core",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

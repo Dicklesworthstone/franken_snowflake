@@ -351,6 +351,8 @@ pub enum ExportFormatContract {
     Csv,
     /// Local JSONL.
     Jsonl,
+    /// Local Parquet.
+    Parquet,
 }
 
 /// Frame ingest contract for downstream materializers.

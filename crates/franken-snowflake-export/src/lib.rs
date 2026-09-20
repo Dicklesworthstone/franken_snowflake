@@ -177,6 +177,8 @@ pub enum ExportFormat {
     Csv,
     /// One JSON object per row.
     Jsonl,
+    /// Apache Parquet binary columnar format.
+    Parquet,
 }
 
 impl ExportFormat {
@@ -186,6 +188,7 @@ impl ExportFormat {
         match self {
             Self::Csv => "csv",
             Self::Jsonl => "jsonl",
+            Self::Parquet => "parquet",
         }
     }
 }
@@ -204,6 +207,8 @@ pub enum CopyCompression {
     None,
     /// Snowflake-side gzip compression.
     Gzip,
+    /// Snowflake-side snappy compression.
+    Snappy,
 }
 
 impl CopyCompression {
@@ -211,6 +216,7 @@ impl CopyCompression {
         match self {
             Self::None => "NONE",
             Self::Gzip => "GZIP",
+            Self::Snappy => "SNAPPY",
         }
     }
 }
@@ -385,6 +391,10 @@ impl CopyIntoPlan {
                 "TYPE = JSON COMPRESSION = {}",
                 self.options.compression.snowflake_sql()
             ),
+            ExportFormat::Parquet => format!(
+                "TYPE = PARQUET COMPRESSION = {}",
+                self.options.compression.snowflake_sql()
+            ),
         }
     }
 }
@@ -397,6 +407,8 @@ pub enum ExportReceiptKind {
     LocalCsv,
     /// Local JSONL artifact.
     LocalJsonl,
+    /// Local Parquet artifact.
+    LocalParquet,
     /// Snowflake-side COPY INTO plan.
     CopyIntoPlan,
 }
@@ -408,6 +420,7 @@ impl ExportReceiptKind {
         match self {
             Self::LocalCsv => "local_csv",
             Self::LocalJsonl => "local_jsonl",
+            Self::LocalParquet => "local_parquet",
             Self::CopyIntoPlan => "copy_into_plan",
         }
     }
@@ -968,6 +981,18 @@ pub use local::{
     ResultPartition, export_csv, export_jsonl, write_csv_stream, write_jsonl_stream,
 };
 
+#[cfg(feature = "parquet")]
+pub mod parquet;
+
+#[cfg(feature = "parquet")]
+pub use parquet::{
+    decode_definition_levels, encode_column_plain, encode_definition_levels, export_parquet,
+    gzip_compress, gzip_decompress, read_parquet_records, snappy_compress, snappy_decompress,
+    validate_parquet, write_parquet_stream, ParquetColumnDescriptor, ParquetCompression,
+    ParquetInspection, ParquetType, ParquetWriterOptions, ThriftCompactReader, ThriftCompactWriter,
+    PARQUET_MAGIC,
+};
+
 /// Convenient re-exports for callers.
 pub mod prelude {
     pub use super::{
@@ -981,6 +1006,13 @@ pub mod prelude {
     pub use super::{
         AddressingSink, ExportByteSink, ExportColumn, LocalExportArtifact, LocalExportInput,
         ResultPartition, export_csv, export_jsonl, write_csv_stream, write_jsonl_stream,
+    };
+
+    #[cfg(feature = "parquet")]
+    pub use super::{
+        decode_definition_levels, encode_definition_levels, export_parquet, read_parquet_records,
+        validate_parquet, write_parquet_stream, ParquetCompression, ParquetInspection,
+        ParquetWriterOptions, PARQUET_MAGIC,
     };
 }
 

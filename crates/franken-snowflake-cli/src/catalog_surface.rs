@@ -1076,8 +1076,9 @@ pub fn export_plan_outcome(
     {
         None | Some("csv") => ExportFormat::Csv,
         Some("jsonl") | Some("json") => ExportFormat::Jsonl,
+        Some("parquet") => ExportFormat::Parquet,
         Some(other) => {
-            return usage_err(format!("Unknown --format `{other}`; use csv or jsonl."));
+            return usage_err(format!("Unknown --format `{other}`; use csv, jsonl, or parquet."));
         }
     };
     let compression = match spec
@@ -1088,9 +1089,10 @@ pub fn export_plan_outcome(
     {
         None | Some("none") => CopyCompression::None,
         Some("gzip") => CopyCompression::Gzip,
+        Some("snappy") => CopyCompression::Snappy,
         Some(other) => {
             return usage_err(format!(
-                "Unknown --compression `{other}`; use none or gzip."
+                "Unknown --compression `{other}`; use none, gzip, or snappy."
             ));
         }
     };
