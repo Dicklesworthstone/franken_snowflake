@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
-use fp_types::DType;
+use fp_types::{DType, Scalar};
 use franken_snowflake_frame::{ResultPartition, SnowflakeColumn};
 use serde_json::Value;
 
@@ -155,3 +155,172 @@ fn captured_wire_golden_decodes_through_the_frame_codec() -> Result<(), String> 
     );
     Ok(())
 }
+
+#[test]
+fn canonical_codec_cells_fixture_decodes_through_the_frame_codec() -> Result<(), String> {
+    const RAW: &str =
+        include_str!("../../franken-snowflake-sqlapi/tests/fixtures/jsonv2_codec_cells.json");
+    let fixture: Value =
+        serde_json::from_str(RAW).map_err(|e| format!("fixture JSON parse error: {e}"))?;
+
+    let meta = fixture
+        .get("resultSetMetaData")
+        .ok_or_else(|| "missing resultSetMetaData".to_string())?;
+    assert_eq!(meta.get("format").and_then(Value::as_str), Some("jsonv2"));
+
+    let row_type = meta
+        .get("rowType")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "missing rowType".to_string())?;
+
+    let snowflake_columns: Vec<SnowflakeColumn> = row_type
+        .iter()
+        .map(|col| SnowflakeColumn {
+            name: col
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            snowflake_type: col
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            scale: col.get("scale").and_then(Value::as_i64).map(|s| s as i32),
+            precision: col.get("precision").and_then(Value::as_i64).map(|p| p as i32),
+            nullable: col.get("nullable").and_then(Value::as_bool).unwrap_or(true),
+        })
+        .collect();
+
+    let data = fixture
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "missing data array".to_string())?;
+
+    let mut row_data = Vec::with_capacity(data.len());
+    for row in data {
+        let row_array = row.as_array().ok_or_else(|| "row is not an array".to_string())?;
+        row_data.push(
+            row_array
+                .iter()
+                .map(|cell| cell.as_str().map(str::to_owned))
+                .collect(),
+        );
+    }
+
+    let partitions = vec![ResultPartition::new(0, row_data)];
+    let frame = franken_snowflake_frame::materialize_partitions(&snowflake_columns, partitions)
+        .map_err(|e| format!("materialization failed: {e}"))?;
+
+    assert_eq!(frame.row_count, 1);
+    assert_eq!(frame.columns.len(), 15);
+
+    // 1. DATE = 18262 epoch days == 2020-01-01T00:00:00Z (1_577_836_800_000_000_000 nanos)
+    let event_date = frame
+        .columns
+        .iter()
+        .find(|c| c.metadata.name == "EVENT_DATE")
+        .unwrap();
+    assert_eq!(event_date.column.dtype(), DType::Datetime64);
+    assert_eq!(
+        event_date.column.value(0),
+        Some(&Scalar::Datetime64(1_577_836_800_000_000_000))
+    );
+
+    // 2. BOOLEAN = "true" -> true
+    let bool_col = frame
+        .columns
+        .iter()
+        .find(|c| c.metadata.name == "BOOL_TRUE")
+        .unwrap();
+    assert_eq!(bool_col.column.dtype(), DType::Bool);
+    assert_eq!(bool_col.column.value(0), Some(&Scalar::Bool(true)));
+
+    // 3. FIXED with scale 2 = "12345678901234567.89" -> DecimalString
+    let n_scale = frame
+        .columns
+        .iter()
+        .find(|c| c.metadata.name == "N_SCALE")
+        .unwrap();
+    assert_eq!(
+        n_scale.metadata.storage_kind,
+        franken_snowflake_frame::FrameStorageKind::DecimalString
+    );
+    assert_eq!(
+        n_scale.column.value(0),
+        Some(&Scalar::Utf8("12345678901234567.89".to_owned()))
+    );
+
+    // 4. REAL = "1.25" -> Float64(1.25)
+    let real_col = frame
+        .columns
+        .iter()
+        .find(|c| c.metadata.name == "REAL_VALUE")
+        .unwrap();
+    assert_eq!(real_col.column.dtype(), DType::Float64);
+    assert_eq!(
+        real_col.column.value(0),
+        Some(&Scalar::Float64(1.25))
+    );
+
+    // 5. TIMESTAMP_NTZ = "1611871777.123456789" -> 1611871777123456789 nanos
+    let ts_ntz = frame
+        .columns
+        .iter()
+        .find(|c| c.metadata.name == "TS_NTZ")
+        .unwrap();
+    assert_eq!(ts_ntz.column.dtype(), DType::Datetime64);
+    assert_eq!(
+        ts_ntz.column.value(0),
+        Some(&Scalar::Datetime64(1_611_871_777_123_456_789))
+    );
+
+    // 6. TIMESTAMP_TZ = "1616173619.000000000 1500" -> 1616173619000000000 nanos, offset = 1500 - 1440 = +60
+    let ts_tz = frame
+        .columns
+        .iter()
+        .find(|c| c.metadata.name == "TS_TZ")
+        .unwrap();
+    assert_eq!(ts_tz.column.dtype(), DType::Datetime64);
+    assert_eq!(
+        ts_tz.column.value(0),
+        Some(&Scalar::Datetime64(1_616_173_619_000_000_000))
+    );
+    assert_eq!(
+        ts_tz.timestamp_tz_offsets_minutes.as_ref().unwrap(),
+        &[Some(60)]
+    );
+
+    // 7. BINARY = "DEADBEEF" -> BinaryHex
+    let bin_col = frame
+        .columns
+        .iter()
+        .find(|c| c.metadata.name == "BIN_VALUE")
+        .unwrap();
+    assert_eq!(
+        bin_col.metadata.storage_kind,
+        franken_snowflake_frame::FrameStorageKind::BinaryHex
+    );
+    assert_eq!(
+        bin_col.column.value(0),
+        Some(&Scalar::Utf8("DEADBEEF".to_owned()))
+    );
+
+    // 8. NULL_TEXT = null -> FrameMissingKind::SqlNull and Scalar::Null
+    let null_col = frame
+        .columns
+        .iter()
+        .find(|c| c.metadata.name == "NULL_TEXT")
+        .unwrap();
+    assert_eq!(
+        null_col.missing_kinds[0],
+        Some(franken_snowflake_frame::FrameMissingKind::SqlNull)
+    );
+    assert_eq!(
+        null_col.column.value(0),
+        Some(&Scalar::Null(fp_types::NullKind::Null))
+    );
+
+    Ok(())
+}
+
