@@ -66,9 +66,9 @@ impl ZeroCopyJsonv2Scanner {
     }
 
     /// Stream all rows from a `jsonv2` byte slice, calling `visit_row` with each row's cells.
-    pub fn scan_rows<'a, F>(
+    pub fn scan_rows<F>(
         &mut self,
-        bytes: &'a [u8],
+        bytes: &[u8],
         partition_index: u32,
         expected_columns: usize,
         mut visit_cell: F,
@@ -557,6 +557,8 @@ impl Datetime64Builder {
     }
 }
 
+type TimestampTzParts = (Column, Vec<Option<FrameMissingKind>>, Vec<Option<i32>>);
+
 /// Column builder for TIMESTAMP_TZ storage.
 struct TimestampTzBuilder {
     datetime_builder: Datetime64Builder,
@@ -581,9 +583,7 @@ impl TimestampTzBuilder {
         self.tz_offsets.push(Some(offset_minutes));
     }
 
-    fn finish(
-        self,
-    ) -> Result<(Column, Vec<Option<FrameMissingKind>>, Vec<Option<i32>>), FrameError> {
+    fn finish(self) -> Result<TimestampTzParts, FrameError> {
         let (col, missing) = self.datetime_builder.finish()?;
         Ok((col, missing, self.tz_offsets))
     }

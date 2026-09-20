@@ -31,6 +31,7 @@ LANES=(
   "-p franken-snowflake-http|live"
   "-p franken-snowflake-http|testkit"
   "-p franken-snowflake-export|export"
+  "-p franken-snowflake-export|parquet"
   "-p franken-snowflake-graph|graph"
   "-p franken-snowflake-http|compression"
   "-p franken-snowflake-core|adapter-fixtures"

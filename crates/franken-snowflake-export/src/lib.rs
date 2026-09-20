@@ -975,11 +975,14 @@ mod local {
     }
 }
 
-#[cfg(feature = "export")]
+#[cfg(any(feature = "export", feature = "parquet"))]
 pub use local::{
     AddressingSink, ExportByteSink, ExportColumn, LocalExportArtifact, LocalExportInput,
-    ResultPartition, export_csv, export_jsonl, write_csv_stream, write_jsonl_stream,
+    ResultPartition,
 };
+
+#[cfg(feature = "export")]
+pub use local::{export_csv, export_jsonl, write_csv_stream, write_jsonl_stream};
 
 #[cfg(feature = "parquet")]
 pub mod parquet;
@@ -1002,11 +1005,14 @@ pub mod prelude {
         VERSION,
     };
 
-    #[cfg(feature = "export")]
+    #[cfg(any(feature = "export", feature = "parquet"))]
     pub use super::{
         AddressingSink, ExportByteSink, ExportColumn, LocalExportArtifact, LocalExportInput,
-        ResultPartition, export_csv, export_jsonl, write_csv_stream, write_jsonl_stream,
+        ResultPartition,
     };
+
+    #[cfg(feature = "export")]
+    pub use super::{export_csv, export_jsonl, write_csv_stream, write_jsonl_stream};
 
     #[cfg(feature = "parquet")]
     pub use super::{

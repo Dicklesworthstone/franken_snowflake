@@ -127,6 +127,10 @@ implementation first and the test/hardening pass follows in a later wave. The
 
 ### Fixed
 
+- **Feature Lane Clippy Gate Across All Workspace Features (`scripts/check-feature-lanes.sh`):**
+  - Cleaned Clippy warnings across all 21 feature combinations under `-D warnings`.
+  - Resolved needless lifetimes, complex return types, manual default impls, identity bitwise ops, collapsible if conditions, and simplified iterators in `franken-snowflake-export` and `franken-snowflake-frame`.
+  - Added coverage for `franken-snowflake-export|parquet` feature lane in `scripts/check-feature-lanes.sh` with 100% coverage verification.
 - **Harness & Pre-Built Binary Discovery (`scripts/`):**
   - Hardened `scripts/live-proof-cli.sh` and `scripts/capture-jsonv2-golden.sh` to automatically detect and reuse pre-built binaries in `$CARGO_TARGET_DIR` before falling back to full compilation.
 

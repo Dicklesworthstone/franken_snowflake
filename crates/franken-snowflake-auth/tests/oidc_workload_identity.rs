@@ -134,7 +134,7 @@ fn test_token_exchange_request_formation() {
     let form_body = format_rfc7523_form_body(&raw_jwt, Some("session:role-any"), Some("MY_INTEGRATION_CLIENT_ID"));
 
     assert!(form_body.contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer"));
-    assert!(form_body.contains(&format!("assertion={}", &raw_jwt)));
+    assert!(form_body.contains(&format!("assertion={}", raw_jwt)));
     assert!(form_body.contains("scope=session%3Arole-any"));
     assert!(form_body.contains("client_id=MY_INTEGRATION_CLIENT_ID"));
 

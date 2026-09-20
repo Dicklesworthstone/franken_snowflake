@@ -13,7 +13,11 @@ publish.workspace = true
 [features]
 default = []
 export = ["parquet"]
-parquet = []
+parquet = ["export"]
+
+[[test]]
+name = "parquet_conformance"
+required-features = ["parquet"]
 
 [lints]
 workspace = true

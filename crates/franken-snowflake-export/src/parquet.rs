@@ -21,12 +21,13 @@ use crate::{
 pub const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
 
 /// Parquet compression codec selection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParquetCompression {
     /// Uncompressed page data.
     Uncompressed,
     /// Google Snappy block compression (Parquet default).
+    #[default]
     Snappy,
     /// Gzip / Deflate compression.
     Gzip,
@@ -53,12 +54,6 @@ impl ParquetCompression {
                 message: format!("unsupported Parquet compression codec id: {other}"),
             }),
         }
-    }
-}
-
-impl Default for ParquetCompression {
-    fn default() -> Self {
-        Self::Snappy
     }
 }
 
@@ -550,7 +545,7 @@ fn emit_snappy_literal(lit: &[u8], out: &mut Vec<u8>) {
         return;
     }
     if len <= 60 {
-        out.push(((len.saturating_sub(1) as u8) << 2) | 0x00);
+        out.push((len.saturating_sub(1) as u8) << 2);
     } else if len <= 256 {
         out.push(0xF0);
         out.push(len.saturating_sub(1) as u8);
@@ -948,10 +943,7 @@ pub fn encode_column_plain(
                         values.extend_from_slice(&val.to_bits().to_le_bytes());
                     }
                     ParquetType::Boolean => {
-                        let val = match s.trim().to_ascii_lowercase().as_str() {
-                            "true" | "1" | "t" => true,
-                            _ => false,
-                        };
+                        let val = matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "t");
                         bool_bits.push(val);
                     }
                     ParquetType::ByteArray => {
@@ -1024,13 +1016,10 @@ fn parse_i64_cell(s: &str, converted: Option<ParquetConvertedType>) -> ExportRes
         return Ok(f as i64);
     }
     // Handle timestamp microseconds with decimal fractional seconds e.g. "1704067200.123456"
-    if trimmed.contains('.') {
-        let mut parts = trimmed.split('.');
-        if let (Some(sec_str), Some(frac_str)) = (parts.next(), parts.next()) {
-            if let Ok(sec) = sec_str.parse::<i64>() {
-                let frac_micros = parse_fractional_micros(frac_str);
-                return Ok(sec.saturating_mul(1_000_000).saturating_add(frac_micros));
-            }
+    if let Some((sec_str, frac_str)) = trimmed.split_once('.') {
+        let frac_micros = parse_fractional_micros(frac_str);
+        if let Ok(sec) = sec_str.parse::<i64>() {
+            return Ok(sec.saturating_mul(1_000_000).saturating_add(frac_micros));
         }
     }
     Err(ExportError::Sink {
@@ -1391,13 +1380,11 @@ where
     let mut previous_partition = None;
 
     for partition in partitions {
-        if let Some(prev) = previous_partition {
-            if partition.index <= prev {
-                return Err(ExportError::PartitionOrder {
-                    previous: prev,
-                    next: partition.index,
-                });
-            }
+        if let Some(prev) = previous_partition.filter(|&prev| partition.index <= prev) {
+            return Err(ExportError::PartitionOrder {
+                previous: prev,
+                next: partition.index,
+            });
         }
         previous_partition = Some(partition.index);
 
@@ -1777,7 +1764,7 @@ pub fn read_parquet_records(bytes: &[u8]) -> ExportResult<LocalExportInput> {
                                         Some("TEXT") => Some(ParquetConvertedType::Utf8),
                                         _ => None,
                                     };
-                                    let nullable = columns.get(col_idx).map_or(true, |c| c.nullable);
+                                    let nullable = columns.get(col_idx).is_none_or(|c| c.nullable);
                                     chunk_offsets.push((data_page_offset, codec, ptype, conv, nullable));
                                 }
                             }
@@ -1928,13 +1915,14 @@ pub fn read_parquet_records(bytes: &[u8]) -> ExportResult<LocalExportInput> {
     }
 
     // Pivot columns back into rows
-    let mut rows = Vec::with_capacity(inspection.row_count as usize);
-    for row_idx in 0..inspection.row_count as usize {
-        let mut row = Vec::with_capacity(columns.len());
-        for col_idx in 0..columns.len() {
-            row.push(reconstructed_cols[col_idx][row_idx].clone());
+    let row_count = inspection.row_count as usize;
+    let mut rows: Vec<Vec<Option<String>>> = (0..row_count)
+        .map(|_| Vec::with_capacity(columns.len()))
+        .collect();
+    for col in &reconstructed_cols {
+        for (row_idx, cell) in col.iter().enumerate().take(row_count) {
+            rows[row_idx].push(cell.clone());
         }
-        rows.push(row);
     }
 
     Ok(LocalExportInput::new(columns, vec![ResultPartition::new(0, rows)]))

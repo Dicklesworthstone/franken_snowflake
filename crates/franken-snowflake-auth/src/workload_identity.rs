@@ -309,10 +309,8 @@ pub fn format_rfc7523_form_body(
     parts.push(format!("assertion={}", url_encode(assertion)));
     let scope_val = scope.unwrap_or(DEFAULT_OIDC_SCOPE);
     parts.push(format!("scope={}", url_encode(scope_val)));
-    if let Some(cid) = client_id {
-        if !cid.trim().is_empty() {
-            parts.push(format!("client_id={}", url_encode(cid)));
-        }
+    if let Some(cid) = client_id.filter(|cid| !cid.trim().is_empty()) {
+        parts.push(format!("client_id={}", url_encode(cid)));
     }
     parts.join("&")
 }
@@ -344,7 +342,6 @@ pub struct SnowflakeSessionToken {
 }
 
 impl SnowflakeSessionToken {
-    #[must_use]
     pub fn new(
         token: impl Into<String>,
         token_type: impl Into<String>,
