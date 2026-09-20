@@ -69,13 +69,21 @@ fi
 resolve_bin() {
   if [ -n "${FSNOW_BIN:-}" ]; then
     printf '%s' "$FSNOW_BIN"
-    return
+    return 0
+  fi
+  if [ -x "$CARGO_TARGET_DIR/release/franken-snowflake" ]; then
+    printf '%s' "$CARGO_TARGET_DIR/release/franken-snowflake"
+    return 0
+  fi
+  if [ -x "$CARGO_TARGET_DIR/debug/franken-snowflake" ]; then
+    printf '%s' "$CARGO_TARGET_DIR/debug/franken-snowflake"
+    return 0
   fi
   log "building franken-snowflake with --features live,mcp"
-  (cd "$REPO_ROOT" && cargo build --locked --release -p franken-snowflake-cli --features live,mcp >"$RUN_DIR/build.log" 2>&1) || {
+  if ! (cd "$REPO_ROOT" && cargo build --locked --release -p franken-snowflake-cli --features live,mcp >"$RUN_DIR/build.log" 2>&1); then
     log "build failed; see $RUN_DIR/build.log"
-    exit 74
-  }
+    return 1
+  fi
   printf '%s' "$CARGO_TARGET_DIR/release/franken-snowflake"
 }
 

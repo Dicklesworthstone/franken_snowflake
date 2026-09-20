@@ -57,6 +57,14 @@ fi
 # --- binary -----------------------------------------------------------------
 if [ -n "${FSNOW_BIN:-}" ]; then
   BIN="$FSNOW_BIN"
+elif [ -x "${CARGO_TARGET_DIR:-target}/release/franken-snowflake" ]; then
+  BIN="${CARGO_TARGET_DIR:-target}/release/franken-snowflake"
+elif [ -x "${CARGO_TARGET_DIR:-target}/debug/franken-snowflake" ]; then
+  BIN="${CARGO_TARGET_DIR:-target}/debug/franken-snowflake"
+elif [ -x "target/release/franken-snowflake" ]; then
+  BIN="target/release/franken-snowflake"
+elif [ -x "target/debug/franken-snowflake" ]; then
+  BIN="target/debug/franken-snowflake"
 else
   echo "building the live binary (set FSNOW_BIN to skip this build)..."
   cargo build --release -p franken-snowflake-cli --features live --bin franken-snowflake || exit 1
