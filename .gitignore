@@ -89,3 +89,5 @@ Desktop.ini
 /tui-rel-target/
 /target-tui-rel/
 /fsnow-golden-teeth/
+.rch-target/
+.rch-tmp/
