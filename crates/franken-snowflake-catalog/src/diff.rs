@@ -274,10 +274,8 @@ pub fn diff_snapshots(base: &CatalogSnapshot, target: &CatalogSnapshot) -> Catal
 
                     let precision = if b_col.precision != t_col.precision {
                         // Narrowing precision is breaking
-                        if let (Some(b_prec), Some(t_prec)) = (b_col.precision, t_col.precision) {
-                            if t_prec < b_prec {
-                                is_breaking = true;
-                            }
+                        if matches!((b_col.precision, t_col.precision), (Some(b), Some(t)) if t < b) {
+                            is_breaking = true;
                         }
                         Some(ValueChange {
                             old: b_col.precision,
@@ -288,10 +286,8 @@ pub fn diff_snapshots(base: &CatalogSnapshot, target: &CatalogSnapshot) -> Catal
                     };
 
                     let scale = if b_col.scale != t_col.scale {
-                        if let (Some(b_scale), Some(t_scale)) = (b_col.scale, t_col.scale) {
-                            if t_scale < b_scale {
-                                is_breaking = true;
-                            }
+                        if matches!((b_col.scale, t_col.scale), (Some(b), Some(t)) if t < b) {
+                            is_breaking = true;
                         }
                         Some(ValueChange {
                             old: b_col.scale,
