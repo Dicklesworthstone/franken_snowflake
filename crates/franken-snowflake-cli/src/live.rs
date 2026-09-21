@@ -209,7 +209,7 @@ pub fn run_query_outcome(
             rows_success(
                 format,
                 request_id,
-                profile,
+                profile.clone(),
                 "query.run",
                 "fsnow.query.run.v1",
                 Vec::new(),
@@ -1024,7 +1024,7 @@ pub fn run_query_cancel_outcome(
         ]),
     );
     envelope.data_source = "live";
-    envelope.profile_id = Some(profile);
+    envelope.profile_id = Some(profile.clone());
     envelope.statement_handle = Some(statement_handle);
     if !acknowledged {
         envelope.error = Some(error_info(
@@ -1134,7 +1134,7 @@ pub fn dataset_profile_execute_outcome(
         request_id,
         json_object(data),
     );
-    stamp_live(&mut envelope, &plan.profile, &rows, receipt_hash);
+    stamp_live(&mut envelope, &plan.profile, &rows, receipt_hash.clone());
     envelope.warnings = warnings;
     envelope.safe_next_commands = vec![
         format!("franken-snowflake dataset inspect {dataset_id} --json"),
@@ -2862,6 +2862,13 @@ mod tests {
     ];
 
     fn information_schema_script() -> Vec<Result<CompletedStatement, SnowflakeError>> {
+        information_schema_script_with_scope("ANALYTICS", "PUBLIC")
+    }
+
+    fn information_schema_script_with_scope(
+        database: &str,
+        schema: &str,
+    ) -> Vec<Result<CompletedStatement, SnowflakeError>> {
         vec![
             Ok(completed(
                 "01b2c3d4-0000-0000-0000-00000000cc01",
@@ -2875,8 +2882,8 @@ mod tests {
                     ("BYTES", "FIXED"),
                 ],
                 &[vec![
-                    Some("ANALYTICS"),
-                    Some("PUBLIC"),
+                    Some(database),
+                    Some(schema),
                     Some("EVENTS"),
                     Some("BASE TABLE"),
                     None,
@@ -2901,8 +2908,8 @@ mod tests {
                 ],
                 &[
                     vec![
-                        Some("ANALYTICS"),
-                        Some("PUBLIC"),
+                        Some(database),
+                        Some(schema),
                         Some("EVENTS"),
                         Some("EVENT_DATE"),
                         Some("1"),
@@ -2914,8 +2921,8 @@ mod tests {
                         None,
                     ],
                     vec![
-                        Some("ANALYTICS"),
-                        Some("PUBLIC"),
+                        Some(database),
+                        Some(schema),
                         Some("EVENTS"),
                         Some("ENTITY_ID"),
                         Some("2"),
@@ -2927,8 +2934,8 @@ mod tests {
                         None,
                     ],
                     vec![
-                        Some("ANALYTICS"),
-                        Some("PUBLIC"),
+                        Some(database),
+                        Some(schema),
                         Some("EVENTS"),
                         Some("VALUE"),
                         Some("3"),
@@ -3108,6 +3115,18 @@ mod tests {
         );
         assert_eq!(datasets[0]["approx_row_count"], 1200, "{env}");
         assert_eq!(env["receipt_hash"].as_str().map(str::len), Some(64));
+        assert_eq!(env["data"]["drift"]["summary"]["datasets_added"], 1);
+        assert_eq!(env["data"]["drift"]["summary"]["has_breaking_changes"], false);
+        let safe_cmds = env["safe_next_commands"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            safe_cmds
+                .iter()
+                .any(|c| c.as_str().unwrap_or("").contains(&dataset_id)),
+            "safe_next_commands should name the dataset: {safe_cmds:?}"
+        );
 
         // Discovery statements are bound, never interpolated, carry the
         // session context, and always fetch every partition.
@@ -3222,6 +3241,53 @@ mod tests {
             "{profile}"
         );
         assert_eq!(profile_script.submitted().len(), 1);
+    }
+
+    #[test]
+    fn scripted_catalog_scan_detects_drift_across_successive_scans() {
+        // First scan: initial scan for this profile, 1 dataset added
+        let _s1 = install(
+            "drift_profile",
+            None,
+            None,
+            information_schema_script_with_scope("DRIFT_DB", "DRIFT_SCHEMA"),
+        );
+        let env1 = envelope(run_catalog_scan_outcome(
+            OutputFormat::Json,
+            "req-scan-drift-1".to_owned(),
+            "drift_profile".to_owned(),
+            "DRIFT_DB".to_owned(),
+            "DRIFT_SCHEMA".to_owned(),
+            false,
+        ));
+        assert_eq!(env1["ok"], true);
+        assert_eq!(env1["data"]["drift"]["summary"]["datasets_added"], 1);
+        assert_eq!(
+            env1["data"]["drift"]["base_snapshot_id"],
+            serde_json::Value::Null
+        );
+
+        // Second scan: identical catalog
+        let _s2 = install(
+            "drift_profile",
+            None,
+            None,
+            information_schema_script_with_scope("DRIFT_DB", "DRIFT_SCHEMA"),
+        );
+        let env2 = envelope(run_catalog_scan_outcome(
+            OutputFormat::Json,
+            "req-scan-drift-2".to_owned(),
+            "drift_profile".to_owned(),
+            "DRIFT_DB".to_owned(),
+            "DRIFT_SCHEMA".to_owned(),
+            false,
+        ));
+        assert_eq!(env2["ok"], true);
+        assert_eq!(env2["data"]["drift"]["summary"]["is_identical"], true);
+        assert_eq!(
+            env2["data"]["drift"]["base_snapshot_id"],
+            env1["data"]["store"]["snapshot_id"]
+        );
     }
 
     #[test]
