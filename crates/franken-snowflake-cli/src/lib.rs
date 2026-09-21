@@ -90,6 +90,13 @@ enum Command {
         /// Force a live re-scan even when the local store has a snapshot.
         refresh: bool,
     },
+    CatalogDiff {
+        profile: String,
+        database: Option<String>,
+        schema: Option<String>,
+        base_snapshot: Option<String>,
+        target_snapshot: Option<String>,
+    },
     DatasetInspect {
         dataset_id: String,
     },
@@ -381,6 +388,16 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         invocation: "franken-snowflake catalog graph <profile> --database <db> [--schema <schema>] [--refresh] [--json|--toon|--mermaid|--svg]",
         output_contract_id: "fsnow.catalog.graph.v1",
         description: "Render catalog lineage (profile > database > schema > object > column, dataset/field edges) from the local snapshot, or from a live scan with --refresh / when nothing is cached.",
+        read_only: true,
+        provider_network: false,
+        mutates_local_state: false,
+        sensitive_output: false,
+    },
+    CommandSpec {
+        id: "catalog.diff",
+        invocation: "franken-snowflake catalog diff <profile> [--database <db>] [--schema <schema>] [--base <snapshot-id>] [--target <snapshot-id>] --json",
+        output_contract_id: "fsnow.catalog.diff.v1",
+        description: "Compare two catalog snapshots or audit schema drift across historical scans from the local store.",
         read_only: true,
         provider_network: false,
         mutates_local_state: false,
@@ -775,6 +792,34 @@ fn parse_catalog(
                 vec![],
             )),
         },
+        Some("diff") => match resolve_profile(positional_profile(args)) {
+            Some(profile) => {
+                let database = value_after(args, "--database");
+                let schema = value_after(args, "--schema");
+                let base_snapshot = value_after(args, "--base")
+                    .or_else(|| value_after(args, "--base-snapshot"));
+                let target_snapshot = value_after(args, "--target")
+                    .or_else(|| value_after(args, "--target-snapshot"));
+                Ok(Command::CatalogDiff {
+                    profile,
+                    database,
+                    schema,
+                    base_snapshot,
+                    target_snapshot,
+                })
+            }
+            None => Err(usage_error(
+                output,
+                "catalog.diff",
+                "fsnow.catalog.diff.v1",
+                "Missing profile for `catalog diff`. Pass <profile> or set FRANKEN_SNOWFLAKE_DEFAULT_PROFILE.",
+                vec![
+                    "franken-snowflake catalog diff <profile> [--database <db>] [--schema <schema>] --json"
+                        .to_string(),
+                ],
+                vec![],
+            )),
+        },
         Some(other) => Err(usage_error(
             output,
             "catalog",
@@ -784,8 +829,10 @@ fn parse_catalog(
                 "franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json"
                     .to_string(),
                 "franken-snowflake catalog graph <profile> --mermaid".to_string(),
+                "franken-snowflake catalog diff <profile> [--database <db>] [--schema <schema>] --json"
+                    .to_string(),
             ],
-            did_you_mean(other, &["scan", "graph"]),
+            did_you_mean(other, &["scan", "graph", "diff"]),
         )),
         None => Err(usage_error(
             output,
@@ -796,6 +843,8 @@ fn parse_catalog(
                 "franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json"
                     .to_string(),
                 "franken-snowflake catalog graph <profile> --mermaid".to_string(),
+                "franken-snowflake catalog diff <profile> [--database <db>] [--schema <schema>] --json"
+                    .to_string(),
             ],
             vec![],
         )),
@@ -1273,6 +1322,21 @@ fn dispatch(invocation: Invocation) -> Outcome {
             schema,
             graph_output,
             refresh,
+        ),
+        Command::CatalogDiff {
+            profile,
+            database,
+            schema,
+            base_snapshot,
+            target_snapshot,
+        } => catalog_surface::catalog_diff_outcome(
+            invocation.output,
+            request_id,
+            profile,
+            database,
+            schema,
+            base_snapshot,
+            target_snapshot,
         ),
         Command::DatasetInspect { dataset_id } => {
             catalog_surface::dataset_inspect_outcome(invocation.output, request_id, dataset_id)
@@ -2216,6 +2280,24 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
                 false,
                 "Graph output: json (default), toon, mermaid, or svg (--json / --toon / --mermaid / --svg)",
             ),
+        ],
+        "catalog.diff" => vec![
+            input("profile", "string", true, "positional: profile id"),
+            database,
+            schema,
+            input(
+                "base",
+                "string",
+                false,
+                "Base (older) snapshot ID (--base / --base-snapshot); defaults to snapshot preceding target",
+            ),
+            input(
+                "target",
+                "string",
+                false,
+                "Target (newer) snapshot ID (--target / --target-snapshot); defaults to latest snapshot",
+            ),
+            OUTPUT_INPUT,
         ],
         "dataset.inspect" => vec![
             input(
@@ -7120,5 +7202,38 @@ mod tests {
             escape_json_string("a\"b\\c\n"),
             "a\\\"b\\\\c\\n".to_string()
         );
+    }
+
+    #[test]
+    fn catalog_diff_invocation_requires_profile() {
+        let outcome = execute(vec!["catalog".into(), "diff".into(), "--json".into()]);
+        assert_eq!(outcome.status.code(), CoreExitCode::Usage.code());
+        let rendered = render_outcome(outcome);
+        assert!(rendered.contains("Missing profile for `catalog diff`"));
+    }
+
+    #[test]
+    fn catalog_diff_missing_snapshot_returns_typed_metadata_error() {
+        let outcome = execute(vec![
+            "catalog".into(),
+            "diff".into(),
+            "unseen_profile_xyz".into(),
+            "--database".into(),
+            "DB".into(),
+            "--schema".into(),
+            "SCH".into(),
+            "--json".into(),
+        ]);
+        assert_ne!(outcome.status.code(), 0);
+        let rendered = render_outcome(outcome);
+        assert!(rendered.contains("\"command_id\":\"catalog.diff\""));
+        assert!(rendered.contains("no catalog snapshot for profile `unseen_profile_xyz`"));
+    }
+
+    #[test]
+    fn capabilities_lists_catalog_diff() {
+        let rendered = render_json(&envelope_for(&["capabilities", "--json"]));
+        assert!(rendered.contains("\"command_id\":\"catalog.diff\""));
+        assert!(rendered.contains("fsnow.catalog.diff.v1"));
     }
 }

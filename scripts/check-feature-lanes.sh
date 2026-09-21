@@ -56,13 +56,13 @@ for lane in "${LANES[@]}"; do
   for attempt in 1 2 3 4 5; do
     # shellcheck disable=SC2086
     if [ -n "$features" ]; then
-      cargo clippy $scope --features "$features" --all-targets --locked -- -D warnings >/dev/null 2>"/tmp/fsnow-lane-$$.err"
+      cargo clippy -j 2 $scope --features "$features" --all-targets --locked -- -D warnings >/dev/null 2>"/tmp/fsnow-lane-$$.err"
     else
-      cargo clippy $scope --all-targets --locked -- -D warnings >/dev/null 2>"/tmp/fsnow-lane-$$.err"
+      cargo clippy -j 2 $scope --all-targets --locked -- -D warnings >/dev/null 2>"/tmp/fsnow-lane-$$.err"
     fi
     rc=$?
     if [ "$rc" -eq 103 ]; then
-      sleep 3
+      sleep 10
       continue
     fi
     break

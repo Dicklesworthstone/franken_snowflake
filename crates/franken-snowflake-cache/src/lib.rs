@@ -1105,7 +1105,7 @@ impl CacheBackend for FrankenSqliteCache {
                 opt_text(schema_name.map(str::to_owned)),
             ],
         )?;
-        rows.into_iter().map(row_catalog_snapshot).collect()
+        rows.iter().map(row_catalog_snapshot).collect()
     }
 
     fn upsert_dataset_manifest(&self, record: DatasetManifestRecord) -> CacheResult<()> {

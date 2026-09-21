@@ -5,6 +5,7 @@
 //! operator catalog. The live build reuses the same renderers after a scan.
 
 use franken_snowflake_cache::{CacheBackend, CacheError, CatalogSnapshotRecord};
+use franken_snowflake_catalog::diff::CatalogDiff;
 use franken_snowflake_catalog::model::{
     CatalogSnapshot, ColumnCatalogEntry, DatasetManifest, DtypeClass, FieldRole,
 };
@@ -1007,6 +1008,264 @@ pub fn catalog_graph_from_store_outcome(
         DATA_SOURCE_CACHE,
         graph_output,
     )
+}
+
+/// `catalog diff` from the local store: compare two catalog snapshots or audit
+/// schema drift across historical scans.
+#[allow(clippy::too_many_arguments)]
+pub fn catalog_diff_outcome(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    database: Option<String>,
+    schema: Option<String>,
+    base_snapshot_id: Option<String>,
+    target_snapshot_id: Option<String>,
+) -> Outcome {
+    let store = match local_store::open_store() {
+        Ok(store) => store,
+        Err(error) => {
+            return store_error(
+                format,
+                "catalog.diff",
+                "fsnow.catalog.diff.v1",
+                request_id,
+                Some(profile),
+                &error,
+            );
+        }
+    };
+
+    // 1. Resolve target snapshot record.
+    let target_record = match &target_snapshot_id {
+        Some(id) => match store.cache.catalog_snapshot(id) {
+            Ok(Some(rec)) => rec,
+            Ok(None) => {
+                return typed_error(
+                    format,
+                    "catalog.diff",
+                    "fsnow.catalog.diff.v1",
+                    request_id,
+                    Some(profile.clone()),
+                    SnowflakeErrorCode::MetadataError,
+                    format!("Target catalog snapshot `{id}` was not found in the local store."),
+                    vec![json_string("local store")],
+                    vec![format!(
+                        "franken-snowflake catalog scan {profile} --database {} --schema {} --json",
+                        database.as_deref().unwrap_or("<db>"),
+                        schema.as_deref().unwrap_or("<schema>")
+                    )],
+                    vec![],
+                    vec![],
+                );
+            }
+            Err(error) => {
+                return cache_error(
+                    format,
+                    "catalog.diff",
+                    "fsnow.catalog.diff.v1",
+                    request_id,
+                    Some(profile),
+                    &error,
+                );
+            }
+        },
+        None => match store.cache.latest_catalog_snapshot(
+            &profile,
+            database.as_deref(),
+            schema.as_deref(),
+        ) {
+            Ok(Some(rec)) => rec,
+            Ok(None) => {
+                let scan = format!(
+                    "franken-snowflake catalog scan {profile} --database {} --schema {} --json",
+                    database.as_deref().unwrap_or("<db>"),
+                    schema.as_deref().unwrap_or("<schema>")
+                );
+                return typed_error(
+                    format,
+                    "catalog.diff",
+                    "fsnow.catalog.diff.v1",
+                    request_id,
+                    Some(profile.clone()),
+                    SnowflakeErrorCode::MetadataError,
+                    format!(
+                        "no catalog snapshot for profile `{profile}` (database={}, schema={}) in the local store; run a catalog scan first",
+                        database.as_deref().unwrap_or("*"),
+                        schema.as_deref().unwrap_or("*")
+                    ),
+                    vec![json_string("local store")],
+                    vec![scan.clone()],
+                    vec![scan],
+                    vec![],
+                );
+            }
+            Err(error) => {
+                return cache_error(
+                    format,
+                    "catalog.diff",
+                    "fsnow.catalog.diff.v1",
+                    request_id,
+                    Some(profile),
+                    &error,
+                );
+            }
+        },
+    };
+
+    // 2. Resolve base snapshot record.
+    let base_record = match &base_snapshot_id {
+        Some(id) => match store.cache.catalog_snapshot(id) {
+            Ok(Some(rec)) => Some(rec),
+            Ok(None) => {
+                return typed_error(
+                    format,
+                    "catalog.diff",
+                    "fsnow.catalog.diff.v1",
+                    request_id,
+                    Some(profile.clone()),
+                    SnowflakeErrorCode::MetadataError,
+                    format!("Base catalog snapshot `{id}` was not found in the local store."),
+                    vec![json_string("local store")],
+                    vec![],
+                    vec![],
+                    vec![],
+                );
+            }
+            Err(error) => {
+                return cache_error(
+                    format,
+                    "catalog.diff",
+                    "fsnow.catalog.diff.v1",
+                    request_id,
+                    Some(profile),
+                    &error,
+                );
+            }
+        },
+        None => {
+            // Find the snapshot immediately preceding target in this scope.
+            let db_scope = database.as_deref().or(target_record.database_name.as_deref());
+            let sch_scope = schema.as_deref().or(target_record.schema_name.as_deref());
+            match store.cache.catalog_snapshots(&profile, db_scope, sch_scope) {
+                Ok(snapshots) => snapshots.into_iter().find(|s| {
+                    s.snapshot_id != target_record.snapshot_id
+                        && (s.captured_at_ms < target_record.captured_at_ms
+                            || (s.captured_at_ms == target_record.captured_at_ms
+                                && s.snapshot_id < target_record.snapshot_id))
+                }),
+                Err(error) => {
+                    return cache_error(
+                        format,
+                        "catalog.diff",
+                        "fsnow.catalog.diff.v1",
+                        request_id,
+                        Some(profile),
+                        &error,
+                    );
+                }
+            }
+        }
+    };
+
+    // 3. Deserialize snapshots and compute diff.
+    let target_snapshot: CatalogSnapshot = match serde_json::from_str(&target_record.payload.canonical) {
+        Ok(s) => s,
+        Err(error) => {
+            return typed_error(
+                format,
+                "catalog.diff",
+                "fsnow.catalog.diff.v1",
+                request_id,
+                Some(profile),
+                SnowflakeErrorCode::MetadataError,
+                format!("Failed to parse target snapshot `{}`: {error}", target_record.snapshot_id),
+                vec![json_string("catalog snapshot")],
+                vec![],
+                vec![],
+                vec![],
+            );
+        }
+    };
+
+    let diff = match &base_record {
+        Some(base_rec) => {
+            let base_snapshot: CatalogSnapshot = match serde_json::from_str(&base_rec.payload.canonical) {
+                Ok(s) => s,
+                Err(error) => {
+                    return typed_error(
+                        format,
+                        "catalog.diff",
+                        "fsnow.catalog.diff.v1",
+                        request_id,
+                        Some(profile),
+                        SnowflakeErrorCode::MetadataError,
+                        format!("Failed to parse base snapshot `{}`: {error}", base_rec.snapshot_id),
+                        vec![json_string("catalog snapshot")],
+                        vec![],
+                        vec![],
+                        vec![],
+                    );
+                }
+            };
+            target_snapshot.diff_from(&base_snapshot)
+        }
+        None => CatalogDiff::initial_scan(&target_snapshot),
+    };
+
+    // 4. Build envelope.
+    let mut warnings = Vec::new();
+    if diff.is_breaking() {
+        warnings.push(json_string(format!(
+            "breaking schema drift detected: {}",
+            diff.summary_text()
+        )));
+    }
+
+    let mut safe_next_commands = vec![
+        format!(
+            "franken-snowflake catalog graph {profile} --database {} --mermaid",
+            target_record.database_name.as_deref().unwrap_or("<db>")
+        ),
+    ];
+    if let Some(first_ds) = target_snapshot.datasets.first() {
+        safe_next_commands.push(format!(
+            "franken-snowflake dataset inspect {} --json",
+            first_ds.id
+        ));
+    }
+
+    let mut envelope = base_envelope(
+        true,
+        "success",
+        "catalog.diff",
+        "fsnow.catalog.diff.v1",
+        request_id,
+        json_object(vec![
+            ("diff", Json::from_value(&diff)),
+            ("target_snapshot_id", json_string(diff.target_snapshot_id.clone())),
+            ("base_snapshot_id", option_json(diff.base_snapshot_id.clone())),
+            ("has_changes", Json::Bool(diff.has_changes())),
+            ("is_breaking", Json::Bool(diff.is_breaking())),
+            ("summary_text", json_string(diff.summary_text())),
+            (
+                "store",
+                json_object(vec![(
+                    "data_dir",
+                    json_string(store.dir.display().to_string()),
+                )]),
+            ),
+        ]),
+    );
+    envelope.profile_id = Some(profile);
+    envelope.data_source = DATA_SOURCE_CACHE;
+    envelope.warnings = warnings;
+    envelope.safe_next_commands = safe_next_commands;
+
+    Outcome {
+        status: CoreExitCode::Success,
+        body: Body::Envelope { envelope, format },
+    }
 }
 
 // ---------------------------------------------------------------------------

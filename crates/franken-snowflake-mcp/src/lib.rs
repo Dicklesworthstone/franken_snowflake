@@ -60,6 +60,7 @@ mod fastmcp_surface {
         ProfileDoctor,
         CatalogScan,
         CatalogGraph,
+        CatalogDiff,
         DatasetInspect,
         DatasetProfile,
         DatasetDescribeOperator,
@@ -82,6 +83,7 @@ mod fastmcp_surface {
         ReadVerb::ProfileDoctor,
         ReadVerb::CatalogScan,
         ReadVerb::CatalogGraph,
+        ReadVerb::CatalogDiff,
         ReadVerb::DatasetInspect,
         ReadVerb::DatasetProfile,
         ReadVerb::DatasetDescribeOperator,
@@ -255,6 +257,40 @@ mod fastmcp_surface {
                         ),
                     ],
                     tags: &["catalog", "graph"],
+                },
+                Self::CatalogDiff => ToolSpec {
+                    name: "catalog_diff",
+                    description: "Compare two catalog snapshots or audit schema drift across historical scans from the local store.",
+                    open_world_hint: "offline",
+                    read_only: true,
+                    params: vec![
+                        ParamSpec::string(
+                            "profile",
+                            "Profile id to inspect.",
+                            true,
+                        ),
+                        ParamSpec::string(
+                            "database",
+                            "Snowflake database name scope filter.",
+                            false,
+                        ),
+                        ParamSpec::string(
+                            "schema",
+                            "Snowflake schema name scope filter.",
+                            false,
+                        ),
+                        ParamSpec::string(
+                            "base_snapshot",
+                            "Base (older) snapshot ID. Defaults to the snapshot preceding target.",
+                            false,
+                        ),
+                        ParamSpec::string(
+                            "target_snapshot",
+                            "Target (newer) snapshot ID. Defaults to the latest snapshot.",
+                            false,
+                        ),
+                    ],
+                    tags: &["catalog", "diff", "drift", "offline"],
                 },
                 Self::DatasetInspect => ToolSpec {
                     name: "dataset_inspect",
@@ -430,6 +466,31 @@ mod fastmcp_surface {
                             ));
                         }
                     }
+                    Ok(args)
+                }
+                Self::CatalogDiff => {
+                    let mut args = vec![
+                        "catalog".to_string(),
+                        "diff".to_string(),
+                        required_string(arguments, "profile")?,
+                    ];
+                    if let Some(database) = optional_string(arguments, "database")? {
+                        args.push("--database".to_string());
+                        args.push(database);
+                    }
+                    if let Some(schema) = optional_string(arguments, "schema")? {
+                        args.push("--schema".to_string());
+                        args.push(schema);
+                    }
+                    if let Some(base) = optional_string(arguments, "base_snapshot")? {
+                        args.push("--base".to_string());
+                        args.push(base);
+                    }
+                    if let Some(target) = optional_string(arguments, "target_snapshot")? {
+                        args.push("--target".to_string());
+                        args.push(target);
+                    }
+                    args.push("--json".to_string());
                     Ok(args)
                 }
                 Self::DatasetInspect => Ok(json_args_with(
@@ -1338,6 +1399,30 @@ mod fastmcp_surface {
                 .collect::<Vec<_>>()
             );
 
+            let cat_diff = ReadVerb::CatalogDiff
+                .cli_args(&json!({"profile": "demo", "database": "DB", "schema": "SCH", "base_snapshot": "snap1", "target_snapshot": "snap2"}))
+                .map_err(|e| format!("{e:?}"))?;
+            assert_eq!(
+                cat_diff,
+                vec![
+                    "catalog",
+                    "diff",
+                    "demo",
+                    "--database",
+                    "DB",
+                    "--schema",
+                    "SCH",
+                    "--base",
+                    "snap1",
+                    "--target",
+                    "snap2",
+                    "--json"
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+            );
+
             let query_live = ReadVerb::QueryRun
                 .cli_args(&json!({"profile": "demo", "sql": "select 1", "require_live": true}))
                 .map_err(|e| format!("{e:?}"))?;
@@ -1352,6 +1437,7 @@ mod fastmcp_surface {
                 .map_err(|err| format!("tool schemas serialize: {err}"))?;
             assert!(schemas.contains("\"name\":\"capabilities\""));
             assert!(schemas.contains("\"name\":\"profile_validate\""));
+            assert!(schemas.contains("\"name\":\"catalog_diff\""));
             assert!(schemas.contains("\"inputSchema\""));
             Ok(())
         }

@@ -39,6 +39,7 @@ franken-snowflake profile validate <profile> --json
 franken-snowflake profile doctor <profile> --json          # --online attempts a minimal live check
 franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json
 franken-snowflake catalog graph <profile> --mermaid
+franken-snowflake catalog diff <profile> [--database <db>] [--schema <schema>] --json
 franken-snowflake dataset inspect <dataset-id> --json
 franken-snowflake dataset profile <dataset-id> --json       # column stats via SQL pushdown (APPROX_*)
 franken-snowflake dataset describe-operator <operator> --jsonschema

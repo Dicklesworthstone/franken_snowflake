@@ -425,18 +425,21 @@ handle sets per auth lane.
 |---|---|
 | `fsnow catalog scan <profile> --database <db> --schema <schema> [--require-live] --json` | Discover tables, views, and columns through bound `INFORMATION_SCHEMA` statements, build dataset manifests (field roles, row/byte hints), and persist the snapshot to the local store; `--require-live` hard-refuses with `FSNOW-3003` unless served by the live transport |
 | `fsnow catalog graph <profile> --database <db> [--schema <schema>] [--refresh] [--json\|--toon\|--mermaid\|--svg]` | Render the lineage graph (profile > database > schema > object > column, dataset and field edges) from the local snapshot, or from a live scan with `--refresh` |
+| `fsnow catalog diff <profile> [--database <db>] [--schema <schema>] [--base <snapshot-id>] [--target <snapshot-id>] --json` | Compare two catalog snapshots or audit schema drift across historical scans from the local store; reports added/removed/modified tables and columns with breaking-change classification and envelope warnings |
 
 Both `--database` and `--schema` are required for `catalog scan`. `catalog
-graph` requires `--database` and takes `--schema` optionally. Exactly one output
+graph` requires `--database` and takes `--schema` optionally. `catalog diff`
+audits schema drift offline across stored snapshots. Exactly one output
 format may be chosen for `catalog graph`; mixing `--mermaid` with `--json` (or
 two raw formats) is a usage error. Scope values are passed to Snowflake as
 positional bindings, never interpolated. `catalog scan` requires the `live`
 feature plus credentials (the default build returns a typed "live transport
-required" envelope); `catalog graph`, `dataset inspect`, and `dataset profile`
+required" envelope); `catalog graph`, `catalog diff`, `dataset inspect`, and `dataset profile`
 then work offline from the persisted snapshot.
 
 ```bash
 fsnow catalog scan demo-prod --database ANALYTICS --schema PUBLIC --json
+fsnow catalog diff demo-prod --database ANALYTICS --schema PUBLIC --json
 fsnow catalog graph demo-prod --database ANALYTICS --mermaid
 fsnow catalog graph demo-prod --database ANALYTICS --schema PUBLIC --svg
 ```
@@ -780,10 +783,10 @@ The exposed tools mirror the CLI read and discovery verbs:
 capabilities          onboard               doctor
 agent_handbook        robot_docs_guide      selftest
 profile_validate      profile_doctor        catalog_scan
-catalog_graph         dataset_inspect       dataset_profile
-dataset_describe_operator                   query_plan
-query_run             query_cancel          receipt_show
-export_plan
+catalog_graph         catalog_diff          dataset_inspect
+dataset_profile       query_plan            query_run
+query_cancel          receipt_show          export_plan
+dataset_describe_operator
 ```
 
 ```bash
