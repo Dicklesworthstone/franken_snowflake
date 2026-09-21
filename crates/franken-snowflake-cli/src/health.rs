@@ -706,6 +706,13 @@ pub fn profile_handle_presence(profile: &str) -> HandlePresence {
         Some("pat" | "programmatic_access_token") => Some("PAT"),
         Some("oauth" | "oauth_bearer" | "oauth_bearer_token") => Some("OAUTH_BEARER"),
         Some("key_pair_jwt" | "jwt") => Some("PRIVATE_KEY_PEM"),
+        Some("workload_identity" | "workload_identity_federation" | "oidc") => {
+            if present("OIDC_TOKEN_FILE") {
+                Some("OIDC_TOKEN_FILE")
+            } else {
+                Some("OIDC_TOKEN")
+            }
+        }
         _ => None,
     };
     let mut handles = Vec::new();
@@ -743,10 +750,26 @@ pub fn profile_handle_presence(profile: &str) -> HandlePresence {
             if key == "PRIVATE_KEY_PEM" {
                 push("PRIVATE_KEY_PASSPHRASE", false, true);
                 push("JWT_VALIDITY_SECONDS", false, false);
+            } else if key == "OIDC_TOKEN" || key == "OIDC_TOKEN_FILE" {
+                if key == "OIDC_TOKEN" {
+                    push("OIDC_TOKEN_FILE", false, true);
+                } else {
+                    push("OIDC_TOKEN", false, true);
+                }
+                push("OIDC_TOKEN_URL", false, false);
+                push("OIDC_SCOPE", false, false);
+                push("OIDC_CLIENT_ID", false, false);
+                push("OIDC_REFRESH_BEFORE_EXPIRY_SECONDS", false, false);
             }
         }
         None => {
-            for key in ["PAT", "OAUTH_BEARER", "PRIVATE_KEY_PEM"] {
+            for key in [
+                "PAT",
+                "OAUTH_BEARER",
+                "PRIVATE_KEY_PEM",
+                "OIDC_TOKEN",
+                "OIDC_TOKEN_FILE",
+            ] {
                 push(key, false, true);
             }
         }
@@ -764,5 +787,6 @@ pub fn supported_auth_lanes() -> Json {
         "pat".to_string(),
         "key_pair_jwt".to_string(),
         "oauth_bearer".to_string(),
+        "workload_identity".to_string(),
     ])
 }

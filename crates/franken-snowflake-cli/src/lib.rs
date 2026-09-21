@@ -2853,7 +2853,7 @@ fn profile_diagnostics_data(
         None => check_json(
             "auth_lane",
             "not_checked",
-            "_AUTH handle is unset; expected pat, key_pair_jwt, or oauth_bearer",
+            "_AUTH handle is unset; expected pat, key_pair_jwt, oauth_bearer, or workload_identity",
         ),
         Some(
             "pat"
@@ -2862,7 +2862,10 @@ fn profile_diagnostics_data(
             | "oauth_bearer"
             | "oauth_bearer_token"
             | "key_pair_jwt"
-            | "jwt",
+            | "jwt"
+            | "workload_identity"
+            | "workload_identity_federation"
+            | "oidc",
         ) => check_json_owned(
             "auth_lane",
             "pass",
@@ -2874,7 +2877,7 @@ fn profile_diagnostics_data(
         Some(other) => check_json_owned(
             "auth_lane",
             "warn",
-            format!("auth lane `{other}` is not supported; use pat, key_pair_jwt, or oauth_bearer"),
+            format!("auth lane `{other}` is not supported; use pat, key_pair_jwt, oauth_bearer, or workload_identity"),
         ),
     };
     let live_probe_check = check_json(
@@ -2970,6 +2973,17 @@ fn credential_lifetime_warnings() -> Vec<Json> {
             ),
             ("secret_values_read", Json::Bool(false)),
         ]),
+        json_object(vec![
+            ("auth_lane", json_string("workload_identity")),
+            ("severity", json_string("warning")),
+            (
+                "message",
+                json_string(
+                    "Workload identity federation tokens are refreshed automatically or re-read from OIDC_TOKEN_FILE before expiration",
+                ),
+            ),
+            ("secret_values_read", Json::Bool(false)),
+        ]),
     ]
 }
 
@@ -3002,6 +3016,21 @@ fn profile_env_handle_sets(env_prefix: &str) -> Vec<Json> {
         json_object(vec![
             ("auth_lane", json_string("oauth_bearer")),
             ("env_vars", string_array(base("OAUTH_BEARER"))),
+        ]),
+        json_object(vec![
+            ("auth_lane", json_string("workload_identity")),
+            (
+                "env_vars",
+                string_array({
+                    let mut vars = base("OIDC_TOKEN");
+                    vars.push(format!("{env_prefix}_OIDC_TOKEN_FILE"));
+                    vars.push(format!("{env_prefix}_OIDC_TOKEN_URL"));
+                    vars.push(format!("{env_prefix}_OIDC_SCOPE"));
+                    vars.push(format!("{env_prefix}_OIDC_CLIENT_ID"));
+                    vars.push(format!("{env_prefix}_OIDC_REFRESH_BEFORE_EXPIRY_SECONDS"));
+                    vars
+                }),
+            ),
         ]),
     ]
 }
@@ -6539,10 +6568,21 @@ mod tests {
         assert!(rendered.contains("one-hour cap"));
         assert!(rendered.contains("oauth_bearer_token"));
         assert!(rendered.contains("roughly 10-minute lifetime"));
+        assert!(rendered.contains("workload_identity"));
         assert!(rendered.contains("\"secret_values_read\":false"));
         assert!(!rendered.contains("snowflake_pat_"));
         assert!(!rendered.contains("BEGIN PRIVATE KEY"));
         assert!(!rendered.contains("eyJ"));
+    }
+
+    #[test]
+    fn profile_validate_includes_workload_identity_in_supported_lanes_and_handle_sets() {
+        let rendered = render_json(&envelope_for(&["profile", "validate", "demo-prod"]));
+        assert!(rendered.contains("\"command_id\":\"profile.validate\""));
+        assert!(rendered.contains("\"workload_identity\""));
+        assert!(rendered.contains("FRANKEN_SNOWFLAKE_DEMO_PROD_OIDC_TOKEN"));
+        assert!(rendered.contains("FRANKEN_SNOWFLAKE_DEMO_PROD_OIDC_TOKEN_FILE"));
+        assert!(rendered.contains("FRANKEN_SNOWFLAKE_DEMO_PROD_OIDC_TOKEN_URL"));
     }
 
     #[test]
