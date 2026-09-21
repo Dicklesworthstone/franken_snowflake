@@ -569,7 +569,7 @@ that live transport and credentials are required); it never fakes an execution.
 |---|---|
 | `fsnow receipt show <receipt-hash> --json` | Look up a content-addressed query receipt, its partition evidence, and the audit events that reference it |
 | `fsnow export plan --profile <p> --sql <select>\|--query-id <id> --location @stage/path [--format csv\|jsonl] [--compression gzip] [--header false] [--overwrite] [--single] [--max-file-size <bytes>] --json` | Build a content-addressed `COPY INTO <stage>` plan (Snowflake-side unload) and the exact `query write` command that executes it |
-| `fsnow export run --profile <p> --sql <select> --format csv\|jsonl\|frame --out <path> --json` | Run a read live and write a content-addressed local CSV/JSONL/frame artifact (live feature; frame requires `--features frankenpandas`) |
+| `fsnow export run --profile <p> --sql <select> --format csv\|jsonl\|parquet\|frame --out <path> --json` | Run a read live and write a content-addressed local CSV/JSONL/Parquet/frame artifact (live feature; frame requires `--features frankenpandas`) |
 
 ```bash
 fsnow export plan --profile demo-prod --sql "select * from events" --location @my_stage/exports/run_001 --format jsonl --json
@@ -743,7 +743,7 @@ statement handle.
               |
               v
     catalog (info-schema discovery · manifests · operator catalog · dataset planner · predicate AST)
-    graph (lineage · Mermaid/SVG) · export (COPY INTO plans + local CSV/JSONL/frame writers)
+    graph (lineage · Mermaid/SVG) · export (COPY INTO plans + local CSV/JSONL/Parquet/frame writers)
     cache (local store: append-only JSONL by default; FrankenSQLite backend opt-in)
     frame (fp-columnar/fp-types via --features frankenpandas) · text-indexing (frankensearch via --features frankensearch)
     interactive surface: tui (FrankenTUI via --features tui)
@@ -843,8 +843,9 @@ confirmation required, `FSNOW-3009` DDL not opted in) with an exact next command
 - `catalog scan` needs the `live` feature; everything that reads the snapshot
   (`dataset inspect`, `dataset profile` planning, `catalog graph`, dataset-mode
   `query plan`) works offline afterwards.
-- Local Arrow/Parquet export is not implemented yet; local export covers
-  CSV/JSONL, and large export uses Snowflake-side `COPY INTO`.
+- Local Parquet export is supported via the pure safe Rust Tokio-free v2.0 writer
+  (with Snappy and Gzip compression); Arrow IPC is not implemented locally, and large
+  export uses Snowflake-side `COPY INTO`.
 - The local store is an append-only JSONL file store; the FrankenSQLite-backed
   store exists in the cache crate behind its `frankensqlite` feature but is not
   the CLI default (the locked fsqlite crates do not build on Windows yet).
