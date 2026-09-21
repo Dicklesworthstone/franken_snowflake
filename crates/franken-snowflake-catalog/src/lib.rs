@@ -10,6 +10,7 @@
 //! discovery builds SQL API submit requests and ingests completed statement
 //! results, then persists through `franken-snowflake-cache`.
 
+pub mod diff;
 pub mod discovery;
 pub mod model;
 pub mod operator;
@@ -21,6 +22,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Convenient re-exports for callers and tests.
 pub mod prelude {
+    pub use crate::diff::{
+        CatalogDiff, CatalogDiffSummary, ColumnDiff, DatasetDiff, MetricChange, ValueChange,
+        diff_snapshots,
+    };
     pub use crate::discovery::{
         CatalogDiscoveryInput, CatalogDiscoverySql, CatalogDiscoveryTables, DiscoveryStatementKind,
         InformationSchemaRow, build_information_schema_requests,

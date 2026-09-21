@@ -55,6 +55,12 @@ impl CatalogSnapshot {
         columns.sort_by_key(|column| column.ordinal);
         columns
     }
+
+    /// Diff this snapshot against an older base snapshot to detect drift and breaking changes.
+    #[must_use]
+    pub fn diff_from(&self, base: &Self) -> crate::diff::CatalogDiff {
+        crate::diff::diff_snapshots(base, self)
+    }
 }
 
 /// Secret-free provenance attached to snapshots and artifacts.
