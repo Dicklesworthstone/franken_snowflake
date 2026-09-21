@@ -215,12 +215,11 @@ pub fn run_query_outcome(
                 Vec::new(),
                 &rows,
                 emit_cap,
-                receipt_hash,
+                receipt_hash.clone(),
                 warnings,
                 vec![
-                    "franken-snowflake receipt show <receipt-hash> --json".to_string(),
-                    "franken-snowflake query plan --profile <profile> --sql <sql> --json"
-                        .to_string(),
+                    receipt_show_command(receipt_hash.as_deref()),
+                    format!("franken-snowflake query plan --profile {profile} --sql <sql> --json"),
                 ],
             )
         }
@@ -328,10 +327,10 @@ pub fn run_dataset_query_outcome(
         crate::dataset_mode::plan_json(&planned),
         &rows,
         emit_cap,
-        receipt_hash,
+        receipt_hash.clone(),
         warnings,
         vec![
-            "franken-snowflake receipt show <receipt-hash> --json".to_string(),
+            receipt_show_command(receipt_hash.as_deref()),
             format!("franken-snowflake dataset inspect {} --json", manifest.id),
         ],
     )
@@ -497,11 +496,10 @@ fn write_success(
             ),
         ]),
     );
-    stamp_live(&mut envelope, &profile, rows, receipt_hash);
+    stamp_live(&mut envelope, &profile, rows, receipt_hash.clone());
     envelope.safe_next_commands = vec![
-        "franken-snowflake receipt show <receipt-hash> --json".to_string(),
-        "franken-snowflake query run --profile <profile> --sql <select-to-verify> --json"
-            .to_string(),
+        receipt_show_command(receipt_hash.as_deref()),
+        format!("franken-snowflake query run --profile {profile} --sql <select-to-verify> --json"),
     ];
     if truncated {
         warnings.push(json_string(format!(
@@ -530,6 +528,7 @@ struct ScanResult {
     tables: LiveRows,
     columns: LiveRows,
     store_dir: Option<String>,
+    drift: Option<franken_snowflake_catalog::diff::CatalogDiff>,
     warnings: Vec<Json>,
 }
 
@@ -614,22 +613,38 @@ fn scan_catalog(
         },
     };
     let mut warnings = Vec::new();
-    let store_dir = match local_store::open_store() {
-        Ok(store) => match persist_snapshot(&store.cache, &input, &snapshot, now_ms) {
-            Ok(()) => Some(store.dir.display().to_string()),
-            Err(error) => {
-                warnings.push(json_string(format!(
-                    "snapshot was not persisted to the local store: {error}"
-                )));
-                None
-            }
-        },
+    let (drift, store_dir) = match local_store::open_store() {
+        Ok(store) => {
+            let previous_snapshot = match store
+                .cache
+                .latest_catalog_snapshot(profile, Some(database), schema)
+            {
+                Ok(Some(record)) => {
+                    serde_json::from_str::<CatalogSnapshot>(&record.payload.canonical).ok()
+                }
+                _ => None,
+            };
+            let drift = match previous_snapshot.as_ref() {
+                Some(prev) => franken_snowflake_catalog::diff::diff_snapshots(prev, &snapshot),
+                None => franken_snowflake_catalog::diff::CatalogDiff::initial_scan(&snapshot),
+            };
+            let dir = match persist_snapshot(&store.cache, &input, &snapshot, now_ms) {
+                Ok(()) => Some(store.dir.display().to_string()),
+                Err(error) => {
+                    warnings.push(json_string(format!(
+                        "snapshot was not persisted to the local store: {error}"
+                    )));
+                    None
+                }
+            };
+            (Some(drift), dir)
+        }
         Err(error) => {
             warnings.push(json_string(format!(
                 "snapshot was not persisted: {}",
                 error.message()
             )));
-            None
+            (None, None)
         }
     };
     Ok(ScanResult {
@@ -639,6 +654,7 @@ fn scan_catalog(
         tables,
         columns,
         store_dir,
+        drift,
         warnings,
     })
 }
@@ -703,10 +719,24 @@ pub fn run_catalog_scan_outcome(
 
     let mut data = vec![
         ("profile_id", json_string(profile.clone())),
-        ("database", json_string(database)),
+        ("database", json_string(database.clone())),
         ("schema", json_string(schema)),
     ];
     data.extend(catalog_surface::snapshot_summary_json(&scan.snapshot));
+    if let Some(drift) = &scan.drift {
+        data.push(("drift", Json::from_value(drift)));
+        if drift.is_breaking() {
+            warnings.push(json_string(format!(
+                "Catalog scan detected breaking schema changes: {}",
+                drift.summary_text()
+            )));
+        } else if drift.has_changes() && drift.base_snapshot_id.is_some() {
+            warnings.push(json_string(format!(
+                "Catalog drift detected: {}",
+                drift.summary_text()
+            )));
+        }
+    }
     data.push((
         "statements",
         json_object(vec![
@@ -767,10 +797,16 @@ pub fn run_catalog_scan_outcome(
         ),
     ]);
     envelope.warnings = warnings;
+    let example_dataset = scan
+        .snapshot
+        .datasets
+        .first()
+        .map(|d| d.id.as_str())
+        .unwrap_or("<dataset-id>");
     envelope.safe_next_commands = vec![
-        "franken-snowflake dataset inspect <dataset-id> --json".to_string(),
-        format!("franken-snowflake catalog graph {profile} --database <db> --mermaid"),
-        "franken-snowflake dataset profile <dataset-id> --json".to_string(),
+        format!("franken-snowflake dataset inspect {example_dataset} --json"),
+        format!("franken-snowflake catalog graph {profile} --database {database} --mermaid"),
+        format!("franken-snowflake dataset profile {example_dataset} --json"),
     ];
     crate::Outcome {
         status: CoreExitCode::Success,
@@ -997,10 +1033,10 @@ pub fn run_query_cancel_outcome(
             vec![json_string("live SQL API transport")],
         ));
         envelope.repair_commands =
-            vec!["franken-snowflake profile doctor <profile> --online --json".to_string()];
+            vec![format!("franken-snowflake profile doctor {profile} --online --json")];
     }
     envelope.safe_next_commands =
-        vec!["franken-snowflake receipt show <receipt-hash> --json".to_string()];
+        vec![format!("franken-snowflake profile doctor {profile} --online --json")];
     crate::Outcome {
         status: if acknowledged {
             CoreExitCode::Success
@@ -1102,7 +1138,7 @@ pub fn dataset_profile_execute_outcome(
     envelope.warnings = warnings;
     envelope.safe_next_commands = vec![
         format!("franken-snowflake dataset inspect {dataset_id} --json"),
-        "franken-snowflake receipt show <receipt-hash> --json".to_string(),
+        receipt_show_command(receipt_hash.as_deref()),
     ];
     crate::Outcome {
         status: CoreExitCode::Success,
@@ -1364,10 +1400,9 @@ pub fn export_run_outcome(
             ),
         ]),
     );
-    stamp_live(&mut envelope, &profile, &rows, receipt_hash);
+    stamp_live(&mut envelope, &profile, &rows, receipt_hash.clone());
     envelope.warnings = warnings;
-    envelope.safe_next_commands =
-        vec!["franken-snowflake receipt show <receipt-hash> --json".to_string()];
+    envelope.safe_next_commands = vec![receipt_show_command(receipt_hash.as_deref())];
     crate::Outcome {
         status: CoreExitCode::Success,
         body: Body::Envelope { envelope, format },
@@ -1476,9 +1511,8 @@ fn probe_success(
     stamp_live(&mut envelope, &profile, rows, receipt_hash);
     envelope.warnings = warnings;
     envelope.safe_next_commands = vec![
-        "franken-snowflake catalog scan <profile> --database <db> --schema <schema> --json"
-            .to_string(),
-        "franken-snowflake query run --profile <profile> --sql <sql> --json".to_string(),
+        format!("franken-snowflake catalog scan {profile} --database <db> --schema <schema> --json"),
+        format!("franken-snowflake query run --profile {profile} --sql <sql> --json"),
     ];
     crate::Outcome {
         status: CoreExitCode::Success,
@@ -1901,6 +1935,14 @@ fn stamp_live(
         ("polls", Json::Number(i64::from(rows.stats.polls))),
         ("rows", Json::Number(rows.total_rows)),
     ]);
+}
+
+/// The copy-pasteable `receipt show` command for a given receipt hash.
+fn receipt_show_command(receipt_hash: Option<&str>) -> String {
+    match receipt_hash {
+        Some(hash) => format!("franken-snowflake receipt show {hash} --json"),
+        None => "franken-snowflake receipt show <receipt-hash> --json".to_string(),
+    }
 }
 
 /// The secret env-var name a given auth lane requires, or `None` for an

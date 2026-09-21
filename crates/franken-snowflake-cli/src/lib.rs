@@ -478,7 +478,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "export.run",
-        invocation: "franken-snowflake export run --profile <profile> --sql <select> --format csv|jsonl|parquet|frame --out <path> --json",
+        invocation: "franken-snowflake export run --profile <profile> --sql <select>|--query-id <id> --format csv|jsonl|parquet|frame [--compression none|snappy|gzip] --out <path> --json",
         output_contract_id: "fsnow.export.run.v1",
         description: "Run a read statement live and write a content-addressed local CSV/JSONL/Parquet/frame artifact (live feature).",
         read_only: true,
