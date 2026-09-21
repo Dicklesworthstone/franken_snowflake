@@ -249,6 +249,16 @@ impl CacheBackend for FileCache {
             .latest_catalog_snapshot(profile_id, database_name, schema_name)
     }
 
+    fn catalog_snapshots(
+        &self,
+        profile_id: &str,
+        database_name: Option<&str>,
+        schema_name: Option<&str>,
+    ) -> CacheResult<Vec<CatalogSnapshotRecord>> {
+        self.inner
+            .catalog_snapshots(profile_id, database_name, schema_name)
+    }
+
     fn upsert_dataset_manifest(&self, record: DatasetManifestRecord) -> CacheResult<()> {
         self.inner.upsert_dataset_manifest(record.clone())?;
         self.append_line(Table::DatasetManifests, &record)
@@ -516,6 +526,32 @@ mod tests {
             !dir.join("query_receipts.jsonl").exists(),
             "a rejected record must not reach the log"
         );
+        fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn file_cache_round_trips_catalog_snapshots_and_orders_newest_first() -> CacheResult<()> {
+        let dir = temp_dir("snapshots");
+        {
+            let cache = FileCache::open(&dir)?;
+            let snap = |id: &str, time: u64| CatalogSnapshotRecord {
+                snapshot_id: id.to_owned(),
+                profile_id: "demo".to_owned(),
+                source_kind: "information_schema".to_owned(),
+                database_name: Some("DB".to_owned()),
+                schema_name: Some("PUBLIC".to_owned()),
+                captured_at_ms: time,
+                payload: payload(&format!("{{\"id\":\"{id}\"}}")),
+            };
+            cache.insert_catalog_snapshot(snap("snap-1", 100))?;
+            cache.insert_catalog_snapshot(snap("snap-2", 200))?;
+        }
+
+        let reopened = FileCache::open(&dir)?;
+        let snapshots = reopened.catalog_snapshots("demo", Some("DB"), Some("PUBLIC"))?;
+        let ids: Vec<_> = snapshots.into_iter().map(|s| s.snapshot_id).collect();
+        assert_eq!(ids, vec!["snap-2", "snap-1"]);
         fs::remove_dir_all(&dir).ok();
         Ok(())
     }

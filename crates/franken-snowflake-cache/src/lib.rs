@@ -539,6 +539,14 @@ pub trait CacheBackend {
         database_name: Option<&str>,
         schema_name: Option<&str>,
     ) -> CacheResult<Option<CatalogSnapshotRecord>>;
+    /// Return catalog snapshots matching the given profile and optional database/schema scope,
+    /// ordered newest-to-oldest (`captured_at_ms DESC, snapshot_id DESC`).
+    fn catalog_snapshots(
+        &self,
+        profile_id: &str,
+        database_name: Option<&str>,
+        schema_name: Option<&str>,
+    ) -> CacheResult<Vec<CatalogSnapshotRecord>>;
 
     fn upsert_dataset_manifest(&self, record: DatasetManifestRecord) -> CacheResult<()>;
     fn dataset_manifest(&self, dataset_id: &str) -> CacheResult<Option<DatasetManifestRecord>>;
@@ -678,6 +686,32 @@ impl CacheBackend for InMemoryCache {
                     .then_with(|| a.snapshot_id.cmp(&b.snapshot_id))
             })
             .cloned())
+    }
+
+    fn catalog_snapshots(
+        &self,
+        profile_id: &str,
+        database_name: Option<&str>,
+        schema_name: Option<&str>,
+    ) -> CacheResult<Vec<CatalogSnapshotRecord>> {
+        let mut snapshots: Vec<_> = self
+            .catalog_snapshots
+            .borrow()
+            .values()
+            .filter(|record| {
+                record.profile_id == profile_id
+                    && database_name
+                        .is_none_or(|name| record.database_name.as_deref() == Some(name))
+                    && schema_name.is_none_or(|name| record.schema_name.as_deref() == Some(name))
+            })
+            .cloned()
+            .collect();
+        snapshots.sort_by(|a, b| {
+            b.captured_at_ms
+                .cmp(&a.captured_at_ms)
+                .then_with(|| b.snapshot_id.cmp(&a.snapshot_id))
+        });
+        Ok(snapshots)
     }
 
     fn upsert_dataset_manifest(&self, record: DatasetManifestRecord) -> CacheResult<()> {
@@ -1049,6 +1083,29 @@ impl CacheBackend for FrankenSqliteCache {
             ],
         )?;
         rows.first().map(row_catalog_snapshot).transpose()
+    }
+
+    fn catalog_snapshots(
+        &self,
+        profile_id: &str,
+        database_name: Option<&str>,
+        schema_name: Option<&str>,
+    ) -> CacheResult<Vec<CatalogSnapshotRecord>> {
+        let rows = self.query(
+            "SELECT snapshot_id, profile_id, source_kind, database_name, schema_name, \
+                    captured_at_ms, payload_json, payload_hash, payload_bytes \
+             FROM catalog_snapshots \
+             WHERE profile_id = ?1 \
+               AND (?2 IS NULL OR database_name = ?2) \
+               AND (?3 IS NULL OR schema_name = ?3) \
+             ORDER BY captured_at_ms DESC, snapshot_id DESC",
+            &[
+                Value::Text(profile_id.to_owned()),
+                opt_text(database_name.map(str::to_owned)),
+                opt_text(schema_name.map(str::to_owned)),
+            ],
+        )?;
+        rows.into_iter().map(row_catalog_snapshot).collect()
     }
 
     fn upsert_dataset_manifest(&self, record: DatasetManifestRecord) -> CacheResult<()> {
@@ -2066,6 +2123,24 @@ mod tests {
     }
 
     #[test]
+    fn catalog_snapshots_returns_newest_to_oldest_order() -> CacheResult<()> {
+        let cache = InMemoryCache::default();
+        cache.insert_catalog_snapshot(snapshot("snap-old", "DB", "PUBLIC", 10))?;
+        cache.insert_catalog_snapshot(snapshot("snap-mid", "DB", "PUBLIC", 20))?;
+        cache.insert_catalog_snapshot(snapshot("snap-new", "DB", "PUBLIC", 30))?;
+        cache.insert_catalog_snapshot(snapshot("snap-other", "OTHER", "PUBLIC", 25))?;
+
+        let list = cache.catalog_snapshots("demo", Some("DB"), Some("PUBLIC"))?;
+        let ids: Vec<_> = list.into_iter().map(|s| s.snapshot_id).collect();
+        assert_eq!(ids, vec!["snap-new", "snap-mid", "snap-old"]);
+
+        let all = cache.catalog_snapshots("demo", None, None)?;
+        let all_ids: Vec<_> = all.into_iter().map(|s| s.snapshot_id).collect();
+        assert_eq!(all_ids, vec!["snap-new", "snap-other", "snap-mid", "snap-old"]);
+        Ok(())
+    }
+
+    #[test]
     fn secret_prefixes_are_reexported_from_core() {
         assert_eq!(
             SECRET_PREFIXES,
@@ -2569,6 +2644,24 @@ mod frankensqlite_tests {
             cache.latest_catalog_snapshot("demo", Some("DB"), Some("NOPE"))?,
             None
         );
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_catalog_snapshots_returns_newest_to_oldest_order() -> CacheResult<()> {
+        let cache = FrankenSqliteCache::open_memory()?;
+        cache.insert_catalog_snapshot(snapshot("snap-old", "DB", "PUBLIC", 10))?;
+        cache.insert_catalog_snapshot(snapshot("snap-mid", "DB", "PUBLIC", 20))?;
+        cache.insert_catalog_snapshot(snapshot("snap-new", "DB", "PUBLIC", 30))?;
+        cache.insert_catalog_snapshot(snapshot("snap-other", "OTHER", "PUBLIC", 25))?;
+
+        let list = cache.catalog_snapshots("demo", Some("DB"), Some("PUBLIC"))?;
+        let ids: Vec<_> = list.into_iter().map(|s| s.snapshot_id).collect();
+        assert_eq!(ids, vec!["snap-new", "snap-mid", "snap-old"]);
+
+        let all = cache.catalog_snapshots("demo", None, None)?;
+        let all_ids: Vec<_> = all.into_iter().map(|s| s.snapshot_id).collect();
+        assert_eq!(all_ids, vec!["snap-new", "snap-other", "snap-mid", "snap-old"]);
         Ok(())
     }
 
