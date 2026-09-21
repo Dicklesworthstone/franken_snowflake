@@ -310,3 +310,80 @@ fn zero_copy_high_throughput_benchmark_exceeds_350_mb_s() -> Result<(), String> 
 
     Ok(())
 }
+
+#[test]
+fn zero_copy_decodes_envelope_objects_with_bitwise_parity() -> Result<(), String> {
+    use franken_snowflake_frame::extract_jsonv2_data_array;
+
+    let columns = vec![
+        col("ID", "FIXED").with_scale(0).nullable(false),
+        col("NAME", "TEXT").nullable(true),
+        col("AMOUNT", "NUMBER").with_scale(2).nullable(false),
+        col("FLAG", "BOOLEAN").nullable(true),
+    ];
+
+    let bare_json = b"[[\"1\",\"Alice\",\"100.50\",\"true\"],[\"2\",\"Bob\",\"-20.00\",\"false\"]]";
+    let envelope_json = b"{\"data\": [[\"1\",\"Alice\",\"100.50\",\"true\"],[\"2\",\"Bob\",\"-20.00\",\"false\"]]}";
+    let full_response_json = br#"{
+        "code": "090001",
+        "message": "Statement executed successfully.",
+        "statementHandle": "01b754ca-3b10-4efc-bc9f-063217ae295a",
+        "resultSetMetaData": {
+            "numRows": 2,
+            "format": "jsonv2",
+            "rowType": [
+                {"name": "ID", "type": "FIXED", "scale": 0, "nullable": false},
+                {"name": "NAME", "type": "TEXT", "nullable": true},
+                {"name": "AMOUNT", "type": "NUMBER", "scale": 2, "nullable": false},
+                {"name": "FLAG", "type": "BOOLEAN", "nullable": true}
+            ]
+        },
+        "data": [
+            ["1", "Alice", "100.50", "true"],
+            ["2", "Bob", "-20.00", "false"]
+        ],
+        "createdOn": 1700000000000
+    }"#;
+
+    // Test extraction
+    let ext1 = extract_jsonv2_data_array(bare_json).map_err(|e| e.to_string())?;
+    assert_eq!(ext1, bare_json);
+
+    let ext2 = extract_jsonv2_data_array(envelope_json).map_err(|e| e.to_string())?;
+    assert_eq!(ext2, b"[[\"1\",\"Alice\",\"100.50\",\"true\"],[\"2\",\"Bob\",\"-20.00\",\"false\"]]");
+
+    // Test materialization parity
+    let frame_bare = materialize_partition_bytes(&columns, bare_json)
+        .map_err(|e| format!("bare decode failed: {e}"))?;
+    let frame_envelope = materialize_partition_bytes(&columns, envelope_json)
+        .map_err(|e| format!("envelope decode failed: {e}"))?;
+    let frame_full = materialize_partition_bytes(&columns, full_response_json)
+        .map_err(|e| format!("full response decode failed: {e}"))?;
+
+    assert_eq!(frame_bare.row_count, 2);
+    assert_eq!(frame_envelope.row_count, 2);
+    assert_eq!(frame_full.row_count, 2);
+
+    for col_idx in 0..columns.len() {
+        let b_col = &frame_bare.columns[col_idx];
+        let e_col = &frame_envelope.columns[col_idx];
+        let f_col = &frame_full.columns[col_idx];
+
+        assert_eq!(b_col.column.dtype(), e_col.column.dtype());
+        assert_eq!(b_col.column.dtype(), f_col.column.dtype());
+
+        for row_idx in 0..2 {
+            assert_eq!(b_col.column.value(row_idx), e_col.column.value(row_idx));
+            assert_eq!(b_col.column.value(row_idx), f_col.column.value(row_idx));
+        }
+    }
+
+    // Negative tests: missing data, unclosed, bad types
+    let missing_data = b"{\"code\": \"090001\", \"message\": \"ok\"}";
+    assert!(materialize_partition_bytes(&columns, missing_data).is_err());
+
+    let invalid_json = b"{\"data\": unclosed";
+    assert!(materialize_partition_bytes(&columns, invalid_json).is_err());
+
+    Ok(())
+}

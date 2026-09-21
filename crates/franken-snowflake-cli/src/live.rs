@@ -1200,9 +1200,35 @@ pub fn export_run_outcome(
     );
     let created_at_ms = local_store::now_unix_ms();
     let target_label = redact(&out_path).into_owned();
+    let parquet_compression = match spec
+        .compression
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("snappy") => franken_snowflake_export::ParquetCompression::Snappy,
+        Some("gzip") => franken_snowflake_export::ParquetCompression::Gzip,
+        Some("none") | Some("uncompressed") => {
+            franken_snowflake_export::ParquetCompression::Uncompressed
+        }
+        Some(other) => {
+            return fail(&usage(&format!(
+                "Unknown --compression `{other}`; for parquet use snappy (default), gzip, or none."
+            )));
+        }
+    };
+    let parquet_opts = franken_snowflake_export::ParquetWriterOptions {
+        compression: parquet_compression,
+        ..Default::default()
+    };
     let artifact = match export_format {
         "csv" => export_csv(&input, target_label.clone(), created_at_ms),
-        "parquet" => franken_snowflake_export::export_parquet(&input, target_label.clone(), created_at_ms, None),
+        "parquet" => franken_snowflake_export::export_parquet(
+            &input,
+            target_label.clone(),
+            created_at_ms,
+            Some(parquet_opts),
+        ),
         "frame" => {
             #[cfg(feature = "frankenpandas")]
             {

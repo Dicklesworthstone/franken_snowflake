@@ -2440,6 +2440,12 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
                 "csv (default), jsonl, parquet, or frame (--format)",
             ),
             input(
+                "compression",
+                "string",
+                false,
+                "none, gzip, or snappy for parquet (--compression)",
+            ),
+            input(
                 "out",
                 "string",
                 true,

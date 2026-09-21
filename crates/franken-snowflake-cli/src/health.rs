@@ -19,7 +19,7 @@ use franken_snowflake_core::write_intent::{
     WriteIntentDecision, WriteIntentMode, WriteIntentPolicy, WriteIntentRefusalCode,
     WriteIntentRequest, WriteStatementKind, evaluate_write_intent,
 };
-use franken_snowflake_export::{CopyIntoPlan, CopySource};
+use franken_snowflake_export::{CopyIntoOptions, CopyIntoPlan, CopySource, ExportFormat};
 
 use crate::local_store;
 use crate::{
@@ -500,6 +500,18 @@ fn export_plan_fixture() -> Json {
     )
     .to_sql()
     .is_ok();
+    let parquet = CopyIntoPlan::new(
+        "@selftest_stage/run",
+        CopySource::Query {
+            sql: "select 1".to_owned(),
+        },
+    )
+    .with_options(CopyIntoOptions {
+        format: ExportFormat::Parquet,
+        ..Default::default()
+    })
+    .to_sql()
+    .is_ok();
     let injected = CopyIntoPlan::new(
         "@selftest_stage/run; drop table t --",
         CopySource::Query {
@@ -516,18 +528,18 @@ fn export_plan_fixture() -> Json {
     )
     .to_sql()
     .is_err();
-    if good && injected && multi {
+    if good && parquet && injected && multi {
         check_json(
             "export_plan_hardening",
             "pass",
-            "COPY INTO plan renders; injected location and multi-statement source are refused",
+            "COPY INTO plan renders (CSV & Parquet); injected location and multi-statement source are refused",
         )
     } else {
         check_json_owned(
             "export_plan_hardening",
             "fail",
             format!(
-                "renders={good} location_injection_refused={injected} multi_statement_refused={multi}"
+                "renders_csv={good} renders_parquet={parquet} location_injection_refused={injected} multi_statement_refused={multi}"
             ),
         )
     }

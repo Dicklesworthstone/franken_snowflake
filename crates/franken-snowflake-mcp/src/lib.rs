@@ -352,7 +352,7 @@ mod fastmcp_surface {
                 },
                 Self::ExportRun => ToolSpec {
                     name: "export_run",
-                    description: "Run a read-only query live and write a content-addressed local CSV or JSONL file at `out`; records an export receipt in the local store.",
+                    description: "Run a read-only query live and write a content-addressed local CSV, JSONL, or Parquet file at `out`; records an export receipt in the local store.",
                     open_world_hint: "snowflake",
                     read_only: false,
                     params: export_params(false),
@@ -672,7 +672,15 @@ mod fastmcp_surface {
                 ParamSpec::string("max_file_size", "Maximum stage file size in bytes.", false),
             ]);
         } else {
-            params.push(ParamSpec::string("out", "Local file path to write.", true));
+            params.extend([
+                ParamSpec::string("out", "Local file path to write.", true),
+                ParamSpec::string_enum(
+                    "compression",
+                    "Compression for parquet export: snappy (default), gzip, or none.",
+                    false,
+                    &["snappy", "gzip", "none"],
+                ),
+            ]);
         }
         params
     }
@@ -733,6 +741,10 @@ mod fastmcp_surface {
                 args.push("--single".to_string());
             }
         } else {
+            if let Some(compression) = optional_string(arguments, "compression")? {
+                args.push("--compression".to_string());
+                args.push(compression);
+            }
             args.push("--out".to_string());
             args.push(required_string(arguments, "out")?);
         }
@@ -1218,6 +1230,36 @@ mod fastmcp_surface {
                     "frame",
                     "--out",
                     "events.json",
+                    "--json",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+            );
+            let run_parquet = ReadVerb::ExportRun
+                .cli_args(&json!({
+                    "profile": "demo",
+                    "sql": "select 1",
+                    "format": "parquet",
+                    "compression": "gzip",
+                    "out": "events.parquet"
+                }))
+                .map_err(|e| format!("{e:?}"))?;
+            assert_eq!(
+                run_parquet,
+                vec![
+                    "export",
+                    "run",
+                    "--profile",
+                    "demo",
+                    "--sql",
+                    "select 1",
+                    "--format",
+                    "parquet",
+                    "--compression",
+                    "gzip",
+                    "--out",
+                    "events.parquet",
                     "--json",
                 ]
                 .into_iter()

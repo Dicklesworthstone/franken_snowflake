@@ -47,6 +47,147 @@ impl<'a> CellSlice<'a> {
 }
 
 /// Fast streaming byte scanner for Snowflake SQL API `jsonv2` 2D arrays.
+#[inline(always)]
+fn skip_json_string(bytes: &[u8], mut pos: usize) -> Option<usize> {
+    let len = bytes.len();
+    while pos < len {
+        let rel = find_quote_or_escape(&bytes[pos..])?;
+        let hit = pos + rel;
+        if bytes[hit] == b'"' {
+            return Some(hit + 1);
+        } else if bytes[hit] == b'\\' {
+            pos = hit + 2;
+        } else {
+            pos = hit + 1;
+        }
+    }
+    None
+}
+
+/// Extract the raw `jsonv2` 2D array byte slice from either a bare array (`[[...]]`)
+/// or a Snowflake SQL API response envelope containing a top-level `"data"` array
+/// (`{"data": [[...]]}` or `{"resultSetMetaData": {...}, "data": [[...]]}`).
+///
+/// Operates directly on the input byte slice with zero heap allocations.
+pub fn extract_jsonv2_data_array(bytes: &[u8]) -> FrameResult<&[u8]> {
+    let len = bytes.len();
+    let pos = skip_whitespace(bytes, 0);
+    if pos >= len {
+        return Err(FrameError::Decode {
+            column: String::new(),
+            snowflake_type: String::new(),
+            reason: "unexpected EOF: expected '[' or '{' at start of jsonv2 payload",
+        });
+    }
+
+    match bytes[pos] {
+        b'[' => Ok(&bytes[pos..]),
+        b'{' => {
+            let mut curr = pos + 1;
+            let mut depth = 1usize;
+            while curr < len && depth > 0 {
+                curr = skip_whitespace(bytes, curr);
+                if curr >= len {
+                    break;
+                }
+                match bytes[curr] {
+                    b'"' => {
+                        let str_start = curr + 1;
+                        let after_quote = skip_json_string(bytes, str_start).ok_or_else(|| {
+                            FrameError::Decode {
+                                column: String::new(),
+                                snowflake_type: String::new(),
+                                reason: "unterminated string in jsonv2 envelope",
+                            }
+                        })?;
+                        let str_end = after_quote - 1;
+                        let key_bytes = &bytes[str_start..str_end];
+                        curr = after_quote;
+
+                        if depth == 1 && key_bytes == b"data" {
+                            curr = skip_whitespace(bytes, curr);
+                            if curr >= len || bytes[curr] != b':' {
+                                return Err(FrameError::Decode {
+                                    column: String::new(),
+                                    snowflake_type: String::new(),
+                                    reason: "expected ':' after 'data' key in envelope",
+                                });
+                            }
+                            curr += 1;
+                            curr = skip_whitespace(bytes, curr);
+                            if curr >= len || bytes[curr] != b'[' {
+                                return Err(FrameError::Decode {
+                                    column: String::new(),
+                                    snowflake_type: String::new(),
+                                    reason: "expected '[' at start of 'data' array in envelope",
+                                });
+                            }
+                            let array_start = curr;
+                            let mut arr_depth = 1usize;
+                            curr += 1;
+                            while curr < len && arr_depth > 0 {
+                                match bytes[curr] {
+                                    b'"' => {
+                                        curr = skip_json_string(bytes, curr + 1).ok_or_else(|| {
+                                            FrameError::Decode {
+                                                column: String::new(),
+                                                snowflake_type: String::new(),
+                                                reason: "unterminated string inside 'data' array",
+                                            }
+                                        })?;
+                                    }
+                                    b'[' => {
+                                        arr_depth += 1;
+                                        curr += 1;
+                                    }
+                                    b']' => {
+                                        arr_depth -= 1;
+                                        curr += 1;
+                                    }
+                                    _ => {
+                                        curr += 1;
+                                    }
+                                }
+                            }
+                            if arr_depth != 0 {
+                                return Err(FrameError::Decode {
+                                    column: String::new(),
+                                    snowflake_type: String::new(),
+                                    reason: "unclosed 'data' array in envelope",
+                                });
+                            }
+                            let array_end = curr;
+                            return Ok(&bytes[array_start..array_end]);
+                        }
+                    }
+                    b'{' => {
+                        depth += 1;
+                        curr += 1;
+                    }
+                    b'}' => {
+                        depth -= 1;
+                        curr += 1;
+                    }
+                    _ => {
+                        curr += 1;
+                    }
+                }
+            }
+            Err(FrameError::Decode {
+                column: String::new(),
+                snowflake_type: String::new(),
+                reason: "missing 'data' array in jsonv2 envelope object",
+            })
+        }
+        _ => Err(FrameError::Decode {
+            column: String::new(),
+            snowflake_type: String::new(),
+            reason: "expected '[' or '{' at start of jsonv2 payload",
+        }),
+    }
+}
+
+/// Fast streaming byte scanner for Snowflake SQL API `jsonv2` 2D arrays.
 ///
 /// Operates directly on `&'a [u8]` without intermediate `serde_json::Value` or
 /// per-cell `String` allocations. Uses SWAR (SIMD Within A Register) chunk
@@ -66,6 +207,9 @@ impl ZeroCopyJsonv2Scanner {
     }
 
     /// Stream all rows from a `jsonv2` byte slice, calling `visit_row` with each row's cells.
+    ///
+    /// Accepts either a bare 2D JSON array (`[[...]]`) or an envelope object containing
+    /// a `"data"` array (`{"data": [[...]]}`), operating with zero allocations.
     pub fn scan_rows<F>(
         &mut self,
         bytes: &[u8],
@@ -76,6 +220,7 @@ impl ZeroCopyJsonv2Scanner {
     where
         F: FnMut(usize, usize, CellSlice<'_>) -> FrameResult<()>,
     {
+        let bytes = extract_jsonv2_data_array(bytes)?;
         let len = bytes.len();
         let mut pos = skip_whitespace(bytes, 0);
         if pos >= len {
