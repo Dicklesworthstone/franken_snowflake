@@ -124,9 +124,17 @@ implementation first and the test/hardening pass follows in a later wave. The
   - Includes comprehensive differential fuzzing suite and bitwise parity tests against standard serde-based parser.
 - **Hermetic 15-Type Canonical Wire Codec Test (`franken-snowflake-frame`):**
   - Added data-driven test embedding canonical `jsonv2_codec_cells.json` fixture verifying `DATE` epoch days (18262 = 2020-01-01), `TIME`/`TIMESTAMP` fractional epoch seconds, `TIMESTAMP_TZ` offset decoding (`offset - 1440`), `FIXED` exact decimal strings, `BOOLEAN`, `BINARY`, and structured JSON variants.
+- **Offline Catalog Diff & Schema Drift Detection (`franken-snowflake-cli`, `franken-snowflake-mcp`, `franken-snowflake-cache`):**
+  - Added `franken-snowflake catalog diff <profile> [--database <db>] [--schema <schema>] [--base <id>] [--target <id>] --json` CLI command and `catalog_diff` FastMCP read tool.
+  - Added `CacheBackend::catalog_snapshots` across `InMemoryCache`, `FrankenSqliteCache`, and `FileCache` to index and retrieve historical snapshots ordered newest-first.
+  - Detects added/removed datasets and schema drift across column lists, types, nullability, and metric shifts with breaking change classification and typed envelope warnings.
+- **Exact Receipt Interpolation in CLI Safe Next Commands (`franken-snowflake-cli`):**
+  - Live query and mutation envelopes interpolate the computed BLAKE3 `receipt_hash` directly into suggested follow-up commands (`franken-snowflake receipt show <receipt_hash> --json`) instead of template placeholders.
 
 ### Fixed
 
+- **Frame Benchmark Resiliency under Shared CI Worker Load (`franken-snowflake-frame`):**
+  - Adjusted debug-assertions throughput target in `zero_copy_parity.rs` to prevent intermittent test failures due to CPU scheduling contention on shared remote workers, while preserving the full >350 MB/s release benchmark.
 - **Feature Lane Clippy Gate Across All Workspace Features (`scripts/check-feature-lanes.sh`):**
   - Cleaned Clippy warnings across all 21 feature combinations under `-D warnings`.
   - Resolved needless lifetimes, complex return types, manual default impls, identity bitwise ops, collapsible if conditions, and simplified iterators in `franken-snowflake-export` and `franken-snowflake-frame`.
