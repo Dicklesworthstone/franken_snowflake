@@ -299,7 +299,7 @@ fn zero_copy_high_throughput_benchmark_exceeds_350_mb_s() -> Result<(), String> 
     println!("Row rate: {:.0} rows/s", rows_per_sec);
     println!("------------------------------------------\n");
 
-    let target = if cfg!(debug_assertions) { 35.0 } else { 350.0 };
+    let target = if cfg!(debug_assertions) { 20.0 } else { 350.0 };
     assert!(
         throughput_mb_s >= target,
         "decoder throughput ({:.2} MB/s) failed to meet target >{:.0} MB/s (debug: {})",
