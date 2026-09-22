@@ -234,6 +234,7 @@ fn capabilities_registry_documents_every_command_with_input_schemas() {
         "profile.doctor",
         "catalog.scan",
         "catalog.graph",
+        "catalog.diff",
         "dataset.inspect",
         "dataset.profile",
         "dataset.describe_operator",
@@ -584,6 +585,10 @@ fn store_backed_lookups_are_typed_misses_on_a_fresh_store() {
             "dataset.profile",
         ),
         (vec!["receipt", "show", "0000", "--json"], "receipt.show"),
+        (
+            vec!["catalog", "diff", "e2e", "--database", "DB", "--json"],
+            "catalog.diff",
+        ),
     ] {
         let run = h.run(&args);
         assert_eq!(run.exit, 7, "{args:?}: {}", run.stdout);
