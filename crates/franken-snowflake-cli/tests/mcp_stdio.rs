@@ -67,6 +67,7 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
         r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"dataset_describe_operator","arguments":{"operator":"between"}}}"#,
         r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"export_plan","arguments":{"profile":"demo","sql":"select * from events","location":"@my_stage/exports/run_001","format":"jsonl"}}}"#,
         r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"query_plan","arguments":{"dataset_id":"never_scanned_b3_0000","entity":"E1"}}}"#,
+        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"catalog_diff","arguments":{"profile":"demo"}}}"#,
     ];
     {
         let stdin = child.stdin.as_mut().expect("stdin");
@@ -79,7 +80,7 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
 
     let mut responses = std::collections::BTreeMap::<u64, serde_json::Value>::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while responses.len() < 6 && std::time::Instant::now() < deadline {
+    while responses.len() < 7 && std::time::Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_secs(5)) {
             Ok(line) => {
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
@@ -98,8 +99,8 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
 
     assert_eq!(
         responses.len(),
-        6,
-        "expected 6 responses, got {responses:?}"
+        7,
+        "expected 7 responses, got {responses:?}"
     );
 
     let init = &responses[&1]["result"];
@@ -113,7 +114,7 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(tools.len(), 19, "{names:?}");
+    assert_eq!(tools.len(), 20, "{names:?}");
     for expected in [
         "capabilities",
         "onboard",
@@ -122,6 +123,7 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
         "profile_validate",
         "catalog_scan",
         "catalog_graph",
+        "catalog_diff",
         "dataset_inspect",
         "dataset_describe_operator",
         "query_plan",
@@ -190,5 +192,19 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
     assert!(
         envelope.to_string().contains("catalog scan"),
         "the repair command names the scan: {envelope}"
+    );
+
+    let diff = responses[&7]["result"]["content"][0]["text"]
+        .as_str()
+        .expect("catalog_diff tool result carries the CLI envelope");
+    let diff_envelope: serde_json::Value = serde_json::from_str(diff).expect("envelope JSON");
+    assert_eq!(diff_envelope["ok"], false, "{diff_envelope}");
+    assert_eq!(diff_envelope["command_id"], "catalog.diff", "{diff_envelope}");
+    assert_eq!(diff_envelope["error"]["code"], "FSNOW-7002", "{diff_envelope}");
+    assert!(
+        diff_envelope
+            .to_string()
+            .contains("no catalog snapshot for profile `demo`"),
+        "{diff_envelope}"
     );
 }
