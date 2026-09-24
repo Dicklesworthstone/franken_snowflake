@@ -36,6 +36,7 @@ use crate::lifecycle::{
     CompletedStatement, MIN_POLL_INTERVAL, PollPlan, Progress, StatementMachine,
 };
 use crate::request::{SubmitQueryParams, SubmitStatementRequest};
+use crate::response::ResultSet;
 use crate::status::ResponseClass;
 
 /// The driver outcome: a fully-assembled [`CompletedStatement`] or one of the
@@ -209,7 +210,54 @@ pub async fn run_statement_with_auth<T: StatementTransport, A: AuthProvider>(
     poll_plan: PollPlan,
 ) -> (StatementOutcome, DriverStats) {
     let mut stats = DriverStats::default();
-    let outcome = drive(cx, client, auth, request, params, poll_plan, &mut stats).await;
+    let outcome = drive(
+        cx, client, auth, request, params, poll_plan, &mut stats, None,
+    )
+    .await;
+    (outcome, stats)
+}
+
+/// Receives a statement's rows in partition order while it streams
+/// (reality-check bead E5).
+pub trait RowSink {
+    /// Take the next rows: the inline rows, then each fetched partition. An
+    /// error stops the fetch and cancels the statement server-side.
+    ///
+    /// # Errors
+    /// Whatever the sink could not do with the rows (a write failure, a
+    /// row limit).
+    fn accept(
+        &mut self,
+        result_set: &ResultSet,
+        rows: Vec<Vec<Option<String>>>,
+    ) -> Result<(), SnowflakeError>;
+}
+
+/// [`run_statement_with_auth`], handing rows to `sink` as each fetch window
+/// completes instead of assembling them, so peak memory is one window of
+/// partitions. The returned [`CompletedStatement`] keeps the metadata; its
+/// `rows` are empty because every row went to the sink.
+pub async fn run_statement_streaming<T: StatementTransport, A: AuthProvider>(
+    cx: &Cx,
+    client: &T,
+    auth: &mut A,
+    request: SubmitStatementRequest,
+    params: SubmitQueryParams,
+    poll_plan: PollPlan,
+    sink: &mut dyn RowSink,
+) -> (StatementOutcome, DriverStats) {
+    let mut stats = DriverStats::default();
+    let outcome = drive(
+        cx,
+        client,
+        auth,
+        request,
+        params,
+        poll_plan,
+        &mut stats,
+        Some(sink),
+    )
+    .await;
     (outcome, stats)
 }
 
@@ -245,6 +293,7 @@ fn refresh_after_unauthorized<A: AuthProvider>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drive<T: StatementTransport, A: AuthProvider>(
     cx: &Cx,
     client: &T,
@@ -253,6 +302,7 @@ async fn drive<T: StatementTransport, A: AuthProvider>(
     params: SubmitQueryParams,
     poll_plan: PollPlan,
     stats: &mut DriverStats,
+    mut sink: Option<&mut dyn RowSink>,
 ) -> StatementOutcome {
     let body = match serde_json::to_vec(&request) {
         Ok(body) => body,
@@ -309,7 +359,17 @@ async fn drive<T: StatementTransport, A: AuthProvider>(
 
     loop {
         match progress {
-            Progress::Complete(completed) => return SnowflakeOutcome::ok(completed),
+            Progress::Complete(mut completed) => {
+                // The statement is finished server-side: a sink error needs no
+                // remote cancel.
+                if let Some(sink) = sink.as_mut() {
+                    let rows = std::mem::take(&mut completed.rows);
+                    if let Err(error) = sink.accept(&completed.result_set, rows) {
+                        return SnowflakeOutcome::err(error);
+                    }
+                }
+                return SnowflakeOutcome::ok(completed);
+            }
             Progress::TimedOut(failure) => {
                 return SnowflakeOutcome::err(terminal_failure_error(
                     SnowflakeErrorCode::StatementTimeout,
@@ -404,6 +464,17 @@ async fn drive<T: StatementTransport, A: AuthProvider>(
                     return cancel_locally(cx, client, &auth, &handle, local_cancel_reason(cx))
                         .await;
                 }
+                // Streaming: hand over what is assembled (the inline rows, then
+                // the previous window) before fetching more.
+                if let Some(sink) = sink.as_mut() {
+                    let rows = machine.drain_rows();
+                    if !rows.is_empty()
+                        && let Some(result_set) = machine.result_set()
+                        && let Err(error) = sink.accept(result_set, rows)
+                    {
+                        return abandon_with_error(cx, client, &auth, &handle, error).await;
+                    }
+                }
                 let (next, total) = machine
                     .assembling_window()
                     .unwrap_or((partition, partition.saturating_add(1)));
@@ -413,7 +484,15 @@ async fn drive<T: StatementTransport, A: AuthProvider>(
                     && machine.rows_assembled() >= cap
                 {
                     return match machine.complete_early() {
-                        Ok(done) => SnowflakeOutcome::ok(done),
+                        Ok(mut done) => {
+                            if let Some(sink) = sink.as_mut() {
+                                let rows = std::mem::take(&mut done.rows);
+                                if let Err(error) = sink.accept(&done.result_set, rows) {
+                                    return SnowflakeOutcome::err(error);
+                                }
+                            }
+                            SnowflakeOutcome::ok(done)
+                        }
                         Err(error) => {
                             abandon_with_error(
                                 cx,
@@ -1890,6 +1969,127 @@ mod tests {
             )
             .await;
             assert!(matches!(outcome, SnowflakeOutcome::Err(_)));
+            assert_eq!(transport.orphan_cancels.borrow().len(), 1);
+        });
+    }
+
+    /// Collects what a streaming run hands over, batch by batch.
+    struct CollectingSink {
+        batches: Vec<Vec<Vec<Option<String>>>>,
+        refuse: bool,
+    }
+
+    impl RowSink for CollectingSink {
+        fn accept(
+            &mut self,
+            _result_set: &ResultSet,
+            rows: Vec<Vec<Option<String>>>,
+        ) -> Result<(), SnowflakeError> {
+            if self.refuse {
+                return Err(SnowflakeError::new(
+                    SnowflakeErrorCode::UsageError,
+                    "the sink refused the rows",
+                ));
+            }
+            self.batches.push(rows);
+            Ok(())
+        }
+    }
+
+    fn streaming_transport() -> FakeTransport {
+        let transport = FakeTransport::new(Scripted::Ok(
+            StatusClass::Completed,
+            RESP_200_MULTI.to_vec(),
+        ));
+        transport.script_partition(
+            1,
+            Scripted::Ok(
+                StatusClass::Completed,
+                br#"{"data":[["p1a","x"],["p1b","x"]]}"#.to_vec(),
+            ),
+        );
+        transport.script_partition(
+            2,
+            Scripted::Ok(
+                StatusClass::Completed,
+                br#"{"data":[["p2a","x"]]}"#.to_vec(),
+            ),
+        );
+        transport
+    }
+
+    /// Reality-check bead E5: rows reach the sink in partition order, one
+    /// window at a time (never the whole result), and the completed statement
+    /// keeps only metadata.
+    #[test]
+    fn streaming_hands_rows_to_the_sink_one_window_at_a_time() {
+        asupersync::test_utils::run_test(|| async {
+            let transport = streaming_transport();
+            let mut sink = CollectingSink {
+                batches: Vec::new(),
+                refuse: false,
+            };
+            let mut auth = fake_auth();
+            let cx = Cx::for_testing();
+            let (outcome, _) = run_statement_streaming(
+                &cx,
+                &transport,
+                &mut auth,
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5).with_partition_concurrency(1),
+                &mut sink,
+            )
+            .await;
+            let SnowflakeOutcome::Ok(done) = outcome else {
+                panic!("streaming run failed: {outcome:?}");
+            };
+            assert!(done.rows.is_empty(), "every row went to the sink");
+            assert_eq!(done.fetched_partitions, 3);
+            let firsts: Vec<String> = sink
+                .batches
+                .iter()
+                .flatten()
+                .map(|row| row.first().cloned().flatten().unwrap_or_default())
+                .collect();
+            assert_eq!(firsts.len(), 5, "inline 2 + 2 + 1");
+            assert_eq!(&firsts[2..], ["p1a", "p1b", "p2a"]);
+            assert_eq!(
+                sink.batches.len(),
+                3,
+                "one batch per partition with window 1"
+            );
+            assert!(
+                sink.batches.iter().all(|batch| batch.len() <= 2),
+                "no batch holds more than one partition"
+            );
+            assert!(transport.orphan_cancels.borrow().is_empty());
+        });
+    }
+
+    /// Negative: a sink that fails stops the fetch and cancels the statement.
+    #[test]
+    fn a_failing_sink_cancels_the_statement() {
+        asupersync::test_utils::run_test(|| async {
+            let transport = streaming_transport();
+            let mut sink = CollectingSink {
+                batches: Vec::new(),
+                refuse: true,
+            };
+            let mut auth = fake_auth();
+            let cx = Cx::for_testing();
+            let (outcome, stats) = run_statement_streaming(
+                &cx,
+                &transport,
+                &mut auth,
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5).with_partition_concurrency(1),
+                &mut sink,
+            )
+            .await;
+            assert!(matches!(outcome, SnowflakeOutcome::Err(_)), "{outcome:?}");
+            assert_eq!(stats.partitions_fetched, 0, "stopped before any fetch");
             assert_eq!(transport.orphan_cancels.borrow().len(), 1);
         });
     }

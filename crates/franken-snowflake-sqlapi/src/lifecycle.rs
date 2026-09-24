@@ -246,6 +246,9 @@ pub struct StatementMachine {
     poll_plan: PollPlan,
     polls_done: u32,
     phase: Phase,
+    /// Rows handed out by [`StatementMachine::drain_rows`] (streaming); they
+    /// still count toward the row cap and the final `numRows` check.
+    drained_rows: usize,
 }
 
 impl StatementMachine {
@@ -256,6 +259,32 @@ impl StatementMachine {
             poll_plan,
             polls_done: 0,
             phase: Phase::Pending,
+            drained_rows: 0,
+        }
+    }
+
+    /// Streaming (reality-check bead E5): take the rows assembled so far, in
+    /// partition order, so a caller can write them out before the next
+    /// partitions arrive. Drained rows still count toward
+    /// [`StatementMachine::rows_assembled`] and the final `numRows` check; the
+    /// completed statement then holds only the rows not yet drained.
+    pub fn drain_rows(&mut self) -> Vec<Vec<Option<String>>> {
+        match &mut self.phase {
+            Phase::Assembling { rows, .. } => {
+                let drained = std::mem::take(rows);
+                self.drained_rows = self.drained_rows.saturating_add(drained.len());
+                drained
+            }
+            Phase::Pending | Phase::Done => Vec::new(),
+        }
+    }
+
+    /// While assembling: the terminal result set (metadata and column types).
+    #[must_use]
+    pub fn result_set(&self) -> Option<&ResultSet> {
+        match &self.phase {
+            Phase::Assembling { result_set, .. } => Some(result_set),
+            Phase::Pending | Phase::Done => None,
         }
     }
 
@@ -278,7 +307,7 @@ impl StatementMachine {
     #[must_use]
     pub fn rows_assembled(&self) -> usize {
         match &self.phase {
-            Phase::Assembling { rows, .. } => rows.len(),
+            Phase::Assembling { rows, .. } => self.drained_rows.saturating_add(rows.len()),
             Phase::Pending | Phase::Done => 0,
         }
     }
@@ -428,7 +457,10 @@ impl StatementMachine {
         rows.append(&mut partition_rows);
         let upcoming = next.saturating_add(1);
         if upcoming >= total {
-            validate_total_row_count(rows.len(), result_set.result_set_meta_data.num_rows)?;
+            validate_total_row_count(
+                self.drained_rows.saturating_add(rows.len()),
+                result_set.result_set_meta_data.num_rows,
+            )?;
             Ok(Progress::Complete(CompletedStatement {
                 statement_handle: handle,
                 result_set,
