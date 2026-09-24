@@ -47,6 +47,7 @@ pub mod adapter;
 pub mod budget;
 pub mod cancel;
 pub mod capabilities;
+pub mod endpoint;
 pub mod envelope;
 pub mod error;
 pub mod exit;

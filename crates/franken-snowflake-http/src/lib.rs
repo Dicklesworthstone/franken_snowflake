@@ -40,7 +40,6 @@ const HEADER_ACCEPT_ENCODING: &str = "Accept-Encoding";
 const HEADER_CONTENT_ENCODING: &str = "Content-Encoding";
 const JSON_MEDIA_TYPE: &str = "application/json";
 const PARTITION_ACCEPT_ENCODING: &str = "gzip, identity";
-const SNOWFLAKE_HOST_SUFFIX: &str = ".snowflakecomputing.com";
 /// Official Snowflake SQL API resubmit contract consulted 2026-06-25.
 pub const SNOWFLAKE_SQL_API_RESUBMIT_DOC_URL: &str = "https://docs.snowflake.com/en/developer-guide/sql-api/submitting-requests#resubmitting-a-request-to-execute-sql-statements";
 /// Date the Snowflake SQL API resubmit contract above was consulted.
@@ -625,50 +624,15 @@ pub struct SnowflakeEndpoint {
 
 impl SnowflakeEndpoint {
     /// Validate and canonicalize a Snowflake SQL API base endpoint.
+    ///
+    /// The rule lives in `franken_snowflake_core::endpoint` so offline
+    /// `profile validate` refuses exactly what this transport refuses.
     pub fn parse(raw: impl AsRef<str>) -> Result<Self, TransportError> {
-        let raw = raw.as_ref().trim();
-        if raw.is_empty() {
-            return Err(TransportError::new(
-                TransportErrorCode::InvalidSnowflakeHost,
-                "Snowflake endpoint is empty",
-            ));
-        }
-        let Some(rest) = strip_prefix_ignore_ascii_case(raw, "https://") else {
-            return Err(TransportError::new(
-                TransportErrorCode::InvalidSnowflakeHost,
-                "Snowflake endpoint must use https://",
-            ));
-        };
-        if rest.contains('@') || raw.contains('#') || raw.contains('?') {
-            return Err(TransportError::new(
-                TransportErrorCode::InvalidSnowflakeHost,
-                "Snowflake endpoint must not contain credentials, fragments, or query strings",
-            ));
-        }
-        let trimmed = rest.trim_end_matches('/');
-        if trimmed.contains('/') {
-            return Err(TransportError::new(
-                TransportErrorCode::InvalidSnowflakeHost,
-                "Snowflake endpoint must not contain path segments",
-            ));
-        }
-        let host = trimmed
-            .split('/')
-            .next()
-            .filter(|candidate| !candidate.is_empty())
-            .ok_or_else(|| {
-                TransportError::new(
-                    TransportErrorCode::InvalidSnowflakeHost,
-                    "Snowflake endpoint host is missing",
-                )
+        let (base_url, host) = franken_snowflake_core::endpoint::validate_endpoint(raw.as_ref())
+            .map_err(|reason| {
+                TransportError::new(TransportErrorCode::InvalidSnowflakeHost, reason)
             })?;
-        let host_lower = host.to_ascii_lowercase();
-        validate_host(&host_lower)?;
-        let base_url = format!("https://{host_lower}");
-        Ok(Self {
-            base_url,
-            host: host_lower,
-        })
+        Ok(Self { base_url, host })
     }
 
     /// Canonical base URL without a trailing slash.
@@ -687,35 +651,6 @@ impl SnowflakeEndpoint {
     #[must_use]
     pub fn route_url(&self, route: &TransportRoute) -> String {
         format!("{}{}", self.base_url, route.path_and_query())
-    }
-}
-
-fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
-    } else {
-        None
-    }
-}
-
-fn validate_host(host: &str) -> Result<(), TransportError> {
-    let host_lower = host.to_ascii_lowercase();
-    let valid = host_lower
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
-        && host_lower.contains('.')
-        && !host_lower.starts_with('.')
-        && !host_lower.ends_with('.')
-        && !host_lower.contains("..")
-        && host_lower.ends_with(SNOWFLAKE_HOST_SUFFIX)
-        && host_lower.len() > SNOWFLAKE_HOST_SUFFIX.len();
-    if valid {
-        Ok(())
-    } else {
-        Err(TransportError::new(
-            TransportErrorCode::InvalidSnowflakeHost,
-            "Snowflake endpoint host is not canonical",
-        ))
     }
 }
 
