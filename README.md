@@ -158,9 +158,10 @@ path and every deadline, budget, shutdown, or user cancellation fires a
 best-effort remote cancel, and the
 server-side `STATEMENT_TIMEOUT_IN_SECONDS` (60 s by default) is sent with every
 request as the backstop. The retry loop is the project's own, built on that
-client. Not yet wired: signal handling (Ctrl-C or a killed process leaves a
-submitted statement to the server timeout), capability-row narrowing, and a
-cost budget on the live path. The testkit explores a model of the driver's
+client. While a statement runs, Ctrl-C (SIGINT) or SIGTERM cancels it the same
+way (a second signal exits at once); a process killed with SIGKILL still leaves
+it to the server timeout. Not yet wired: a drop guard for the statement handle,
+capability-row narrowing, and a cost budget on the live path. The testkit explores a model of the driver's
 cancel and retry interleavings with DPOR.
 
 **Deterministic tests.** The protocol is exercised without a warehouse. Two
@@ -422,7 +423,7 @@ fsnow agent-handbook --json
 |---|---|
 | `fsnow profile validate <profile> --json` | Validate the profile id and report which env-var handles are set, by name only (exit 1 lists the missing ones with exact `export` repair commands; exit 3 / `FSNOW-2002` when the live path would refuse the profile: an `_ACCOUNT` that does not form a canonical `https://<account>.snowflakecomputing.com` endpoint, or an unknown or quarantined auth lane) |
 | `fsnow profile doctor <profile> --json` | Inspect profile readiness offline |
-| `fsnow profile doctor <profile> --online --json` | Attempt a minimal live probe (`SELECT CURRENT_VERSION()`); requires the `live` feature and credentials |
+| `fsnow profile doctor <profile> --online --json` | Attempt a minimal live probe (`SELECT CURRENT_VERSION()`) and report the credential's remaining lifetime where knowable (a JWT OAuth bearer's `exp`; the PAT lane's active tokens from `SHOW USER PROGRAMMATIC ACCESS TOKENS`); requires the `live` feature and credentials |
 
 ```bash
 fsnow profile validate demo-prod --json
@@ -581,7 +582,8 @@ Snowflake and needs `WRITE_ALLOW_EXTERNAL=true` (unloads to `@stage` stay
 ordinary writes). `WRITE_ALLOWED_KINDS=insert,merge,...` restricts a profile to
 the listed statement kinds. Statements the SQL API cannot run as a single
 statement (`PUT`, `GET`, `USE`, `ALTER SESSION`, `BEGIN`/`COMMIT`/`ROLLBACK`,
-`SET`) are refused. Every write attempt is recorded on the append-only local
+`SET`) are refused. A `COPY` with inline `CREDENTIALS` gets a warning to use a
+storage integration instead (the key values are redacted in every output). Every write attempt is recorded on the append-only local
 audit log (dry run, refusal, submission, result), and a write does not proceed
 when the store cannot take the record.
 
@@ -805,9 +807,10 @@ statement handle.
 ```
 
 Once a statement is submitted, the driver fires a best-effort remote cancel on
-every error path and on a deadline, budget, shutdown, or user cancellation; a
-process that is killed outright leaves the statement to the server-side
-`STATEMENT_TIMEOUT_IN_SECONDS` sent with every request. A `query write` runs in two rungs: a dry-run plans and emits a confirmation
+every error path, on a deadline, budget, shutdown, or user cancellation, and on
+Ctrl-C (SIGINT) or SIGTERM; a process killed outright (SIGKILL) leaves the
+statement to the server-side `STATEMENT_TIMEOUT_IN_SECONDS` sent with every
+request. A `query write` runs in two rungs: a dry-run plans and emits a confirmation
 token, and a confirm submits the authorized mutation through the same live
 transport as a read. The dataset planner compiles a named dataset plus entity
 and date-range hints into pushed-down SQL with positional typed bindings; raw

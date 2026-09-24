@@ -128,7 +128,12 @@ profile the live path would refuse: an `_ACCOUNT` that does not form a canonical
 the transport applies) or an unknown or quarantined lane. `profile doctor`
 reports lifetime guidance for the configured lane from non-secret configuration
 only (for example, a `_JWT_VALIDITY_SECONDS` above the 3600 s cap); it cannot see
-a PAT or OAuth token's expiry offline. RSA keys under 2048 bits are refused when
+a PAT or OAuth token's expiry offline. `profile doctor --online` reports what is
+knowable once authenticated: a JWT-shaped OAuth bearer's `exp` (warning under 10
+minutes; Snowflake's own OAuth tokens are opaque), and for the PAT lane the
+user's active tokens from `SHOW USER PROGRAMMATIC ACCESS TOKENS` with a warning
+when one expires within 7 days (the secret is never returned, so the profile's
+own token cannot be singled out). RSA keys under 2048 bits are refused when
 the live path loads the key.
 
 ## Fail-Closed Rights

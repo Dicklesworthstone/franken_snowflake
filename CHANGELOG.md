@@ -192,6 +192,10 @@ implementation first and the test/hardening pass follows in a later wave. The
   `https://<account>.snowflakecomputing.com` endpoint, or an unknown or
   quarantined auth lane, is exit 3 (`FSNOW-2002`) with a repair command;
   `profile doctor` gives lifetime guidance for the configured lane only.
+- **Ctrl-C cancels a running statement.** SIGINT (or SIGTERM) while a live
+  statement runs cancels it through the driver, which sends the SQL API
+  remote cancel, and the envelope reads `cancelled`; a second signal exits at
+  once (130/143). Outside a statement the signals keep their default action.
 - **Default `QUERY_TAG`.** Every live statement carries
   `fsnow:<command_id>:<request_id>` (profile-configurable with
   `<PREFIX>_QUERY_TAG`, `off` to disable), and receipts record the tag, so a

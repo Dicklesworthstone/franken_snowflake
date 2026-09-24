@@ -28,9 +28,13 @@ This is the target contract; not every line below is wired yet.
   remote cancel (quiet-drain kinds skip it); the deadline and poll-quota budget
   in the transport; a bounded partition-fetch window; Asupersync's HTTP/TLS
   client with gzip. Submit retries are the project's own loop on that client.
-- Not wired yet: a `bracket` or drop guard for the statement handle (signal
-  handling is absent, so Ctrl-C or a killed process leaves a submitted statement
-  to the server-side `STATEMENT_TIMEOUT_IN_SECONDS`); capability rows (the types
+- Wired since 2026-09-24: SIGINT/SIGTERM during a statement cancel its `Cx`
+  (`User`/`Shutdown`), so the driver fires the remote cancel; outside a
+  statement the signals keep their default action (signal-hook flag API, not
+  Asupersync's global dispatcher, which would swallow them process-wide).
+- Not wired yet: a `bracket` or drop guard for the statement handle (a process
+  killed with SIGKILL, or a panic, still leaves a submitted statement to the
+  server-side `STATEMENT_TIMEOUT_IN_SECONDS`); capability rows (the types
   exist in `franken-snowflake-core::capabilities`, but no call path narrows its
   `Cx`); the cost quota on the live path; `web::request_region` around MCP calls;
   `cli::progress` events; the declared `PoolConfig`; backup requests.
