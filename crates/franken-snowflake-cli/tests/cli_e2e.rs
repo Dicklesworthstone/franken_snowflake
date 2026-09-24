@@ -258,6 +258,8 @@ fn capabilities_registry_documents_every_command_with_input_schemas() {
         "dataset.inspect",
         "dataset.profile",
         "dataset.describe_operator",
+        "dataset.validate_manifest",
+        "catalog.search",
         "query.plan",
         "query.run",
         "query.write",
@@ -395,6 +397,91 @@ fn every_operator_has_a_schema_and_typos_get_suggestions() {
     assert_eq!(typo.exit, 64);
     let value = assert_envelope(&typo, "dataset.describe_operator");
     assert_eq!(value["did_you_mean"][0], "between");
+}
+
+/// Reality-check bead oj0.36: `catalog search` with no snapshot is a typed
+/// FSNOW-7002 naming the scan to run; a query with no words is a usage error.
+#[test]
+fn catalog_search_needs_a_snapshot_and_words() {
+    let h = Harness::new("search");
+    let missing = h.run(&["catalog", "search", "e2e", "revenue", "--json"]);
+    assert_eq!(missing.exit, 7, "{}", missing.stdout);
+    assert_eq!(missing.code(), "FSNOW-7002");
+    assert!(
+        missing.stdout.contains("catalog scan e2e"),
+        "{}",
+        missing.stdout
+    );
+    let wordless = h.run(&["catalog", "search", "e2e", "::", "--json"]);
+    assert_eq!(wordless.exit, 64, "{}", wordless.stdout);
+    let no_query = h.run(&["catalog", "search", "e2e", "--json"]);
+    assert_eq!(no_query.exit, 64, "{}", no_query.stdout);
+}
+
+/// Reality-check bead oj0.35: `dataset validate-manifest` reads the overlay
+/// named by FRANKEN_SNOWFLAKE_MANIFEST offline. No file is an empty success; a
+/// valid file lists its entries (unscanned ones as warnings); a
+/// credential-like key is refused without echoing its value; a missing
+/// explicit file is an error, never a silent default.
+#[test]
+fn validate_manifest_reads_the_overlay_offline() {
+    let h = Harness::new("overlay");
+    let none = h.run(&["dataset", "validate-manifest", "--json"]);
+    assert_eq!(none.exit, 0, "{}", none.stderr);
+    let value = assert_envelope(&none, "dataset.validate_manifest");
+    assert_eq!(value["data"]["present"], false);
+
+    let path = h.data_dir.join("overlay.toml");
+    let path_text = path.to_string_lossy().into_owned();
+    fs::write(
+        &path,
+        "[[datasets]]\ndatabase = \"ANALYTICS\"\nschema = \"PUBLIC\"\nobject = \"EVENTS\"\ndefault_limit = 10\n\n[[datasets.fields]]\ncolumn = \"ACCOUNT_REF\"\nrole = \"entity_key\"\n",
+    )
+    .expect("write overlay");
+    let env = [("FRANKEN_SNOWFLAKE_MANIFEST", path_text.as_str())];
+    let valid = h.run_with(&["dataset", "validate-manifest", "--json"], &env);
+    assert_eq!(valid.exit, 0, "{}", valid.stdout);
+    let value = assert_envelope(&valid, "dataset.validate_manifest");
+    assert_eq!(value["data"]["present"], true);
+    assert_eq!(value["data"]["entry_count"], 1);
+    assert_eq!(
+        value["data"]["entries"][0]["target"],
+        "ANALYTICS.PUBLIC.EVENTS"
+    );
+    assert!(
+        value["warnings"].to_string().contains("matches no dataset"),
+        "{}",
+        valid.stdout
+    );
+
+    fs::write(
+        &path,
+        "[[datasets]]\nid = \"x\"\nsnowflake_password = \"hunter2-canary\"\n",
+    )
+    .expect("write overlay");
+    let secret = h.run_with(&["dataset", "validate-manifest", "--json"], &env);
+    assert_eq!(secret.exit, 64, "{}", secret.stdout);
+    assert_eq!(secret.code(), "FSNOW-1002");
+    assert!(secret.stdout.contains("snowflake_password"));
+    assert!(
+        !secret.stdout.contains("hunter2-canary"),
+        "{}",
+        secret.stdout
+    );
+    assert!(
+        !secret.stderr.contains("hunter2-canary"),
+        "{}",
+        secret.stderr
+    );
+
+    let missing = h.run_with(
+        &["dataset", "validate-manifest", "--json"],
+        &[(
+            "FRANKEN_SNOWFLAKE_MANIFEST",
+            "/nonexistent/fsnow-overlay.toml",
+        )],
+    );
+    assert_eq!(missing.exit, 64, "{}", missing.stdout);
 }
 
 #[test]

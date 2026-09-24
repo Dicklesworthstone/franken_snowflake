@@ -280,8 +280,12 @@ fn dispatch_body(
     if let Err(error) = gate_tool_call(&request, policy) {
         return HttpResponse::ok().with_json(&json!({"jsonrpc": "2.0", "id": id, "error": error}));
     }
-    // Client notifications need no dispatch or reply.
+    // Client notifications need no dispatch or reply; a cancellation is
+    // recorded for the running call it names (reality-check bead E2).
     if request.method.starts_with("notifications/") {
+        if request.method == "notifications/cancelled" {
+            crate::fastmcp_surface::note_http_cancellation(request.params.as_ref());
+        }
         return HttpResponse::new(HttpStatus::ACCEPTED);
     }
     let notify: NotificationSender = Arc::new(|_| {});

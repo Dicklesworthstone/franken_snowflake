@@ -18,18 +18,25 @@ pub struct CliContractOutput {
     pub stderr: Option<String>,
 }
 
+/// Asks whether the MCP request behind a running CLI invocation was
+/// cancelled (a `notifications/cancelled` for it, or the client went away).
+/// The CLI polls it while a statement runs and cancels the statement when it
+/// turns true (reality-check bead E2).
+pub type CancelProbe = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// Minimal contract this adapter needs from the CLI crate.
 pub trait CliContractRunner: Send + Sync {
-    /// Execute one CLI command invocation and render its contract output.
-    fn run_cli_contract(&self, args: Vec<String>) -> CliContractOutput;
+    /// Execute one CLI command invocation and render its contract output;
+    /// `cancel` reports whether the MCP request was cancelled meanwhile.
+    fn run_cli_contract(&self, args: Vec<String>, cancel: CancelProbe) -> CliContractOutput;
 }
 
 impl<F> CliContractRunner for F
 where
-    F: Fn(Vec<String>) -> CliContractOutput + Send + Sync,
+    F: Fn(Vec<String>, CancelProbe) -> CliContractOutput + Send + Sync,
 {
-    fn run_cli_contract(&self, args: Vec<String>) -> CliContractOutput {
-        self(args)
+    fn run_cli_contract(&self, args: Vec<String>, cancel: CancelProbe) -> CliContractOutput {
+        self(args, cancel)
     }
 }
 
@@ -44,9 +51,141 @@ mod fastmcp_surface {
     use franken_snowflake_core::redact::redact;
     use serde_json::{Map, Value, json};
 
-    use super::{CliContractOutput, CliContractRunner};
+    use super::{CancelProbe, CliContractOutput, CliContractRunner};
 
     const SERVER_NAME: &str = "franken-snowflake";
+
+    /// Cancellations the client sent while tool calls ran, by FastMCP's
+    /// request id, from either transport, and whether stdin closed.
+    #[derive(Default)]
+    struct RequestCancellations {
+        cancelled: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+        closed: std::sync::atomic::AtomicBool,
+    }
+
+    impl RequestCancellations {
+        /// Note a stdin line if it is a `notifications/cancelled`.
+        fn observe(&self, line: &[u8]) {
+            let Ok(message) = serde_json::from_slice::<Value>(line) else {
+                return;
+            };
+            if message.get("method").and_then(Value::as_str) == Some("notifications/cancelled") {
+                self.note(message.get("params"));
+            }
+        }
+
+        /// Note the request a `notifications/cancelled` names.
+        fn note(&self, params: Option<&Value>) {
+            let id = match params.and_then(|params| params.get("requestId")) {
+                Some(Value::Number(number)) => number
+                    .as_u64()
+                    .or_else(|| number.as_i64().map(|signed| signed as u64)),
+                Some(Value::String(text)) => Some(request_id_hash(text)),
+                _ => None,
+            };
+            if let (Some(id), Ok(mut cancelled)) = (id, self.cancelled.lock()) {
+                cancelled.insert(id);
+            }
+        }
+
+        fn is_cancelled(&self, request_id: u64) -> bool {
+            self.closed.load(std::sync::atomic::Ordering::SeqCst)
+                || self
+                    .cancelled
+                    .lock()
+                    .is_ok_and(|cancelled| cancelled.contains(&request_id))
+        }
+
+        /// Forget a finished call's cancellation: clients reuse ids.
+        fn finish(&self, request_id: u64) {
+            if let Ok(mut cancelled) = self.cancelled.lock() {
+                cancelled.remove(&request_id);
+            }
+        }
+    }
+
+    /// Record a `notifications/cancelled` that arrived over HTTP (the HTTP
+    /// front answers notifications itself instead of dispatching them).
+    pub(crate) fn note_http_cancellation(params: Option<&Value>) {
+        CANCELLATIONS.note(params);
+    }
+
+    /// FastMCP's request id for a string JSON-RPC id (FNV-1a, 0 remapped),
+    /// so a cancellation matches the `McpContext::request_id` of its call.
+    fn request_id_hash(value: &str) -> u64 {
+        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash = OFFSET;
+        for byte in value.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        if hash == 0 { OFFSET } else { hash }
+    }
+
+    static CANCELLATIONS: std::sync::LazyLock<std::sync::Arc<RequestCancellations>> =
+        std::sync::LazyLock::new(std::sync::Arc::default);
+
+    /// Stdin as the stdio transport sees it, read by a thread that notes
+    /// cancellations and EOF the moment they arrive: FastMCP's stdio loop
+    /// handles one request at a time, so it would read a
+    /// `notifications/cancelled` only after the call it cancels had finished.
+    struct WatchedStdin {
+        lines: std::sync::mpsc::Receiver<Vec<u8>>,
+        pending: Vec<u8>,
+        offset: usize,
+    }
+
+    impl std::io::Read for WatchedStdin {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.offset >= self.pending.len() {
+                match self.lines.recv() {
+                    Ok(line) => {
+                        self.pending = line;
+                        self.offset = 0;
+                    }
+                    Err(_) => return Ok(0),
+                }
+            }
+            let available = self.pending.get(self.offset..).unwrap_or_default();
+            let count = available.len().min(buf.len());
+            if let (Some(target), Some(source)) = (buf.get_mut(..count), available.get(..count)) {
+                target.copy_from_slice(source);
+            }
+            self.offset += count;
+            Ok(count)
+        }
+    }
+
+    fn watched_stdin(state: std::sync::Arc<RequestCancellations>) -> WatchedStdin {
+        let (sender, lines) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            let stdin = std::io::stdin();
+            let mut reader = stdin.lock();
+            loop {
+                let mut line = Vec::new();
+                match reader.read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        state.observe(&line);
+                        if sender.send(line).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            // The client is gone: a call still running is cancelled.
+            state
+                .closed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        WatchedStdin {
+            lines,
+            pending: Vec::new(),
+            offset: 0,
+        }
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ReadVerb {
@@ -61,8 +200,13 @@ mod fastmcp_surface {
         CatalogScan,
         CatalogGraph,
         CatalogDiff,
+        CatalogSearch,
+        CatalogRelates,
+        CatalogLineage,
+        CatalogCycles,
         DatasetInspect,
         DatasetProfile,
+        DatasetValidateManifest,
         DatasetDescribeOperator,
         QueryPlan,
         QueryRun,
@@ -85,8 +229,13 @@ mod fastmcp_surface {
         ReadVerb::CatalogScan,
         ReadVerb::CatalogGraph,
         ReadVerb::CatalogDiff,
+        ReadVerb::CatalogSearch,
+        ReadVerb::CatalogRelates,
+        ReadVerb::CatalogLineage,
+        ReadVerb::CatalogCycles,
         ReadVerb::DatasetInspect,
         ReadVerb::DatasetProfile,
+        ReadVerb::DatasetValidateManifest,
         ReadVerb::DatasetDescribeOperator,
         ReadVerb::QueryPlan,
         ReadVerb::QueryRun,
@@ -222,6 +371,16 @@ mod fastmcp_surface {
                             "Set true to enforce a hard refusal if live transport is unavailable.",
                             false,
                         ),
+                        ParamSpec::string(
+                            "max_view_refs",
+                            "Views whose dependencies are read, one statement each (0-500, default 25; 0 skips).",
+                            false,
+                        ),
+                        ParamSpec::boolean(
+                            "tags",
+                            "Set true to also read tag assignments from SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES (needs GOVERNANCE_VIEWER; lags up to 2 h).",
+                            false,
+                        ),
                     ],
                     tags: &["catalog", "snowflake"],
                 },
@@ -286,6 +445,81 @@ mod fastmcp_surface {
                     ],
                     tags: &["catalog", "diff", "drift", "offline"],
                 },
+                Self::CatalogRelates => ToolSpec {
+                    name: "catalog_relates",
+                    description: "What relates to a catalog object (node key, dataset id, or DB.SCHEMA.OBJECT[.COLUMN]) within `depth` hops, from the local snapshot.",
+                    open_world_hint: "offline",
+                    read_only: true,
+                    params: vec![
+                        ParamSpec::string("profile", "Profile id whose snapshot to read.", true),
+                        ParamSpec::string(
+                            "object",
+                            "Node key, dataset id, or DB.SCHEMA.OBJECT[.COLUMN].",
+                            true,
+                        ),
+                        ParamSpec::string("depth", "Hops to follow, 1..=6 (default 2).", false),
+                        ParamSpec::string("database", "Snapshot scope: database.", false),
+                        ParamSpec::string("schema", "Snapshot scope: schema.", false),
+                    ],
+                    tags: &["catalog", "graph", "offline"],
+                },
+                Self::CatalogLineage => ToolSpec {
+                    name: "catalog_lineage",
+                    description: "Everything above (direction up) or below (down) a catalog object in the catalog graph, from the local snapshot.",
+                    open_world_hint: "offline",
+                    read_only: true,
+                    params: vec![
+                        ParamSpec::string("profile", "Profile id whose snapshot to read.", true),
+                        ParamSpec::string(
+                            "object",
+                            "Node key, dataset id, or DB.SCHEMA.OBJECT[.COLUMN].",
+                            true,
+                        ),
+                        ParamSpec::string_enum(
+                            "direction",
+                            "up (ancestors) or down (descendants).",
+                            true,
+                            &["up", "down"],
+                        ),
+                        ParamSpec::string("database", "Snapshot scope: database.", false),
+                        ParamSpec::string("schema", "Snapshot scope: schema.", false),
+                    ],
+                    tags: &["catalog", "graph", "lineage", "offline"],
+                },
+                Self::CatalogSearch => ToolSpec {
+                    name: "catalog_search",
+                    description: "Find datasets in the local snapshot whose names, columns, comments, or tags contain the query's words; ranked, offline.",
+                    open_world_hint: "offline",
+                    read_only: true,
+                    params: vec![
+                        ParamSpec::string("profile", "Profile id whose snapshot to search.", true),
+                        ParamSpec::string(
+                            "query",
+                            "Words to find (e.g. \"customer email\").",
+                            true,
+                        ),
+                        ParamSpec::string(
+                            "limit",
+                            "Most hits to return, 1-100 (default 10).",
+                            false,
+                        ),
+                        ParamSpec::string("database", "Snapshot scope: database.", false),
+                        ParamSpec::string("schema", "Snapshot scope: schema.", false),
+                    ],
+                    tags: &["catalog", "search", "offline"],
+                },
+                Self::CatalogCycles => ToolSpec {
+                    name: "catalog_cycles",
+                    description: "Dependency cycles in the catalog graph, from the local snapshot.",
+                    open_world_hint: "offline",
+                    read_only: true,
+                    params: vec![
+                        ParamSpec::string("profile", "Profile id whose snapshot to read.", true),
+                        ParamSpec::string("database", "Snapshot scope: database.", false),
+                        ParamSpec::string("schema", "Snapshot scope: schema.", false),
+                    ],
+                    tags: &["catalog", "graph", "offline"],
+                },
                 Self::DatasetInspect => ToolSpec {
                     name: "dataset_inspect",
                     description: "Return the dataset manifest surface through the CLI dataset inspect handler.",
@@ -312,6 +546,14 @@ mod fastmcp_surface {
                         ),
                     ],
                     tags: &["dataset", "snowflake"],
+                },
+                Self::DatasetValidateManifest => ToolSpec {
+                    name: "dataset_validate_manifest",
+                    description: "Parse the non-secret dataset manifest overlay (field roles, limits, rights class) and check each entry against the datasets in the local store.",
+                    open_world_hint: "offline",
+                    read_only: true,
+                    params: Vec::new(),
+                    tags: &["dataset", "offline"],
                 },
                 Self::DatasetDescribeOperator => ToolSpec {
                     name: "dataset_describe_operator",
@@ -454,6 +696,13 @@ mod fastmcp_surface {
                     if optional_bool(arguments, "require_live")?.unwrap_or(false) {
                         args.push("--require-live".to_string());
                     }
+                    if let Some(limit) = optional_string(arguments, "max_view_refs")? {
+                        args.push("--max-view-refs".to_string());
+                        args.push(limit);
+                    }
+                    if optional_bool(arguments, "tags")?.unwrap_or(false) {
+                        args.push("--tags".to_string());
+                    }
                     args.push("--json".to_string());
                     Ok(args)
                 }
@@ -513,6 +762,57 @@ mod fastmcp_surface {
                     args.push("--json".to_string());
                     Ok(args)
                 }
+                Self::CatalogSearch => {
+                    let mut args = vec![
+                        "catalog".to_string(),
+                        "search".to_string(),
+                        required_string(arguments, "profile")?,
+                        required_string(arguments, "query")?,
+                    ];
+                    for (key, flag) in [
+                        ("limit", "--limit"),
+                        ("database", "--database"),
+                        ("schema", "--schema"),
+                    ] {
+                        if let Some(value) = optional_string(arguments, key)? {
+                            args.push(flag.to_string());
+                            args.push(value);
+                        }
+                    }
+                    args.push("--json".to_string());
+                    Ok(args)
+                }
+                Self::CatalogRelates | Self::CatalogLineage | Self::CatalogCycles => {
+                    let verb = match self {
+                        Self::CatalogRelates => "relates",
+                        Self::CatalogLineage => "lineage",
+                        _ => "cycles",
+                    };
+                    let mut args = vec![
+                        "catalog".to_string(),
+                        verb.to_string(),
+                        required_string(arguments, "profile")?,
+                    ];
+                    if !matches!(self, Self::CatalogCycles) {
+                        args.push(required_string(arguments, "object")?);
+                    }
+                    if matches!(self, Self::CatalogLineage) {
+                        let direction = required_string(arguments, "direction")?;
+                        args.push(if direction == "up" { "--up" } else { "--down" }.to_string());
+                    }
+                    for (key, flag) in [
+                        ("depth", "--depth"),
+                        ("database", "--database"),
+                        ("schema", "--schema"),
+                    ] {
+                        if let Some(value) = optional_string(arguments, key)? {
+                            args.push(flag.to_string());
+                            args.push(value);
+                        }
+                    }
+                    args.push("--json".to_string());
+                    Ok(args)
+                }
                 Self::DatasetInspect => Ok(json_args_with(
                     &["dataset", "inspect"],
                     vec![required_string(arguments, "dataset_id")?],
@@ -529,6 +829,7 @@ mod fastmcp_surface {
                     args.push("--json".to_string());
                     Ok(args)
                 }
+                Self::DatasetValidateManifest => Ok(json_args(&["dataset", "validate-manifest"])),
                 Self::DatasetDescribeOperator => Ok(vec![
                     "dataset".to_string(),
                     "describe-operator".to_string(),
@@ -963,7 +1264,17 @@ mod fastmcp_surface {
         fn call(&self, ctx: &McpContext, arguments: Value) -> McpResult<Vec<Content>> {
             ctx.checkpoint()?;
             let args = self.verb.cli_args(&arguments)?;
-            let output = self.runner.run_cli_contract(args);
+            // A cancellation arrives on the watched stdin or, over HTTP, on
+            // another connection; both land in CANCELLATIONS. A cancelled
+            // request Cx counts too.
+            let request_cx = ctx.cx().clone();
+            let request_id = ctx.request_id();
+            let cancellations = std::sync::Arc::clone(&CANCELLATIONS);
+            let cancel: CancelProbe = std::sync::Arc::new(move || {
+                request_cx.is_cancel_requested() || cancellations.is_cancelled(request_id)
+            });
+            let output = self.runner.run_cli_contract(args, cancel);
+            CANCELLATIONS.finish(request_id);
             ctx.checkpoint()?;
             cli_output_to_mcp_result(output)
         }
@@ -1019,7 +1330,13 @@ mod fastmcp_surface {
         R: CliContractRunner + 'static,
     {
         match mode {
-            McpServeMode::Stdio => build_mcp_server(runner).run_stdio(),
+            McpServeMode::Stdio => {
+                let transport = fastmcp_rust::StdioTransport::new(
+                    watched_stdin(std::sync::Arc::clone(&CANCELLATIONS)),
+                    std::io::stdout(),
+                );
+                build_mcp_server(runner).run_transport(transport)
+            }
             McpServeMode::Http(options) => crate::http_front::run_secure_http(
                 build_mcp_server(runner),
                 &options,
@@ -1213,12 +1530,56 @@ mod fastmcp_surface {
         use super::*;
         use crate::CliContractOutput;
 
-        fn fake_runner(args: Vec<String>) -> CliContractOutput {
+        fn fake_runner(args: Vec<String>, _cancel: CancelProbe) -> CliContractOutput {
             CliContractOutput {
                 exit_code: 0,
                 stdout: args.join(" "),
                 stderr: None,
             }
+        }
+
+        #[test]
+        fn a_cancel_notification_marks_its_request_and_nothing_else() {
+            let stdio = RequestCancellations::default();
+            stdio.observe(br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{}}"#);
+            assert!(!stdio.is_cancelled(3), "a request is not a cancellation");
+            stdio.observe(
+                br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7,"reason":"user"}}"#,
+            );
+            assert!(stdio.is_cancelled(7));
+            assert!(!stdio.is_cancelled(8));
+            stdio.observe(
+                br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"call-a"}}"#,
+            );
+            assert!(stdio.is_cancelled(request_id_hash("call-a")));
+            stdio.observe(b"not json");
+            // A finished call's id is forgotten: the next call reusing it runs.
+            stdio.finish(7);
+            assert!(!stdio.is_cancelled(7));
+            stdio
+                .closed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                stdio.is_cancelled(8),
+                "stdin closed: every call is cancelled"
+            );
+        }
+
+        #[test]
+        fn watched_stdin_hands_bytes_through_unchanged() {
+            use std::io::Read as _;
+            let (sender, lines) = std::sync::mpsc::channel::<Vec<u8>>();
+            sender.send(b"{\"a\":1}\n".to_vec()).expect("send");
+            sender.send(b"{\"b\":2}\n".to_vec()).expect("send");
+            drop(sender);
+            let mut reader = WatchedStdin {
+                lines,
+                pending: Vec::new(),
+                offset: 0,
+            };
+            let mut text = String::new();
+            reader.read_to_string(&mut text).expect("read");
+            assert_eq!(text, "{\"a\":1}\n{\"b\":2}\n");
         }
 
         #[test]

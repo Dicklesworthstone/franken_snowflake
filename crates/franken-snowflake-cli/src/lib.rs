@@ -18,6 +18,9 @@
 // deliberate design, not correctness issues.
 #![allow(clippy::result_large_err, clippy::large_enum_variant)]
 
+use franken_snowflake_catalog::relations::{
+    DEFAULT_VIEW_REFERENCE_LIMIT, MAX_VIEW_REFERENCE_LIMIT, RelationOptions,
+};
 use franken_snowflake_core::error::SnowflakeErrorCode;
 use franken_snowflake_core::exit::ExitCode as CoreExitCode;
 use franken_snowflake_core::ids::RequestId;
@@ -85,6 +88,14 @@ enum Command {
         database: Option<String>,
         schema: Option<String>,
         require_live: bool,
+        relations: RelationOptions,
+    },
+    CatalogSearch {
+        profile: String,
+        query: String,
+        limit: Option<String>,
+        database: Option<String>,
+        schema: Option<String>,
     },
     CatalogGraph {
         profile: String,
@@ -108,6 +119,7 @@ enum Command {
         dataset_id: String,
         execute: bool,
     },
+    DatasetValidateManifest,
     DatasetDescribeOperator {
         operator: String,
     },
@@ -131,6 +143,12 @@ enum Command {
     QueryCancel {
         profile: Option<String>,
         statement_handle: String,
+    },
+    CatalogQuery {
+        query: catalog_surface::GraphQuery,
+        profile: String,
+        database: Option<String>,
+        schema: Option<String>,
     },
     ReceiptRefetch {
         receipt_hash: String,
@@ -198,6 +216,9 @@ struct QueryRunOptions {
     /// (`--raw-cells`, reality-check bead C1). Read by the live transport only.
     #[cfg_attr(not(feature = "live"), allow(dead_code))]
     raw_cells: bool,
+    /// NDJSON progress events on stderr (`--progress`, reality-check bead E5).
+    #[cfg_attr(not(feature = "live"), allow(dead_code))]
+    progress: bool,
     /// Inline typed bindings for embedded callers (the TUI executor): the
     /// same JSON shape `--bindings-env` carries, parsed with the same
     /// validation. `None` keeps the env-var path.
@@ -451,6 +472,16 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         sensitive_output: false,
     },
     CommandSpec {
+        id: "dataset.validate_manifest",
+        invocation: "franken-snowflake dataset validate-manifest --json",
+        output_contract_id: "fsnow.dataset.validate_manifest.v1",
+        description: "Parse the non-secret dataset manifest overlay (FRANKEN_SNOWFLAKE_MANIFEST or <data dir>/datasets.toml) and check each entry's fields against the datasets in the local store.",
+        read_only: true,
+        provider_network: false,
+        mutates_local_state: false,
+        sensitive_output: false,
+    },
+    CommandSpec {
         id: "dataset.describe_operator",
         invocation: "franken-snowflake dataset describe-operator <operator> --jsonschema",
         output_contract_id: "fsnow.dataset.operator_schema.v1",
@@ -497,6 +528,46 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         description: "Cancel a remote SQL API statement handle.",
         read_only: false,
         provider_network: true,
+        mutates_local_state: false,
+        sensitive_output: false,
+    },
+    CommandSpec {
+        id: "catalog.relates",
+        invocation: "franken-snowflake catalog relates <profile> <object> [--depth <n>] [--database <db>] [--schema <schema>] --json",
+        output_contract_id: "fsnow.catalog.relates.v1",
+        description: "What relates to a catalog object (node key, dataset id, or DB.SCHEMA.OBJECT[.COLUMN]) within --depth hops, offline from the local snapshot.",
+        read_only: true,
+        provider_network: false,
+        mutates_local_state: false,
+        sensitive_output: false,
+    },
+    CommandSpec {
+        id: "catalog.lineage",
+        invocation: "franken-snowflake catalog lineage <profile> <object> (--up | --down) [--database <db>] [--schema <schema>] --json",
+        output_contract_id: "fsnow.catalog.lineage.v1",
+        description: "Everything above (--up) or below (--down) a catalog object in the catalog graph, offline from the local snapshot.",
+        read_only: true,
+        provider_network: false,
+        mutates_local_state: false,
+        sensitive_output: false,
+    },
+    CommandSpec {
+        id: "catalog.search",
+        invocation: "franken-snowflake catalog search <profile> <query> [--limit <n>] [--database <db>] [--schema <schema>] --json",
+        output_contract_id: "fsnow.catalog.search.v1",
+        description: "Rank the datasets of the newest local snapshot by the query's words in their names, columns, comments, and tags, offline.",
+        read_only: true,
+        provider_network: false,
+        mutates_local_state: false,
+        sensitive_output: false,
+    },
+    CommandSpec {
+        id: "catalog.cycles",
+        invocation: "franken-snowflake catalog cycles <profile> [--database <db>] [--schema <schema>] --json",
+        output_contract_id: "fsnow.catalog.cycles.v1",
+        description: "Dependency cycles in the catalog graph, offline from the local snapshot.",
+        read_only: true,
+        provider_network: false,
         mutates_local_state: false,
         sensitive_output: false,
     },
@@ -763,11 +834,36 @@ fn parse_catalog(
                     ));
                 }
                 let require_live = has_flag(args, "--require-live");
+                let view_reference_limit = match value_after(args, "--max-view-refs") {
+                    None => DEFAULT_VIEW_REFERENCE_LIMIT,
+                    Some(raw) => match raw.parse::<usize>() {
+                        Ok(limit) if limit <= MAX_VIEW_REFERENCE_LIMIT => limit,
+                        _ => {
+                            return Err(usage_error(
+                                output,
+                                "catalog.scan",
+                                "fsnow.catalog.scan.v1",
+                                &format!(
+                                    "--max-view-refs must be 0..={MAX_VIEW_REFERENCE_LIMIT} (views whose dependencies are read, one statement each)"
+                                ),
+                                vec![
+                                    "franken-snowflake catalog scan <profile> --database <db> --schema <schema> --max-view-refs 25 --json"
+                                        .to_string(),
+                                ],
+                                vec![],
+                            ));
+                        }
+                    },
+                };
                 Ok(Command::CatalogScan {
                     profile,
                     database,
                     schema,
                     require_live,
+                    relations: RelationOptions {
+                        view_reference_limit,
+                        tags: has_flag(args, "--tags"),
+                    },
                 })
             }
             None => Err(usage_error(
@@ -860,6 +956,39 @@ fn parse_catalog(
                 vec![],
             )),
         },
+        Some(verb @ ("relates" | "lineage" | "cycles")) => parse_catalog_query(verb, args, output),
+        Some("search") => {
+            let usage = |message: &str| {
+                usage_error(
+                    output,
+                    "catalog.search",
+                    "fsnow.catalog.search.v1",
+                    message,
+                    vec![
+                        "franken-snowflake catalog search <profile> \"customer email\" --json"
+                            .to_string(),
+                    ],
+                    vec![],
+                )
+            };
+            let Some(profile) = resolve_profile(positional_profile(args)) else {
+                return Err(usage(
+                    "Missing profile for `catalog search`. Pass <profile> or set FRANKEN_SNOWFLAKE_DEFAULT_PROFILE.",
+                ));
+            };
+            let Some(query) = args.get(3).filter(|value| !value.starts_with('-')).cloned() else {
+                return Err(usage(
+                    "Missing <query> for `catalog search` (quote several words as one argument).",
+                ));
+            };
+            Ok(Command::CatalogSearch {
+                profile,
+                query,
+                limit: value_after(args, "--limit"),
+                database: value_after(args, "--database"),
+                schema: value_after(args, "--schema"),
+            })
+        }
         Some(other) => Err(usage_error(
             output,
             "catalog",
@@ -872,7 +1001,12 @@ fn parse_catalog(
                 "franken-snowflake catalog diff <profile> [--database <db>] [--schema <schema>] --json"
                     .to_string(),
             ],
-            did_you_mean(other, &["scan", "graph", "diff"]),
+            did_you_mean(
+                other,
+                &[
+                    "scan", "graph", "diff", "search", "relates", "lineage", "cycles",
+                ],
+            ),
         )),
         None => Err(usage_error(
             output,
@@ -889,6 +1023,72 @@ fn parse_catalog(
             vec![],
         )),
     }
+}
+
+/// `catalog relates|lineage|cycles` (reality-check bead oj0.34).
+fn parse_catalog_query(
+    verb: &str,
+    args: &[String],
+    output: OutputFormat,
+) -> Result<Command, Outcome> {
+    let (command_id, contract_id, example) = match verb {
+        "relates" => (
+            "catalog.relates",
+            "fsnow.catalog.relates.v1",
+            "franken-snowflake catalog relates <profile> <object> [--depth <n>] --json",
+        ),
+        "lineage" => (
+            "catalog.lineage",
+            "fsnow.catalog.lineage.v1",
+            "franken-snowflake catalog lineage <profile> <object> --up|--down --json",
+        ),
+        _ => (
+            "catalog.cycles",
+            "fsnow.catalog.cycles.v1",
+            "franken-snowflake catalog cycles <profile> --json",
+        ),
+    };
+    let usage = |message: String| {
+        usage_error(
+            output,
+            command_id,
+            contract_id,
+            &message,
+            vec![example.to_string()],
+            vec![],
+        )
+    };
+    let Some(profile) = resolve_profile(positional_profile(args)) else {
+        return Err(usage(format!(
+            "Missing profile for `catalog {verb}`. Pass <profile> or set FRANKEN_SNOWFLAKE_DEFAULT_PROFILE."
+        )));
+    };
+    let object = args.get(3).filter(|value| !value.starts_with('-')).cloned();
+    let query = match verb {
+        "relates" => catalog_surface::GraphQuery::Relates {
+            object: object
+                .ok_or_else(|| usage(format!("Missing <object> for `catalog {verb}`.")))?,
+            depth: value_after(args, "--depth"),
+        },
+        "lineage" => {
+            let up = has_flag(args, "--up");
+            if up == has_flag(args, "--down") {
+                return Err(usage("Choose exactly one of --up or --down.".to_string()));
+            }
+            catalog_surface::GraphQuery::Lineage {
+                object: object
+                    .ok_or_else(|| usage(format!("Missing <object> for `catalog {verb}`.")))?,
+                up,
+            }
+        }
+        _ => catalog_surface::GraphQuery::Cycles,
+    };
+    Ok(Command::CatalogQuery {
+        query,
+        profile,
+        database: value_after(args, "--database"),
+        schema: value_after(args, "--schema"),
+    })
 }
 
 fn parse_dataset(args: &[String], output: OutputFormat) -> Result<Command, Outcome> {
@@ -920,6 +1120,7 @@ fn parse_dataset(args: &[String], output: OutputFormat) -> Result<Command, Outco
                 vec![],
             )),
         },
+        Some("validate-manifest") => Ok(Command::DatasetValidateManifest),
         Some("describe-operator") => match args.get(2) {
             Some(operator) => Ok(Command::DatasetDescribeOperator {
                 operator: operator.clone(),
@@ -945,7 +1146,15 @@ fn parse_dataset(args: &[String], output: OutputFormat) -> Result<Command, Outco
                 "franken-snowflake dataset profile <dataset-id> --json".to_string(),
                 "franken-snowflake dataset describe-operator between --jsonschema".to_string(),
             ],
-            did_you_mean(other, &["inspect", "profile", "describe-operator"]),
+            did_you_mean(
+                other,
+                &[
+                    "inspect",
+                    "profile",
+                    "validate-manifest",
+                    "describe-operator",
+                ],
+            ),
         )),
         None => Err(usage_error(
             output,
@@ -1173,6 +1382,7 @@ fn query_run_options(args: &[String]) -> QueryRunOptions {
         statement_timeout: value_after(args, "--statement-timeout"),
         require_live: has_flag(args, "--require-live"),
         raw_cells: has_flag(args, "--raw-cells"),
+        progress: has_flag(args, "--progress"),
         bindings_json: None,
     }
 }
@@ -1190,6 +1400,7 @@ fn export_plan_spec(args: &[String]) -> catalog_surface::ExportPlanSpec {
         single: has_flag(args, "--single"),
         max_file_size: value_after(args, "--max-file-size"),
         max_rows: value_after(args, "--max-rows"),
+        progress: has_flag(args, "--progress"),
     }
 }
 
@@ -1389,6 +1600,7 @@ fn dispatch(invocation: Invocation) -> Outcome {
             database,
             schema,
             require_live,
+            relations,
         } => catalog_scan_dispatch(
             invocation.output,
             request_id,
@@ -1396,6 +1608,7 @@ fn dispatch(invocation: Invocation) -> Outcome {
             database,
             schema,
             require_live,
+            relations,
         ),
         Command::CatalogGraph {
             profile,
@@ -1434,6 +1647,9 @@ fn dispatch(invocation: Invocation) -> Outcome {
             dataset_id,
             execute,
         } => dataset_profile_dispatch(invocation.output, request_id, dataset_id, execute),
+        Command::DatasetValidateManifest => {
+            catalog_surface::validate_manifest_outcome(invocation.output, request_id)
+        }
         Command::DatasetDescribeOperator { operator } => {
             catalog_surface::describe_operator_outcome(invocation.output, request_id, operator)
         }
@@ -1474,6 +1690,34 @@ fn dispatch(invocation: Invocation) -> Outcome {
         Command::ReceiptShow { receipt_hash } => {
             catalog_surface::receipt_show_outcome(invocation.output, request_id, receipt_hash)
         }
+        Command::CatalogSearch {
+            profile,
+            query,
+            limit,
+            database,
+            schema,
+        } => catalog_surface::catalog_search_outcome(
+            invocation.output,
+            request_id,
+            profile,
+            query,
+            limit,
+            database,
+            schema,
+        ),
+        Command::CatalogQuery {
+            query,
+            profile,
+            database,
+            schema,
+        } => catalog_surface::catalog_graph_query_outcome(
+            invocation.output,
+            request_id,
+            query,
+            profile,
+            database,
+            schema,
+        ),
         Command::ReceiptRefetch {
             receipt_hash,
             profile,
@@ -2075,10 +2319,46 @@ fn error_json(error: Option<ErrorInfo>) -> Json {
     }
 }
 
+/// A cancelled run that a signal caused exits 130 (SIGINT) / 143 (SIGTERM)
+/// instead of the cancel policy's code (reality-check bead E1).
+#[cfg(feature = "live")]
+fn signal_exit_status() -> Option<u8> {
+    live::signal_exit_status()
+}
+
+#[cfg(not(feature = "live"))]
+fn signal_exit_status() -> Option<u8> {
+    None
+}
+
+/// Run `work` with `cancel` watched: a live statement it starts is cancelled
+/// (with the SQL API remote cancel) once `cancel` turns true (reality-check
+/// bead E2: an MCP request cancelled or a client gone).
+#[cfg(all(feature = "mcp", feature = "live"))]
+pub(crate) fn with_external_cancel<T>(
+    cancel: franken_snowflake_mcp::CancelProbe,
+    work: impl FnOnce() -> T,
+) -> T {
+    live::with_external_cancel(cancel, work)
+}
+
+#[cfg(all(feature = "mcp", not(feature = "live")))]
+pub(crate) fn with_external_cancel<T>(
+    _cancel: franken_snowflake_mcp::CancelProbe,
+    work: impl FnOnce() -> T,
+) -> T {
+    work()
+}
+
 fn write_outcome(outcome: Outcome) -> ExitCode {
     let status = outcome.status;
     match outcome.body {
         Body::Envelope { envelope, format } => {
+            let signalled = if !envelope.ok && envelope.outcome_kind == "cancelled" {
+                signal_exit_status()
+            } else {
+                None
+            };
             if !envelope.ok {
                 let diagnostic = match &envelope.error {
                     Some(error) => format!("{}: {}\n", error.code.stable_code(), error.message),
@@ -2091,7 +2371,7 @@ fn write_outcome(outcome: Outcome) -> ExitCode {
             }
             let rendered = render_envelope(&envelope, format);
             match write_stdout(&rendered) {
-                Ok(()) => process_exit_code(status),
+                Ok(()) => signalled.map_or_else(|| process_exit_code(status), ExitCode::from),
                 Err(()) => process_exit_code(CoreExitCode::Io),
             }
         }
@@ -2381,6 +2661,18 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
                 false,
                 "Hard-refuse (FSNOW-3003) unless served by the live transport (--require-live)",
             ),
+            input(
+                "max_view_refs",
+                "integer",
+                false,
+                "Views whose dependencies are read with GET_OBJECT_REFERENCES, one statement each (--max-view-refs, 0..=500, default 25; 0 skips)",
+            ),
+            input(
+                "tags",
+                "boolean",
+                false,
+                "Also read tag assignments from SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES (--tags; needs the GOVERNANCE_VIEWER database role, lags up to 2 h)",
+            ),
             OUTPUT_INPUT,
         ],
         "catalog.graph" => vec![
@@ -2442,6 +2734,7 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
             ),
             OUTPUT_INPUT,
         ],
+        "dataset.validate_manifest" => vec![OUTPUT_INPUT],
         "dataset.describe_operator" => vec![
             input(
                 "operator",
@@ -2523,6 +2816,12 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
                     false,
                     "Emit the SQL API jsonv2 wire strings instead of typed.v1 cells (--raw-cells)",
                 ),
+                input(
+                    "progress",
+                    "boolean",
+                    false,
+                    "One JSON object per statement event (submitted, polled, partition_fetched, completed) on stderr (--progress)",
+                ),
             ];
             inputs.extend(
                 dataset_mode_inputs()
@@ -2570,6 +2869,81 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
                 "string",
                 true,
                 "positional: BLAKE3 receipt hash from an envelope",
+            ),
+            OUTPUT_INPUT,
+        ],
+        "catalog.relates" | "catalog.lineage" | "catalog.cycles" => {
+            let mut inputs = vec![input("profile", "string", true, "positional: profile id")];
+            if command_id != "catalog.cycles" {
+                inputs.push(input(
+                    "object",
+                    "string",
+                    true,
+                    "positional: node key, dataset id, or DB.SCHEMA.OBJECT[.COLUMN]",
+                ));
+            }
+            inputs.push(input(
+                "database",
+                "string",
+                false,
+                "Snapshot scope: database (--database)",
+            ));
+            inputs.push(input(
+                "schema",
+                "string",
+                false,
+                "Snapshot scope: schema (--schema)",
+            ));
+            if command_id == "catalog.relates" {
+                inputs.push(input(
+                    "depth",
+                    "integer",
+                    false,
+                    "Hops to follow in either direction, 1..=6 (--depth; default 2)",
+                ));
+            }
+            if command_id == "catalog.lineage" {
+                inputs.push(input(
+                    "up",
+                    "boolean",
+                    false,
+                    "Upstream: what the object reads or references (--up)",
+                ));
+                inputs.push(input(
+                    "down",
+                    "boolean",
+                    false,
+                    "Downstream: what reads or references the object (--down)",
+                ));
+            }
+            inputs.push(OUTPUT_INPUT);
+            inputs
+        }
+        "catalog.search" => vec![
+            input("profile", "string", true, "positional: profile id"),
+            input(
+                "query",
+                "string",
+                true,
+                "positional: words to find in dataset names, columns, comments, and tags (quote several words)",
+            ),
+            input(
+                "limit",
+                "integer",
+                false,
+                "Most hits to return, 1..=100 (--limit; default 10)",
+            ),
+            input(
+                "database",
+                "string",
+                false,
+                "Snapshot scope: database (--database)",
+            ),
+            input(
+                "schema",
+                "string",
+                false,
+                "Snapshot scope: schema (--schema)",
             ),
             OUTPUT_INPUT,
         ],
@@ -2702,6 +3076,12 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
                 "integer",
                 false,
                 "Refuse (FSNOW-3004) a result with more rows than this (--max-rows; default <PREFIX>_EXPORT_MAX_ROWS or 1000000)",
+            ),
+            input(
+                "progress",
+                "boolean",
+                false,
+                "One JSON object per statement event (submitted, polled, partition_fetched, completed) on stderr (--progress)",
             ),
             OUTPUT_INPUT,
         ],
@@ -4513,6 +4893,7 @@ fn catalog_scan_dispatch(
     database: Option<String>,
     schema: Option<String>,
     require_live: bool,
+    relations: RelationOptions,
 ) -> Outcome {
     live::run_catalog_scan_outcome(
         format,
@@ -4521,6 +4902,7 @@ fn catalog_scan_dispatch(
         database.unwrap_or_default(),
         schema.unwrap_or_default(),
         require_live,
+        relations,
     )
 }
 
@@ -4534,6 +4916,7 @@ fn catalog_scan_dispatch(
     database: Option<String>,
     schema: Option<String>,
     require_live: bool,
+    relations: RelationOptions,
 ) -> Outcome {
     live_transport_required_with_data(
         format,
@@ -4545,6 +4928,18 @@ fn catalog_scan_dispatch(
             ("requested_database", option_json(database)),
             ("requested_schema", option_json(schema)),
             ("require_live", Json::Bool(require_live)),
+            (
+                "requested_relations",
+                json_object(vec![
+                    (
+                        "max_view_refs",
+                        Json::Number(
+                            i64::try_from(relations.view_reference_limit).unwrap_or(i64::MAX),
+                        ),
+                    ),
+                    ("tags", Json::Bool(relations.tags)),
+                ]),
+            ),
             (
                 "requires",
                 json_array(vec![
@@ -5145,6 +5540,7 @@ fn command_id(command: &Command) -> Option<&'static str> {
         Command::CatalogDiff { .. } => "catalog.diff",
         Command::DatasetInspect { .. } => "dataset.inspect",
         Command::DatasetProfile { .. } => "dataset.profile",
+        Command::DatasetValidateManifest => "dataset.validate_manifest",
         Command::DatasetDescribeOperator { .. } => "dataset.describe_operator",
         Command::QueryPlan { .. } => "query.plan",
         Command::QueryRun { .. } => "query.run",
@@ -5152,6 +5548,8 @@ fn command_id(command: &Command) -> Option<&'static str> {
         Command::QueryCancel { .. } => "query.cancel",
         Command::ReceiptShow { .. } => "receipt.show",
         Command::ReceiptRefetch { .. } => "receipt.refetch",
+        Command::CatalogQuery { query, .. } => query.command_id(),
+        Command::CatalogSearch { .. } => "catalog.search",
         Command::ExportPlan { .. } => "export.plan",
         Command::ExportRun { .. } => "export.run",
         Command::Tui { .. } => "tui",

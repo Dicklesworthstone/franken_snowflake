@@ -114,7 +114,7 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(tools.len(), 21, "{names:?}");
+    assert_eq!(tools.len(), 26, "{names:?}");
     for expected in [
         "capabilities",
         "onboard",
@@ -124,8 +124,10 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
         "catalog_scan",
         "catalog_graph",
         "catalog_diff",
+        "catalog_search",
         "dataset_inspect",
         "dataset_describe_operator",
+        "dataset_validate_manifest",
         "query_plan",
         "query_run",
         "query_cancel",

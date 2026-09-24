@@ -21,11 +21,12 @@
 //!   already redacted and the crate-root `sanitize_envelope` pass runs the
 //!   secret-leak redactor over the whole envelope before output.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
@@ -42,7 +43,11 @@ use franken_snowflake_catalog::discovery::{
     CatalogDiscoveryInput, CatalogDiscoveryTables, DiscoveryStatementKind,
     build_information_schema_requests, build_snapshot_from_information_schema, persist_snapshot,
 };
-use franken_snowflake_catalog::model::{CatalogSnapshot, DataSourceClass};
+use franken_snowflake_catalog::model::{CatalogSnapshot, DataSourceClass, DiscoveryGapKind};
+use franken_snowflake_catalog::relations::{
+    RelationOptions, RelationOutcome, RelationSource, apply_relation_results,
+    plan_relation_discovery,
+};
 use franken_snowflake_core::cancel::{
     CancelKind, attempts_remote_cancel, cancel_outcome_kind, cancel_policy,
 };
@@ -64,7 +69,8 @@ use franken_snowflake_http::{
     SnowflakeHttpClient, StatusClass, TlsRootPolicy, TransportConfig, TransportError,
 };
 use franken_snowflake_sqlapi::driver::{
-    AuthProvider, DriverStats, RowSink, run_statement_streaming, run_statement_with_auth,
+    AuthProvider, DriverEvent, DriverObserver, DriverStats, RowSink, StatementHooks,
+    run_statement_hooked,
 };
 use franken_snowflake_sqlapi::lifecycle::{
     CompletedStatement, DEFAULT_PARTITION_CONCURRENCY, MAX_PARTITION_CONCURRENCY, PollPlan,
@@ -209,7 +215,8 @@ pub fn run_query_outcome(
     let conn = match LiveConn::resolve(&profile, &overrides) {
         Ok(conn) => conn
             .tagged("query.run", &request_id)
-            .with_statement_tag(request_options.query_tag.as_deref()),
+            .with_statement_tag(request_options.query_tag.as_deref())
+            .with_progress(options.progress),
         Err(error) => return fail(&error, profile),
     };
     match execute(&conn, sql, request_options) {
@@ -475,7 +482,8 @@ pub fn run_dataset_query_outcome(
     let conn = match LiveConn::resolve(&profile, &overrides) {
         Ok(conn) => conn
             .tagged("query.run", &request_id)
-            .with_statement_tag(Some(&planned.plan.guardrails.query_tag)),
+            .with_statement_tag(Some(&planned.plan.guardrails.query_tag))
+            .with_progress(options.progress),
         Err(error) => return fail(&error),
     };
     // Every planner binding becomes a positional SQL API binding; values never
@@ -805,28 +813,36 @@ fn write_success(
 // catalog scan / catalog graph
 // ---------------------------------------------------------------------------
 
-/// A live discovery scan: the snapshot, its store record, the two statements'
-/// row sets, and what happened to persistence.
+/// A live discovery scan: the snapshot, its store record, the TABLES/COLUMNS
+/// row sets, the relation pass's statement count and polls, and what happened
+/// to persistence.
 struct ScanResult {
     input: CatalogDiscoveryInput,
     snapshot: CatalogSnapshot,
     record: CatalogSnapshotRecord,
     tables: LiveRows,
     columns: LiveRows,
+    relation_statements: usize,
+    relation_polls: u32,
     store_dir: Option<String>,
     drift: Option<franken_snowflake_catalog::diff::CatalogDiff>,
     warnings: Vec<Json>,
 }
 
 /// Run the catalog crate's bound INFORMATION_SCHEMA discovery statements
-/// (TABLES + COLUMNS) live, build the snapshot, and persist it to the local
-/// store. `schema = None` scans every schema in the database.
+/// (TABLES + COLUMNS) live, then its relation pass (keys, view dependencies,
+/// stages, file formats, external tables, opt-in tags), build the snapshot,
+/// and persist it to the local store. `schema = None` scans every schema in
+/// the database. A relation statement Snowflake rejects (privilege, edition,
+/// a view it cannot resolve) becomes a gap in the snapshot; any other error
+/// ends the scan.
 fn scan_catalog(
     conn: &LiveConn,
     profile: &str,
     database: &str,
     schema: Option<&str>,
     trace_id: &str,
+    relation_options: RelationOptions,
 ) -> Result<ScanResult, SnowflakeError> {
     let now_ms = local_store::now_unix_ms();
     let snapshot_id = format!(
@@ -879,7 +895,27 @@ fn scan_catalog(
         tables: tables.completed_view(),
         columns: columns.completed_view(),
     };
-    let snapshot = build_snapshot_from_information_schema(&input, &discovery_tables);
+    let mut snapshot = build_snapshot_from_information_schema(&input, &discovery_tables);
+    let plan = plan_relation_discovery(&input, &snapshot, relation_options);
+    let relation_statements = plan.statements.len();
+    let mut relation_polls = 0_u32;
+    let mut relation_results = Vec::with_capacity(relation_statements);
+    for statement in plan.statements {
+        let mut request = statement.request.clone();
+        apply_session(conn, &mut request);
+        let outcome = match execute_request(conn, request, None, None) {
+            Ok((completed, stats, _)) => {
+                relation_polls = relation_polls.saturating_add(stats.polls);
+                RelationOutcome::Completed(completed)
+            }
+            Err(error) if error.code == SnowflakeErrorCode::StatementFailed => {
+                RelationOutcome::Failed(error.message)
+            }
+            Err(error) => return Err(error),
+        };
+        relation_results.push((statement, outcome));
+    }
+    apply_relation_results(&mut snapshot, plan.gaps, relation_results);
     let canonical = serde_json::to_string(&snapshot).map_err(|error| {
         SnowflakeError::new(
             SnowflakeErrorCode::Internal,
@@ -940,6 +976,8 @@ fn scan_catalog(
         record,
         tables,
         columns,
+        relation_statements,
+        relation_polls,
         store_dir,
         drift,
         warnings,
@@ -948,6 +986,8 @@ fn scan_catalog(
 
 /// `catalog scan <profile> --database <db> --schema <schema>`: live discovery
 /// through the catalog crate, persisted locally, summarized in the envelope.
+/// A relation source Snowflake refused makes the scan `partial_success`
+/// (exit 1) with a warning naming the source; the snapshot is still kept.
 pub fn run_catalog_scan_outcome(
     format: OutputFormat,
     request_id: String,
@@ -955,6 +995,7 @@ pub fn run_catalog_scan_outcome(
     database: String,
     schema: String,
     require_live: bool,
+    relations: RelationOptions,
 ) -> crate::Outcome {
     let fail = |error: &SnowflakeError| {
         failure_outcome(
@@ -981,7 +1022,14 @@ pub fn run_catalog_scan_outcome(
         Ok(conn) => conn.tagged("catalog.scan", &request_id),
         Err(error) => return fail(&error),
     };
-    let scan = match scan_catalog(&conn, &profile, &database, Some(&schema), &request_id) {
+    let scan = match scan_catalog(
+        &conn,
+        &profile,
+        &database,
+        Some(&schema),
+        &request_id,
+        relations,
+    ) {
         Ok(scan) => scan,
         Err(error) => return fail(&error),
     };
@@ -992,7 +1040,10 @@ pub fn run_catalog_scan_outcome(
         "catalog.scan",
         &conn,
         &request_id,
-        "INFORMATION_SCHEMA.TABLES + INFORMATION_SCHEMA.COLUMNS discovery",
+        &format!(
+            "INFORMATION_SCHEMA.TABLES + INFORMATION_SCHEMA.COLUMNS discovery and {} relation statements",
+            scan.relation_statements
+        ),
         &scan.tables,
         "catalog_scanned",
         serde_json::json!({
@@ -1003,6 +1054,27 @@ pub fn run_catalog_scan_outcome(
         }),
     );
     warnings.extend(scan.warnings.iter().cloned());
+    let mut relation_failed = false;
+    for gap in &scan.snapshot.gaps {
+        let what = match gap.kind {
+            DiscoveryGapKind::Skipped => continue,
+            DiscoveryGapKind::Failed => {
+                relation_failed = true;
+                "was refused"
+            }
+            DiscoveryGapKind::Truncated => "was truncated",
+            DiscoveryGapKind::Unresolved => "left rows unresolved",
+        };
+        let documentation = relation_source_documentation(&gap.source);
+        warnings.push(json_string(format!(
+            "catalog relation source `{}` {what}: {}{}",
+            gap.source,
+            gap.detail,
+            documentation
+                .map(|url| format!(" (see {url})"))
+                .unwrap_or_default()
+        )));
+    }
 
     let mut data = vec![
         ("profile_id", json_string(profile.clone())),
@@ -1061,7 +1133,11 @@ pub fn run_catalog_scan_outcome(
     ));
     let mut envelope = base_envelope(
         true,
-        "success",
+        if relation_failed {
+            "partial_success"
+        } else {
+            "success"
+        },
         "catalog.scan",
         "fsnow.catalog.scan.v1",
         request_id,
@@ -1072,7 +1148,11 @@ pub fn run_catalog_scan_outcome(
         ("deadline_ms", Json::Number(0)),
         (
             "polls",
-            Json::Number(i64::from(scan.tables.stats.polls) + i64::from(scan.columns.stats.polls)),
+            Json::Number(
+                i64::from(scan.tables.stats.polls)
+                    + i64::from(scan.columns.stats.polls)
+                    + i64::from(scan.relation_polls),
+            ),
         ),
         (
             "rows",
@@ -1093,12 +1173,34 @@ pub fn run_catalog_scan_outcome(
     envelope.safe_next_commands = vec![
         format!("franken-snowflake dataset inspect {example_dataset} --json"),
         format!("franken-snowflake catalog graph {profile} --database {database} --mermaid"),
+        format!("franken-snowflake catalog lineage {profile} <DB.SCHEMA.OBJECT> --down --json"),
         format!("franken-snowflake dataset profile {example_dataset} --json"),
     ];
     crate::Outcome {
-        status: CoreExitCode::Success,
+        status: if relation_failed {
+            CoreExitCode::Findings
+        } else {
+            CoreExitCode::Success
+        },
         body: Body::Envelope { envelope, format },
     }
+}
+
+/// The documentation URL of a relation source named in a gap.
+fn relation_source_documentation(source: &str) -> Option<&'static str> {
+    [
+        RelationSource::PrimaryKeys,
+        RelationSource::TableConstraints,
+        RelationSource::ReferentialConstraints,
+        RelationSource::Stages,
+        RelationSource::FileFormats,
+        RelationSource::ExternalTables,
+        RelationSource::ObjectReferences,
+        RelationSource::TagReferences,
+    ]
+    .into_iter()
+    .find(|candidate| candidate.as_str() == source)
+    .map(RelationSource::documentation)
 }
 
 /// `catalog graph` in the live build: render from the local snapshot when one
@@ -1172,7 +1274,14 @@ pub fn run_catalog_graph_outcome(
         Ok(conn) => conn.tagged("catalog.graph", &request_id),
         Err(error) => return fail(&error),
     };
-    let scan = match scan_catalog(&conn, &profile, &database, schema.as_deref(), &request_id) {
+    let scan = match scan_catalog(
+        &conn,
+        &profile,
+        &database,
+        schema.as_deref(),
+        &request_id,
+        RelationOptions::default(),
+    ) {
         Ok(scan) => scan,
         Err(error) => return fail(&error),
     };
@@ -1524,7 +1633,9 @@ pub fn export_run_outcome(
         ));
     }
     let conn = match LiveConn::resolve(&profile, &SessionOverrides::default()) {
-        Ok(conn) => conn.tagged("export.run", &request_id),
+        Ok(conn) => conn
+            .tagged("export.run", &request_id)
+            .with_progress(spec.progress),
         Err(error) => return fail(&error),
     };
     let max_rows = match export_max_rows(spec.max_rows.as_deref(), &profile) {
@@ -1900,6 +2011,7 @@ fn execute_streaming<S: RowSink + 'static>(
         .and_then(|parameters| parameters.get("QUERY_TAG"))
         .cloned();
     let sql_api_request_id = fixed_request_id.unwrap_or_else(unique_request_id);
+    LAST_RUN.with(RefCell::take);
     #[cfg(test)]
     if let Some(script) = &conn.script {
         let mut sink = sink;
@@ -1918,15 +2030,21 @@ fn execute_streaming<S: RowSink + 'static>(
     };
     let poll_plan = PollPlan::with_max_polls(conn.max_polls)
         .with_partition_concurrency(conn.partition_concurrency);
-    let (outcome, stats, sink) = with_runtime(conn, move |cx, client, auth| {
+    let progress = conn.progress;
+    let (outcome, stats, sink, facts) = with_runtime(conn, move |cx, client, auth| {
         Box::pin(async move {
             let mut sink = sink;
+            let mut observer = RunObserver::new(progress);
+            let hooks = StatementHooks {
+                sink: Some(&mut sink),
+                observer: Some(&mut observer),
+            };
             let (outcome, stats) =
-                run_statement_streaming(cx, client, auth, request, params, poll_plan, &mut sink)
-                    .await;
-            Ok((outcome, stats, sink))
+                run_statement_hooked(cx, client, auth, request, params, poll_plan, hooks).await;
+            Ok((outcome, stats, sink, observer.facts))
         })
     })?;
+    LAST_RUN.with(|slot| *slot.borrow_mut() = facts);
     let done = outcome_into_result(outcome, "the statement", true)?;
     let mut live = into_rows(done, stats, sql_api_request_id);
     live.query_tag = query_tag;
@@ -2489,6 +2607,8 @@ struct LiveConn {
     /// request sets its own (`--query-tag`, the dataset planner); set by
     /// [`LiveConn::tagged`].
     query_tag: Option<String>,
+    /// `--progress`: NDJSON progress events on stderr (reality-check bead E5).
+    progress: bool,
     /// Test-only: answers every `execute_request` from a script instead of the
     /// SQL API (see `test_support`). Always `None` in production builds.
     #[cfg(test)]
@@ -2606,9 +2726,16 @@ impl LiveConn {
                 .clamp(1, MAX_PARTITION_CONCURRENCY),
             query_tag_policy: query_tag_policy(env_value(&name(&prefix, "QUERY_TAG")).as_deref())?,
             query_tag: None,
+            progress: false,
             #[cfg(test)]
             script: None,
         })
+    }
+
+    /// Report progress on stderr as NDJSON (`--progress`).
+    fn with_progress(mut self, progress: bool) -> Self {
+        self.progress = progress;
+        self
     }
 
     /// Bind the invocation's default QUERY_TAG (reality-check bead L5), so
@@ -2852,9 +2979,10 @@ struct SignalFlags {
     in_flight: AtomicUsize,
 }
 
+static SIGNAL_FLAGS: OnceLock<Option<SignalFlags>> = OnceLock::new();
+
 fn signal_flags() -> Option<&'static SignalFlags> {
-    static FLAGS: OnceLock<Option<SignalFlags>> = OnceLock::new();
-    FLAGS
+    SIGNAL_FLAGS
         .get_or_init(|| {
             use signal_hook::consts::{SIGINT, SIGTERM};
             use signal_hook::flag;
@@ -2876,6 +3004,28 @@ fn signal_flags() -> Option<&'static SignalFlags> {
             Some(flags)
         })
         .as_ref()
+}
+
+/// The exit status of a run that a signal cancelled: 130 after SIGINT, 143
+/// after SIGTERM (the shell convention, so a script's `set -e` or loop stops
+/// as it would for any interrupted command). `None` when no signal arrived;
+/// never installs the handlers itself.
+pub(crate) fn signal_exit_status() -> Option<u8> {
+    let flags = SIGNAL_FLAGS.get().and_then(Option::as_ref)?;
+    signal_status(
+        flags.interrupt.load(Ordering::SeqCst),
+        flags.terminate.load(Ordering::SeqCst),
+    )
+}
+
+fn signal_status(interrupt: bool, terminate: bool) -> Option<u8> {
+    if interrupt {
+        Some(130)
+    } else if terminate {
+        Some(143)
+    } else {
+        None
+    }
 }
 
 /// Marks a statement in flight for the signal handlers; restores the default
@@ -2903,12 +3053,40 @@ impl Drop for InFlight {
     }
 }
 
-/// Drive `work` to completion; a pending SIGINT/SIGTERM cancels `cx` once.
+/// Reports whether the MCP request a statement serves was cancelled.
+pub(crate) type CancelProbe = Arc<dyn Fn() -> bool + Send + Sync>;
+
+thread_local! {
+    /// The cancel probe of the MCP request this thread is serving, if any.
+    static EXTERNAL_CANCEL: RefCell<Option<CancelProbe>> = const { RefCell::new(None) };
+}
+
+/// Run `work` with `cancel` as this thread's external cancel probe.
+#[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+pub(crate) fn with_external_cancel<T>(cancel: CancelProbe, work: impl FnOnce() -> T) -> T {
+    struct Reset(Option<CancelProbe>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            EXTERNAL_CANCEL.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+    let _reset = Reset(EXTERNAL_CANCEL.with(|slot| slot.borrow_mut().replace(cancel)));
+    work()
+}
+
+/// Drive `work` to completion; a pending SIGINT/SIGTERM, or the external
+/// cancel probe of an MCP request, cancels `cx` once.
 async fn cancel_on_signal<T>(cx: &Cx, work: impl std::future::Future<Output = T>) -> T {
-    let Some(flags) = signal_flags() else {
-        return work.await;
-    };
-    cancel_on_flags(cx, work, &flags.interrupt, &flags.terminate).await
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    let external = EXTERNAL_CANCEL.with(|slot| slot.borrow().clone());
+    match signal_flags() {
+        Some(flags) => {
+            cancel_on_flags(cx, work, &flags.interrupt, &flags.terminate, external).await
+        }
+        None if external.is_some() => cancel_on_flags(cx, work, &NEVER, &NEVER, external).await,
+        None => work.await,
+    }
 }
 
 /// The signal-independent core of [`cancel_on_signal`] (unit-testable).
@@ -2917,6 +3095,7 @@ async fn cancel_on_flags<T>(
     work: impl std::future::Future<Output = T>,
     interrupt: &AtomicBool,
     terminate: &AtomicBool,
+    external: Option<CancelProbe>,
 ) -> T {
     use std::task::Poll;
     let mut work = std::pin::pin!(work);
@@ -2944,9 +3123,107 @@ async fn cancel_on_flags<T>(
             } else if terminate.load(Ordering::SeqCst) {
                 cx.cancel_with(CancelKind::Shutdown, Some("terminated (SIGTERM)"));
                 raised = true;
+            } else if external.as_ref().is_some_and(|cancelled| cancelled()) {
+                cx.cancel_with(CancelKind::User, Some("the MCP request was cancelled"));
+                raised = true;
             }
         }
     }
+}
+
+/// What one statement run learned beyond its outcome: the handle Snowflake
+/// issued (none when the statement was never accepted) and the answer to the
+/// remote cancel, when one was sent (reality-check bead E1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RunFacts {
+    statement_handle: Option<String>,
+    remote_cancel: Option<(bool, String)>,
+}
+
+thread_local! {
+    /// The facts of the last statement run on this thread, for the terminal
+    /// receipt of a run that ended without rows.
+    static LAST_RUN: RefCell<RunFacts> = RefCell::new(RunFacts::default());
+}
+
+/// Watches every live statement: records its [`RunFacts`] and, with
+/// `--progress`, prints one JSON object per driver event on stderr (stdout
+/// keeps the single envelope), with the milliseconds since the statement
+/// started.
+struct RunObserver {
+    started: Instant,
+    progress: bool,
+    facts: RunFacts,
+}
+
+impl RunObserver {
+    fn new(progress: bool) -> Self {
+        Self {
+            started: Instant::now(),
+            progress,
+            facts: RunFacts::default(),
+        }
+    }
+}
+
+impl DriverObserver for RunObserver {
+    fn event(&mut self, event: DriverEvent) {
+        match &event {
+            DriverEvent::Submitted {
+                statement_handle: Some(handle),
+                ..
+            } => self.facts.statement_handle = Some(handle.clone()),
+            DriverEvent::RemoteCancel {
+                statement_handle,
+                acknowledged,
+                detail,
+            } => {
+                self.facts
+                    .statement_handle
+                    .get_or_insert_with(|| statement_handle.clone());
+                self.facts.remote_cancel = Some((*acknowledged, detail.clone()));
+            }
+            _ => {}
+        }
+        if self.progress {
+            use std::io::Write as _;
+            let elapsed_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let line = progress_line(&event, elapsed_ms);
+            let _ = writeln!(std::io::stderr().lock(), "{line}");
+        }
+    }
+}
+
+fn progress_line(event: &DriverEvent, elapsed_ms: u64) -> String {
+    let value = match event {
+        DriverEvent::Submitted {
+            statement_handle,
+            running,
+        } => serde_json::json!({
+            "event": "submitted", "statement_handle": statement_handle,
+            "running": running, "elapsed_ms": elapsed_ms,
+        }),
+        DriverEvent::Polled { polls } => {
+            serde_json::json!({ "event": "polled", "polls": polls, "elapsed_ms": elapsed_ms })
+        }
+        DriverEvent::PartitionFetched { index, rows, bytes } => serde_json::json!({
+            "event": "partition_fetched", "index": index, "rows": rows,
+            "bytes": bytes, "elapsed_ms": elapsed_ms,
+        }),
+        DriverEvent::Completed { rows, partitions } => serde_json::json!({
+            "event": "completed", "rows": rows, "partitions": partitions,
+            "elapsed_ms": elapsed_ms,
+        }),
+        DriverEvent::RemoteCancel {
+            statement_handle,
+            acknowledged,
+            detail,
+        } => serde_json::json!({
+            "event": "remote_cancel", "statement_handle": statement_handle,
+            "acknowledged": acknowledged, "detail": detail, "elapsed_ms": elapsed_ms,
+        }),
+    };
+    value.to_string()
 }
 
 /// Submit one prepared request and drive it to completion. Returns the completed
@@ -2958,6 +3235,7 @@ fn execute_request(
     fixed_request_id: Option<String>,
 ) -> Result<(CompletedStatement, DriverStats, String), SnowflakeError> {
     let sql_api_request_id = fixed_request_id.unwrap_or_else(unique_request_id);
+    LAST_RUN.with(RefCell::take);
     #[cfg(test)]
     if let Some(script) = &conn.script {
         return script.execute(request, row_cap, &sql_api_request_id);
@@ -2972,11 +3250,20 @@ fn execute_request(
     let poll_plan = PollPlan::with_max_polls(max_polls)
         .with_partition_concurrency(conn.partition_concurrency)
         .with_row_cap(row_cap);
-    let (outcome, stats) = with_runtime(conn, move |cx, client, auth| {
+    let progress = conn.progress;
+    let (outcome, stats, facts) = with_runtime(conn, move |cx, client, auth| {
         Box::pin(async move {
-            Ok(run_statement_with_auth(cx, client, auth, request, params, poll_plan).await)
+            let mut observer = RunObserver::new(progress);
+            let hooks = StatementHooks {
+                sink: None,
+                observer: Some(&mut observer),
+            };
+            let (outcome, stats) =
+                run_statement_hooked(cx, client, auth, request, params, poll_plan, hooks).await;
+            Ok((outcome, stats, observer.facts))
         })
     })?;
+    LAST_RUN.with(|slot| *slot.borrow_mut() = facts);
     outcome_into_result(outcome, "the statement", true)
         .map(|done| (done, stats, sql_api_request_id))
 }
@@ -3140,12 +3427,13 @@ fn with_terminal_receipt(
     let cancel_kind = error.cancel_kind.map(|kind| format!("{kind:?}"));
     let message = redact(&error.message);
     let preview = crate::compact_sql(&redact(sql));
+    let run = LAST_RUN.with(RefCell::take);
     let facts = ExecutionFacts {
         command_id,
         profile: &conn.profile,
         trace_id,
         sql_preview_redacted: &preview,
-        statement_handle: None,
+        statement_handle: run.statement_handle.as_deref(),
         sql_api_request_id: None,
         query_tag: conn.query_tag.as_deref(),
         row_count: 0,
@@ -3158,7 +3446,7 @@ fn with_terminal_receipt(
         statement_timeout_seconds: conn.statement_timeout_seconds,
         polls: 0,
         event_kind: "statement_terminal",
-        extra: serde_json::json!({}),
+        extra: terminal_run_json(&run),
         terminal_failure: Some(local_store::TerminalFailure {
             outcome_kind,
             error_code: error.stable_code(),
@@ -3172,6 +3460,10 @@ fn with_terminal_receipt(
             local_store::record_execution(&store, &facts).map_err(|error| error.to_string())
         });
     if let crate::Body::Envelope { envelope, .. } = &mut outcome.body {
+        if run.statement_handle.is_some() {
+            envelope.statement_handle.clone_from(&run.statement_handle);
+            envelope.query_id.clone_from(&run.statement_handle);
+        }
         match recorded {
             Ok(hash) => {
                 envelope
@@ -3185,6 +3477,23 @@ fn with_terminal_receipt(
         }
     }
     outcome
+}
+
+/// The terminal receipt's account of the run: whether Snowflake ever accepted
+/// the statement (a run cancelled while connecting never was) and, when a
+/// remote cancel was sent, whether Snowflake acknowledged it.
+fn terminal_run_json(run: &RunFacts) -> serde_json::Value {
+    let mut extra = serde_json::json!({
+        "accepted_by_snowflake": run.statement_handle.is_some(),
+    });
+    if let (Some((acknowledged, detail)), Some(body)) = (&run.remote_cancel, extra.as_object_mut())
+    {
+        body.insert(
+            "remote_cancel".to_owned(),
+            serde_json::json!({ "acknowledged": acknowledged, "detail": detail }),
+        );
+    }
+    extra
 }
 
 /// Stamp the live provenance fields shared by every successful live envelope.
@@ -4009,6 +4318,7 @@ mod test_support {
                 partition_concurrency: DEFAULT_PARTITION_CONCURRENCY,
                 query_tag_policy: QueryTagPolicy::Generated,
                 query_tag: None,
+                progress: false,
                 script: Some(scripted.script.clone()),
             })
         })
@@ -4211,7 +4521,7 @@ mod tests {
         database: &str,
         schema: &str,
     ) -> Vec<Result<CompletedStatement, SnowflakeError>> {
-        vec![
+        let mut script = vec![
             Ok(completed(
                 "01b2c3d4-0000-0000-0000-00000000cc01",
                 &[
@@ -4290,6 +4600,66 @@ mod tests {
                     ],
                 ],
             )),
+        ];
+        script.extend(relation_script(database, schema));
+        script
+    }
+
+    /// The relation pass for a schema holding one base table: SHOW PRIMARY
+    /// KEYS (EVENTS keyed on ENTITY_ID, EVENT_DATE), then empty constraint,
+    /// stage and file-format listings. No view or external table, and tags
+    /// are opt-in, so nothing else is submitted.
+    fn relation_script(
+        database: &str,
+        schema: &str,
+    ) -> Vec<Result<CompletedStatement, SnowflakeError>> {
+        let pk = |column, sequence| {
+            vec![
+                Some("2026-09-01"),
+                Some(database),
+                Some(schema),
+                Some("EVENTS"),
+                Some(column),
+                Some(sequence),
+                None,
+                Some("PK_EVENTS"),
+            ]
+        };
+        let empty = |handle: &str, columns: &[(&str, &str)]| Ok(completed(handle, columns, &[]));
+        vec![
+            Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000cc03",
+                &[
+                    ("created_on", "TEXT"),
+                    ("database_name", "TEXT"),
+                    ("schema_name", "TEXT"),
+                    ("table_name", "TEXT"),
+                    ("column_name", "TEXT"),
+                    ("key_sequence", "FIXED"),
+                    ("comment", "TEXT"),
+                    ("constraint_name", "TEXT"),
+                ],
+                &[pk("EVENT_DATE", "2"), pk("ENTITY_ID", "1")],
+            )),
+            empty(
+                "01b2c3d4-0000-0000-0000-00000000cc04",
+                &[("CONSTRAINT_NAME", "TEXT"), ("CONSTRAINT_TYPE", "TEXT")],
+            ),
+            empty(
+                "01b2c3d4-0000-0000-0000-00000000cc05",
+                &[
+                    ("CONSTRAINT_NAME", "TEXT"),
+                    ("UNIQUE_CONSTRAINT_NAME", "TEXT"),
+                ],
+            ),
+            empty(
+                "01b2c3d4-0000-0000-0000-00000000cc06",
+                &[("STAGE_NAME", "TEXT")],
+            ),
+            empty(
+                "01b2c3d4-0000-0000-0000-00000000cc07",
+                &[("FILE_FORMAT_NAME", "TEXT")],
+            ),
         ]
     }
 
@@ -4455,8 +4825,10 @@ mod tests {
             "ANALYTICS".to_owned(),
             "PUBLIC".to_owned(),
             false,
+            RelationOptions::default(),
         ));
         assert_eq!(env["ok"], true, "{env}");
+        assert_eq!(env["outcome_kind"], "success", "{env}");
         assert_eq!(env["data_source"], "live");
         let datasets = env["data"]["datasets"]
             .as_array()
@@ -4490,12 +4862,33 @@ mod tests {
             "safe_next_commands should name the dataset: {safe_cmds:?}"
         );
 
+        // The relation pass: the primary key in key order, and the opt-in
+        // tag source reported as skipped rather than silently empty.
+        assert_eq!(
+            datasets[0]["primary_key"],
+            serde_json::json!(["ENTITY_ID", "EVENT_DATE"]),
+            "{env}"
+        );
+        let relations = &env["data"]["relations"];
+        assert_eq!(relations["discovered"], true, "{env}");
+        assert_eq!(relations["primary_key_count"], 1, "{env}");
+        assert!(
+            relations["gaps"].to_string().contains("tag_references"),
+            "{env}"
+        );
+
         // Discovery statements are bound, never interpolated, carry the
-        // session context, and always fetch every partition.
+        // session context, and always fetch every partition; SHOW takes no
+        // binds, so its scope is quoted.
         let submitted = script.submitted();
-        assert_eq!(submitted.len(), 2);
-        assert_eq!(script.row_caps(), vec![None, None]);
-        for request in &submitted {
+        assert_eq!(submitted.len(), 7);
+        assert_eq!(script.row_caps(), vec![None; 7]);
+        let show = request_json(&submitted[2]);
+        assert_eq!(
+            show["statement"], r#"SHOW PRIMARY KEYS IN SCHEMA "ANALYTICS"."PUBLIC""#,
+            "{show}"
+        );
+        for request in &submitted[..2] {
             let json = request_json(request);
             let statement = json["statement"].as_str().unwrap_or("");
             assert!(statement.contains("TABLE_CATALOG = ?"), "{statement}");
@@ -4521,6 +4914,11 @@ mod tests {
         assert!(
             inspect.to_string().contains("ENTITY_ID"),
             "column catalog missing: {inspect}"
+        );
+        assert_eq!(
+            inspect["data"]["relations"]["primary_key"],
+            serde_json::json!(["ENTITY_ID", "EVENT_DATE"]),
+            "{inspect}"
         );
         let graph = envelope(run_catalog_graph_outcome(
             OutputFormat::Json,
@@ -4621,6 +5019,7 @@ mod tests {
             "DRIFT_DB".to_owned(),
             "DRIFT_SCHEMA".to_owned(),
             false,
+            RelationOptions::default(),
         ));
         assert_eq!(env1["ok"], true);
         assert_eq!(env1["data"]["drift"]["summary"]["datasets_added"], 1);
@@ -4643,6 +5042,7 @@ mod tests {
             "DRIFT_DB".to_owned(),
             "DRIFT_SCHEMA".to_owned(),
             false,
+            RelationOptions::default(),
         ));
         assert_eq!(env2["ok"], true);
         assert_eq!(env2["data"]["drift"]["summary"]["is_identical"], true);
@@ -4650,6 +5050,231 @@ mod tests {
             env2["data"]["drift"]["base_snapshot_id"],
             env1["data"]["store"]["snapshot_id"]
         );
+    }
+
+    #[test]
+    fn a_refused_relation_source_is_partial_success_and_the_snapshot_is_kept() {
+        let mut script = information_schema_script_with_scope("GAP_DB", "GAP_SCHEMA");
+        // TABLES, COLUMNS, SHOW PRIMARY KEYS, then TABLE_CONSTRAINTS refused.
+        script[3] = Err(SnowflakeError::new(
+            SnowflakeErrorCode::StatementFailed,
+            "SQL access control error: Insufficient privileges to operate on schema 'GAP_SCHEMA'",
+        ));
+        install("gap_profile", None, None, script);
+        let outcome = run_catalog_scan_outcome(
+            OutputFormat::Json,
+            "req-scan-gap".to_owned(),
+            "gap_profile".to_owned(),
+            "GAP_DB".to_owned(),
+            "GAP_SCHEMA".to_owned(),
+            false,
+            RelationOptions::default(),
+        );
+        assert_eq!(outcome.status, CoreExitCode::Findings);
+        let env = envelope(outcome);
+        assert_eq!(env["ok"], true, "{env}");
+        assert_eq!(env["outcome_kind"], "partial_success", "{env}");
+        assert_eq!(env["data"]["store"]["persisted"], true, "{env}");
+        assert_eq!(env["data"]["datasets"][0]["column_count"], 3, "{env}");
+        let warnings = env["warnings"].to_string();
+        assert!(
+            warnings.contains("`table_constraints` was refused")
+                && warnings.contains("Insufficient privileges")
+                && warnings.contains("info-schema/table_constraints"),
+            "{env}"
+        );
+        assert!(
+            env["data"]["relations"]["gaps"]
+                .to_string()
+                .contains(r#""kind":"failed""#),
+            "{env}"
+        );
+    }
+
+    /// Reality-check bead oj0.35: a manifest overlay reassigns roles and limits
+    /// at read time (inspect and dataset planning), and a field naming a
+    /// column the dataset lacks is refused with suggestions, never ignored.
+    #[test]
+    fn a_manifest_overlay_reassigns_roles_at_read_time() {
+        let column = |name, ordinal, kind| {
+            vec![
+                Some("OVL_DB"),
+                Some("PUBLIC"),
+                Some("EVENTS"),
+                Some(name),
+                Some(ordinal),
+                Some(kind),
+                None,
+                None,
+                None,
+                Some("YES"),
+                None,
+            ]
+        };
+        let mut script = vec![
+            Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000cd01",
+                &[
+                    ("TABLE_CATALOG", "TEXT"),
+                    ("TABLE_SCHEMA", "TEXT"),
+                    ("TABLE_NAME", "TEXT"),
+                    ("TABLE_TYPE", "TEXT"),
+                    ("COMMENT", "TEXT"),
+                ],
+                &[vec![
+                    Some("OVL_DB"),
+                    Some("PUBLIC"),
+                    Some("EVENTS"),
+                    Some("BASE TABLE"),
+                    None,
+                ]],
+            )),
+            Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000cd02",
+                &[
+                    ("TABLE_CATALOG", "TEXT"),
+                    ("TABLE_SCHEMA", "TEXT"),
+                    ("TABLE_NAME", "TEXT"),
+                    ("COLUMN_NAME", "TEXT"),
+                    ("ORDINAL_POSITION", "FIXED"),
+                    ("DATA_TYPE", "TEXT"),
+                    ("NUMERIC_PRECISION", "FIXED"),
+                    ("NUMERIC_SCALE", "FIXED"),
+                    ("CHARACTER_MAXIMUM_LENGTH", "FIXED"),
+                    ("IS_NULLABLE", "TEXT"),
+                    ("COMMENT", "TEXT"),
+                ],
+                &[
+                    column("EVENT_DATE", "1", "DATE"),
+                    column("LOADED_AT", "2", "TIMESTAMP_NTZ"),
+                    column("ACCOUNT_REF", "3", "TEXT"),
+                    column("VALUE", "4", "NUMBER"),
+                ],
+            )),
+        ];
+        script.extend(relation_script("OVL_DB", "PUBLIC"));
+        install("overlay_profile", None, None, script);
+        let scan = envelope(run_catalog_scan_outcome(
+            OutputFormat::Json,
+            "req-scan-overlay".to_owned(),
+            "overlay_profile".to_owned(),
+            "OVL_DB".to_owned(),
+            "PUBLIC".to_owned(),
+            false,
+            RelationOptions::default(),
+        ));
+        let dataset_id = scan["data"]["datasets"][0]["dataset_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(!dataset_id.is_empty(), "{scan}");
+        let plan = || {
+            envelope(crate::dataset_mode::dataset_plan_outcome(
+                OutputFormat::Json,
+                "req-plan-overlay".to_owned(),
+                crate::dataset_mode::DatasetQuerySpec {
+                    dataset_id: dataset_id.clone(),
+                    from: Some("2024-01-01".to_owned()),
+                    to: Some("2024-02-01".to_owned()),
+                    ..Default::default()
+                },
+            ))
+        };
+        let before = plan();
+        let sql = before["data"]["sql"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            sql.contains(r#""EVENT_DATE" >= ?"#),
+            "discovery's time index: {before}"
+        );
+
+        let overlay_path = local_store::data_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("overlay-{:?}.toml", std::thread::current().id()));
+        let use_overlay = |text: &str| {
+            std::fs::create_dir_all(overlay_path.parent().unwrap_or(&overlay_path)).ok();
+            std::fs::write(&overlay_path, text).expect("write overlay");
+            catalog_surface::TEST_MANIFEST_OVERLAY
+                .with(|slot| *slot.borrow_mut() = Some(overlay_path.clone()));
+        };
+        use_overlay(
+            "[[datasets]]\ndatabase = \"ovl_db\"\nschema = \"public\"\nobject = \"events\"\ndefault_limit = 7\n\n[[datasets.fields]]\ncolumn = \"loaded_at\"\nrole = \"time_index\"\n\n[[datasets.fields]]\ncolumn = \"ACCOUNT_REF\"\nrole = \"entity_key\"\n",
+        );
+        let after = plan();
+        let sql = after["data"]["sql"].as_str().unwrap_or_default().to_owned();
+        assert!(
+            sql.contains(r#""LOADED_AT" >= ?"#) && !sql.contains(r#""EVENT_DATE" >= ?"#),
+            "the overlay's time index wins: {after}"
+        );
+        assert!(
+            after["data"]["bindings"]
+                .to_string()
+                .contains(r#""value":"7""#),
+            "the overlay's default limit binds the LIMIT: {after}"
+        );
+        let inspect = envelope(catalog_surface::dataset_inspect_outcome(
+            OutputFormat::Json,
+            "req-inspect-overlay".to_owned(),
+            dataset_id.clone(),
+        ));
+        assert_eq!(inspect["ok"], true, "{inspect}");
+        assert!(inspect["data"]["overlay"].as_str().is_some(), "{inspect}");
+        let fields = inspect["data"]["manifest"]["fields"].to_string();
+        assert!(
+            fields.contains(r#""column":"ACCOUNT_REF","role":"entity_key""#)
+                && fields.contains(r#""role_confidence":"overlay""#),
+            "{fields}"
+        );
+
+        // A column the dataset does not have: refused, with a suggestion.
+        use_overlay(
+            "[[datasets]]\nid = \"DATASET\"\n\n[[datasets.fields]]\ncolumn = \"LOADED\"\nrole = \"time_index\"\n"
+                .replace("DATASET", &dataset_id)
+                .as_str(),
+        );
+        let refused = envelope(catalog_surface::dataset_inspect_outcome(
+            OutputFormat::Json,
+            "req-inspect-overlay-bad".to_owned(),
+            dataset_id.clone(),
+        ));
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["error"]["code"], "FSNOW-1002", "{refused}");
+        assert!(
+            refused["did_you_mean"].to_string().contains("LOADED_AT"),
+            "{refused}"
+        );
+        let validated = envelope(catalog_surface::validate_manifest_outcome(
+            OutputFormat::Json,
+            "req-validate-overlay".to_owned(),
+        ));
+        assert_eq!(validated["ok"], false, "{validated}");
+        catalog_surface::TEST_MANIFEST_OVERLAY.with(|slot| *slot.borrow_mut() = None);
+        let _ = std::fs::remove_file(&overlay_path);
+    }
+
+    #[test]
+    fn a_transport_error_in_the_relation_pass_fails_the_scan() {
+        let mut script = information_schema_script_with_scope("NET_DB", "NET_SCHEMA");
+        script[2] = Err(SnowflakeError::new(
+            SnowflakeErrorCode::NetworkError,
+            "connection reset",
+        ));
+        install("net_profile", None, None, script);
+        let outcome = run_catalog_scan_outcome(
+            OutputFormat::Json,
+            "req-scan-net".to_owned(),
+            "net_profile".to_owned(),
+            "NET_DB".to_owned(),
+            "NET_SCHEMA".to_owned(),
+            false,
+            RelationOptions::default(),
+        );
+        assert_ne!(outcome.status, CoreExitCode::Success);
+        assert_ne!(outcome.status, CoreExitCode::Findings);
+        let env = envelope(outcome);
+        assert_eq!(env["ok"], false, "{env}");
     }
 
     #[test]
@@ -4989,10 +5614,12 @@ mod tests {
     /// untouched.
     #[test]
     fn a_pending_signal_cancels_the_statement_context() {
-        let run = |interrupt: bool, terminate: bool| {
+        let run = |interrupt: bool, terminate: bool, external: bool| {
             let runtime = RuntimeBuilder::current_thread().build().unwrap();
             let interrupt = AtomicBool::new(interrupt);
             let terminate = AtomicBool::new(terminate);
+            // An MCP request's cancel probe (reality-check bead E2).
+            let external = external.then(|| Arc::new(|| true) as CancelProbe);
             runtime.block_on(async move {
                 let cx = Cx::current().unwrap();
                 // Stands in for the driver's poll wait: runs until its context
@@ -5010,13 +5637,14 @@ mod tests {
                     }
                     None
                 };
-                cancel_on_flags(&cx, work, &interrupt, &terminate).await
+                cancel_on_flags(&cx, work, &interrupt, &terminate, external).await
             })
         };
-        assert_eq!(run(true, false), Some(CancelKind::User));
-        assert_eq!(run(false, true), Some(CancelKind::Shutdown));
+        assert_eq!(run(true, false, false), Some(CancelKind::User));
+        assert_eq!(run(false, true, false), Some(CancelKind::Shutdown));
+        assert_eq!(run(false, false, true), Some(CancelKind::User));
         assert_eq!(
-            run(false, false),
+            run(false, false, false),
             None,
             "nothing pending: the work is not cancelled"
         );
@@ -5358,6 +5986,75 @@ mod tests {
         assert!(!is_write_capable_privilege("SELECT"));
         assert!(!is_write_capable_privilege("USAGE"));
         assert_eq!(quoted_identifier(r#"we"ird"#), r#""we""ird""#);
+    }
+
+    #[test]
+    fn progress_lines_are_one_json_object_per_event() {
+        let line = progress_line(
+            &DriverEvent::PartitionFetched {
+                index: 2,
+                rows: 10,
+                bytes: 512,
+            },
+            7,
+        );
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+        assert_eq!(value["event"], "partition_fetched");
+        assert_eq!(value["index"], 2);
+        assert_eq!(value["rows"], 10);
+        assert_eq!(value["bytes"], 512);
+        assert_eq!(value["elapsed_ms"], 7);
+        assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn the_run_observer_keeps_the_handle_and_the_cancel_answer() {
+        let mut observer = RunObserver::new(false);
+        observer.event(DriverEvent::Submitted {
+            statement_handle: Some("01b2-handle".to_owned()),
+            running: true,
+        });
+        observer.event(DriverEvent::Polled { polls: 1 });
+        observer.event(DriverEvent::RemoteCancel {
+            statement_handle: "01b2-handle".to_owned(),
+            acknowledged: true,
+            detail: "completed".to_owned(),
+        });
+        assert_eq!(
+            observer.facts,
+            RunFacts {
+                statement_handle: Some("01b2-handle".to_owned()),
+                remote_cancel: Some((true, "completed".to_owned())),
+            }
+        );
+        let extra = terminal_run_json(&observer.facts);
+        assert_eq!(extra["accepted_by_snowflake"], true);
+        assert_eq!(extra["remote_cancel"]["acknowledged"], true);
+        // Never accepted (cancelled while connecting): no handle, no cancel.
+        let never = terminal_run_json(&RunFacts::default());
+        assert_eq!(never["accepted_by_snowflake"], false);
+        assert!(never.get("remote_cancel").is_none());
+        let line = progress_line(
+            &DriverEvent::RemoteCancel {
+                statement_handle: "h".to_owned(),
+                acknowledged: false,
+                detail: "unexpected".to_owned(),
+            },
+            3,
+        );
+        assert!(line.contains(r#""event":"remote_cancel""#), "{line}");
+    }
+
+    #[test]
+    fn signal_cancelled_runs_exit_130_or_143() {
+        assert_eq!(signal_status(true, false), Some(130));
+        assert_eq!(signal_status(false, true), Some(143));
+        assert_eq!(
+            signal_status(true, true),
+            Some(130),
+            "SIGINT was the cancel"
+        );
+        assert_eq!(signal_status(false, false), None);
     }
 
     #[test]

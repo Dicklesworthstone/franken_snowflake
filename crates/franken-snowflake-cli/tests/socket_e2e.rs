@@ -691,8 +691,300 @@ fn sigint_cancels_the_statement_in_flight() {
         "{}",
         run.context()
     );
-    // A user cancel is exit 0 by the core cancel policy.
-    assert_eq!(run.exit, 0, "{}", run.context());
+    // An interrupted command exits 130, as the shell expects.
+    assert_eq!(run.exit, 130, "{}", run.context());
+    assert_eq!(
+        run.envelope["statement_handle"],
+        HANDLE,
+        "{}",
+        run.context()
+    );
+    // The receipt says the statement was accepted and the cancel acknowledged.
+    let receipt = run.envelope["receipt_hash"]
+        .as_str()
+        .expect("a cancelled run records a receipt")
+        .to_owned();
+    let show = h.run(server.port, &["receipt", "show", &receipt, "--json"]);
+    let shown = show.envelope["data"].to_string();
+    assert!(
+        shown.contains(r#""accepted_by_snowflake":true"#)
+            && shown.contains(r#""remote_cancel":{"acknowledged":true"#)
+            && shown.contains(HANDLE),
+        "{}",
+        show.context()
+    );
+}
+
+/// Reality-check bead E2: over `mcp serve --stdio`, a `notifications/cancelled`
+/// for a running `query_run` cancels the statement server-side while the call
+/// is still running, and the call answers `cancelled`.
+#[cfg(feature = "mcp")]
+#[test]
+fn an_mcp_cancel_notification_cancels_the_running_statement() {
+    use std::io::{BufRead as _, Write as _};
+    const HANDLE: &str = "01b2c3d4-0000-0000-0000-00000000f160";
+    let cert = TestCert::mint();
+    let server = MockServer::start(&cert, |request, _| {
+        if request.is_submit() || request.is_poll_of(HANDLE) {
+            return running(HANDLE);
+        }
+        if request.method == "POST" && request.path() == format!("{SUBMIT_PATH}/{HANDLE}/cancel") {
+            return scenarios::cancel();
+        }
+        not_found()
+    });
+    let h = Harness::new("mcpcancel", &cert);
+    let mut child = h
+        .command(server.port, &["mcp", "serve", "--stdio"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn mcp serve --stdio");
+    let stdout = child.stdout.take().expect("stdout");
+    let (lines, received) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut send = |line: &str| {
+        stdin.write_all(line.as_bytes()).expect("write");
+        stdin.write_all(b"\n").expect("newline");
+        stdin.flush().expect("flush");
+    };
+    send(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"fsnow-e2e","version":"0"}}}"#,
+    );
+    send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+    send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query_run","arguments":{"profile":"sock","sql":"select system$wait(600)"}}}"#,
+    );
+    server.wait_for("the first poll", |seen| {
+        seen.iter().any(|s| s.is_poll_of(HANDLE))
+    });
+    send(
+        r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2,"reason":"user pressed stop"}}"#,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut answer = None;
+    while answer.is_none() && std::time::Instant::now() < deadline {
+        if let Ok(line) = received.recv_timeout(std::time::Duration::from_secs(1))
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
+            && value["id"] == 2
+        {
+            answer = Some(value);
+        }
+    }
+    let seen = server.seen();
+    drop(send);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        seen.iter()
+            .any(|s| s.method == "POST" && s.path() == format!("{SUBMIT_PATH}/{HANDLE}/cancel")),
+        "the running statement was cancelled server-side: {seen:?}"
+    );
+    let answer = answer.expect("the cancelled call answers");
+    let text = answer.to_string();
+    assert!(text.contains("cancelled"), "{text}");
+    assert!(!text.contains(CANARY_PAT), "{text}");
+}
+
+/// Send one HTTP/1.1 request to `mcp serve --http` and return (status, body).
+#[cfg(feature = "mcp")]
+fn mcp_http_post(port: u16, token: &str, body: &str) -> (u16, String) {
+    use std::io::{Read as _, Write as _};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(90)))
+        .expect("read timeout");
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).expect("write");
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, payload) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    (status, payload.to_owned())
+}
+
+/// The CLI envelope inside an MCP `tools/call` answer, without the fields
+/// that differ per invocation.
+#[cfg(feature = "mcp")]
+fn tool_envelope(answer: &str) -> serde_json::Value {
+    let answer: serde_json::Value = serde_json::from_str(answer).expect("JSON-RPC answer");
+    let text = answer["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tool text in {answer}"));
+    stable_envelope(serde_json::from_str(text).expect("envelope JSON"))
+}
+
+/// Drop what legitimately differs between two runs of the same statement.
+#[cfg(feature = "mcp")]
+fn stable_envelope(mut envelope: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = envelope.as_object_mut() {
+        for key in [
+            "request_id",
+            "receipt_hash",
+            "safe_next_commands",
+            "started_at",
+            "finished_at",
+            "duration_ms",
+        ] {
+            object.remove(key);
+        }
+    }
+    if let Some(data) = envelope["data"].as_object_mut() {
+        data.remove("sql_api_request_id");
+    }
+    envelope
+}
+
+/// Reality-check beads oj0.32 and E2 over `mcp serve --http` with the real
+/// TLS transport: an authorized `query_run` answers the same envelope as the
+/// CLI for the same statement (volatile fields aside), and a
+/// `notifications/cancelled` sent on another connection while a call runs
+/// cancels its statement server-side.
+#[cfg(feature = "mcp")]
+#[test]
+fn mcp_over_http_matches_the_cli_and_a_cancel_notification_cancels_the_call() {
+    use std::io::BufRead as _;
+    const DONE: &str = "01b2c3d4-0000-0000-0000-00000000f170";
+    const HELD: &str = "01b2c3d4-0000-0000-0000-00000000f171";
+    const TOKEN: &str = "fsnow-socket-token-0123456789abcdef0123456789";
+    let cert = TestCert::mint();
+    let server = MockServer::start(&cert, |request, _| {
+        if request.is_submit() {
+            let statement = request.body_json()["statement"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            return if statement.contains("system$wait") {
+                running(HELD)
+            } else {
+                completed_single(DONE)
+            };
+        }
+        if request.is_poll_of(HELD) {
+            return running(HELD);
+        }
+        if request.method == "POST" && request.path() == format!("{SUBMIT_PATH}/{HELD}/cancel") {
+            return scenarios::cancel();
+        }
+        not_found()
+    });
+    let h = Harness::new("mcphttp", &cert);
+    let cli = h.run(
+        server.port,
+        &[
+            "query",
+            "run",
+            "--profile",
+            "sock",
+            "--sql",
+            "select 1",
+            "--json",
+        ],
+    );
+    assert_eq!(cli.exit, 0, "{}", cli.context());
+
+    let mut child = h
+        .command(server.port, &["mcp", "serve", "--http", "127.0.0.1:0"])
+        .env("FRANKEN_SNOWFLAKE_MCP_TOKEN", TOKEN)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn mcp serve --http");
+    let stderr = child.stderr.take().expect("stderr");
+    let (lines, received) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let port: u16 = loop {
+        let line = received
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the server announces its address");
+        if let Some(rest) = line.split("http://127.0.0.1:").nth(1)
+            && let Some(port) = rest.split('/').next().and_then(|p| p.parse().ok())
+        {
+            break port;
+        }
+    };
+
+    // The server refuses tools/call until the client has initialized.
+    let (status, answer) = mcp_http_post(
+        port,
+        TOKEN,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"fsnow-e2e","version":"0"}}}"#,
+    );
+    assert_eq!(status, 200, "{answer}");
+
+    // Parity: the same statement through MCP answers the CLI's envelope.
+    let (status, answer) = mcp_http_post(
+        port,
+        TOKEN,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query_run","arguments":{"profile":"sock","sql":"select 1"}}}"#,
+    );
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(
+        tool_envelope(&answer),
+        stable_envelope(cli.envelope.clone()),
+        "MCP and CLI envelopes differ"
+    );
+
+    // Cancellation: call on one connection, cancel on another.
+    let call = std::thread::spawn(move || {
+        mcp_http_post(
+            port,
+            TOKEN,
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"query_run","arguments":{"profile":"sock","sql":"select system$wait(600)"}}}"#,
+        )
+    });
+    server.wait_for("the held statement's first poll", |seen| {
+        seen.iter().any(|s| s.is_poll_of(HELD))
+    });
+    let (status, _) = mcp_http_post(
+        port,
+        TOKEN,
+        r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7,"reason":"user pressed stop"}}"#,
+    );
+    assert!(status == 200 || status == 202 || status == 204, "{status}");
+    let (status, answer) = call.join().expect("the cancelled call returns");
+    let seen = server.seen();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        seen.iter()
+            .any(|s| s.method == "POST" && s.path() == format!("{SUBMIT_PATH}/{HELD}/cancel")),
+        "the running statement was cancelled server-side: {seen:?}"
+    );
+    assert!(!answer.contains(CANARY_PAT), "{answer}");
+    assert!(
+        status != 200 || answer.contains("cancel"),
+        "the call answers as cancelled: {status} {answer}"
+    );
 }
 
 /// Negative: a server whose certificate does not chain to the profile's CA
@@ -1177,14 +1469,17 @@ fn raw_cells_returns_the_wire_strings() {
 
 /// The discovery-to-query path over the wire: `catalog scan` runs its
 /// INFORMATION_SCHEMA statements (filters bound as parameters, never
-/// interpolated) and persists a snapshot; `dataset inspect` reads it offline;
-/// `query run --dataset` compiles and submits the pushed-down SQL and returns
-/// typed rows.
+/// interpolated) and its relation pass (keys, the view's dependencies,
+/// stages, file formats), and persists a snapshot; `dataset inspect` reads it
+/// offline; the graph verbs walk it; `query run --dataset` compiles and
+/// submits the pushed-down SQL and returns typed rows. A second scan asking
+/// for tags the role cannot read is `partial_success`, never a silent empty.
 #[test]
 fn catalog_scan_then_dataset_inspect_then_dataset_query() {
     const TABLES: &str = "01b2c3d4-0000-0000-0000-00000000f120";
     const COLUMNS: &str = "01b2c3d4-0000-0000-0000-00000000f121";
     const QUERY: &str = "01b2c3d4-0000-0000-0000-00000000f122";
+    const RELATION: &str = "01b2c3d4-0000-0000-0000-00000000f123";
     let cert = TestCert::mint();
     let server = MockServer::start(&cert, |request, _| {
         if !request.is_submit() {
@@ -1194,6 +1489,7 @@ fn catalog_scan_then_dataset_inspect_then_dataset_query() {
             .as_str()
             .unwrap_or_default()
             .to_owned();
+        let text = |name| (name, "TEXT", None, None);
         if statement.contains("INFORMATION_SCHEMA.TABLES") {
             return result_set(
                 TABLES,
@@ -1206,16 +1502,107 @@ fn catalog_scan_then_dataset_inspect_then_dataset_query() {
                     ("ROW_COUNT", "FIXED", Some(38), Some(0)),
                     ("BYTES", "FIXED", Some(38), Some(0)),
                 ],
+                &[
+                    vec![
+                        Some("DB"),
+                        Some("PUBLIC"),
+                        Some("EVENTS"),
+                        Some("BASE TABLE"),
+                        Some("daily events"),
+                        Some("3"),
+                        Some("4096"),
+                    ],
+                    vec![
+                        Some("DB"),
+                        Some("PUBLIC"),
+                        Some("EVENTS_DAILY"),
+                        Some("VIEW"),
+                        None,
+                        None,
+                        None,
+                    ],
+                ],
+            );
+        }
+        if statement.starts_with("SHOW PRIMARY KEYS") {
+            return result_set(
+                RELATION,
+                &[
+                    text("created_on"),
+                    text("database_name"),
+                    text("schema_name"),
+                    text("table_name"),
+                    text("column_name"),
+                    ("key_sequence", "FIXED", Some(38), Some(0)),
+                    text("comment"),
+                    text("constraint_name"),
+                ],
                 &[vec![
+                    Some("2026-09-01"),
                     Some("DB"),
                     Some("PUBLIC"),
                     Some("EVENTS"),
-                    Some("BASE TABLE"),
-                    Some("daily events"),
-                    Some("3"),
-                    Some("4096"),
+                    Some("ENTITY_ID"),
+                    Some("1"),
+                    None,
+                    Some("PK_EVENTS"),
                 ]],
             );
+        }
+        if statement.contains("GET_OBJECT_REFERENCES") {
+            return result_set(
+                RELATION,
+                &[
+                    text("DATABASE_NAME"),
+                    text("SCHEMA_NAME"),
+                    text("VIEW_NAME"),
+                    text("REFERENCED_DATABASE_NAME"),
+                    text("REFERENCED_SCHEMA_NAME"),
+                    text("REFERENCED_OBJECT_NAME"),
+                    text("REFERENCED_OBJECT_TYPE"),
+                ],
+                &[vec![
+                    Some("DB"),
+                    Some("PUBLIC"),
+                    Some("EVENTS_DAILY"),
+                    Some("DB"),
+                    Some("PUBLIC"),
+                    Some("EVENTS"),
+                    Some("TABLE"),
+                ]],
+            );
+        }
+        if statement.contains("INFORMATION_SCHEMA.STAGES") {
+            return result_set(
+                RELATION,
+                &[
+                    text("STAGE_CATALOG"),
+                    text("STAGE_SCHEMA"),
+                    text("STAGE_NAME"),
+                    text("STAGE_URL"),
+                    text("STAGE_REGION"),
+                    text("STAGE_TYPE"),
+                    text("COMMENT"),
+                ],
+                &[vec![
+                    Some("DB"),
+                    Some("PUBLIC"),
+                    Some("LANDING"),
+                    None,
+                    None,
+                    Some("Internal Named"),
+                    None,
+                ]],
+            );
+        }
+        if statement.contains("TAG_REFERENCES") {
+            return scenarios::statement_failed();
+        }
+        if statement.contains("INFORMATION_SCHEMA.TABLE_CONSTRAINTS")
+            || statement.contains("INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS")
+            || statement.contains("INFORMATION_SCHEMA.FILE_FORMATS")
+        {
+            return result_set(RELATION, &[text("CONSTRAINT_NAME")], &[]);
         }
         if statement.contains("INFORMATION_SCHEMA.COLUMNS") {
             let column = |name, ordinal, kind, precision, scale| {
@@ -1281,11 +1668,30 @@ fn catalog_scan_then_dataset_inspect_then_dataset_query() {
         ],
     );
     assert_eq!(scan.exit, 0, "{}", scan.context());
+    assert_eq!(
+        scan.envelope["outcome_kind"],
+        "success",
+        "{}",
+        scan.context()
+    );
     let data = &scan.envelope["data"];
     assert_eq!(data["store"]["persisted"], true, "{}", scan.context());
     let dataset = &data["datasets"][0];
     assert_eq!(dataset["object"], "EVENTS", "{}", scan.context());
     assert_eq!(dataset["column_count"], 3, "{}", scan.context());
+    assert_eq!(
+        dataset["primary_key"],
+        serde_json::json!(["ENTITY_ID"]),
+        "{}",
+        scan.context()
+    );
+    assert_eq!(
+        data["relations"]["view_depends_on"],
+        1,
+        "{}",
+        scan.context()
+    );
+    assert_eq!(data["relations"]["stage_count"], 1, "{}", scan.context());
     // Field roles inferred from the discovered column types.
     assert_eq!(dataset["roles"]["time_index"][0], "EVENT_DATE");
     assert_eq!(dataset["roles"]["entity_key"][0], "ENTITY_ID");
@@ -1293,8 +1699,11 @@ fn catalog_scan_then_dataset_inspect_then_dataset_query() {
         .as_str()
         .expect("dataset id")
         .to_owned();
+    // TABLES, COLUMNS, then the relation pass: SHOW PRIMARY KEYS, the two
+    // constraint views, STAGES, FILE_FORMATS, and one GET_OBJECT_REFERENCES
+    // for the view (no external table, tags not requested).
     let discovery: Vec<Seen> = server.seen();
-    assert_eq!(discovery.len(), 2, "{discovery:?}");
+    assert_eq!(discovery.len(), 8, "{discovery:?}");
     for statement in &discovery {
         let body = statement.body_json();
         let sql = body["statement"].as_str().unwrap_or_default();
@@ -1302,13 +1711,18 @@ fn catalog_scan_then_dataset_inspect_then_dataset_query() {
             !sql.contains("'DB'") && !sql.contains("'PUBLIC'"),
             "filters are bound, never interpolated: {sql}"
         );
-        assert_eq!(body["bindings"]["1"]["value"], "DB", "{body}");
-        assert_eq!(body["bindings"]["2"]["value"], "PUBLIC", "{body}");
+        if sql.starts_with("SHOW") {
+            assert_eq!(sql, r#"SHOW PRIMARY KEYS IN SCHEMA "DB"."PUBLIC""#);
+        } else if sql.contains("GET_OBJECT_REFERENCES") {
+            assert_eq!(body["bindings"]["3"]["value"], "\"EVENTS_DAILY\"", "{body}");
+        } else {
+            assert_eq!(body["bindings"]["1"]["value"], "DB", "{body}");
+        }
     }
 
     let inspect = h.run(server.port, &["dataset", "inspect", &dataset_id, "--json"]);
     assert_eq!(inspect.exit, 0, "{}", inspect.context());
-    assert_eq!(server.seen().len(), 2, "inspect is offline");
+    assert_eq!(server.seen().len(), 8, "inspect is offline");
 
     let query = h.run(
         server.port,
@@ -1324,8 +1738,8 @@ fn catalog_scan_then_dataset_inspect_then_dataset_query() {
     );
     assert_eq!(query.exit, 0, "{}", query.context());
     let seen = server.seen();
-    assert_eq!(seen.len(), 3, "{seen:?}");
-    let submitted = seen[2].body_json();
+    assert_eq!(seen.len(), 9, "{seen:?}");
+    let submitted = seen[8].body_json();
     let sql = submitted["statement"].as_str().unwrap_or_default();
     assert!(sql.contains("EVENTS"), "{sql}");
     assert_eq!(
@@ -1333,6 +1747,179 @@ fn catalog_scan_then_dataset_inspect_then_dataset_query() {
         serde_json::json!([["2020-01-01", "ENTITY123", "12.50"]]),
         "{}",
         query.context()
+    );
+
+    // Graph verbs over the persisted snapshot (reality-check bead oj0.34),
+    // all offline: the mock sees no further request.
+    let relates = h.run(
+        server.port,
+        &["catalog", "relates", "sock", "db.public.events", "--json"],
+    );
+    assert_eq!(relates.exit, 0, "{}", relates.context());
+    let related: Vec<String> = relates.envelope["data"]["related"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry["node"]["qualified_name"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    for expected in ["DB.PUBLIC", "DB.PUBLIC.EVENTS.AMOUNT", "DB"] {
+        assert!(
+            related.iter().any(|name| name == expected),
+            "{expected}: {related:?}"
+        );
+    }
+    // Lineage follows dependencies, not containment: the view reads the
+    // table, and the table is read by the view and by its dataset.
+    let up = h.run(
+        server.port,
+        &[
+            "catalog",
+            "lineage",
+            "sock",
+            "DB.PUBLIC.EVENTS_DAILY",
+            "--up",
+            "--json",
+        ],
+    );
+    assert_eq!(up.exit, 0, "{}", up.context());
+    assert_eq!(up.envelope["data"]["count"], 1, "{}", up.context());
+    let source = &up.envelope["data"]["nodes"][0];
+    assert_eq!(
+        source["node"]["qualified_name"],
+        "DB.PUBLIC.EVENTS",
+        "{}",
+        up.context()
+    );
+    assert_eq!(source["via"], "view_depends_on", "{}", up.context());
+    let down = h.run(
+        server.port,
+        &[
+            "catalog",
+            "lineage",
+            "sock",
+            "DB.PUBLIC.EVENTS",
+            "--down",
+            "--json",
+        ],
+    );
+    let dependents: Vec<String> = down.envelope["data"]["nodes"]
+        .as_array()
+        .map(|nodes| {
+            nodes
+                .iter()
+                .map(|step| format!("{}:{}", step["via"], step["node"]["kind"]))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        dependents.contains(&r#""view_depends_on":"object""#.to_owned())
+            && dependents.contains(&r#""dataset_object":"dataset""#.to_owned()),
+        "{dependents:?} {}",
+        down.context()
+    );
+    assert!(
+        !down.envelope["data"]["nodes"]
+            .to_string()
+            .contains("DB.PUBLIC.EVENTS.AMOUNT"),
+        "columns are containment, not lineage: {}",
+        down.context()
+    );
+    let cycles = h.run(server.port, &["catalog", "cycles", "sock", "--json"]);
+    assert_eq!(cycles.exit, 0, "{}", cycles.context());
+    assert_eq!(cycles.envelope["data"]["count"], 0, "{}", cycles.context());
+    let unknown = h.run(
+        server.port,
+        &["catalog", "relates", "sock", "DB.PUBLIC.EVENTZ", "--json"],
+    );
+    assert_eq!(
+        unknown.envelope["error"]["code"],
+        "FSNOW-7002",
+        "{}",
+        unknown.context()
+    );
+    assert!(
+        unknown.envelope["did_you_mean"]
+            .to_string()
+            .contains("DB.PUBLIC.EVENTS"),
+        "{}",
+        unknown.context()
+    );
+    // Search ranks by the query's words, offline; nothing matching is an
+    // empty success, not an error (reality-check bead oj0.36).
+    let search = h.run(
+        server.port,
+        &["catalog", "search", "sock", "daily events", "--json"],
+    );
+    assert_eq!(search.exit, 0, "{}", search.context());
+    assert_eq!(
+        search.envelope["data"]["hits"][0]["qualified_name"],
+        "DB.PUBLIC.EVENTS_DAILY",
+        "both words beat one: {}",
+        search.context()
+    );
+    assert_eq!(search.envelope["data"]["count"], 2, "{}", search.context());
+    let amount = h.run(
+        server.port,
+        &["catalog", "search", "sock", "amount", "--json"],
+    );
+    assert_eq!(
+        amount.envelope["data"]["hits"][0]["matches"][0]["text"],
+        "AMOUNT",
+        "{}",
+        amount.context()
+    );
+    let nothing = h.run(
+        server.port,
+        &["catalog", "search", "sock", "zebra", "--json"],
+    );
+    assert_eq!(nothing.exit, 0, "{}", nothing.context());
+    assert_eq!(
+        nothing.envelope["data"]["count"],
+        0,
+        "{}",
+        nothing.context()
+    );
+    assert_eq!(server.seen().len(), 9, "graph verbs and search are offline");
+
+    // Tags the role cannot read: the scan still lands, as partial_success
+    // (exit 1) with a warning naming the source.
+    let tagged = h.run(
+        server.port,
+        &[
+            "catalog",
+            "scan",
+            "sock",
+            "--database",
+            "DB",
+            "--schema",
+            "PUBLIC",
+            "--tags",
+            "--json",
+        ],
+    );
+    assert_eq!(tagged.exit, 1, "{}", tagged.context());
+    assert_eq!(
+        tagged.envelope["outcome_kind"],
+        "partial_success",
+        "{}",
+        tagged.context()
+    );
+    assert_eq!(tagged.envelope["ok"], true, "{}", tagged.context());
+    assert!(
+        tagged.envelope["warnings"]
+            .to_string()
+            .contains("`tag_references` was refused"),
+        "{}",
+        tagged.context()
+    );
+    assert_eq!(
+        tagged.envelope["data"]["relations"]["view_depends_on"],
+        1,
+        "{}",
+        tagged.context()
     );
 }
 
@@ -1510,4 +2097,100 @@ fn export_run_streams_csv_and_max_rows_refuses_without_a_file() {
         "the oversized statement was cancelled: {:?}",
         server.seen()
     );
+}
+
+/// `--progress` (reality-check bead E5): one JSON object per statement event
+/// on stderr, while stdout stays the single envelope and the export is the
+/// same bytes as without it.
+#[test]
+fn progress_events_go_to_stderr_and_change_nothing_else() {
+    const HANDLE: &str = "01b2c3d4-0000-0000-0000-00000000f150";
+    let cert = TestCert::mint();
+    let server = MockServer::start(&cert, |request, before| {
+        if request.is_submit() {
+            return running(HANDLE);
+        }
+        if request.is_poll_of(HANDLE) {
+            // Polls of this run only: the second export resubmits the handle.
+            let polls = before
+                .iter()
+                .rev()
+                .take_while(|seen| !seen.is_submit())
+                .filter(|seen| seen.is_poll_of(HANDLE))
+                .count();
+            return if polls == 0 {
+                running(HANDLE)
+            } else {
+                completed_multi(HANDLE)
+            };
+        }
+        match request.query("partition") {
+            Some("1") => scenarios::gzip_partition(),
+            Some("2") => MockHttpResponse::json(200, br#"{"data":[["5","epsilon"]]}"#.to_vec()),
+            _ => not_found(),
+        }
+    });
+    let h = Harness::new("progress", &cert);
+    let export = |name: &str, progress: bool| {
+        let out = h.dir.join(name).to_string_lossy().into_owned();
+        let mut args = vec![
+            "export",
+            "run",
+            "--profile",
+            "sock",
+            "--sql",
+            "select 1",
+            "--format",
+            "jsonl",
+        ];
+        if progress {
+            args.push("--progress");
+        }
+        args.extend(["--out", out.as_str(), "--json"]);
+        let run = h.run(server.port, &args);
+        (run, fs::read(&out).unwrap_or_default())
+    };
+    let (quiet, quiet_bytes) = export("quiet.jsonl", false);
+    let (loud, loud_bytes) = export("loud.jsonl", true);
+    assert_eq!(quiet.exit, 0, "{}", quiet.context());
+    assert_eq!(loud.exit, 0, "{}", loud.context());
+    assert!(!quiet_bytes.is_empty());
+    assert_eq!(
+        quiet_bytes, loud_bytes,
+        "--progress changes no output bytes"
+    );
+    assert!(
+        quiet.stderr.trim().is_empty(),
+        "no events unasked: {}",
+        quiet.stderr
+    );
+    let events: Vec<serde_json::Value> = loud
+        .stderr
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each stderr line is one JSON object"))
+        .collect();
+    let kinds: Vec<&str> = events
+        .iter()
+        .map(|event| event["event"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "submitted",
+            "polled",
+            "polled",
+            "partition_fetched",
+            "partition_fetched",
+            "completed"
+        ],
+        "{}",
+        loud.stderr
+    );
+    assert_eq!(events[0]["running"], true);
+    assert_eq!(events[0]["statement_handle"], HANDLE);
+    assert_eq!(events[3]["index"], 1);
+    assert_eq!(events[3]["rows"], 2);
+    assert_eq!(events[5]["rows"], 5);
+    assert_eq!(events[5]["partitions"], 3);
+    assert!(events.iter().all(|event| event["elapsed_ms"].is_u64()));
 }

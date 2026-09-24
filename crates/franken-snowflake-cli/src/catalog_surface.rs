@@ -7,19 +7,28 @@
 use franken_snowflake_cache::{CacheBackend, CacheError, CatalogSnapshotRecord};
 use franken_snowflake_catalog::diff::CatalogDiff;
 use franken_snowflake_catalog::model::{
-    CatalogSnapshot, ColumnCatalogEntry, DatasetManifest, DtypeClass, FieldRole,
+    CatalogRelation, CatalogSnapshot, ColumnCatalogEntry, DatasetManifest, DtypeClass, FieldRole,
+    ObjectRef,
 };
 use franken_snowflake_catalog::operator::{
     OperatorArity, OperatorCatalogEntry, built_in_operator_catalog, describe_operator_json_schema,
 };
+use franken_snowflake_catalog::overlay::{
+    ManifestOverlay, apply_dataset_overlay, overlay_for, parse_overlay,
+};
 use franken_snowflake_catalog::planner::{quote_identifier, quote_qualified_object};
+use franken_snowflake_catalog::search::{
+    DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT, search_snapshot, search_words,
+};
 use franken_snowflake_core::error::SnowflakeErrorCode;
 use franken_snowflake_core::exit::ExitCode as CoreExitCode;
 use franken_snowflake_export::{
     CopyCompression, CopyIntoOptions, CopyIntoPlan, CopySource, ExportFormat,
     LOCAL_BACKENDS_ENABLED,
 };
-use franken_snowflake_graph::graph_from_snapshot;
+use franken_snowflake_graph::{
+    CatalogGraph, CatalogNodeKind, LineageDirection, dataset_key, graph_from_snapshot,
+};
 
 use crate::local_store::{self, Store};
 use crate::{
@@ -36,6 +45,483 @@ pub const DATA_SOURCE_CACHE: &str = "cache";
 /// Cap on profiled columns per `dataset profile` statement so one pushdown
 /// query stays bounded on wide tables.
 pub const PROFILE_COLUMN_CAP: usize = 50;
+
+// ---------------------------------------------------------------------------
+// catalog relates / lineage / cycles (reality-check bead oj0.34)
+// ---------------------------------------------------------------------------
+
+/// A graph question answered offline from the newest local catalog snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GraphQuery {
+    /// What relates to `object` within `depth` hops, in either direction.
+    Relates {
+        /// Node key, dataset id, or qualified name (`DB.SCHEMA.OBJECT[.COLUMN]`).
+        object: String,
+        /// `--depth` as given (1..=6, default 2).
+        depth: Option<String>,
+    },
+    /// Dependency lineage of `object`: `up` is what it reads or references
+    /// (view sources, referenced tables, stages, file formats), transitively;
+    /// down is what reads or references it (views, datasets, referencing
+    /// tables). Containment is not lineage.
+    Lineage {
+        /// Node key, dataset id, or qualified name.
+        object: String,
+        /// `--up` (upstream) rather than `--down` (downstream).
+        up: bool,
+    },
+    /// Dependency cycles in the graph.
+    Cycles,
+}
+
+impl GraphQuery {
+    /// The command id of this verb.
+    #[must_use]
+    pub const fn command_id(&self) -> &'static str {
+        match self {
+            Self::Relates { .. } => "catalog.relates",
+            Self::Lineage { .. } => "catalog.lineage",
+            Self::Cycles => "catalog.cycles",
+        }
+    }
+
+    const fn contract_id(&self) -> &'static str {
+        match self {
+            Self::Relates { .. } => "fsnow.catalog.relates.v1",
+            Self::Lineage { .. } => "fsnow.catalog.lineage.v1",
+            Self::Cycles => "fsnow.catalog.cycles.v1",
+        }
+    }
+}
+
+const DEFAULT_RELATES_DEPTH: usize = 2;
+const MAX_RELATES_DEPTH: usize = 6;
+
+/// The newest snapshot for a scope, or the typed "scan first" / store error.
+fn latest_snapshot(
+    format: OutputFormat,
+    command_id: &'static str,
+    contract_id: &'static str,
+    request_id: &str,
+    profile: &str,
+    database: Option<&str>,
+    schema: Option<&str>,
+) -> Result<(CatalogSnapshot, CatalogSnapshotRecord), Outcome> {
+    let store = local_store::open_store().map_err(|error| {
+        store_error(
+            format,
+            command_id,
+            contract_id,
+            request_id.to_owned(),
+            Some(profile.to_owned()),
+            &error,
+        )
+    })?;
+    let record = match store
+        .cache
+        .latest_catalog_snapshot(profile, database, schema)
+    {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            let scan = format!(
+                "franken-snowflake catalog scan {profile} --database {} --schema {} --json",
+                database.unwrap_or("<db>"),
+                schema.unwrap_or("<schema>")
+            );
+            return Err(typed_error(
+                format,
+                command_id,
+                contract_id,
+                request_id.to_owned(),
+                Some(profile.to_owned()),
+                SnowflakeErrorCode::MetadataError,
+                format!(
+                    "no catalog snapshot for profile `{profile}` (database={}, schema={}) in the local store; run a catalog scan first",
+                    database.unwrap_or("*"),
+                    schema.unwrap_or("*")
+                ),
+                vec![json_string("local store")],
+                vec![scan.clone()],
+                vec![scan],
+                vec![],
+            ));
+        }
+        Err(error) => {
+            return Err(cache_error(
+                format,
+                command_id,
+                contract_id,
+                request_id.to_owned(),
+                Some(profile.to_owned()),
+                &error,
+            ));
+        }
+    };
+    let snapshot =
+        serde_json::from_str::<CatalogSnapshot>(&record.payload.canonical).map_err(|error| {
+            typed_error(
+                format,
+                command_id,
+                contract_id,
+                request_id.to_owned(),
+                Some(profile.to_owned()),
+                SnowflakeErrorCode::MetadataError,
+                format!("stored snapshot is unreadable: {error}"),
+                vec![json_string("local store")],
+                vec![],
+                vec!["franken-snowflake doctor --json".to_string()],
+                vec![],
+            )
+        })?;
+    Ok((snapshot, record))
+}
+
+/// The node an agent means: an exact node key, a dataset id, or a qualified
+/// name (case-insensitive, the catalog object before a dataset that shares
+/// it). Otherwise the suggestions: close names, and names ending in the same
+/// last segment (`EVENTS` suggests `DB.PUBLIC.EVENTS`).
+fn resolve_graph_node(graph: &CatalogGraph, object: &str) -> Result<String, Vec<String>> {
+    if graph.nodes.contains_key(object) {
+        return Ok(object.to_owned());
+    }
+    let dataset = dataset_key(object);
+    if graph.nodes.contains_key(&dataset) {
+        return Ok(dataset);
+    }
+    let mut matches: Vec<_> = graph
+        .nodes
+        .values()
+        .filter(|node| {
+            node.qualified_name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(object))
+        })
+        .collect();
+    matches.sort_by_key(|node| node.kind == CatalogNodeKind::Dataset);
+    if let Some(node) = matches.first() {
+        return Ok(node.key.clone());
+    }
+    let names: Vec<&str> = graph
+        .nodes
+        .values()
+        .filter_map(|node| node.qualified_name.as_deref())
+        .collect();
+    let last = object.rsplit('.').next().unwrap_or(object);
+    let mut suggestions = did_you_mean(object, &names);
+    for name in &names {
+        let name_last = name.rsplit('.').next().unwrap_or(name);
+        if name_last.eq_ignore_ascii_case(last) && !suggestions.iter().any(|s| s == name) {
+            suggestions.push((*name).to_owned());
+        }
+    }
+    suggestions.sort();
+    suggestions.truncate(5);
+    Err(suggestions)
+}
+
+fn graph_node_json(graph: &CatalogGraph, key: &str) -> Json {
+    match graph.nodes.get(key) {
+        Some(node) => json_object(vec![
+            ("key", json_string(node.key.clone())),
+            ("kind", json_string(node.kind.as_str())),
+            ("label", json_string(node.label.clone())),
+            ("qualified_name", option_json(node.qualified_name.clone())),
+        ]),
+        None => json_object(vec![("key", json_string(key.to_owned()))]),
+    }
+}
+
+/// `catalog relates|lineage|cycles`: answer a graph question offline from the
+/// newest local snapshot. An empty answer is a success with an empty list; an
+/// unknown object is FSNOW-7002 with suggestions, never an empty success.
+pub fn catalog_graph_query_outcome(
+    format: OutputFormat,
+    request_id: String,
+    query: GraphQuery,
+    profile: String,
+    database: Option<String>,
+    schema: Option<String>,
+) -> Outcome {
+    let command_id = query.command_id();
+    let contract_id = query.contract_id();
+    let (snapshot, record) = match latest_snapshot(
+        format,
+        command_id,
+        contract_id,
+        &request_id,
+        &profile,
+        database.as_deref(),
+        schema.as_deref(),
+    ) {
+        Ok(found) => found,
+        Err(outcome) => return outcome,
+    };
+    let graph = graph_from_snapshot(&snapshot);
+    let unknown = |object: &str, suggestions: Vec<String>| {
+        typed_error(
+            format,
+            command_id,
+            contract_id,
+            request_id.clone(),
+            Some(profile.clone()),
+            SnowflakeErrorCode::MetadataError,
+            format!(
+                "`{object}` is not in the catalog snapshot of profile `{profile}`; use a node key, a dataset id, or DB.SCHEMA.OBJECT[.COLUMN]"
+            ),
+            vec![json_string("local store")],
+            vec![format!("franken-snowflake catalog graph {profile} --json")],
+            vec![format!(
+                "franken-snowflake catalog scan {profile} --database <db> --schema <schema> --json"
+            )],
+            suggestions,
+        )
+    };
+    let data: Vec<(&'static str, Json)> = match &query {
+        GraphQuery::Relates { object, depth } => {
+            let depth = match depth.as_deref().map(str::parse::<usize>) {
+                None => DEFAULT_RELATES_DEPTH,
+                Some(Ok(depth)) if (1..=MAX_RELATES_DEPTH).contains(&depth) => depth,
+                Some(_) => {
+                    return typed_error(
+                        format,
+                        command_id,
+                        contract_id,
+                        request_id,
+                        Some(profile),
+                        SnowflakeErrorCode::UsageError,
+                        format!("--depth must be 1..={MAX_RELATES_DEPTH}"),
+                        vec![],
+                        vec![],
+                        vec![format!(
+                            "franken-snowflake catalog relates <profile> {object} --depth 2 --json"
+                        )],
+                        vec![],
+                    );
+                }
+            };
+            let key = match resolve_graph_node(&graph, object) {
+                Ok(key) => key,
+                Err(suggestions) => return unknown(object, suggestions),
+            };
+            let related: Vec<Json> = graph
+                .what_relates_to(&key, depth)
+                .into_iter()
+                .map(|entry| {
+                    let mut fields = vec![("node", graph_node_json(&graph, &entry.node))];
+                    fields.extend([
+                        (
+                            "depth",
+                            Json::Number(i64::try_from(entry.depth).unwrap_or(i64::MAX)),
+                        ),
+                        ("incoming", Json::Bool(entry.incoming)),
+                        ("outgoing", Json::Bool(entry.outgoing)),
+                    ]);
+                    json_object(fields)
+                })
+                .collect();
+            vec![
+                ("object", graph_node_json(&graph, &key)),
+                (
+                    "depth",
+                    Json::Number(i64::try_from(depth).unwrap_or(i64::MAX)),
+                ),
+                (
+                    "count",
+                    Json::Number(i64::try_from(related.len()).unwrap_or(i64::MAX)),
+                ),
+                ("related", json_array(related)),
+            ]
+        }
+        GraphQuery::Lineage { object, up } => {
+            let key = match resolve_graph_node(&graph, object) {
+                Ok(key) => key,
+                Err(suggestions) => return unknown(object, suggestions),
+            };
+            let direction = if *up {
+                LineageDirection::Upstream
+            } else {
+                LineageDirection::Downstream
+            };
+            let nodes: Vec<Json> = graph
+                .lineage(&key, direction)
+                .into_iter()
+                .map(|step| {
+                    json_object(vec![
+                        ("node", graph_node_json(&graph, &step.node)),
+                        (
+                            "depth",
+                            Json::Number(i64::try_from(step.depth).unwrap_or(i64::MAX)),
+                        ),
+                        ("via", json_string(step.via.as_str())),
+                        ("from", json_string(step.from)),
+                    ])
+                })
+                .collect();
+            vec![
+                ("object", graph_node_json(&graph, &key)),
+                ("direction", json_string(if *up { "up" } else { "down" })),
+                (
+                    "count",
+                    Json::Number(i64::try_from(nodes.len()).unwrap_or(i64::MAX)),
+                ),
+                ("nodes", json_array(nodes)),
+            ]
+        }
+        GraphQuery::Cycles => {
+            let cycles: Vec<Json> = graph
+                .cycles()
+                .iter()
+                .map(|cycle| {
+                    json_array(
+                        cycle
+                            .iter()
+                            .map(|node| graph_node_json(&graph, node))
+                            .collect(),
+                    )
+                })
+                .collect();
+            vec![
+                (
+                    "count",
+                    Json::Number(i64::try_from(cycles.len()).unwrap_or(i64::MAX)),
+                ),
+                ("cycles", json_array(cycles)),
+            ]
+        }
+    };
+    let mut fields = vec![
+        ("profile_id", json_string(profile.clone())),
+        ("database", option_json(database)),
+        ("schema", option_json(schema)),
+        ("snapshot", snapshot_meta_json(&record, "local_store")),
+        (
+            "edge_kinds",
+            string_array(
+                graph
+                    .edges
+                    .iter()
+                    .map(|edge| edge.kind.as_str().to_owned())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+            ),
+        ),
+    ];
+    fields.extend(data);
+    let mut envelope = base_envelope(
+        true,
+        "success",
+        command_id,
+        contract_id,
+        request_id,
+        json_object(fields),
+    );
+    envelope.data_source = DATA_SOURCE_CACHE;
+    if !snapshot.relations_discovered {
+        envelope.warnings.push(json_string(format!(
+            "snapshot {} predates the relation pass: it has containment only (no view dependencies, keys, stages or tags); rescan with `franken-snowflake catalog scan {profile} --database <db> --schema <schema> --json`",
+            snapshot.provenance.snapshot_id
+        )));
+    }
+    envelope.profile_id = Some(profile.clone());
+    envelope.safe_next_commands = vec![
+        format!("franken-snowflake catalog graph {profile} --mermaid"),
+        "franken-snowflake dataset inspect <dataset-id> --json".to_string(),
+    ];
+    Outcome {
+        status: CoreExitCode::Success,
+        body: Body::Envelope { envelope, format },
+    }
+}
+
+/// `catalog search <profile> <query>`: rank the newest snapshot's datasets by
+/// the query's words in their names, columns, comments, and tags
+/// (reality-check bead oj0.36). Offline; nothing matching is an empty success.
+pub fn catalog_search_outcome(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    query: String,
+    limit: Option<String>,
+    database: Option<String>,
+    schema: Option<String>,
+) -> Outcome {
+    const COMMAND: &str = "catalog.search";
+    const CONTRACT: &str = "fsnow.catalog.search.v1";
+    let usage = |message: String| {
+        typed_error(
+            format,
+            COMMAND,
+            CONTRACT,
+            request_id.clone(),
+            Some(profile.clone()),
+            SnowflakeErrorCode::UsageError,
+            message,
+            vec![],
+            vec![],
+            vec![format!(
+                "franken-snowflake catalog search {profile} \"customer email\" --limit 10 --json"
+            )],
+            vec![],
+        )
+    };
+    let limit = match limit.as_deref().map(str::parse::<usize>) {
+        None => DEFAULT_SEARCH_LIMIT,
+        Some(Ok(limit)) if (1..=MAX_SEARCH_LIMIT).contains(&limit) => limit,
+        Some(_) => return usage(format!("--limit must be 1..={MAX_SEARCH_LIMIT}")),
+    };
+    if search_words(&query).is_empty() {
+        return usage("the search query has no words (letters or digits)".to_owned());
+    }
+    let (snapshot, record) = match latest_snapshot(
+        format,
+        COMMAND,
+        CONTRACT,
+        &request_id,
+        &profile,
+        database.as_deref(),
+        schema.as_deref(),
+    ) {
+        Ok(found) => found,
+        Err(outcome) => return outcome,
+    };
+    let hits = search_snapshot(&snapshot, &query, limit);
+    let top = hits.first().map(|hit| hit.dataset_id.clone());
+    let mut envelope = base_envelope(
+        true,
+        "success",
+        COMMAND,
+        CONTRACT,
+        request_id,
+        json_object(vec![
+            ("profile_id", json_string(profile.clone())),
+            ("database", option_json(database)),
+            ("schema", option_json(schema)),
+            ("query", json_string(query)),
+            ("snapshot", snapshot_meta_json(&record, "local_store")),
+            ("count", Json::Number(hits.len() as i64)),
+            (
+                "hits",
+                json_array(hits.iter().map(Json::from_value).collect()),
+            ),
+        ]),
+    );
+    envelope.data_source = DATA_SOURCE_CACHE;
+    envelope.profile_id = Some(profile.clone());
+    envelope.safe_next_commands = match top {
+        Some(dataset_id) => vec![
+            format!("franken-snowflake dataset inspect {dataset_id} --json"),
+            format!("franken-snowflake catalog lineage {profile} {dataset_id} --up --json"),
+        ],
+        None => vec![format!(
+            "franken-snowflake catalog scan {profile} --database <db> --schema <schema> --json"
+        )],
+    };
+    Outcome {
+        status: CoreExitCode::Success,
+        body: Body::Envelope { envelope, format },
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared error envelope
@@ -276,11 +762,13 @@ pub fn describe_operator_outcome(
 // ---------------------------------------------------------------------------
 
 /// A dataset resolved from the local store: its manifest record, the parsed
-/// manifest, and the snapshot it came from (for columns and operators).
+/// manifest (with the manifest overlay applied), the snapshot it came from
+/// (for columns and operators), and the overlay file that applied, if any.
 pub struct StoredDataset {
     pub manifest: DatasetManifest,
     pub snapshot: CatalogSnapshot,
     pub snapshot_record: CatalogSnapshotRecord,
+    pub overlay: Option<String>,
 }
 
 /// Why a dataset could not be resolved offline.
@@ -291,6 +779,105 @@ pub enum DatasetLookupError {
         known: Vec<String>,
     },
     Corrupt(String),
+    Overlay(OverlayLoadError),
+}
+
+/// Env var naming the dataset manifest overlay file (reality-check bead
+/// oj0.35); without it the overlay is `<data dir>/datasets.toml`, if present.
+pub const MANIFEST_OVERLAY_ENV: &str = "FRANKEN_SNOWFLAKE_MANIFEST";
+
+/// An overlay file that could not be read or applied.
+pub struct OverlayLoadError {
+    pub path: String,
+    pub message: String,
+    pub did_you_mean: Vec<String>,
+}
+
+/// A parsed overlay and the file it came from.
+pub struct LoadedOverlay {
+    pub path: String,
+    pub overlay: ManifestOverlay,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Unit tests name their overlay here: the workspace forbids mutating the
+    /// process environment in tests, and the per-process data dir is shared.
+    pub static TEST_MANIFEST_OVERLAY: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Where the overlay is read from, and whether that place was named
+/// explicitly (an explicit file that is missing is an error; the default one
+/// is optional).
+pub fn manifest_overlay_path() -> Option<(std::path::PathBuf, bool)> {
+    #[cfg(test)]
+    {
+        TEST_MANIFEST_OVERLAY.with(|slot| slot.borrow().clone().map(|path| (path, true)))
+    }
+    #[cfg(not(test))]
+    {
+        match std::env::var_os(MANIFEST_OVERLAY_ENV).filter(|value| !value.is_empty()) {
+            Some(path) => Some((std::path::PathBuf::from(path), true)),
+            None => local_store::data_dir().map(|dir| (dir.join("datasets.toml"), false)),
+        }
+    }
+}
+
+/// Read and parse the overlay: `Ok(None)` when there is none.
+///
+/// # Errors
+/// An unreadable explicit file, or an overlay that does not parse.
+pub fn load_manifest_overlay() -> Result<Option<LoadedOverlay>, OverlayLoadError> {
+    let Some((path, explicit)) = manifest_overlay_path() else {
+        return Ok(None);
+    };
+    let shown = path.display().to_string();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !explicit => {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(OverlayLoadError {
+                path: shown,
+                message: format!("the overlay file cannot be read: {error}"),
+                did_you_mean: Vec::new(),
+            });
+        }
+    };
+    match parse_overlay(&text) {
+        Ok(overlay) => Ok(Some(LoadedOverlay {
+            path: shown,
+            overlay,
+        })),
+        Err(error) => Err(OverlayLoadError {
+            path: shown,
+            message: error.message(),
+            did_you_mean: error.did_you_mean(),
+        }),
+    }
+}
+
+/// Apply the overlay entry for `manifest`, if any; the overlay file's path
+/// when one applied.
+fn apply_manifest_overlay(
+    manifest: &mut DatasetManifest,
+) -> Result<Option<String>, DatasetLookupError> {
+    let Some(loaded) = load_manifest_overlay().map_err(DatasetLookupError::Overlay)? else {
+        return Ok(None);
+    };
+    let Some(entry) = overlay_for(&loaded.overlay, manifest) else {
+        return Ok(None);
+    };
+    apply_dataset_overlay(manifest, entry).map_err(|error| {
+        DatasetLookupError::Overlay(OverlayLoadError {
+            path: loaded.path.clone(),
+            message: error.message(),
+            did_you_mean: error.did_you_mean(),
+        })
+    })?;
+    Ok(Some(loaded.path))
 }
 
 /// Resolve a dataset id (exact, or case-insensitive readable-slug prefix) from
@@ -309,7 +896,7 @@ pub fn load_dataset(store: &Store, dataset_id: &str) -> Result<StoredDataset, Da
             });
         }
     };
-    let manifest: DatasetManifest = serde_json::from_str(&record.manifest.canonical)
+    let mut manifest: DatasetManifest = serde_json::from_str(&record.manifest.canonical)
         .map_err(|error| DatasetLookupError::Corrupt(format!("manifest payload: {error}")))?;
     let snapshot_id = record
         .snapshot_id
@@ -322,12 +909,22 @@ pub fn load_dataset(store: &Store, dataset_id: &str) -> Result<StoredDataset, Da
         .ok_or_else(|| {
             DatasetLookupError::Corrupt(format!("snapshot {snapshot_id} is missing from the store"))
         })?;
-    let snapshot: CatalogSnapshot = serde_json::from_str(&snapshot_record.payload.canonical)
+    let mut snapshot: CatalogSnapshot = serde_json::from_str(&snapshot_record.payload.canonical)
         .map_err(|error| DatasetLookupError::Corrupt(format!("snapshot payload: {error}")))?;
+    let overlay = apply_manifest_overlay(&mut manifest)?;
+    if overlay.is_some()
+        && let Some(entry) = snapshot
+            .datasets
+            .iter_mut()
+            .find(|dataset| dataset.id == manifest.id)
+    {
+        *entry = manifest.clone();
+    }
     Ok(StoredDataset {
         manifest,
         snapshot,
         snapshot_record,
+        overlay,
     })
 }
 
@@ -336,6 +933,157 @@ pub fn load_dataset(store: &Store, dataset_id: &str) -> Result<StoredDataset, Da
 /// manifest table only.
 fn known_dataset_ids(store: &Store) -> Vec<String> {
     store.cache.dataset_ids().unwrap_or_default()
+}
+
+/// A dataset manifest overlay that does not parse or does not fit its
+/// dataset: a usage error naming the file, never a silent fallback to the
+/// inferred roles.
+fn overlay_error_outcome(
+    format: OutputFormat,
+    command_id: &'static str,
+    output_contract_id: &'static str,
+    request_id: String,
+    error: OverlayLoadError,
+) -> Outcome {
+    typed_error(
+        format,
+        command_id,
+        output_contract_id,
+        request_id,
+        None,
+        SnowflakeErrorCode::UsageError,
+        format!(
+            "the dataset manifest overlay {} is invalid: {}",
+            error.path, error.message
+        ),
+        vec![json_string(error.path.clone())],
+        vec!["franken-snowflake dataset validate-manifest --json".to_string()],
+        vec![
+            format!("edit {} (or unset {MANIFEST_OVERLAY_ENV})", error.path),
+            "franken-snowflake dataset validate-manifest --json".to_string(),
+        ],
+        error.did_you_mean,
+    )
+}
+
+/// `dataset validate-manifest`: parse the overlay and check each entry
+/// against the datasets in the local store (reality-check bead oj0.35). An
+/// entry that matches no stored dataset is a warning (scan it first); a field
+/// naming a column its dataset lacks is an error.
+pub fn validate_manifest_outcome(format: OutputFormat, request_id: String) -> Outcome {
+    const COMMAND: &str = "dataset.validate_manifest";
+    const CONTRACT: &str = "fsnow.dataset.validate_manifest.v1";
+    let located = manifest_overlay_path();
+    let loaded = match load_manifest_overlay() {
+        Ok(Some(loaded)) => loaded,
+        Ok(None) => {
+            let path = located.map(|(path, _)| path.display().to_string());
+            let mut envelope = base_envelope(
+                true,
+                "success",
+                COMMAND,
+                CONTRACT,
+                request_id,
+                json_object(vec![
+                    ("path", option_json(path.clone())),
+                    ("present", Json::Bool(false)),
+                    ("entries", json_array(Vec::new())),
+                ]),
+            );
+            envelope.warnings = vec![json_string(format!(
+                "no dataset manifest overlay: create {} or set {MANIFEST_OVERLAY_ENV}; discovery's inferred roles apply",
+                path.unwrap_or_else(|| "<data dir>/datasets.toml".to_owned())
+            ))];
+            return Outcome {
+                status: CoreExitCode::Success,
+                body: Body::Envelope { envelope, format },
+            };
+        }
+        Err(error) => {
+            return overlay_error_outcome(format, COMMAND, CONTRACT, request_id, error);
+        }
+    };
+    let manifests: Vec<DatasetManifest> = local_store::open_store()
+        .ok()
+        .map(|store| {
+            store
+                .cache
+                .dataset_ids()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|id| store.cache.dataset_manifest(id).ok().flatten())
+                .filter_map(|record| serde_json::from_str(&record.manifest.canonical).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut entries = Vec::new();
+    let mut warnings = Vec::new();
+    for (index, entry) in loaded.overlay.datasets.iter().enumerate() {
+        let target = entry.id.clone().unwrap_or_else(|| {
+            format!(
+                "{}.{}.{}",
+                entry.database.as_deref().unwrap_or_default(),
+                entry.schema.as_deref().unwrap_or_default(),
+                entry.object.as_deref().unwrap_or_default()
+            )
+        });
+        let mut matched = Vec::new();
+        for manifest in &manifests {
+            let Some(found) = overlay_for(&loaded.overlay, manifest) else {
+                continue;
+            };
+            if !std::ptr::eq(found, entry) {
+                continue;
+            }
+            let mut applied = manifest.clone();
+            if let Err(error) = apply_dataset_overlay(&mut applied, entry) {
+                return overlay_error_outcome(
+                    format,
+                    COMMAND,
+                    CONTRACT,
+                    request_id,
+                    OverlayLoadError {
+                        path: loaded.path.clone(),
+                        message: format!("datasets[{index}]: {}", error.message()),
+                        did_you_mean: error.did_you_mean(),
+                    },
+                );
+            }
+            matched.push(json_string(manifest.id.clone()));
+        }
+        if matched.is_empty() {
+            warnings.push(json_string(format!(
+                "datasets[{index}] ({target}) matches no dataset in the local store yet; run a catalog scan for it"
+            )));
+        }
+        entries.push(json_object(vec![
+            ("index", Json::Number(index as i64)),
+            ("target", json_string(target)),
+            ("fields", Json::Number(entry.fields.len() as i64)),
+            ("matched", json_array(matched)),
+        ]));
+    }
+    let mut envelope = base_envelope(
+        true,
+        "success",
+        COMMAND,
+        CONTRACT,
+        request_id,
+        json_object(vec![
+            ("path", json_string(loaded.path)),
+            ("present", Json::Bool(true)),
+            ("entry_count", Json::Number(entries.len() as i64)),
+            ("entries", json_array(entries)),
+        ]),
+    );
+    envelope.data_source = DATA_SOURCE_CACHE;
+    envelope.warnings = warnings;
+    envelope.safe_next_commands =
+        vec!["franken-snowflake dataset inspect <dataset-id> --json".to_string()];
+    Outcome {
+        status: CoreExitCode::Success,
+        body: Body::Envelope { envelope, format },
+    }
 }
 
 pub fn dataset_lookup_error_outcome(
@@ -370,6 +1118,9 @@ pub fn dataset_lookup_error_outcome(
             vec!["franken-snowflake doctor --json".to_string()],
             vec![],
         ),
+        DatasetLookupError::Overlay(error) => {
+            overlay_error_outcome(format, command_id, output_contract_id, request_id, error)
+        }
         DatasetLookupError::NotFound { dataset_id, known } => {
             let known_refs: Vec<&str> = known.iter().map(String::as_str).collect();
             let suggestions = did_you_mean(&dataset_id, &known_refs);
@@ -501,11 +1252,23 @@ pub fn dataset_inspect_outcome(
         json_object(vec![
             ("dataset_id", json_string(stored.manifest.id.clone())),
             ("manifest", Json::from_value(&stored.manifest)),
+            ("overlay", option_json(stored.overlay.clone())),
             ("roles", roles_json(&stored.manifest)),
             ("column_count", Json::Number(columns.len() as i64)),
             (
                 "columns",
                 json_array(columns.iter().map(Json::from_value).collect()),
+            ),
+            (
+                "relations",
+                object_relations_json(
+                    &stored.snapshot,
+                    &ObjectRef::new(
+                        &stored.manifest.database,
+                        &stored.manifest.schema,
+                        &stored.manifest.object,
+                    ),
+                ),
             ),
             (
                 "operators",
@@ -749,6 +1512,86 @@ pub fn dataset_profile_plan_outcome(
 // catalog scan summary + catalog graph rendering (shared with the live path)
 // ---------------------------------------------------------------------------
 
+/// The relation pass as it concerns one object: its primary key, the
+/// relations naming it, and the tags set on it or its columns.
+fn object_relations_json(snapshot: &CatalogSnapshot, object: &ObjectRef) -> Json {
+    let names = |relation: &CatalogRelation| match relation {
+        CatalogRelation::ViewDependsOn { view, source, .. } => view == object || source == object,
+        CatalogRelation::ForeignKey { from, to, .. } => from == object || to == object,
+        CatalogRelation::UsesStage { object: user, .. }
+        | CatalogRelation::UsesFileFormat { object: user, .. } => user == object,
+    };
+    json_object(vec![
+        ("discovered", Json::Bool(snapshot.relations_discovered)),
+        (
+            "primary_key",
+            snapshot
+                .primary_key(object)
+                .map_or(Json::Null, |key| string_array(key.columns.clone())),
+        ),
+        (
+            "relations",
+            json_array(
+                snapshot
+                    .relations
+                    .iter()
+                    .filter(|relation| names(relation))
+                    .map(Json::from_value)
+                    .collect(),
+            ),
+        ),
+        (
+            "tags",
+            json_array(
+                snapshot
+                    .tags
+                    .iter()
+                    .filter(|tag| &tag.object == object)
+                    .map(Json::from_value)
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+/// Counts of the relation pass plus every gap it left, for the scan envelope.
+#[cfg(feature = "live")]
+fn relations_summary_json(snapshot: &CatalogSnapshot) -> Json {
+    let count = |kind: &str| {
+        snapshot
+            .relations
+            .iter()
+            .filter(|relation| match relation {
+                CatalogRelation::ViewDependsOn { .. } => kind == "view_depends_on",
+                CatalogRelation::ForeignKey { .. } => kind == "foreign_key",
+                CatalogRelation::UsesStage { .. } => kind == "uses_stage",
+                CatalogRelation::UsesFileFormat { .. } => kind == "uses_file_format",
+            })
+            .count() as i64
+    };
+    json_object(vec![
+        ("discovered", Json::Bool(snapshot.relations_discovered)),
+        ("view_depends_on", Json::Number(count("view_depends_on"))),
+        ("foreign_key", Json::Number(count("foreign_key"))),
+        ("uses_stage", Json::Number(count("uses_stage"))),
+        ("uses_file_format", Json::Number(count("uses_file_format"))),
+        (
+            "primary_key_count",
+            Json::Number(snapshot.primary_keys.len() as i64),
+        ),
+        ("stage_count", Json::Number(snapshot.stages.len() as i64)),
+        (
+            "file_format_count",
+            Json::Number(snapshot.file_formats.len() as i64),
+        ),
+        ("tag_count", Json::Number(snapshot.tags.len() as i64)),
+        (
+            "gaps",
+            json_array(snapshot.gaps.iter().map(Json::from_value).collect()),
+        ),
+    ])
+}
+
 /// Deterministic summary of a snapshot for the `catalog scan` envelope.
 #[cfg(feature = "live")]
 pub fn snapshot_summary_json(snapshot: &CatalogSnapshot) -> Vec<(&'static str, Json)> {
@@ -782,6 +1625,16 @@ pub fn snapshot_summary_json(snapshot: &CatalogSnapshot) -> Vec<(&'static str, J
                 ("column_count", Json::Number(column_count as i64)),
                 ("roles", roles_json(dataset)),
                 ("description", option_json(dataset.description.clone())),
+                (
+                    "primary_key",
+                    snapshot
+                        .primary_key(&ObjectRef::new(
+                            &dataset.database,
+                            &dataset.schema,
+                            &dataset.object,
+                        ))
+                        .map_or(Json::Null, |key| string_array(key.columns.clone())),
+                ),
             ])
         })
         .collect();
@@ -807,6 +1660,7 @@ pub fn snapshot_summary_json(snapshot: &CatalogSnapshot) -> Vec<(&'static str, J
             "operator_count",
             Json::Number(snapshot.operators.len() as i64),
         ),
+        ("relations", relations_summary_json(snapshot)),
         ("datasets", json_array(datasets)),
     ]
 }
@@ -1303,6 +2157,9 @@ pub struct ExportPlanSpec {
     /// transport only.
     #[cfg_attr(not(feature = "live"), allow(dead_code))]
     pub max_rows: Option<String>,
+    /// `export run --progress`: NDJSON progress on stderr (bead E5).
+    #[cfg_attr(not(feature = "live"), allow(dead_code))]
+    pub progress: bool,
 }
 
 const EXPORT_PLAN_EXAMPLE: &str = "franken-snowflake export plan --profile <profile> --sql \"select * from events\" --location @my_stage/exports/run_001 --format csv --json";
