@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::RequestId;
 use crate::redact::redact;
-use crate::sql_lexer::{self, SqlToken};
+use crate::sql_lexer::{self, SqlToken, SqlTokenKind};
 
 /// Write-intent schema version carried by dry-run plans and receipts.
 pub const WRITE_INTENT_SCHEMA_VERSION: u16 = 1;
@@ -87,6 +87,18 @@ pub enum WriteStatementKind {
     Remove,
     /// `USE ...`
     Use,
+    /// `EXECUTE IMMEDIATE ...` / `EXECUTE TASK ...`: runs arbitrary SQL, like `CALL`.
+    Execute,
+    /// `GET @stage ...` (file download; not supported by the SQL API).
+    Get,
+    /// `ALTER SESSION ...`
+    AlterSession,
+    /// `BEGIN` / `START TRANSACTION` / `COMMIT` / `ROLLBACK`.
+    Transaction,
+    /// `SET` / `UNSET` session variables.
+    SessionVariable,
+    /// `COPY INTO '<scheme>://...'`: an unload to a location outside Snowflake.
+    CopyIntoExternal,
     /// Read-only or unknown statements are not valid write-intent statements.
     Unknown,
 }
@@ -105,11 +117,33 @@ impl WriteStatementKind {
             | Self::Truncate
             | Self::Grant
             | Self::Revoke => WriteSafetyClass::Ddl,
-            Self::Call => WriteSafetyClass::Procedure,
-            Self::Put | Self::Remove | Self::CopyIntoStage => WriteSafetyClass::ExternalFile,
-            Self::Use => WriteSafetyClass::SessionState,
+            Self::Call | Self::Execute => WriteSafetyClass::Procedure,
+            Self::Put | Self::Get | Self::Remove | Self::CopyIntoStage | Self::CopyIntoExternal => {
+                WriteSafetyClass::ExternalFile
+            }
+            Self::Use | Self::AlterSession | Self::Transaction | Self::SessionVariable => {
+                WriteSafetyClass::SessionState
+            }
             Self::Unknown => WriteSafetyClass::Unknown,
         }
+    }
+
+    /// Statement kinds the Snowflake SQL API does not run as a single
+    /// statement: `PUT`/`GET` file transfer, and `USE`, `ALTER SESSION`,
+    /// transactions and `SET`, which it supports only inside a multi-statement
+    /// request (docs.snowflake.com/en/developer-guide/sql-api/intro, "Limitations
+    /// of the SQL API", consulted 2026-09-23).
+    #[must_use]
+    pub const fn sql_api_unsupported(self) -> bool {
+        matches!(
+            self,
+            Self::Put
+                | Self::Get
+                | Self::Use
+                | Self::AlterSession
+                | Self::Transaction
+                | Self::SessionVariable
+        )
     }
 
     /// Stable lowercase token used in confirmation phrases.
@@ -132,6 +166,12 @@ impl WriteStatementKind {
             Self::Put => "put",
             Self::Remove => "remove",
             Self::Use => "use",
+            Self::Execute => "execute",
+            Self::Get => "get",
+            Self::AlterSession => "alter_session",
+            Self::Transaction => "transaction",
+            Self::SessionVariable => "session_variable",
+            Self::CopyIntoExternal => "copy_into_external",
             Self::Unknown => "unknown",
         }
     }
@@ -193,6 +233,16 @@ pub struct WriteIntentPolicy {
     pub require_append_only_audit: bool,
     /// Explicit allowlist of statement families permitted by this profile.
     pub statement_allowlist: Vec<StatementAllowlistEntry>,
+    /// `CALL`, `EXECUTE IMMEDIATE` and `EXECUTE TASK` can run DDL and `GRANT`
+    /// inside the procedure, so they need their own opt-in beyond `allow_ddl`.
+    #[serde(default)]
+    pub allow_procedures: bool,
+    /// `COPY INTO '<scheme>://...'` moves data outside Snowflake.
+    #[serde(default)]
+    pub allow_external_unload: bool,
+    /// When set, only these statement kinds may run (a profile allowlist).
+    #[serde(default)]
+    pub allowed_kinds: Option<Vec<WriteStatementKind>>,
 }
 
 impl Default for WriteIntentPolicy {
@@ -205,6 +255,9 @@ impl Default for WriteIntentPolicy {
             require_idempotency_request_id: true,
             require_append_only_audit: true,
             statement_allowlist: Vec::new(),
+            allow_procedures: false,
+            allow_external_unload: false,
+            allowed_kinds: None,
         }
     }
 }
@@ -376,6 +429,12 @@ pub enum WriteIntentRefusalCode {
     ConfirmationTokenMismatch,
     /// The caller omitted an append-only audit intent.
     MissingAppendOnlyAudit,
+    /// The SQL API does not run this statement kind as a single statement.
+    StatementUnsupported,
+    /// A procedure or `EXECUTE` statement without the procedures opt-in.
+    ProceduresRefused,
+    /// An unload to an external location without its opt-in.
+    ExternalUnloadRefused,
     /// Reserved: every ladder rung passed but the calling surface has no live
     /// execution transport linked. The ladder itself now authorizes execution
     /// (see [`WriteIntentDecision::ExecutionAuthorized`]); this code is for a
@@ -455,11 +514,43 @@ pub fn evaluate_write_intent(
 
     let statement_kind = classify_write_statement(&request.redacted_sql_preview);
     let safety_class = statement_kind.safety_class();
+    if statement_kind.sql_api_unsupported() {
+        return refused(
+            WriteIntentRefusalCode::StatementUnsupported,
+            WriteIntentStage::SafetyClassified,
+            "the Snowflake SQL API does not run this statement as a single statement (PUT/GET file transfer, USE, ALTER SESSION, transactions, SET)",
+        );
+    }
     if safety_class == WriteSafetyClass::Ddl && !policy.allow_ddl {
         return refused(
             WriteIntentRefusalCode::DdlRefused,
             WriteIntentStage::SafetyClassified,
             "DDL is disabled by the write-intent ladder",
+        );
+    }
+    if safety_class == WriteSafetyClass::Procedure && !policy.allow_procedures {
+        return refused(
+            WriteIntentRefusalCode::ProceduresRefused,
+            WriteIntentStage::SafetyClassified,
+            "procedures and EXECUTE IMMEDIATE/TASK can run DDL and GRANT; they need their own opt-in",
+        );
+    }
+    if statement_kind == WriteStatementKind::CopyIntoExternal && !policy.allow_external_unload {
+        return refused(
+            WriteIntentRefusalCode::ExternalUnloadRefused,
+            WriteIntentStage::SafetyClassified,
+            "COPY INTO an external URL moves data outside Snowflake; it needs its own opt-in",
+        );
+    }
+    if policy
+        .allowed_kinds
+        .as_ref()
+        .is_some_and(|kinds| !kinds.contains(&statement_kind))
+    {
+        return refused(
+            WriteIntentRefusalCode::StatementNotAllowlisted,
+            WriteIntentStage::StatementAllowlisted,
+            "statement kind is not in the profile's allowed write kinds",
         );
     }
 
@@ -561,13 +652,30 @@ pub fn evaluate_write_intent(
 /// Classify a SQL preview into a write statement kind.
 #[must_use]
 pub fn classify_write_statement(sql: &str) -> WriteStatementKind {
-    match sql_lexer::lex(sql).first_word().as_deref() {
+    // Words only (like the verb check before): a stray symbol such as the
+    // `*/` left by a nested comment must not hide the verb.
+    let words = sql_lexer::lex(sql).words();
+    let first = words.first().map(String::as_str);
+    let second = words.get(1).map(String::as_str);
+    match (first, second) {
+        (Some("alter"), Some("session")) => WriteStatementKind::AlterSession,
+        (Some("execute"), _) => WriteStatementKind::Execute,
+        (Some("get"), _) => WriteStatementKind::Get,
+        (Some("begin" | "commit" | "rollback"), _) | (Some("start"), Some("transaction")) => {
+            WriteStatementKind::Transaction
+        }
+        (Some("set" | "unset"), _) => WriteStatementKind::SessionVariable,
+        (Some("copy"), _) => copy_into_target_kind(sql),
+        (first, _) => classify_by_verb(first),
+    }
+}
+
+fn classify_by_verb(verb: Option<&str>) -> WriteStatementKind {
+    match verb {
         Some("insert") => WriteStatementKind::Insert,
         Some("merge") => WriteStatementKind::Merge,
         Some("update") => WriteStatementKind::Update,
         Some("delete") => WriteStatementKind::Delete,
-        Some("copy") if looks_like_copy_into_stage(sql) => WriteStatementKind::CopyIntoStage,
-        Some("copy") => WriteStatementKind::CopyIntoTable,
         Some("create") => WriteStatementKind::Create,
         Some("alter") => WriteStatementKind::Alter,
         Some("drop") => WriteStatementKind::Drop,
@@ -605,23 +713,128 @@ fn refused(
     }
 }
 
-/// `COPY INTO @stage ...` (an unload to a stage) vs `COPY INTO <table> ...`:
-/// the first significant token after the leading `COPY INTO` decides.
-fn looks_like_copy_into_stage(sql: &str) -> bool {
+/// The first significant token after `COPY INTO` decides the kind: `@...` is
+/// an unload to a named, user or table stage; a quoted `'<scheme>://...'` is an
+/// unload to an external location (`s3://`, `gcs://`, `azure://`, ...);
+/// anything else is a load into a table.
+fn copy_into_target_kind(sql: &str) -> WriteStatementKind {
     let lexed = sql_lexer::lex(sql);
     let mut significant = lexed.significant();
     let copy = significant.next().and_then(SqlToken::word);
     let into = significant.next().and_then(SqlToken::word);
-    copy.as_deref() == Some("copy")
-        && into.as_deref() == Some("into")
-        && significant
-            .next()
-            .is_some_and(|target| target.text.starts_with('@'))
+    if copy.as_deref() != Some("copy") || into.as_deref() != Some("into") {
+        return WriteStatementKind::CopyIntoTable;
+    }
+    match significant.next() {
+        Some(target) if target.text.starts_with('@') => WriteStatementKind::CopyIntoStage,
+        Some(target)
+            if target.kind == SqlTokenKind::StringLiteral && target.text.contains("://") =>
+        {
+            WriteStatementKind::CopyIntoExternal
+        }
+        _ => WriteStatementKind::CopyIntoTable,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reality-check bead B4: statements the SQL API cannot run alone are
+    /// refused typed; procedures and external unloads need their own opt-in;
+    /// a profile kind allowlist is enforced, not generated.
+    #[test]
+    fn b4_statement_families_are_gated() {
+        let policy_for = |kind: WriteStatementKind| WriteIntentPolicy {
+            enabled: true,
+            allow_ddl: true,
+            require_dry_run: false,
+            require_exact_confirmation: false,
+            require_append_only_audit: false,
+            statement_allowlist: vec![StatementAllowlistEntry::new("auto", kind)],
+            ..WriteIntentPolicy::default()
+        };
+        let decide = |sql: &str, adjust: &dyn Fn(&mut WriteIntentPolicy)| {
+            let kind = classify_write_statement(sql);
+            let mut policy = policy_for(kind);
+            adjust(&mut policy);
+            let mut req = WriteIntentRequest::new(WriteIntentMode::PrepareExecution, sql);
+            req.dry_run = true;
+            req.allowlist_id = Some("auto".to_string());
+            req.request_id = Some(RequestId::new("req-b4"));
+            (kind, evaluate_write_intent(&req, &policy))
+        };
+        let refusal = |decision: &WriteIntentDecision| match decision {
+            WriteIntentDecision::Refused { refusal } => Some(refusal.code),
+            _ => None,
+        };
+        for sql in [
+            "put file:///etc/hosts @s",
+            "get @s file:///tmp",
+            "use role accountadmin",
+            "alter session set query_tag = 'x'",
+            "begin",
+            "start transaction",
+            "commit",
+            "rollback",
+            "set v = 1",
+        ] {
+            let (kind, decision) = decide(sql, &|_| {});
+            assert!(kind.sql_api_unsupported(), "{sql} -> {kind:?}");
+            assert_eq!(
+                refusal(&decision),
+                Some(WriteIntentRefusalCode::StatementUnsupported),
+                "{sql}"
+            );
+        }
+        for sql in [
+            "call my_proc()",
+            "execute immediate 'drop table t'",
+            "execute task t1",
+        ] {
+            let (_, decision) = decide(sql, &|_| {});
+            assert_eq!(
+                refusal(&decision),
+                Some(WriteIntentRefusalCode::ProceduresRefused),
+                "{sql}"
+            );
+            let (_, allowed) = decide(sql, &|policy| policy.allow_procedures = true);
+            assert_eq!(refusal(&allowed), None, "{sql}");
+        }
+        let unload = "copy into 's3://bucket/x' from t credentials = (aws_key_id = 'a')";
+        assert_eq!(
+            classify_write_statement(unload),
+            WriteStatementKind::CopyIntoExternal
+        );
+        let (_, decision) = decide(unload, &|_| {});
+        assert_eq!(
+            refusal(&decision),
+            Some(WriteIntentRefusalCode::ExternalUnloadRefused)
+        );
+        let (_, allowed) = decide(unload, &|policy| policy.allow_external_unload = true);
+        assert_eq!(refusal(&allowed), None);
+        // Stage unloads and table loads keep their classes.
+        assert_eq!(
+            classify_write_statement("copy into @s/x from t"),
+            WriteStatementKind::CopyIntoStage
+        );
+        assert_eq!(
+            classify_write_statement("copy into t from @s"),
+            WriteStatementKind::CopyIntoTable
+        );
+        // The kind allowlist is enforced when set.
+        let (_, decision) = decide("delete from t", &|policy| {
+            policy.allowed_kinds = Some(vec![WriteStatementKind::Insert]);
+        });
+        assert_eq!(
+            refusal(&decision),
+            Some(WriteIntentRefusalCode::StatementNotAllowlisted)
+        );
+        let (_, decision) = decide("insert into t values (1)", &|policy| {
+            policy.allowed_kinds = Some(vec![WriteStatementKind::Insert]);
+        });
+        assert_eq!(refusal(&decision), None);
+    }
 
     fn enabled_policy() -> WriteIntentPolicy {
         WriteIntentPolicy::dry_run_only(vec![StatementAllowlistEntry::new(

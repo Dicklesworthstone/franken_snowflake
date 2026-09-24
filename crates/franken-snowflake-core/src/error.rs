@@ -50,6 +50,11 @@ pub enum SnowflakeErrorCode {
     WriteConfirmationRequired,
     /// A DDL statement was refused; DDL stays behind an explicit opt-in.
     WriteDdlRefused,
+    /// The SQL API does not run this statement kind as a single statement
+    /// (`PUT`/`GET`, `USE`, `ALTER SESSION`, transactions, `SET`).
+    StatementUnsupported,
+    /// A procedure or external unload needs its own per-profile opt-in.
+    WriteOptInRequired,
     /// An upstream Snowflake SQL API error.
     UpstreamError,
     /// A statement failed upstream (422 / SQL error).
@@ -119,6 +124,8 @@ impl SnowflakeErrorCode {
         Self::WriteDisabled,
         Self::WriteConfirmationRequired,
         Self::WriteDdlRefused,
+        Self::StatementUnsupported,
+        Self::WriteOptInRequired,
         Self::UpstreamError,
         Self::StatementFailed,
         Self::StatementTimeout,
@@ -304,6 +311,33 @@ impl SnowflakeErrorCode {
                     "franken-snowflake query plan --profile <profile> --sql <sql> --json",
                 ],
                 repair_commands: &["export FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ALLOW_DDL=true"],
+            },
+            Self::StatementUnsupported => ErrorEntry {
+                code: self,
+                stable_code: "FSNOW-3010",
+                exit_code: ExitCode::SafetyRefusal,
+                retryable: false,
+                policy_boundary: true,
+                summary: "The Snowflake SQL API does not run this statement as a single statement (PUT/GET, USE, ALTER SESSION, transactions, SET).",
+                safe_next_commands: &["franken-snowflake capabilities --json"],
+                repair_commands: &[
+                    "franken-snowflake query write --profile <profile> --sql <one DML statement> --json",
+                ],
+            },
+            Self::WriteOptInRequired => ErrorEntry {
+                code: self,
+                stable_code: "FSNOW-3011",
+                exit_code: ExitCode::SafetyRefusal,
+                retryable: false,
+                policy_boundary: true,
+                summary: "Procedures and external unloads need their own per-profile opt-in.",
+                safe_next_commands: &[
+                    "franken-snowflake query write --profile <profile> --sql <sql> --dry-run --json",
+                ],
+                repair_commands: &[
+                    "export FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ALLOW_PROCEDURES=true",
+                    "export FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ALLOW_EXTERNAL=true",
+                ],
             },
             Self::UpstreamError => ErrorEntry {
                 code: self,
