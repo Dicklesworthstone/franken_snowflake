@@ -17,7 +17,10 @@ use std::path::Path;
 
 use asupersync::Cx;
 use asupersync::http::{Client as AsupersyncHttpClient, Method};
-use base64::{Engine as _, engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD}};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::redaction_policy::REDACTED;
@@ -116,7 +119,10 @@ impl OidcTokenSource {
         }
     }
 
-    pub fn probe_offline<R: SecretResolver>(&self, resolver: &R) -> (SecretSourceKind, SecretPresence) {
+    pub fn probe_offline<R: SecretResolver>(
+        &self,
+        resolver: &R,
+    ) -> (SecretSourceKind, SecretPresence) {
         match self {
             Self::EnvVar { name } => {
                 let presence = if resolver.env_var_present(name) {
@@ -145,12 +151,11 @@ impl OidcTokenSource {
         match self {
             Self::EnvVar { name } => resolver.read_env_secret(name),
             Self::File { path } => {
-                let content = std::fs::read_to_string(path).map_err(|err| {
-                    AuthError::OidcAssertionIo {
+                let content =
+                    std::fs::read_to_string(path).map_err(|err| AuthError::OidcAssertionIo {
                         path: path.clone(),
                         reason: err.to_string(),
-                    }
-                })?;
+                    })?;
                 let trimmed = content.trim();
                 if trimmed.is_empty() {
                     return Err(AuthError::OidcAssertionMalformed {
@@ -221,16 +226,16 @@ pub fn parse_and_validate_oidc_assertion(
     if parts.len() != 3 {
         return Err(AuthError::OidcAssertionMalformed {
             reason: format!("expected 3 dot-separated JWT segments, got {}", parts.len()),
-            remediation: "ensure the credential source yields a standard RFC 7519 JWT assertion".to_string(),
+            remediation: "ensure the credential source yields a standard RFC 7519 JWT assertion"
+                .to_string(),
         });
     }
 
-    let payload_bytes = decode_jwt_segment(parts[1]).map_err(|err| {
-        AuthError::OidcAssertionMalformed {
+    let payload_bytes =
+        decode_jwt_segment(parts[1]).map_err(|err| AuthError::OidcAssertionMalformed {
             reason: format!("failed to decode JWT payload base64url: {err}"),
             remediation: "ensure OIDC token payload is standard base64url encoded".to_string(),
-        }
-    })?;
+        })?;
 
     let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).map_err(|err| {
         AuthError::OidcAssertionMalformed {
@@ -241,19 +246,29 @@ pub fn parse_and_validate_oidc_assertion(
 
     let exp = payload.get("exp").and_then(|v| v.as_i64()).ok_or_else(|| {
         AuthError::OidcAssertionMalformed {
-            reason: "missing required `exp` (expiration) timestamp claim in OIDC assertion".to_string(),
-            remediation: "ensure cloud STS / IdP issues a JWT with standard `exp` in Unix seconds".to_string(),
+            reason: "missing required `exp` (expiration) timestamp claim in OIDC assertion"
+                .to_string(),
+            remediation: "ensure cloud STS / IdP issues a JWT with standard `exp` in Unix seconds"
+                .to_string(),
         }
     })?;
 
     let iat = payload.get("iat").and_then(|v| v.as_i64());
-    let iss = payload.get("iss").and_then(|v| v.as_str()).map(str::to_string);
-    let sub = payload.get("sub").and_then(|v| v.as_str()).map(str::to_string);
+    let iss = payload
+        .get("iss")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let sub = payload
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let aud = payload.get("aud").and_then(|v| {
         if let Some(s) = v.as_str() {
             Some(s.to_string())
         } else if let Some(arr) = v.as_array() {
-            arr.first().and_then(|first| first.as_str()).map(str::to_string)
+            arr.first()
+                .and_then(|first| first.as_str())
+                .map(str::to_string)
         } else {
             None
         }
@@ -263,7 +278,8 @@ pub fn parse_and_validate_oidc_assertion(
         return Err(AuthError::OidcAssertionExpired {
             expires_at_unix_seconds: exp,
             now_unix_seconds,
-            remediation: "refresh the cloud STS or projected service account token assertion".to_string(),
+            remediation: "refresh the cloud STS or projected service account token assertion"
+                .to_string(),
         });
     }
 
@@ -395,7 +411,9 @@ impl SnowflakeSessionToken {
 
     #[must_use]
     pub fn needs_refresh(&self, now_unix_seconds: i64, refresh_window_seconds: u64) -> bool {
-        let remaining = self.expires_at_unix_seconds.saturating_sub(now_unix_seconds);
+        let remaining = self
+            .expires_at_unix_seconds
+            .saturating_sub(now_unix_seconds);
         remaining <= refresh_window_seconds as i64
     }
 }
@@ -441,12 +459,11 @@ pub fn parse_rfc7523_token_response(
         });
     }
 
-    let parsed: serde_json::Value = serde_json::from_slice(body).map_err(|err| {
-        AuthError::OidcTokenExchangeFailed {
+    let parsed: serde_json::Value =
+        serde_json::from_slice(body).map_err(|err| AuthError::OidcTokenExchangeFailed {
             status_code,
             reason: format!("failed to parse token endpoint JSON response: {err}"),
-        }
-    })?;
+        })?;
 
     let access_token_str = parsed
         .get("access_token")
@@ -596,10 +613,8 @@ impl WorkloadIdentityAuth {
     ) -> Result<&SnowflakeSessionToken, AuthError> {
         let raw_assertion = self.assertion_source.resolve(resolver)?;
         // Fail-closed pre-flight validation
-        let _claims = parse_and_validate_oidc_assertion(
-            raw_assertion.expose_secret(),
-            now_unix_seconds,
-        )?;
+        let _claims =
+            parse_and_validate_oidc_assertion(raw_assertion.expose_secret(), now_unix_seconds)?;
 
         let form_body = format_rfc7523_form_body(
             raw_assertion.expose_secret(),
@@ -607,12 +622,15 @@ impl WorkloadIdentityAuth {
             self.client_id.as_deref(),
         );
 
-        let (status, body) = transport.post_form(cx, &self.endpoint_url, &form_body).await?;
+        let (status, body) = transport
+            .post_form(cx, &self.endpoint_url, &form_body)
+            .await?;
         let session_token = parse_rfc7523_token_response(status, &body, now_unix_seconds)?;
         self.cached_session = Some(session_token);
-        Ok(self.cached_session.as_ref().unwrap_or_else(|| {
-            unreachable!("cached_session was just set")
-        }))
+        Ok(self
+            .cached_session
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("cached_session was just set")))
     }
 
     /// Retrieve a valid session token, refreshing it automatically if expired or
@@ -626,15 +644,19 @@ impl WorkloadIdentityAuth {
     ) -> Result<&SnowflakeSessionToken, AuthError> {
         let needs_refresh = match &self.cached_session {
             None => true,
-            Some(token) => token.needs_refresh(now_unix_seconds, self.refresh_before_expiry_seconds),
+            Some(token) => {
+                token.needs_refresh(now_unix_seconds, self.refresh_before_expiry_seconds)
+            }
         };
 
         if needs_refresh {
-            self.exchange_token_at(cx, transport, resolver, now_unix_seconds).await
+            self.exchange_token_at(cx, transport, resolver, now_unix_seconds)
+                .await
         } else {
-            Ok(self.cached_session.as_ref().unwrap_or_else(|| {
-                unreachable!("cached_session verified present")
-            }))
+            Ok(self
+                .cached_session
+                .as_ref()
+                .unwrap_or_else(|| unreachable!("cached_session verified present")))
         }
     }
 }
@@ -649,25 +671,25 @@ impl SnowflakeAuth for WorkloadIdentityAuth {
     }
 
     fn headers_at(&mut self, now_unix_seconds: i64) -> Result<AuthHeaders, AuthError> {
-        let token = self.cached_session.as_ref().ok_or_else(|| {
-            AuthError::OidcAssertionMalformed {
-                reason: "no active Snowflake session token; exchange required".to_string(),
-                remediation: "invoke token exchange before attempting SQL API queries".to_string(),
-            }
-        })?;
+        let token =
+            self.cached_session
+                .as_ref()
+                .ok_or_else(|| AuthError::OidcAssertionMalformed {
+                    reason: "no active Snowflake session token; exchange required".to_string(),
+                    remediation: "invoke token exchange before attempting SQL API queries"
+                        .to_string(),
+                })?;
 
         if token.is_expired(now_unix_seconds) {
             return Err(AuthError::OidcAssertionExpired {
                 expires_at_unix_seconds: token.expires_at_unix_seconds,
                 now_unix_seconds,
-                remediation: "Snowflake session token has expired; token refresh required".to_string(),
+                remediation: "Snowflake session token has expired; token refresh required"
+                    .to_string(),
             });
         }
 
-        Ok(AuthHeaders::bearer(
-            token.expose_token(),
-            OAUTH_TOKEN_TYPE,
-        ))
+        Ok(AuthHeaders::bearer(token.expose_token(), OAUTH_TOKEN_TYPE))
     }
 
     fn lifetime(&self) -> CredentialLifetime {
@@ -677,7 +699,10 @@ impl SnowflakeAuth for WorkloadIdentityAuth {
                 issued_at_unix_seconds: Some(token.issued_at_unix_seconds),
                 expires_at_unix_seconds: Some(token.expires_at_unix_seconds),
                 expected_validity_seconds: Some(
-                    token.expires_at_unix_seconds.saturating_sub(token.issued_at_unix_seconds).max(0) as u64,
+                    token
+                        .expires_at_unix_seconds
+                        .saturating_sub(token.issued_at_unix_seconds)
+                        .max(0) as u64,
                 ),
                 max_validity_seconds: Some(3600),
                 refresh_before_expiry_seconds: Some(self.refresh_before_expiry_seconds),
@@ -712,9 +737,15 @@ impl fmt::Debug for WorkloadIdentityAuth {
             .field("endpoint_url", &self.endpoint_url)
             .field("scope", &self.scope)
             .field("client_id", &self.client_id)
-            .field("refresh_before_expiry_seconds", &self.refresh_before_expiry_seconds)
+            .field(
+                "refresh_before_expiry_seconds",
+                &self.refresh_before_expiry_seconds,
+            )
             .field("credential_handle", &self.credential_handle)
-            .field("cached_session", &self.cached_session.as_ref().map(|_| REDACTED))
+            .field(
+                "cached_session",
+                &self.cached_session.as_ref().map(|_| REDACTED),
+            )
             .finish()
     }
 }

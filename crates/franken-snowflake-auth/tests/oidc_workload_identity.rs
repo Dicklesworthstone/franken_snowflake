@@ -6,10 +6,9 @@ use std::sync::{Arc, Mutex};
 use asupersync::Cx;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use franken_snowflake_auth::{
-    AuthError, AuthLane, AuthProfile, OidcHttpExchange, OidcTokenSource,
-    ProcessSecretResolver, SecretPresence, SecretResolver, SecretValue, SnowflakeAuth,
-    WorkloadIdentityAuth, format_rfc7523_form_body, parse_and_validate_oidc_assertion,
-    parse_rfc7523_token_response,
+    AuthError, AuthLane, AuthProfile, OidcHttpExchange, OidcTokenSource, ProcessSecretResolver,
+    SecretPresence, SecretResolver, SecretValue, SnowflakeAuth, WorkloadIdentityAuth,
+    format_rfc7523_form_body, parse_and_validate_oidc_assertion, parse_rfc7523_token_response,
 };
 
 /// Mock HTTP exchanger for deterministic token exchange testing.
@@ -131,7 +130,11 @@ fn test_token_exchange_request_formation() {
         "repo:org/project:ref:refs/heads/main",
     );
 
-    let form_body = format_rfc7523_form_body(&raw_jwt, Some("session:role-any"), Some("MY_INTEGRATION_CLIENT_ID"));
+    let form_body = format_rfc7523_form_body(
+        &raw_jwt,
+        Some("session:role-any"),
+        Some("MY_INTEGRATION_CLIENT_ID"),
+    );
 
     assert!(form_body.contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer"));
     assert!(form_body.contains(&format!("assertion={}", raw_jwt)));
@@ -261,7 +264,10 @@ fn test_mock_token_exchange_and_caching() {
         // Verify headers
         let headers = auth.headers_at(now).expect("headers failed");
         assert_eq!(headers.token_type_value(), "OAUTH");
-        assert_eq!(headers.authorization_value(), "Bearer test_sf_session_token_xyz");
+        assert_eq!(
+            headers.authorization_value(),
+            "Bearer test_sf_session_token_xyz"
+        );
 
         // Second exchange at now + 1000: token has 2600s remaining > 60s window.
         // MUST hit cache and NOT invoke HTTP exchange.
@@ -335,7 +341,10 @@ fn test_mid_flight_token_refresh() {
 
         // Headers now emit refreshed token
         let headers = auth.headers_at(now + 3550).expect("headers failed");
-        assert_eq!(headers.authorization_value(), "Bearer refreshed_session_token");
+        assert_eq!(
+            headers.authorization_value(),
+            "Bearer refreshed_session_token"
+        );
     });
 }
 
@@ -369,20 +378,38 @@ fn test_zero_secret_leaks_in_debug_and_logs() {
 
     // 1. Debug impl must never leak raw session token or OIDC assertion
     let debug_repr = format!("{auth:?}");
-    assert!(!debug_repr.contains(canary_session), "Debug leaked session token!");
-    assert!(!debug_repr.contains(&canary_oidc), "Debug leaked OIDC assertion!");
+    assert!(
+        !debug_repr.contains(canary_session),
+        "Debug leaked session token!"
+    );
+    assert!(
+        !debug_repr.contains(&canary_oidc),
+        "Debug leaked OIDC assertion!"
+    );
     assert!(debug_repr.contains("[REDACTED]"));
 
     // 2. Display impl must never leak
     let display_repr = format!("{auth}");
-    assert!(!display_repr.contains(canary_session), "Display leaked session token!");
-    assert!(!display_repr.contains(&canary_oidc), "Display leaked OIDC assertion!");
+    assert!(
+        !display_repr.contains(canary_session),
+        "Display leaked session token!"
+    );
+    assert!(
+        !display_repr.contains(&canary_oidc),
+        "Display leaked OIDC assertion!"
+    );
 
     // 3. Structured AuthLogLine must never leak
     let log_line = auth.log_line("token_exchanged", "successfully exchanged OIDC assertion");
     let json_log = serde_json::to_string(&log_line).expect("serialization failed");
-    assert!(!json_log.contains(canary_session), "Log line leaked session token!");
-    assert!(!json_log.contains(&canary_oidc), "Log line leaked OIDC assertion!");
+    assert!(
+        !json_log.contains(canary_session),
+        "Log line leaked session token!"
+    );
+    assert!(
+        !json_log.contains(&canary_oidc),
+        "Log line leaked OIDC assertion!"
+    );
     assert!(json_log.contains("\"lane\":\"workload_identity_federation\""));
 }
 
@@ -396,7 +423,10 @@ fn test_oidc_token_file_source() {
     std::fs::write(&token_file, &jwt_content).expect("write file failed");
 
     let source = OidcTokenSource::file(token_file.to_str().unwrap());
-    assert_eq!(source.credential_handle(), format!("file:{}", token_file.display()));
+    assert_eq!(
+        source.credential_handle(),
+        format!("file:{}", token_file.display())
+    );
 
     let resolver = ProcessSecretResolver;
     let secret = source.resolve(&resolver).expect("file resolution failed");
@@ -410,7 +440,8 @@ fn test_oidc_token_file_source() {
 
 #[test]
 fn test_profile_validation_offline() {
-    let profile = AuthProfile::workload_identity_federation(OidcTokenSource::env_var("TEST_WIF_TOKEN"));
+    let profile =
+        AuthProfile::workload_identity_federation(OidcTokenSource::env_var("TEST_WIF_TOKEN"));
     assert_eq!(profile.lane(), AuthLane::WorkloadIdentityFederation);
 
     let mut resolver = StaticSecretResolver::default();
@@ -435,7 +466,10 @@ fn test_token_response_parsing_error() {
 
     let result = parse_rfc7523_token_response(400, error_body.as_bytes(), now);
     match result {
-        Err(AuthError::OidcTokenExchangeFailed { status_code, reason }) => {
+        Err(AuthError::OidcTokenExchangeFailed {
+            status_code,
+            reason,
+        }) => {
             assert_eq!(status_code, 400);
             assert!(reason.contains("The provided assertion has an invalid audience"));
         }
@@ -480,7 +514,10 @@ fn test_token_exchange_http_error_handling() {
             .unwrap_err();
 
         match err {
-            AuthError::OidcTokenExchangeFailed { status_code, reason } => {
+            AuthError::OidcTokenExchangeFailed {
+                status_code,
+                reason,
+            } => {
                 assert_eq!(status_code, 401);
                 assert!(reason.contains("Client not authorized"));
             }
@@ -488,4 +525,3 @@ fn test_token_exchange_http_error_handling() {
         }
     });
 }
-

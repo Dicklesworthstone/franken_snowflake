@@ -99,16 +99,35 @@ pub const AUTH_LOG_SCHEMA_VERSION: u16 = 1;
 pub enum AuthError {
     EmptyAccount,
     EmptyUser,
-    EmptySecretSource { source_kind: &'static str },
-    SecretSourceLooksSensitive { source_kind: &'static str },
+    EmptySecretSource {
+        source_kind: &'static str,
+    },
+    SecretSourceLooksSensitive {
+        source_kind: &'static str,
+    },
     EmptySecretValue,
-    MissingEnvVar { name: String, next_command: String },
-    UnsupportedSecretProvider { handle: String },
-    UnsupportedAuthLane { lane: AuthLane },
-    InvalidPrivateKey { reason: String },
-    InvalidPublicKey { reason: String },
-    RsaKeyTooSmall { bits: usize },
-    JwtSigning { reason: String },
+    MissingEnvVar {
+        name: String,
+        next_command: String,
+    },
+    UnsupportedSecretProvider {
+        handle: String,
+    },
+    UnsupportedAuthLane {
+        lane: AuthLane,
+    },
+    InvalidPrivateKey {
+        reason: String,
+    },
+    InvalidPublicKey {
+        reason: String,
+    },
+    RsaKeyTooSmall {
+        bits: usize,
+    },
+    JwtSigning {
+        reason: String,
+    },
     InvalidValiditySeconds,
     OidcAssertionExpired {
         expires_at_unix_seconds: i64,
@@ -1289,7 +1308,9 @@ impl SnowflakeAuth for AuthMechanism {
             Self::ProgrammaticAccessToken(auth) => auth.on_unauthorized_mid_poll(now_unix_seconds),
             Self::KeyPairJwt(auth) => auth.on_unauthorized_mid_poll(now_unix_seconds),
             Self::OAuthBearer(auth) => auth.on_unauthorized_mid_poll(now_unix_seconds),
-            Self::WorkloadIdentityFederation(auth) => auth.on_unauthorized_mid_poll(now_unix_seconds),
+            Self::WorkloadIdentityFederation(auth) => {
+                auth.on_unauthorized_mid_poll(now_unix_seconds)
+            }
         }
     }
 }
