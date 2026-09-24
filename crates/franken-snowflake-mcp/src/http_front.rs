@@ -25,9 +25,11 @@
 //!   `tools/list` and refused on `tools/call`.
 
 use std::collections::BTreeSet;
-use std::io::{BufReader, BufWriter, Write as _};
+use std::io::{BufReader, BufWriter, ErrorKind, Write as _};
 use std::net::{IpAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use fastmcp_rust::bidirectional::TransportSendFn;
 use fastmcp_rust::http::{HttpMethod, HttpRequest, HttpResponse, HttpStatus, HttpTransport};
@@ -260,6 +262,61 @@ fn filter_tools_list(response: &mut Value, policy: &HttpPolicy) {
     }
 }
 
+/// How often a hang-up watcher checks whether its call has answered.
+const HANG_UP_POLL: Duration = Duration::from_millis(50);
+
+/// Watches a connection while its `tools/call` runs (reality-check bead E2):
+/// a client that closes the connection mid-call gets `on_hang_up`, which
+/// cancels the call as a `notifications/cancelled` would. Dropping the watch
+/// stops it and waits for its thread.
+struct HangUpWatch {
+    answered: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HangUpWatch {
+    fn start(stream: &TcpStream, on_hang_up: impl FnOnce() + Send + 'static) -> Option<Self> {
+        let probe = stream.try_clone().ok()?;
+        // The request has been read in full; from here the connection is
+        // only written, so a read timeout on the shared socket is harmless.
+        probe.set_read_timeout(Some(HANG_UP_POLL)).ok()?;
+        let answered = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&answered);
+        let thread = std::thread::spawn(move || {
+            let mut byte = [0_u8; 1];
+            while !done.load(Ordering::SeqCst) {
+                match probe.peek(&mut byte) {
+                    // More bytes: the client is still there.
+                    Ok(read) if read > 0 => return,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                        ) => {}
+                    // End of stream or a reset: the client hung up.
+                    _ => {
+                        on_hang_up();
+                        return;
+                    }
+                }
+            }
+        });
+        Some(Self {
+            answered,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for HangUpWatch {
+    fn drop(&mut self) {
+        self.answered.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Handle one authorized JSON-RPC body.
 fn dispatch_body(
     server: &Server,
@@ -267,6 +324,7 @@ fn dispatch_body(
     session: &Arc<Mutex<Session>>,
     policy: &HttpPolicy,
     body: &[u8],
+    connection: Option<&TcpStream>,
 ) -> HttpResponse {
     let request: JsonRpcRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
@@ -292,9 +350,23 @@ fn dispatch_body(
     let send_fn: TransportSendFn =
         Arc::new(|_| Err("the HTTP transport does not carry server-to-client requests".into()));
     let request_sender = RequestSender::new(Arc::new(PendingRequests::new()), send_fn);
-    let Some(response) =
-        server.dispatch_request_concurrent(cx, session, request, &notify, &request_sender)
-    else {
+    let json_rpc_id = serde_json::to_value(&id).unwrap_or(Value::Null);
+    let watch = connection
+        .filter(|_| request.method == "tools/call" && !json_rpc_id.is_null())
+        .and_then(|connection| {
+            let request_id = json_rpc_id.clone();
+            HangUpWatch::start(connection, move || {
+                crate::fastmcp_surface::note_http_cancellation(Some(
+                    &json!({ "requestId": request_id }),
+                ));
+            })
+        });
+    let answer = server.dispatch_request_concurrent(cx, session, request, &notify, &request_sender);
+    if let Some(watch) = watch {
+        drop(watch);
+        crate::fastmcp_surface::forget_http_cancellation(&json_rpc_id);
+    }
+    let Some(response) = answer else {
         return HttpResponse::new(HttpStatus::ACCEPTED);
     };
     let mut value = serde_json::to_value(&response).unwrap_or(Value::Null);
@@ -313,6 +385,7 @@ fn serve_connection(
     let Ok(reader_stream) = stream.try_clone() else {
         return;
     };
+    let watched = stream.try_clone().ok();
     let mut transport = HttpTransport::new(BufReader::new(reader_stream), BufWriter::new(stream));
     let Ok(request) = transport.read_request() else {
         return;
@@ -321,7 +394,14 @@ fn serve_connection(
         Decision::Respond(response) => (response, false),
         Decision::Dispatch { cors_origin } => {
             let cx = Cx::for_request();
-            let response = dispatch_body(server, &cx, session, policy, &request.body);
+            let response = dispatch_body(
+                server,
+                &cx,
+                session,
+                policy,
+                &request.body,
+                watched.as_ref(),
+            );
             let response = match cors_origin {
                 Some(origin) => with_cors(response, &origin),
                 None => response,
@@ -607,6 +687,47 @@ mod tests {
         let rendered = format!("{:?}", policy());
         assert!(!rendered.contains(TOKEN));
         assert!(rendered.contains("[REDACTED]"));
+    }
+
+    /// Reality-check bead E2: a hang-up mid-call fires the watch; a client
+    /// that stays connected until the answer, or sends more bytes, does not.
+    #[test]
+    fn a_hang_up_fires_the_watch_and_an_answered_call_does_not() {
+        use std::io::Write as _;
+        use std::sync::mpsc;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let connect = || {
+            let client = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            let (server_side, _) = listener.accept().expect("accept");
+            (client, server_side)
+        };
+        let watch = |stream: &TcpStream| {
+            let (fired, heard) = mpsc::channel();
+            let watch = HangUpWatch::start(stream, move || {
+                let _ = fired.send(());
+            })
+            .expect("watch");
+            (watch, heard)
+        };
+
+        let (client, server_side) = connect();
+        let (_watch, heard) = watch(&server_side);
+        drop(client);
+        assert!(heard.recv_timeout(Duration::from_secs(10)).is_ok());
+
+        let (client, server_side) = connect();
+        let (answered, heard) = watch(&server_side);
+        std::thread::sleep(HANG_UP_POLL * 3);
+        drop(answered);
+        drop(client);
+        assert!(heard.try_recv().is_err(), "the call answered first");
+
+        let (mut client, server_side) = connect();
+        let (_watch, heard) = watch(&server_side);
+        client.write_all(b"GET").expect("write");
+        std::thread::sleep(HANG_UP_POLL * 3);
+        assert!(heard.try_recv().is_err(), "more bytes are not a hang-up");
     }
 
     #[test]

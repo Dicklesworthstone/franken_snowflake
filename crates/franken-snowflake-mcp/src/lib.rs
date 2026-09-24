@@ -76,13 +76,9 @@ mod fastmcp_surface {
 
         /// Note the request a `notifications/cancelled` names.
         fn note(&self, params: Option<&Value>) {
-            let id = match params.and_then(|params| params.get("requestId")) {
-                Some(Value::Number(number)) => number
-                    .as_u64()
-                    .or_else(|| number.as_i64().map(|signed| signed as u64)),
-                Some(Value::String(text)) => Some(request_id_hash(text)),
-                _ => None,
-            };
+            let id = params
+                .and_then(|params| params.get("requestId"))
+                .and_then(fastmcp_request_id);
             if let (Some(id), Ok(mut cancelled)) = (id, self.cancelled.lock()) {
                 cancelled.insert(id);
             }
@@ -108,6 +104,27 @@ mod fastmcp_surface {
     /// front answers notifications itself instead of dispatching them).
     pub(crate) fn note_http_cancellation(params: Option<&Value>) {
         CANCELLATIONS.note(params);
+    }
+
+    /// Forget the cancellation of an HTTP call that has answered: a hang-up
+    /// noted as the call ended would otherwise cancel the next call that
+    /// reuses its JSON-RPC id.
+    pub(crate) fn forget_http_cancellation(json_rpc_id: &Value) {
+        if let Some(id) = fastmcp_request_id(json_rpc_id) {
+            CANCELLATIONS.finish(id);
+        }
+    }
+
+    /// FastMCP's request id for a JSON-RPC id: a number as itself, a string
+    /// hashed.
+    fn fastmcp_request_id(json_rpc_id: &Value) -> Option<u64> {
+        match json_rpc_id {
+            Value::Number(number) => number
+                .as_u64()
+                .or_else(|| number.as_i64().map(|signed| signed as u64)),
+            Value::String(text) => Some(request_id_hash(text)),
+            _ => None,
+        }
     }
 
     /// FastMCP's request id for a string JSON-RPC id (FNV-1a, 0 remapped),
@@ -963,6 +980,11 @@ mod fastmcp_surface {
                     "Set true for the SQL API jsonv2 wire strings instead of typed.v1 cells.",
                     false,
                 ),
+                ParamSpec::boolean(
+                    "allow_multiple_statements",
+                    "Set true to run a batch of read statements in one request (raw mode); data.statements[] holds each result in order.",
+                    false,
+                ),
             ]);
         }
         params
@@ -1031,6 +1053,9 @@ mod fastmcp_surface {
             }
             if optional_bool(arguments, "raw_cells")?.unwrap_or(false) {
                 args.push("--raw-cells".to_string());
+            }
+            if optional_bool(arguments, "allow_multiple_statements")?.unwrap_or(false) {
+                args.push("--allow-multiple-statements".to_string());
             }
         }
         args.push("--json".to_string());
