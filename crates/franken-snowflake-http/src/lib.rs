@@ -13,14 +13,17 @@
 
 use std::fmt;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use asupersync::http::Response;
 use asupersync::http::compress::{Decompressor, GzipDecompressor, IdentityDecompressor};
+use asupersync::http::h1::Http1Client;
 use asupersync::http::{
-    Client as AsupersyncHttpClient, ClientError as AsupersyncClientError, Method, StatusCode,
+    Client as AsupersyncHttpClient, ClientError as AsupersyncClientError, Method, ParsedUrl,
+    Request, Response, Scheme, StatusCode,
 };
+use asupersync::net::TcpStream;
+use asupersync::tls::{Certificate, TlsConnector, TlsConnectorBuilder};
 use asupersync::{CancelKind, Cx, Time};
 use franken_snowflake_core::budget::Budget;
 use franken_snowflake_core::cancel::{CancelPolicy, CancelReason, cancel_policy};
@@ -58,7 +61,7 @@ pub struct TransportCaps;
 
 /// Asupersync-native Snowflake SQL API HTTP client facade.
 #[derive(Clone)]
-pub struct SnowflakeHttpClient<H = AsupersyncHttpClient> {
+pub struct SnowflakeHttpClient<H = LiveHttp> {
     config: TransportConfig,
     client: H,
 }
@@ -107,6 +110,157 @@ impl RawHttp for AsupersyncHttpClient {
     }
 }
 
+/// A single HTTPS exchange whose server certificate must chain to a
+/// caller-provided PEM bundle ([`TlsRootPolicy::ExplicitPemBundle`]): the CA of
+/// a TLS-intercepting corporate proxy, or a private test CA. Each request opens
+/// a fresh connection (no pool): the SQL API call rate is bounded by polling,
+/// so a handshake per call is small next to statement latency.
+#[derive(Clone)]
+pub struct PemBundleHttp {
+    connector: TlsConnector,
+    max_body_bytes: usize,
+}
+
+impl PemBundleHttp {
+    /// Load the roots from `path`. A missing or unreadable file, or one without
+    /// a certificate, is refused: the OS trust store is never used as a
+    /// fallback, so a typo cannot silently widen trust.
+    pub fn from_pem_file(path: &Path, limits: &BodyLimits) -> Result<Self, TransportError> {
+        let refused =
+            |reason: String| TransportError::new(TransportErrorCode::TlsRootPolicyRefused, reason);
+        let roots = Certificate::from_pem_file(path).map_err(|error| {
+            refused(format!(
+                "cannot read the CA bundle {}: {error}",
+                path.display()
+            ))
+        })?;
+        if roots.is_empty() {
+            return Err(refused(format!(
+                "the CA bundle {} holds no PEM certificate",
+                path.display()
+            )));
+        }
+        let connector = TlsConnectorBuilder::new()
+            .add_root_certificates(roots)
+            .alpn_protocols(vec![b"http/1.1".to_vec()])
+            .build()
+            .map_err(|error| {
+                refused(format!(
+                    "the CA bundle {} is unusable: {error}",
+                    path.display()
+                ))
+            })?;
+        Ok(Self {
+            connector,
+            max_body_bytes: max_response_body_bytes(limits),
+        })
+    }
+}
+
+/// The largest response body any route may carry under `limits`. Both live
+/// transports read up to this much, so the per-route limits (enforced after
+/// the read) are the ones that bind; Asupersync's own default is 16 MiB, below
+/// the 64 MiB compressed-partition limit.
+fn max_response_body_bytes(limits: &BodyLimits) -> usize {
+    [
+        limits.max_submit_response_bytes,
+        limits.max_poll_response_bytes,
+        limits.max_partition_compressed_bytes,
+    ]
+    .into_iter()
+    .max()
+    .and_then(|bytes| usize::try_from(bytes).ok())
+    .unwrap_or(usize::MAX)
+}
+
+impl RawHttp for PemBundleHttp {
+    async fn send(
+        &self,
+        cx: &Cx,
+        method: Method,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        timeout: Option<Duration>,
+    ) -> Result<Response, AsupersyncClientError> {
+        let parsed = ParsedUrl::parse(&url)?;
+        if parsed.scheme != Scheme::Https {
+            return Err(AsupersyncClientError::InvalidUrl(format!(
+                "{url}: a CA bundle applies to https endpoints only"
+            )));
+        }
+        let exchange = async {
+            if cx.checkpoint().is_err() {
+                return Err(AsupersyncClientError::Cancelled);
+            }
+            let tcp = TcpStream::connect(format!("{}:{}", parsed.host, parsed.port))
+                .await
+                .map_err(AsupersyncClientError::ConnectError)?;
+            let domain = parsed.host.trim_start_matches('[').trim_end_matches(']');
+            let tls = self
+                .connector
+                .connect(domain, tcp)
+                .await
+                .map_err(|error| AsupersyncClientError::TlsError(error.to_string()))?;
+            if cx.checkpoint().is_err() {
+                return Err(AsupersyncClientError::Cancelled);
+            }
+            let request = Request::builder(method, parsed.path.clone())
+                .header("Host", parsed.authority())
+                .headers(
+                    headers
+                        .into_iter()
+                        .filter(|(name, _)| !name.eq_ignore_ascii_case("host")),
+                )
+                .body(body)
+                .build();
+            let (response, _connection) =
+                Http1Client::request_with_io_and_max_body_size(tls, request, self.max_body_bytes)
+                    .await?;
+            Ok(response)
+        };
+        let Some(limit) = timeout else {
+            return exchange.await;
+        };
+        match asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            limit,
+            std::pin::pin!(exchange),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => Err(AsupersyncClientError::DeadlineExceeded),
+        }
+    }
+}
+
+/// The production transport, chosen by [`TransportConfig::tls_roots`].
+#[derive(Clone)]
+pub enum LiveHttp {
+    /// A pooled client over the OS trust store.
+    NativeRoots(AsupersyncHttpClient),
+    /// Fresh connections verified against a caller-provided PEM bundle.
+    PemBundle(PemBundleHttp),
+}
+
+impl RawHttp for LiveHttp {
+    async fn send(
+        &self,
+        cx: &Cx,
+        method: Method,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        timeout: Option<Duration>,
+    ) -> Result<Response, AsupersyncClientError> {
+        match self {
+            Self::NativeRoots(client) => client.send(cx, method, url, headers, body, timeout).await,
+            Self::PemBundle(client) => client.send(cx, method, url, headers, body, timeout).await,
+        }
+    }
+}
+
 impl<H> fmt::Debug for SnowflakeHttpClient<H> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SnowflakeHttpClient")
@@ -117,13 +271,28 @@ impl<H> fmt::Debug for SnowflakeHttpClient<H> {
 }
 
 impl SnowflakeHttpClient {
-    /// Create a client from the runtime-owned pooled Asupersync HTTP client.
-    #[must_use]
-    pub fn default_for_runtime(config: TransportConfig, cx: &Cx) -> Self {
-        Self {
-            config,
-            client: AsupersyncHttpClient::default_for_runtime(cx),
-        }
+    /// The production client for `config`: a pooled Asupersync client over the
+    /// OS trust store, or fresh connections verified against the configured PEM
+    /// bundle; both read bodies up to the configured limits. The test-only
+    /// insecure marker is refused.
+    pub fn for_runtime(config: TransportConfig) -> Result<Self, TransportError> {
+        let client = match &config.tls_roots {
+            TlsRootPolicy::NativeRoots => LiveHttp::NativeRoots(
+                AsupersyncHttpClient::builder()
+                    .max_body_size(max_response_body_bytes(&config.limits))
+                    .build(),
+            ),
+            TlsRootPolicy::ExplicitPemBundle(path) => {
+                LiveHttp::PemBundle(PemBundleHttp::from_pem_file(path, &config.limits)?)
+            }
+            TlsRootPolicy::TestOnlyInsecureDisabledByDefault => {
+                return Err(TransportError::new(
+                    TransportErrorCode::TlsRootPolicyRefused,
+                    "certificate verification cannot be disabled for a live transport",
+                ));
+            }
+        };
+        Ok(Self { config, client })
     }
 }
 
@@ -645,6 +814,33 @@ impl SnowflakeEndpoint {
     #[must_use]
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    /// A loopback `https://127.0.0.1:<port>` (or `localhost`) endpoint for the
+    /// hermetic socket e2e (reality-check bead F1). Compiled only with the
+    /// `testkit-endpoint` feature, which no release build enables; anything but
+    /// a loopback https host with an explicit port is refused.
+    #[cfg(feature = "testkit-endpoint")]
+    pub fn parse_testkit_loopback(raw: &str) -> Result<Self, TransportError> {
+        let refused = || {
+            TransportError::new(
+                TransportErrorCode::InvalidSnowflakeHost,
+                "a testkit endpoint must be https://127.0.0.1:<port> or https://localhost:<port>",
+            )
+        };
+        let authority = raw
+            .strip_prefix("https://")
+            .map(|rest| rest.strip_suffix('/').unwrap_or(rest))
+            .ok_or_else(refused)?;
+        let (host, port) = authority.rsplit_once(':').ok_or_else(refused)?;
+        let port_ok = port.parse::<u16>().is_ok_and(|port| port != 0);
+        if !matches!(host, "127.0.0.1" | "localhost") || !port_ok {
+            return Err(refused());
+        }
+        Ok(Self {
+            base_url: format!("https://{host}:{port}"),
+            host: host.to_owned(),
+        })
     }
 
     /// Build an absolute URL for a SQL API route.
@@ -2250,6 +2446,79 @@ mod tests {
 
     fn header(name: &str, value: &str) -> Vec<(String, String)> {
         vec![(name.to_string(), value.to_string())]
+    }
+
+    /// Reality-check bead F1: a CA bundle is loaded, or refused typed; the OS
+    /// trust store is never a silent fallback, and verification can never be
+    /// switched off for a live transport.
+    #[test]
+    fn pem_bundle_roots_are_loaded_or_refused() {
+        let dir = std::env::temp_dir().join(format!("fsnow-pem-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let limits = BodyLimits::default();
+        let missing = PemBundleHttp::from_pem_file(&dir.join("absent.pem"), &limits)
+            .err()
+            .unwrap();
+        assert_eq!(missing.code, TransportErrorCode::TlsRootPolicyRefused);
+        let empty = dir.join("empty.pem");
+        std::fs::write(&empty, "not a certificate\n").unwrap();
+        let refused = PemBundleHttp::from_pem_file(&empty, &limits).err().unwrap();
+        assert_eq!(refused.code, TransportErrorCode::TlsRootPolicyRefused);
+        // Asupersync's PEM reader itself rejects a file without a certificate;
+        // either way the refusal names the bundle.
+        assert!(refused.message.contains("empty.pem"), "{refused}");
+
+        let mut config = TransportConfig::new(endpoint());
+        config.tls_roots = TlsRootPolicy::TestOnlyInsecureDisabledByDefault;
+        let error = SnowflakeHttpClient::for_runtime(config.clone())
+            .err()
+            .unwrap();
+        assert_eq!(error.code, TransportErrorCode::TlsRootPolicyRefused);
+        config.tls_roots = TlsRootPolicy::ExplicitPemBundle(empty);
+        assert!(SnowflakeHttpClient::for_runtime(config.clone()).is_err());
+        config.tls_roots = TlsRootPolicy::NativeRoots;
+        assert!(SnowflakeHttpClient::for_runtime(config).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Both live transports read up to the largest configured route limit,
+    /// not Asupersync's 16 MiB default.
+    #[test]
+    fn live_transports_read_up_to_the_configured_body_limit() {
+        let limits = BodyLimits::default();
+        assert_eq!(max_response_body_bytes(&limits), 64 * 1024 * 1024);
+        assert!(max_response_body_bytes(&limits) > 16 * 1024 * 1024);
+        let tight = BodyLimits {
+            max_partition_compressed_bytes: 1024,
+            max_poll_response_bytes: 2048,
+            max_submit_response_bytes: 512,
+            ..limits
+        };
+        assert_eq!(max_response_body_bytes(&tight), 2048);
+    }
+
+    #[cfg(feature = "testkit-endpoint")]
+    #[test]
+    fn testkit_loopback_accepts_only_loopback_https_with_a_port() {
+        let ok = SnowflakeEndpoint::parse_testkit_loopback("https://127.0.0.1:8443/").unwrap();
+        assert_eq!(ok.base_url(), "https://127.0.0.1:8443");
+        assert!(SnowflakeEndpoint::parse_testkit_loopback("https://localhost:9").is_ok());
+        for refused in [
+            "http://127.0.0.1:8443",
+            "https://127.0.0.1",
+            "https://127.0.0.1:0",
+            "https://10.0.0.1:8443",
+            "https://xy123.snowflakecomputing.com:443",
+            "https://127.0.0.1:8443/path",
+            "https://user@127.0.0.1:8443",
+        ] {
+            assert!(
+                SnowflakeEndpoint::parse_testkit_loopback(refused).is_err(),
+                "{refused} must be refused"
+            );
+        }
+        // The production parser still refuses loopback.
+        assert!(SnowflakeEndpoint::parse("https://127.0.0.1:8443").is_err());
     }
 
     #[test]

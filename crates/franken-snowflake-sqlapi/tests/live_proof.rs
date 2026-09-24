@@ -414,8 +414,8 @@ fn run_live_lanes(profile: &LiveProfile, logger: &mut RunLogger) -> Result<(), S
         .map_err(|error| error.to_string())?;
     runtime.block_on(async {
         let cx = Cx::current().ok_or_else(|| "Asupersync runtime did not install Cx".to_string())?;
-        let client =
-            SnowflakeHttpClient::default_for_runtime(TransportConfig::new(profile.endpoint.clone()), &cx);
+        let client = SnowflakeHttpClient::for_runtime(TransportConfig::new(profile.endpoint.clone()))
+            .map_err(|error| error.to_string())?;
         let mut auth = profile
             .auth_profile
             .resolve(&ProcessSecretResolver, &profile.account, &profile.user)

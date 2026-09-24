@@ -15,6 +15,10 @@ default = []
 live = []
 testkit = []
 compression = []
+# Accept a loopback `https://127.0.0.1:<port>` endpoint for the hermetic socket
+# e2e (reality-check bead F1). Never enabled by a release build; production
+# endpoint validation is unchanged.
+testkit-endpoint = []
 
 [lints]
 workspace = true
