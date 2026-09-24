@@ -14,6 +14,7 @@
 //! cleanup request and single-sources the cancel-policy table. Either way the
 //! local outcome is `Cancelled`.
 
+use std::cell::RefCell;
 use std::future::Future;
 use std::time::Duration;
 
@@ -211,7 +212,14 @@ pub async fn run_statement_with_auth<T: StatementTransport, A: AuthProvider>(
 ) -> (StatementOutcome, DriverStats) {
     let mut stats = DriverStats::default();
     let outcome = drive(
-        cx, client, auth, request, params, poll_plan, &mut stats, None,
+        cx,
+        client,
+        auth,
+        request,
+        params,
+        poll_plan,
+        &mut stats,
+        StatementHooks::default(),
     )
     .await;
     (outcome, stats)
@@ -233,6 +241,66 @@ pub trait RowSink {
     ) -> Result<(), SnowflakeError>;
 }
 
+/// What happened during a statement run, for progress reporting
+/// (reality-check bead E5). Carries no SQL text and no credential.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DriverEvent {
+    /// The submit was answered; `running` when the statement continues
+    /// asynchronously and will be polled.
+    Submitted {
+        /// The statement handle, when the response carried one.
+        statement_handle: Option<String>,
+        /// Whether the statement is still running.
+        running: bool,
+    },
+    /// A status poll was answered (`polls` issued so far).
+    Polled {
+        /// Polls issued so far.
+        polls: u32,
+    },
+    /// A result partition was fetched and parsed.
+    PartitionFetched {
+        /// The partition index (1-based; 0 is inline).
+        index: u32,
+        /// Rows in the partition.
+        rows: u64,
+        /// Body bytes after gzip decoding.
+        bytes: u64,
+    },
+    /// The statement completed.
+    Completed {
+        /// Total rows per the result metadata.
+        rows: i64,
+        /// Partitions fetched, the inline partition 0 included.
+        partitions: u32,
+    },
+    /// The driver sent the SQL API cancel for a statement it stopped
+    /// following (a local cancel, or an error after the handle existed).
+    RemoteCancel {
+        /// The cancelled statement.
+        statement_handle: String,
+        /// Whether Snowflake answered the cancel with `200`.
+        acknowledged: bool,
+        /// The answer's status class, or why no answer arrived.
+        detail: String,
+    },
+}
+
+/// Receives [`DriverEvent`]s while a statement runs.
+pub trait DriverObserver {
+    /// One event, in order.
+    fn event(&mut self, event: DriverEvent);
+}
+
+/// Optional per-run hooks: a streaming row sink and a progress observer.
+#[derive(Default)]
+pub struct StatementHooks<'a> {
+    /// Receives the rows instead of the completed statement (streaming).
+    pub sink: Option<&'a mut dyn RowSink>,
+    /// Receives progress events.
+    pub observer: Option<&'a mut dyn DriverObserver>,
+}
+
 /// [`run_statement_with_auth`], handing rows to `sink` as each fetch window
 /// completes instead of assembling them, so peak memory is one window of
 /// partitions. The returned [`CompletedStatement`] keeps the metadata; its
@@ -246,19 +314,45 @@ pub async fn run_statement_streaming<T: StatementTransport, A: AuthProvider>(
     poll_plan: PollPlan,
     sink: &mut dyn RowSink,
 ) -> (StatementOutcome, DriverStats) {
+    let hooks = StatementHooks {
+        sink: Some(sink),
+        observer: None,
+    };
+    run_statement_hooked(cx, client, auth, request, params, poll_plan, hooks).await
+}
+
+/// [`run_statement_with_auth`] with optional [`StatementHooks`].
+pub async fn run_statement_hooked<T: StatementTransport, A: AuthProvider>(
+    cx: &Cx,
+    client: &T,
+    auth: &mut A,
+    request: SubmitStatementRequest,
+    params: SubmitQueryParams,
+    poll_plan: PollPlan,
+    hooks: StatementHooks<'_>,
+) -> (StatementOutcome, DriverStats) {
     let mut stats = DriverStats::default();
     let outcome = drive(
-        cx,
-        client,
-        auth,
-        request,
-        params,
-        poll_plan,
-        &mut stats,
-        Some(sink),
+        cx, client, auth, request, params, poll_plan, &mut stats, hooks,
     )
     .await;
     (outcome, stats)
+}
+
+fn notify(observer: &mut Option<&mut dyn DriverObserver>, event: DriverEvent) {
+    if let Some(observer) = observer.as_mut() {
+        observer.event(event);
+    }
+}
+
+fn progress_handle(progress: &Progress) -> Option<String> {
+    match progress {
+        Progress::PollAgain(handle) | Progress::FetchPartition { handle, .. } => {
+            Some(handle.as_str().to_owned())
+        }
+        Progress::Complete(done) => Some(done.statement_handle.as_str().to_owned()),
+        Progress::TimedOut(_) | Progress::Failed(_) => None,
+    }
 }
 
 /// Build the typed error for a `401` the driver could not recover from.
@@ -293,6 +387,109 @@ fn refresh_after_unauthorized<A: AuthProvider>(
     }
 }
 
+/// Wraps the transport to record the result of every remote cancel the
+/// driver fires; the cancel paths are best-effort and otherwise discard it.
+struct CancelRecorder<'t, T> {
+    inner: &'t T,
+    cancels: RefCell<Vec<DriverEvent>>,
+}
+
+impl<T> CancelRecorder<'_, T> {
+    fn record(&self, handle: &StatementHandle, outcome: &TransportOutcome<CancelHttpResponse>) {
+        let (acknowledged, detail) = match outcome {
+            SnowflakeOutcome::Ok(response) => (
+                response.status == StatusClass::Completed,
+                status_class_label(response.status).to_owned(),
+            ),
+            SnowflakeOutcome::Err(error) => (false, redact(&error.message).into_owned()),
+            SnowflakeOutcome::Cancelled(reason) => (
+                false,
+                format!(
+                    "the cancel request was itself cancelled ({:?})",
+                    reason.kind
+                ),
+            ),
+            SnowflakeOutcome::Panicked(_) => (false, "the cancel request panicked".to_owned()),
+        };
+        self.cancels.borrow_mut().push(DriverEvent::RemoteCancel {
+            statement_handle: handle.as_str().to_owned(),
+            acknowledged,
+            detail,
+        });
+    }
+}
+
+const fn status_class_label(status: StatusClass) -> &'static str {
+    match status {
+        StatusClass::Completed => "completed",
+        StatusClass::Running => "running",
+        StatusClass::StatementTimeout => "statement_timeout",
+        StatusClass::QueryFailure => "query_failure",
+        StatusClass::RateLimited => "rate_limited",
+        StatusClass::ServerErrorRetryable => "server_error",
+        StatusClass::Unauthorized => "unauthorized",
+        StatusClass::Unexpected => "unexpected",
+    }
+}
+
+impl<T: StatementTransport> StatementTransport for CancelRecorder<'_, T> {
+    async fn submit_statement(
+        &self,
+        cx: &Cx,
+        request: SubmitHttpRequest,
+    ) -> TransportOutcome<SubmitHttpResponse> {
+        self.inner.submit_statement(cx, request).await
+    }
+
+    async fn poll_statement(
+        &self,
+        cx: &Cx,
+        request: PollHttpRequest,
+    ) -> TransportOutcome<PollHttpResponse> {
+        self.inner.poll_statement(cx, request).await
+    }
+
+    async fn fetch_partition(
+        &self,
+        cx: &Cx,
+        request: PartitionHttpRequest,
+    ) -> TransportOutcome<PartitionBody> {
+        self.inner.fetch_partition(cx, request).await
+    }
+
+    async fn cancel_after_local_cancel(
+        &self,
+        cx: &Cx,
+        auth: AuthorizationDescriptor,
+        statement_handle: StatementHandle,
+        reason: CancelReason,
+    ) -> TransportOutcome<CancelHttpResponse> {
+        let outcome = self
+            .inner
+            .cancel_after_local_cancel(cx, auth, statement_handle.clone(), reason)
+            .await;
+        self.record(&statement_handle, &outcome);
+        outcome
+    }
+
+    async fn cancel_orphaned_statement(
+        &self,
+        cx: &Cx,
+        auth: AuthorizationDescriptor,
+        statement_handle: StatementHandle,
+    ) -> TransportOutcome<CancelHttpResponse> {
+        let outcome = self
+            .inner
+            .cancel_orphaned_statement(cx, auth, statement_handle.clone())
+            .await;
+        self.record(&statement_handle, &outcome);
+        outcome
+    }
+}
+
+/// Run the statement, then report each remote cancel it fired to the
+/// observer as [`DriverEvent::RemoteCancel`] (reality-check bead E1: the
+/// receipt of a cancelled statement says whether the cancel reached Snowflake).
 #[allow(clippy::too_many_arguments)]
 async fn drive<T: StatementTransport, A: AuthProvider>(
     cx: &Cx,
@@ -302,8 +499,52 @@ async fn drive<T: StatementTransport, A: AuthProvider>(
     params: SubmitQueryParams,
     poll_plan: PollPlan,
     stats: &mut DriverStats,
-    mut sink: Option<&mut dyn RowSink>,
+    hooks: StatementHooks<'_>,
 ) -> StatementOutcome {
+    let recorder = CancelRecorder {
+        inner: client,
+        cancels: RefCell::new(Vec::new()),
+    };
+    let StatementHooks { sink, mut observer } = hooks;
+    let outcome = drive_statement(
+        cx,
+        &recorder,
+        provider,
+        request,
+        params,
+        poll_plan,
+        stats,
+        // Both hooks are reborrowed for the inner run: `StatementHooks` is
+        // invariant in its lifetime, and the observer is needed again after.
+        StatementHooks {
+            sink: sink.map(|sink| sink as &mut dyn RowSink),
+            observer: observer
+                .as_mut()
+                .map(|observer| &mut **observer as &mut dyn DriverObserver),
+        },
+    )
+    .await;
+    for event in recorder.cancels.take() {
+        notify(&mut observer, event);
+    }
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_statement<T: StatementTransport, A: AuthProvider>(
+    cx: &Cx,
+    client: &T,
+    provider: &mut A,
+    request: SubmitStatementRequest,
+    params: SubmitQueryParams,
+    poll_plan: PollPlan,
+    stats: &mut DriverStats,
+    hooks: StatementHooks<'_>,
+) -> StatementOutcome {
+    let StatementHooks {
+        mut sink,
+        mut observer,
+    } = hooks;
     let body = match serde_json::to_vec(&request) {
         Ok(body) => body,
         Err(error) => {
@@ -356,10 +597,24 @@ async fn drive<T: StatementTransport, A: AuthProvider>(
         Ok(progress) => progress,
         Err(error) => return SnowflakeOutcome::err(error.into_snowflake_error()),
     };
+    notify(
+        &mut observer,
+        DriverEvent::Submitted {
+            statement_handle: progress_handle(&progress),
+            running: matches!(progress, Progress::PollAgain(_)),
+        },
+    );
 
     loop {
         match progress {
             Progress::Complete(mut completed) => {
+                notify(
+                    &mut observer,
+                    DriverEvent::Completed {
+                        rows: completed.result_set.total_rows(),
+                        partitions: completed.fetched_partitions,
+                    },
+                );
                 // The statement is finished server-side: a sink error needs no
                 // remote cancel.
                 if let Some(sink) = sink.as_mut() {
@@ -458,6 +713,7 @@ async fn drive<T: StatementTransport, A: AuthProvider>(
                         .await;
                     }
                 };
+                notify(&mut observer, DriverEvent::Polled { polls: stats.polls });
             }
             Progress::FetchPartition { handle, partition } => {
                 if cx.checkpoint().is_err() {
@@ -485,6 +741,13 @@ async fn drive<T: StatementTransport, A: AuthProvider>(
                 {
                     return match machine.complete_early() {
                         Ok(mut done) => {
+                            notify(
+                                &mut observer,
+                                DriverEvent::Completed {
+                                    rows: done.result_set.total_rows(),
+                                    partitions: done.fetched_partitions,
+                                },
+                            );
                             if let Some(sink) = sink.as_mut() {
                                 let rows = std::mem::take(&mut done.rows);
                                 if let Err(error) = sink.accept(&done.result_set, rows) {
@@ -606,26 +869,44 @@ async fn drive<T: StatementTransport, A: AuthProvider>(
                         };
                     }
                     reauth_left = 1;
+                    // Validated against this count by `on_partition` below.
+                    let partition_rows = machine
+                        .result_set()
+                        .and_then(|result_set| {
+                            result_set
+                                .result_set_meta_data
+                                .partition_info
+                                .get(usize::try_from(index).unwrap_or(usize::MAX))
+                        })
+                        .map_or(0, |info| u64::try_from(info.row_count).unwrap_or(0));
+                    let partition_bytes = u64::try_from(response.body.len()).unwrap_or(u64::MAX);
                     // `response.body` is already gzip-decoded by the transport.
-                    after_window = Some(
-                        match machine.on_partition(
-                            response_class(response.status),
+                    let partition_progress = match machine.on_partition(
+                        response_class(response.status),
+                        index,
+                        &response.body,
+                    ) {
+                        Ok(progress) => progress,
+                        Err(error) => {
+                            return abandon_with_error(
+                                cx,
+                                client,
+                                &auth,
+                                &handle,
+                                error.into_snowflake_error(),
+                            )
+                            .await;
+                        }
+                    };
+                    notify(
+                        &mut observer,
+                        DriverEvent::PartitionFetched {
                             index,
-                            &response.body,
-                        ) {
-                            Ok(progress) => progress,
-                            Err(error) => {
-                                return abandon_with_error(
-                                    cx,
-                                    client,
-                                    &auth,
-                                    &handle,
-                                    error.into_snowflake_error(),
-                                )
-                                .await;
-                            }
+                            rows: partition_rows,
+                            bytes: partition_bytes,
                         },
                     );
+                    after_window = Some(partition_progress);
                 }
                 progress = match after_window {
                     Some(progress) => progress,
@@ -2064,6 +2345,156 @@ mod tests {
                 "no batch holds more than one partition"
             );
             assert!(transport.orphan_cancels.borrow().is_empty());
+        });
+    }
+
+    /// Collects progress events.
+    #[derive(Default)]
+    struct CollectingObserver(Vec<DriverEvent>);
+
+    impl DriverObserver for CollectingObserver {
+        fn event(&mut self, event: DriverEvent) {
+            self.0.push(event);
+        }
+    }
+
+    /// Reality-check bead E1: every remote cancel reaches the observer with
+    /// Snowflake's answer, acknowledged or not; a clean run sends none.
+    #[test]
+    fn the_observer_sees_each_remote_cancel_and_its_answer() {
+        asupersync::test_utils::run_test(|| async {
+            let run = |transport: FakeTransport| async move {
+                let mut observer = CollectingObserver::default();
+                let mut auth = fake_auth();
+                let cx = Cx::for_testing();
+                let hooks = StatementHooks {
+                    sink: None,
+                    observer: Some(&mut observer),
+                };
+                let (outcome, _) = run_statement_hooked(
+                    &cx,
+                    &transport,
+                    &mut auth,
+                    SubmitStatementRequest::new("select 1"),
+                    SubmitQueryParams::default(),
+                    fast_poll_plan(5),
+                    hooks,
+                )
+                .await;
+                (outcome, observer.0)
+            };
+            let cancels = |events: &[DriverEvent]| {
+                events
+                    .iter()
+                    .filter_map(|event| match event {
+                        DriverEvent::RemoteCancel {
+                            statement_handle,
+                            acknowledged,
+                            detail,
+                        } => Some((statement_handle.clone(), *acknowledged, detail.clone())),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            // A poll error after the handle exists: the orphan cancel is
+            // answered 200.
+            let acknowledged =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            acknowledged.polls.borrow_mut().push(Scripted::Err);
+            let (outcome, events) = run(acknowledged).await;
+            assert!(matches!(outcome, SnowflakeOutcome::Err(_)), "{outcome:?}");
+            assert_eq!(
+                cancels(&events),
+                vec![(
+                    fixture_handle().as_str().to_owned(),
+                    true,
+                    "completed".to_owned()
+                )],
+                "{events:?}"
+            );
+
+            // The same, but the cancel itself fails: recorded, not hidden.
+            let mut refused =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            refused.polls.borrow_mut().push(Scripted::Err);
+            refused.orphan_cancel_result = Scripted::Err;
+            let (_, events) = run(refused).await;
+            let recorded = cancels(&events);
+            assert_eq!(recorded.len(), 1, "{events:?}");
+            assert!(!recorded[0].1, "{recorded:?}");
+
+            // Negative: a completed statement sends no cancel.
+            let (outcome, events) = run(streaming_transport()).await;
+            assert!(matches!(outcome, SnowflakeOutcome::Ok(_)), "{outcome:?}");
+            assert!(cancels(&events).is_empty(), "{events:?}");
+        });
+    }
+
+    /// Reality-check bead E5: the observer sees the submit, each fetched
+    /// partition (rows from the validated metadata, decoded bytes) and the
+    /// completion, in order.
+    #[test]
+    fn the_observer_sees_submit_partitions_and_completion() {
+        asupersync::test_utils::run_test(|| async {
+            let transport = streaming_transport();
+            let mut observer = CollectingObserver::default();
+            let mut auth = fake_auth();
+            let cx = Cx::for_testing();
+            let hooks = StatementHooks {
+                sink: None,
+                observer: Some(&mut observer),
+            };
+            let (outcome, _) = run_statement_hooked(
+                &cx,
+                &transport,
+                &mut auth,
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5).with_partition_concurrency(1),
+                hooks,
+            )
+            .await;
+            assert!(matches!(outcome, SnowflakeOutcome::Ok(_)), "{outcome:?}");
+            let events = observer.0;
+            assert!(
+                matches!(
+                    &events[0],
+                    DriverEvent::Submitted {
+                        running: false,
+                        statement_handle: Some(_)
+                    }
+                ),
+                "{events:?}"
+            );
+            assert_eq!(
+                events[1],
+                DriverEvent::PartitionFetched {
+                    index: 1,
+                    rows: 2,
+                    bytes: u64::try_from(br#"{"data":[["p1a","x"],["p1b","x"]]}"#.len())
+                        .unwrap_or(0),
+                }
+            );
+            assert!(
+                matches!(
+                    events[2],
+                    DriverEvent::PartitionFetched {
+                        index: 2,
+                        rows: 1,
+                        ..
+                    }
+                ),
+                "{events:?}"
+            );
+            assert_eq!(
+                events[3],
+                DriverEvent::Completed {
+                    rows: 5,
+                    partitions: 3
+                }
+            );
+            assert_eq!(events.len(), 4, "{events:?}");
         });
     }
 
