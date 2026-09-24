@@ -64,6 +64,12 @@ pub enum ExportError {
     Sink { message: String },
     /// Deterministic JSON serialization failed.
     Json { message: String },
+    /// A date/time/timestamp cell did not follow its type's SQL API wire
+    /// convention. The value itself is never included.
+    CellDecode {
+        column: String,
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for ExportError {
@@ -108,6 +114,9 @@ impl fmt::Display for ExportError {
             ),
             Self::Sink { message } => write!(f, "export sink rejected bytes: {message}"),
             Self::Json { message } => write!(f, "export JSON serialization failed: {message}"),
+            Self::CellDecode { column, reason } => {
+                write!(f, "column `{column}`: a cell {reason}")
+            }
         }
     }
 }
@@ -733,7 +742,17 @@ mod local {
         let header = csv_record(columns.iter().map(|column| Some(column.name.as_str())));
         sink.write_chunk(header.as_bytes())?;
         stream_rows(columns, partitions, sink, |row, sink| {
-            let record = csv_record(row.iter().map(|cell| cell.as_deref()));
+            let cells = columns
+                .iter()
+                .zip(row)
+                .map(|(column, cell)| match cell {
+                    Some(value) => Ok(Some(
+                        temporal_text(column, value)?.unwrap_or_else(|| value.clone()),
+                    )),
+                    None => Ok(None),
+                })
+                .collect::<ExportResult<Vec<Option<String>>>>()?;
+            let record = csv_record(cells.iter().map(Option::as_deref));
             sink.write_chunk(record.as_bytes())
         })
     }
@@ -940,7 +959,41 @@ mod local {
         Ok(line)
     }
 
+    /// The `typed.v1` text form of a DATE, TIME or TIMESTAMP_* cell
+    /// (`"2020-01-01"`, `"23:01:59.000000000"`, `"2021-03-19T18:06:59.000000000+01:00"`)
+    /// from the same codec as the query envelopes (reality-check bead C1);
+    /// `None` for every other type, which keeps its wire text.
+    fn temporal_text(column: &ExportColumn, value: &str) -> ExportResult<Option<String>> {
+        use franken_snowflake_core::typed::{ColumnCodec, JsonRepr};
+        let codec = ColumnCodec::new(
+            &column.snowflake_type,
+            column.precision.map(i64::from),
+            column.scale.map(i64::from),
+        );
+        if !matches!(
+            codec.json_repr(),
+            JsonRepr::Date
+                | JsonRepr::Time
+                | JsonRepr::TimestampNtz
+                | JsonRepr::TimestampUtc
+                | JsonRepr::TimestampOffset
+        ) {
+            return Ok(None);
+        }
+        match codec.decode(Some(value)) {
+            Ok(serde_json::Value::String(text)) => Ok(Some(text)),
+            Ok(_) => Ok(None),
+            Err(error) => Err(ExportError::CellDecode {
+                column: column.name.clone(),
+                reason: error.reason,
+            }),
+        }
+    }
+
     fn json_cell_value(column: &ExportColumn, value: &str) -> ExportResult<String> {
+        if let Some(text) = temporal_text(column, value)? {
+            return serde_json::to_string(&text).map_err(ExportError::from);
+        }
         match snowflake_type_family(&column.snowflake_type) {
             SnowflakeTypeFamily::Boolean if matches!(value, "true" | "false") => {
                 Ok(value.to_owned())
@@ -1558,6 +1611,72 @@ mod tests {
             export_jsonl(&input, "artifacts/variant.jsonl", 1).map_err(|e| e.to_string())?;
         let line = String::from_utf8(artifact.bytes).map_err(|e| e.to_string())?;
         assert_eq!(line, format!("{{\"v\":{raw}}}\n"));
+        Ok(())
+    }
+
+    /// Reality-check bead C1: temporal cells leave as the typed.v1 text forms in
+    /// both CSV and JSONL; a malformed one is a typed error naming the column,
+    /// never the value.
+    #[test]
+    fn temporal_cells_export_as_typed_text() -> Result<(), String> {
+        let columns = vec![
+            ExportColumn::new("d", "DATE"),
+            ExportColumn::new("t", "TIME").precision_scale(None, Some(9)),
+            ExportColumn::new("ntz", "TIMESTAMP_NTZ").precision_scale(None, Some(9)),
+            ExportColumn::new("ltz", "TIMESTAMP_LTZ").precision_scale(None, Some(9)),
+            ExportColumn::new("tz", "TIMESTAMP_TZ").precision_scale(None, Some(9)),
+            ExportColumn::new("n", "FIXED").precision_scale(Some(38), Some(2)),
+        ];
+        let row = |cells: [Option<&str>; 6]| cells.map(|cell| cell.map(str::to_owned)).to_vec();
+        let input = LocalExportInput::new(
+            columns.clone(),
+            vec![ResultPartition::new(
+                0,
+                vec![
+                    row([
+                        Some("18262"),
+                        Some("82919.000000000"),
+                        Some("1611871777.123456789"),
+                        Some("1611871777.123456789"),
+                        Some("1616173619.000000000 1500"),
+                        Some("12.50"),
+                    ]),
+                    row([None, None, None, None, None, None]),
+                ],
+            )],
+        );
+        let csv = export_csv(&input, "artifacts/t.csv", 1).map_err(|e| e.to_string())?;
+        assert_eq!(
+            String::from_utf8_lossy(&csv.bytes),
+            "d,t,ntz,ltz,tz,n\n2020-01-01,23:01:59.000000000,2021-01-28T22:09:37.123456789,\
+             2021-01-28T22:09:37.123456789Z,2021-03-19T18:06:59.000000000+01:00,12.50\n,,,,,\n"
+        );
+        let jsonl = export_jsonl(&input, "artifacts/t.jsonl", 1).map_err(|e| e.to_string())?;
+        let first = String::from_utf8_lossy(&jsonl.bytes)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        assert_eq!(
+            first,
+            r#"{"d":"2020-01-01","t":"23:01:59.000000000","ntz":"2021-01-28T22:09:37.123456789","ltz":"2021-01-28T22:09:37.123456789Z","tz":"2021-03-19T18:06:59.000000000+01:00","n":12.50}"#
+        );
+
+        let bad = LocalExportInput::new(
+            vec![ExportColumn::new("d", "DATE")],
+            vec![ResultPartition::new(
+                0,
+                vec![vec![Some("secret-looking-value".to_owned())]],
+            )],
+        );
+        for error in [
+            export_csv(&bad, "artifacts/bad.csv", 1).err(),
+            export_jsonl(&bad, "artifacts/bad.jsonl", 1).err(),
+        ] {
+            let message = error.map(|error| error.to_string()).unwrap_or_default();
+            assert!(message.contains("column `d`"), "{message}");
+            assert!(!message.contains("secret-looking-value"), "{message}");
+        }
         Ok(())
     }
 
