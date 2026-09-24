@@ -41,7 +41,7 @@ mod fastmcp_surface {
         Content, McpContext, McpError, McpErrorCode, McpResult, Server, Tool, ToolAnnotations,
         ToolHandler,
     };
-    use franken_snowflake_core::{error::SnowflakeErrorCode, redact::redact};
+    use franken_snowflake_core::redact::redact;
     use serde_json::{Map, Value, json};
 
     use super::{CliContractOutput, CliContractRunner};
@@ -390,6 +390,7 @@ mod fastmcp_surface {
         }
 
         fn cli_args(self, arguments: &Value) -> McpResult<Vec<String>> {
+            refuse_unknown_arguments(self.spec().name, &self.spec().params, arguments)?;
             match self {
                 Self::Capabilities => Ok(json_args(&["capabilities"])),
                 Self::Onboard => Ok(json_args(&["onboard"])),
@@ -731,7 +732,16 @@ mod fastmcp_surface {
             ]);
         } else {
             params.extend([
-                ParamSpec::string("out", "Local file path to write.", true),
+                ParamSpec::string(
+                    "out",
+                    "File path relative to the server's export directory (<data_dir>/exports); absolute paths, `..` and symlinks are refused.",
+                    true,
+                ),
+                ParamSpec::boolean(
+                    "overwrite",
+                    "Replace an existing regular file at `out` (never a symlink).",
+                    false,
+                ),
                 ParamSpec::string_enum(
                     "compression",
                     "Compression for parquet export: snappy (default), gzip, or none.",
@@ -805,6 +815,12 @@ mod fastmcp_surface {
             }
             args.push("--out".to_string());
             args.push(required_string(arguments, "out")?);
+            if optional_bool(arguments, "overwrite")?.unwrap_or(false) {
+                args.push("--overwrite".to_string());
+            }
+            // An MCP caller never chooses an arbitrary filesystem path: the
+            // export is always confined under <data_dir>/exports.
+            args.push("--sandbox-out".to_string());
         }
         args.push("--json".to_string());
         Ok(args)
@@ -869,10 +885,14 @@ mod fastmcp_surface {
                 icon: None,
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 tags: spec.tags.iter().map(|tag| (*tag).to_string()).collect(),
+                // Truthful hints: only the side-effecting tools (`export_run`
+                // writes a local file, `query_cancel` cancels a remote statement)
+                // are destructive and non-idempotent.
                 annotations: Some(
                     ToolAnnotations::new()
                         .read_only(spec.read_only)
-                        .idempotent(true)
+                        .idempotent(spec.read_only)
+                        .destructive(!spec.read_only)
                         .open_world_hint(spec.open_world_hint),
                 ),
             }
@@ -895,8 +915,10 @@ mod fastmcp_surface {
         let runner: Arc<dyn CliContractRunner> = Arc::new(runner);
         let mut builder = Server::new(SERVER_NAME, env!("CARGO_PKG_VERSION"))
             .instructions(
-                "Read-only Snowflake SQL API tools. Each tool delegates to the same \
-                 franken-snowflake CLI handler and returns the same deterministic envelope.",
+                "Snowflake SQL API tools. Each tool delegates to the same franken-snowflake \
+                 CLI handler and returns the same deterministic envelope. `export_run` writes \
+                 a local file and `query_cancel` cancels a remote statement; every other tool \
+                 only reads.",
             )
             .strict_input_validation(true)
             .mask_error_details(true);
@@ -908,30 +930,39 @@ mod fastmcp_surface {
         builder.build()
     }
 
+    /// How `mcp serve` listens.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum McpServeMode {
+        /// JSON-RPC over stdin/stdout (the agent-spawn path).
+        Stdio,
+        /// The secured HTTP transport (see [`crate::http_front`]).
+        Http(crate::http_front::HttpServeOptions),
+    }
+
+    /// Names of the tools that only read; the HTTP transport exposes these by
+    /// default and the rest only via `--allow-tool`.
+    #[must_use]
+    pub fn read_only_tool_names() -> Vec<&'static str> {
+        READ_VERBS
+            .iter()
+            .map(|verb| verb.spec())
+            .filter(|spec| spec.read_only)
+            .map(|spec| spec.name)
+            .collect()
+    }
+
     /// Run `franken-snowflake mcp serve` on stdio or HTTP.
-    pub fn run_mcp_serve_process<R>(mode: Option<String>, runner: R) -> !
+    pub fn run_mcp_serve_process<R>(mode: McpServeMode, runner: R) -> !
     where
         R: CliContractRunner + 'static,
     {
-        match mode.as_deref() {
-            None | Some("stdio") => build_mcp_server(runner).run_stdio(),
-            Some(value) if value.starts_with("http:") => {
-                // Strip exactly one `http:` mode tag. `trim_start_matches` would
-                // peel every leading `http:`, mangling an address that itself
-                // begins with it (e.g. `--http http://host:port` -> `//host:port`).
-                let addr = value.strip_prefix("http:").unwrap_or(value);
-                build_mcp_server(runner).run_http(addr.to_string())
-            }
-            Some(other) => {
-                // Redact the echoed mode: a secret-shaped value mis-passed as the
-                // serve mode must not leak to stderr (mirrors `invalid_params`).
-                eprintln!(
-                    "{}: unsupported MCP serve mode `{}`; use --stdio or --http <addr>",
-                    SnowflakeErrorCode::UsageError.stable_code(),
-                    franken_snowflake_core::redact::redact(other)
-                );
-                std::process::exit(64)
-            }
+        match mode {
+            McpServeMode::Stdio => build_mcp_server(runner).run_stdio(),
+            McpServeMode::Http(options) => crate::http_front::run_secure_http(
+                build_mcp_server(runner),
+                &options,
+                &read_only_tool_names(),
+            ),
         }
     }
 
@@ -1038,6 +1069,43 @@ mod fastmcp_surface {
             )),
             None => Ok(None),
         }
+    }
+
+    /// An argument the tool's inputSchema does not declare is refused, never
+    /// silently dropped (the schema says `additionalProperties: false`).
+    fn refuse_unknown_arguments(
+        tool: &str,
+        params: &[ParamSpec],
+        arguments: &Value,
+    ) -> McpResult<()> {
+        let Some(object) = arguments.as_object() else {
+            return Ok(());
+        };
+        let unknown: Vec<&str> = object
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !params.iter().any(|param| param.name == *key))
+            .collect();
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        let accepted: Vec<&str> = params.iter().map(|param| param.name).collect();
+        Err(invalid_params(
+            format!(
+                "`{tool}` does not take {}; it accepts {}",
+                unknown
+                    .iter()
+                    .map(|key| format!("`{key}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if accepted.is_empty() {
+                    "no arguments".to_string()
+                } else {
+                    accepted.join(", ")
+                }
+            ),
+            Some(json!({ "unknown_arguments": unknown, "accepted_arguments": accepted })),
+        ))
     }
 
     fn invalid_params(message: impl Into<String>, data: Option<Value>) -> McpError {
@@ -1174,8 +1242,19 @@ mod fastmcp_surface {
                 .map(str::to_string)
                 .collect::<Vec<_>>()
             );
+            // `role` is a query_run argument; query_plan refuses it instead of
+            // dropping it.
+            let refused = ReadVerb::QueryPlan
+                .cli_args(&json!({"profile": "demo", "sql": "select 1", "role": "ANALYST"}));
+            match refused {
+                Err(error) => assert!(
+                    error.message.contains("`query_plan` does not take `role`"),
+                    "{error:?}"
+                ),
+                Ok(args) => return Err(format!("role on query_plan was accepted: {args:?}")),
+            }
             let plan = ReadVerb::QueryPlan
-                .cli_args(&json!({"profile": "demo", "sql": "select 1", "role": "IGNORED_ON_PLAN"}))
+                .cli_args(&json!({"profile": "demo", "sql": "select 1"}))
                 .map_err(|e| format!("{e:?}"))?;
             assert_eq!(
                 plan,
@@ -1266,6 +1345,7 @@ mod fastmcp_surface {
                     "01b2-qid",
                     "--out",
                     "events.csv",
+                    "--sandbox-out",
                     "--json",
                 ]
                 .into_iter()
@@ -1288,6 +1368,7 @@ mod fastmcp_surface {
                     "frame",
                     "--out",
                     "events.json",
+                    "--sandbox-out",
                     "--json",
                 ]
                 .into_iter()
@@ -1318,6 +1399,7 @@ mod fastmcp_surface {
                     "gzip",
                     "--out",
                     "events.parquet",
+                    "--sandbox-out",
                     "--json",
                 ]
                 .into_iter()
@@ -1517,4 +1599,12 @@ mod fastmcp_surface {
 }
 
 #[cfg(feature = "mcp")]
-pub use fastmcp_surface::{build_mcp_server, mcp_tool_schema_json, run_mcp_serve_process};
+pub mod http_front;
+
+#[cfg(feature = "mcp")]
+pub use fastmcp_surface::{
+    McpServeMode, build_mcp_server, mcp_tool_schema_json, read_only_tool_names,
+    run_mcp_serve_process,
+};
+#[cfg(feature = "mcp")]
+pub use http_front::{HttpServeOptions, MCP_TOKEN_ENV};
