@@ -62,6 +62,7 @@ live = [
     "dep:franken-snowflake-http",
     "dep:franken-snowflake-auth",
     "dep:asupersync",
+    "dep:signal-hook",
 ]
 
 [build-dependencies]
@@ -85,6 +86,9 @@ franken-snowflake-sqlapi = { path = "../franken-snowflake-sqlapi", optional = tr
 franken-snowflake-http = { path = "../franken-snowflake-http", optional = true, version = "0.0.4" }
 franken-snowflake-auth = { path = "../franken-snowflake-auth", optional = true, version = "0.0.4" }
 asupersync = { workspace = true, optional = true }
+# SIGINT/SIGTERM handling for in-flight live statements (bead E1), through the
+# safe flag API; already in the graph through asupersync.
+signal-hook = { version = "0.4", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # SHA-256 of the running executable for `capabilities --with-exe-hash` (bead H1);

@@ -22,14 +22,16 @@
 //!   secret-leak redactor over the whole envelope before output.
 
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
 use franken_snowflake_auth::{
-    AuthMechanism, AuthProfile, KEYPAIR_JWT_TOKEN_TYPE, OAUTH_TOKEN_TYPE, OidcTokenSource,
-    PROGRAMMATIC_ACCESS_TOKEN_TYPE, ProcessSecretResolver, ReauthDecision, SecretSource,
-    SnowflakeAuth,
+    AuthLane, AuthMechanism, AuthProfile, CredentialLifetime, KEYPAIR_JWT_TOKEN_TYPE,
+    OAUTH_TOKEN_TYPE, OidcTokenSource, PROGRAMMATIC_ACCESS_TOKEN_TYPE, ProcessSecretResolver,
+    ReauthDecision, SecretSource, SnowflakeAuth,
 };
 use franken_snowflake_cache::{
     CacheBackend, CatalogSnapshotRecord, ContentAddress as CacheAddress, ExportKind, ExportRecord,
@@ -1578,7 +1580,7 @@ pub fn profile_doctor_online_outcome(
                 .first()
                 .and_then(|row| row.first())
                 .and_then(Clone::clone);
-            let (receipt_hash, warnings) = record_receipt(
+            let (receipt_hash, mut warnings) = record_receipt(
                 "profile.doctor",
                 &conn,
                 &request_id,
@@ -1587,6 +1589,8 @@ pub fn profile_doctor_online_outcome(
                 "profile_probed",
                 serde_json::json!({ "snowflake_version": version }),
             );
+            let (credential, mut lifetime_warnings) = online_credential_lifetime(&conn);
+            warnings.append(&mut lifetime_warnings);
             probe_success(
                 format,
                 request_id,
@@ -1595,6 +1599,7 @@ pub fn profile_doctor_online_outcome(
                 &rows,
                 receipt_hash,
                 warnings,
+                credential,
             )
         }
         Err(error) => with_terminal_receipt(
@@ -1615,6 +1620,135 @@ pub fn profile_doctor_online_outcome(
     }
 }
 
+/// The credential's remaining lifetime as far as it can be known online
+/// (reality-check bead C5): the resolved credential's own lifetime (a JWT
+/// OAuth bearer's `exp`, the key-pair validity cap) and, for the PAT lane, the
+/// user's tokens from `SHOW USER PROGRAMMATIC ACCESS TOKENS`
+/// (docs.snowflake.com/en/sql-reference/sql/show-user-programmatic-access-tokens,
+/// consulted 2026-09-24; the secret is never returned, so the one this profile
+/// uses cannot be singled out and the soonest active expiry is reported).
+fn online_credential_lifetime(conn: &LiveConn) -> (Json, Vec<Json>) {
+    let now = now_unix_seconds();
+    let mut fields = Vec::new();
+    let mut warnings = Vec::new();
+    if let Ok(mechanism) =
+        conn.auth_profile
+            .resolve(&ProcessSecretResolver, &conn.account, &conn.user)
+    {
+        let (lifetime, mut found) = lifetime_findings(&mechanism.lifetime(), now);
+        fields.push(("credential", lifetime));
+        warnings.append(&mut found);
+    }
+    if matches!(conn.auth_profile, AuthProfile::Pat { .. }) {
+        match execute(
+            conn,
+            "SHOW USER PROGRAMMATIC ACCESS TOKENS",
+            QueryRequestOptions::default(),
+        ) {
+            Ok(rows) => {
+                let (tokens, mut found) = pat_token_findings(&rows, now);
+                fields.push(("programmatic_access_tokens", tokens));
+                warnings.append(&mut found);
+            }
+            Err(error) => fields.push((
+                "programmatic_access_tokens",
+                json_string(format!(
+                    "not listed ({}): the role may not run SHOW USER PROGRAMMATIC ACCESS TOKENS",
+                    error.stable_code()
+                )),
+            )),
+        }
+    }
+    (json_object(fields), warnings)
+}
+
+/// Remaining lifetime of a resolved credential, with a warning when it is
+/// short: OAuth under 10 minutes, a PAT within 2 days, or a key-pair JWT
+/// validity above Snowflake's cap.
+fn lifetime_findings(lifetime: &CredentialLifetime, now: i64) -> (Json, Vec<Json>) {
+    let remaining = lifetime.seconds_until_expiry(now);
+    let mut warnings = Vec::new();
+    match (lifetime.lane, remaining) {
+        (AuthLane::OAuthBearer, Some(seconds)) if seconds <= 600 => {
+            warnings.push(json_string(format!(
+                "the OAuth access token expires in {} minute(s); this connector cannot refresh it",
+                (seconds.max(0) + 59) / 60
+            )));
+        }
+        _ => {
+            if let Some(warning) = lifetime.doctor_warning_at(now) {
+                warnings.push(json_string(warning.message));
+            }
+        }
+    }
+    let data = json_object(vec![
+        ("lane", json_string(lifetime.lane.to_string())),
+        (
+            "expires_in_seconds",
+            remaining.map_or(Json::Null, Json::Number),
+        ),
+    ]);
+    (data, warnings)
+}
+
+/// Active tokens and the soonest expiry from `SHOW USER PROGRAMMATIC ACCESS
+/// TOKENS`; a warning when an active token expires within 7 days. `expires_at`
+/// is a jsonv2 timestamp (fractional epoch seconds).
+fn pat_token_findings(rows: &LiveRows, now: i64) -> (Json, Vec<Json>) {
+    let column = |name: &str| {
+        rows.columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case(name))
+    };
+    let (Some(name_at), Some(expires_at), Some(status_at)) =
+        (column("name"), column("expires_at"), column("status"))
+    else {
+        return (
+            json_string("unrecognized SHOW USER PROGRAMMATIC ACCESS TOKENS columns"),
+            Vec::new(),
+        );
+    };
+    let cell = |row: &Vec<Option<String>>, at: usize| row.get(at).cloned().flatten();
+    let mut active: Vec<(String, i64)> = rows
+        .rows
+        .iter()
+        .filter(|row| {
+            cell(row, status_at).is_some_and(|status| status.eq_ignore_ascii_case("ACTIVE"))
+        })
+        .filter_map(|row| {
+            let seconds = cell(row, expires_at)?.trim().parse::<f64>().ok()?;
+            Some((
+                cell(row, name_at).unwrap_or_default(),
+                seconds.floor() as i64,
+            ))
+        })
+        .collect();
+    active.sort_by_key(|(_, expires)| *expires);
+    let mut warnings = Vec::new();
+    if let Some((name, expires)) = active.first()
+        && expires - now <= 7 * 24 * 60 * 60
+    {
+        warnings.push(json_string(format!(
+            "programmatic access token `{name}` expires in {} day(s); rotate the profile's PAT if it is this one",
+            ((expires - now).max(0) + 86_399) / 86_400
+        )));
+    }
+    let data = json_object(vec![
+        (
+            "active",
+            Json::Number(i64::try_from(active.len()).unwrap_or(i64::MAX)),
+        ),
+        (
+            "soonest_expiry_unix_seconds",
+            active
+                .first()
+                .map_or(Json::Null, |(_, expires)| Json::Number(*expires)),
+        ),
+    ]);
+    (data, warnings)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn probe_success(
     format: OutputFormat,
     request_id: String,
@@ -1623,13 +1757,16 @@ fn probe_success(
     rows: &LiveRows,
     receipt_hash: Option<String>,
     warnings: Vec<Json>,
+    credential_lifetime: Json,
 ) -> crate::Outcome {
     let data = json_object(vec![
         ("profile_id", json_string(profile.clone())),
         ("live_probe_requested", Json::Bool(true)),
         ("live_probe_attempted", Json::Bool(true)),
         ("live_probe_ok", Json::Bool(true)),
-        ("secret_values_read", Json::Bool(false)),
+        // The probe authenticates, so the credential was read (never emitted).
+        ("secret_values_read", Json::Bool(true)),
+        ("credential_lifetime", credential_lifetime),
         (
             "snowflake_version",
             match version {
@@ -1996,8 +2133,133 @@ where
         // Resolve once up front so a missing/invalid credential fails before
         // any request is built, with the same typed error as before.
         auth.descriptor()?;
-        body(&cx, &client, &mut auth).await
+        let _in_flight = InFlight::enter();
+        cancel_on_signal(&cx, body(&cx, &client, &mut auth)).await
     })
+}
+
+// ---------------------------------------------------------------------------
+// Signals (reality-check bead E1)
+// ---------------------------------------------------------------------------
+
+/// How often an in-flight statement checks for a pending signal.
+const SIGNAL_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Process-wide signal state, installed on first use through signal-hook's
+/// flag API (Asupersync's dispatcher is not used: it would keep SIGINT/SIGTERM
+/// away from the default action for the rest of the process, so a long-lived
+/// `mcp serve` could not be stopped with Ctrl-C).
+///
+/// - No statement in flight (`idle`): SIGINT/SIGTERM keep their default
+///   action; the process ends as it always did.
+/// - A statement in flight: the first signal only sets its pending flag, which
+///   [`cancel_on_signal`] turns into a cancellation of the statement's `Cx`
+///   (`User` for SIGINT, `Shutdown` for SIGTERM), so the driver fires the
+///   SQL API remote cancel and the envelope says `cancelled`.
+/// - A second signal while the first is pending exits at once (130 / 143).
+struct SignalFlags {
+    idle: Arc<AtomicBool>,
+    interrupt: Arc<AtomicBool>,
+    terminate: Arc<AtomicBool>,
+    /// Statements in flight (`mcp serve --http` can run several at once).
+    in_flight: AtomicUsize,
+}
+
+fn signal_flags() -> Option<&'static SignalFlags> {
+    static FLAGS: OnceLock<Option<SignalFlags>> = OnceLock::new();
+    FLAGS
+        .get_or_init(|| {
+            use signal_hook::consts::{SIGINT, SIGTERM};
+            use signal_hook::flag;
+            let flags = SignalFlags {
+                idle: Arc::new(AtomicBool::new(true)),
+                interrupt: Arc::new(AtomicBool::new(false)),
+                terminate: Arc::new(AtomicBool::new(false)),
+                in_flight: AtomicUsize::new(0),
+            };
+            // Registration order matters: signal-hook runs the actions in order.
+            for (signal, pending, status) in [
+                (SIGINT, &flags.interrupt, 130),
+                (SIGTERM, &flags.terminate, 143),
+            ] {
+                flag::register_conditional_default(signal, Arc::clone(&flags.idle)).ok()?;
+                flag::register_conditional_shutdown(signal, status, Arc::clone(pending)).ok()?;
+                flag::register(signal, Arc::clone(pending)).ok()?;
+            }
+            Some(flags)
+        })
+        .as_ref()
+}
+
+/// Marks a statement in flight for the signal handlers; restores the default
+/// action when dropped (a panic unwinding through the runtime included).
+struct InFlight(&'static SignalFlags);
+
+impl InFlight {
+    fn enter() -> Option<Self> {
+        let flags = signal_flags()?;
+        if flags.in_flight.fetch_add(1, Ordering::SeqCst) == 0 {
+            // First statement in flight: forget signals from an idle period.
+            flags.interrupt.store(false, Ordering::SeqCst);
+            flags.terminate.store(false, Ordering::SeqCst);
+        }
+        flags.idle.store(false, Ordering::SeqCst);
+        Some(Self(flags))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if self.0.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.idle.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Drive `work` to completion; a pending SIGINT/SIGTERM cancels `cx` once.
+async fn cancel_on_signal<T>(cx: &Cx, work: impl std::future::Future<Output = T>) -> T {
+    let Some(flags) = signal_flags() else {
+        return work.await;
+    };
+    cancel_on_flags(cx, work, &flags.interrupt, &flags.terminate).await
+}
+
+/// The signal-independent core of [`cancel_on_signal`] (unit-testable).
+async fn cancel_on_flags<T>(
+    cx: &Cx,
+    work: impl std::future::Future<Output = T>,
+    interrupt: &AtomicBool,
+    terminate: &AtomicBool,
+) -> T {
+    use std::task::Poll;
+    let mut work = std::pin::pin!(work);
+    let mut raised = false;
+    loop {
+        let tick = asupersync::time::sleep(cx.now_for_observability(), SIGNAL_CHECK_INTERVAL);
+        let mut tick = std::pin::pin!(tick);
+        let finished = std::future::poll_fn(|task| {
+            if let Poll::Ready(value) = work.as_mut().poll(task) {
+                return Poll::Ready(Some(value));
+            }
+            if tick.as_mut().poll(task).is_ready() {
+                return Poll::Ready(None);
+            }
+            Poll::Pending
+        })
+        .await;
+        if let Some(value) = finished {
+            return value;
+        }
+        if !raised {
+            if interrupt.load(Ordering::SeqCst) {
+                cx.cancel_with(CancelKind::User, Some("interrupted (SIGINT)"));
+                raised = true;
+            } else if terminate.load(Ordering::SeqCst) {
+                cx.cancel_with(CancelKind::Shutdown, Some("terminated (SIGTERM)"));
+                raised = true;
+            }
+        }
+    }
 }
 
 /// Submit one prepared request and drive it to completion. Returns the completed
@@ -3906,6 +4168,124 @@ mod tests {
             local_store::confirmation_consumed_by(&store, &confirm_id).as_deref(),
             confirmed["receipt_hash"].as_str(),
             "the completed confirmed write is recorded against its receipt"
+        );
+    }
+
+    /// Reality-check bead E1: a pending interrupt cancels the statement's
+    /// context with `User` (terminate: `Shutdown`), which is what makes the
+    /// driver fire the remote cancel; with nothing pending the work finishes
+    /// untouched.
+    #[test]
+    fn a_pending_signal_cancels_the_statement_context() {
+        let run = |interrupt: bool, terminate: bool| {
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            let interrupt = AtomicBool::new(interrupt);
+            let terminate = AtomicBool::new(terminate);
+            runtime.block_on(async move {
+                let cx = Cx::current().unwrap();
+                // Stands in for the driver's poll wait: runs until its context
+                // is cancelled, or finishes on its own after ~0.5 s.
+                let work = async {
+                    for _ in 0..50 {
+                        if cx.checkpoint().is_err() {
+                            return cx.cancel_reason().map(|reason| reason.kind);
+                        }
+                        asupersync::time::sleep(
+                            cx.now_for_observability(),
+                            Duration::from_millis(10),
+                        )
+                        .await;
+                    }
+                    None
+                };
+                cancel_on_flags(&cx, work, &interrupt, &terminate).await
+            })
+        };
+        assert_eq!(run(true, false), Some(CancelKind::User));
+        assert_eq!(run(false, true), Some(CancelKind::Shutdown));
+        assert_eq!(
+            run(false, false),
+            None,
+            "nothing pending: the work is not cancelled"
+        );
+    }
+
+    /// Reality-check bead C5: `profile doctor --online` on the PAT lane lists
+    /// the user's tokens and warns about the soonest active expiry.
+    #[test]
+    fn scripted_doctor_online_reports_pat_expiry() {
+        let now = now_unix_seconds();
+        let soon = format!("{}.000000000", now + 2 * 86_400);
+        let later = format!("{}.000000000", now + 90 * 86_400);
+        let expired = format!("{}.000000000", now - 86_400);
+        install(
+            "demo",
+            None,
+            None,
+            vec![
+                Ok(completed(
+                    "01b2c3d4-0000-0000-0000-00000000ab21",
+                    &[("SNOWFLAKE_VERSION", "TEXT")],
+                    &[vec![Some("9.30.0")]],
+                )),
+                Ok(completed(
+                    "01b2c3d4-0000-0000-0000-00000000ab22",
+                    &[
+                        ("name", "TEXT"),
+                        ("expires_at", "TIMESTAMP_LTZ"),
+                        ("status", "TEXT"),
+                    ],
+                    &[
+                        vec![Some("ci_token"), Some(later.as_str()), Some("ACTIVE")],
+                        vec![Some("laptop_token"), Some(soon.as_str()), Some("ACTIVE")],
+                        vec![Some("old_token"), Some(expired.as_str()), Some("EXPIRED")],
+                    ],
+                )),
+            ],
+        );
+        let env = envelope(profile_doctor_online_outcome(
+            OutputFormat::Json,
+            "req-doctor-pat".to_owned(),
+            "demo".to_owned(),
+        ));
+        assert_eq!(env["ok"], true, "{env}");
+        let tokens = &env["data"]["credential_lifetime"]["programmatic_access_tokens"];
+        assert_eq!(tokens["active"], 2, "{env}");
+        assert_eq!(
+            tokens["soonest_expiry_unix_seconds"],
+            now + 2 * 86_400,
+            "{env}"
+        );
+        assert!(
+            env["warnings"]
+                .to_string()
+                .contains("`laptop_token` expires in 2 day(s)"),
+            "{env}"
+        );
+    }
+
+    #[test]
+    fn lifetime_findings_warn_by_lane() {
+        let lifetime = |lane, expires_at| CredentialLifetime {
+            lane,
+            issued_at_unix_seconds: None,
+            expires_at_unix_seconds: expires_at,
+            expected_validity_seconds: None,
+            max_validity_seconds: None,
+            refresh_before_expiry_seconds: None,
+        };
+        let (data, warnings) =
+            lifetime_findings(&lifetime(AuthLane::OAuthBearer, Some(1_300)), 1_000);
+        assert!(crate::render_json(&data).contains(r#""expires_in_seconds":300"#));
+        assert_eq!(warnings.len(), 1);
+        assert!(crate::render_json(&warnings[0]).contains("expires in 5 minute(s)"));
+        let (_, none) = lifetime_findings(&lifetime(AuthLane::OAuthBearer, Some(10_000)), 1_000);
+        assert!(none.is_empty(), "an hour left is not a warning: {none:?}");
+        let (data, none) = lifetime_findings(&lifetime(AuthLane::OAuthBearer, None), 1_000);
+        assert!(none.is_empty());
+        assert!(
+            crate::render_json(&data).contains(r#""expires_in_seconds":null"#),
+            "opaque token: lifetime unknown"
         );
     }
 

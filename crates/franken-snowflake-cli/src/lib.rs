@@ -3852,7 +3852,16 @@ fn query_write_outcome(
         ));
     }
 
-    match evaluate_write_intent(&intent, &policy) {
+    let inline_credentials = matches!(
+        statement_kind,
+        WriteStatementKind::CopyIntoTable
+            | WriteStatementKind::CopyIntoStage
+            | WriteStatementKind::CopyIntoExternal
+    ) && sql_lexer::lex(&sql_text)
+        .words()
+        .iter()
+        .any(|word| word == "credentials");
+    let mut outcome = match evaluate_write_intent(&intent, &policy) {
         WriteIntentDecision::Refused { refusal: detail } => {
             write_refusal_outcome(format, request_id, profile, &sql_text, &detail)
         }
@@ -3884,7 +3893,15 @@ fn query_write_outcome(
             &plan,
             confirm.is_some(),
         ),
+    };
+    // Bead B4: keys written into a COPY statement pass through this process
+    // (redacted in every output, but present in the request).
+    if inline_credentials && let Body::Envelope { envelope, .. } = &mut outcome.body {
+        envelope.warnings.push(json_string(
+            "the statement carries inline CREDENTIALS; prefer a STORAGE INTEGRATION so cloud keys never pass through the connector",
+        ));
     }
+    outcome
 }
 
 /// Default lifetime of a confirmation token (`<PREFIX>_WRITE_TOKEN_TTL_SECONDS`).
@@ -7846,6 +7863,59 @@ mod tests {
         assert!(strict.require_dry_run);
         assert!(strict.require_exact_confirmation);
         assert!(strict.require_append_only_audit);
+    }
+
+    /// Reality-check bead B4: a token whose write already completed is refused,
+    /// as are a token for other SQL and a forged id; a fresh one is accepted.
+    #[test]
+    fn verify_confirmation_refuses_spent_foreign_and_unknown_tokens() -> Result<(), String> {
+        let store = local_store::open_store().map_err(|error| error.message())?;
+        let sql = "insert into spent_check values (1)";
+        let kind = WriteStatementKind::Insert;
+        let id = local_store::random_id()?;
+        record_issued_confirmation(&store, "trace-spent", "spent_profile", sql, kind, &id)?;
+        let token = format!("confirm:insert:{id}");
+        assert_eq!(
+            verify_confirmation(Some(&store), "spent_profile", sql, kind, &token),
+            Ok(id.clone())
+        );
+        let other = verify_confirmation(
+            Some(&store),
+            "spent_profile",
+            "insert into spent_check values (2)",
+            kind,
+            &token,
+        );
+        assert!(
+            other
+                .as_ref()
+                .is_err_and(|reason| reason.contains("different statement")),
+            "{other:?}"
+        );
+        let forged = verify_confirmation(
+            Some(&store),
+            "spent_profile",
+            sql,
+            kind,
+            "confirm:insert:00000000-0000-4000-8000-000000000000",
+        );
+        assert!(
+            forged
+                .as_ref()
+                .is_err_and(|reason| reason.contains("no dry run")),
+            "{forged:?}"
+        );
+        local_store::record_confirmation_consumed(&store, "trace-spent-2", &id, Some("receipt-x"))
+            .map_err(|error| error.to_string())?;
+        let spent = verify_confirmation(Some(&store), "spent_profile", sql, kind, &token);
+        assert!(
+            spent.as_ref().is_err_and(
+                |reason| reason.contains("already used") && reason.contains("receipt-x")
+            ),
+            "{spent:?}"
+        );
+        assert!(verify_confirmation(None, "spent_profile", sql, kind, &token).is_err());
+        Ok(())
     }
 
     #[test]

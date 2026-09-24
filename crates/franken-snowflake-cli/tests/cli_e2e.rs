@@ -1242,13 +1242,23 @@ fn write_ladder_gates_unsupported_procedure_and_external_statements() {
         &[("FRANKEN_SNOWFLAKE_E2E_WRITE_ALLOW_PROCEDURES", "true")],
     );
     assert_ne!(allowed.code(), "FSNOW-3011", "{}", allowed.stdout);
-    let unload = write("copy into 's3://bucket/x' from t", &[]);
+    let unload = write(
+        "copy into 's3://bucket/x' from t credentials = (aws_key_id = 'e2e_key_id')",
+        &[],
+    );
     assert_eq!(unload.code(), "FSNOW-3011", "{}", unload.stdout);
     assert!(
         unload.stdout.contains("WRITE_ALLOW_EXTERNAL"),
         "{}",
         unload.stdout
     );
+    // Inline cloud keys are flagged, and never echoed.
+    assert!(
+        unload.stdout.contains("STORAGE INTEGRATION"),
+        "{}",
+        unload.stdout
+    );
+    assert!(!unload.stdout.contains("e2e_key_id"), "{}", unload.stdout);
     let not_listed = write(
         "delete from t",
         &[("FRANKEN_SNOWFLAKE_E2E_WRITE_ALLOWED_KINDS", "insert")],
