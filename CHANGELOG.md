@@ -217,9 +217,41 @@ implementation first and the test/hardening pass follows in a later wave. The
   hang the command. A breach is a deadline cancel: outcome `timeout`, remote
   cancel sent.
 - **MCP cancellation.** A `notifications/cancelled` for a running tool call
-  (stdio or HTTP), or a stdio client closing its input, cancels the statement
-  the call started, with the SQL API remote cancel; stdin is read by a watcher
-  thread because FastMCP's stdio loop handles one request at a time.
+  (stdio or HTTP), a stdio client closing its input, or an HTTP client closing
+  the call's connection cancels the statement the call started, with the SQL
+  API remote cancel; stdin is read by a watcher thread because FastMCP's stdio
+  loop handles one request at a time, and an HTTP call's socket is watched
+  while it runs.
+- **Terminal escapes in Snowflake data stay inert.** Table names, comments and
+  cell values are data: `catalog graph --mermaid|--svg` render their control
+  characters as visible symbols (ESC as U+241B), and `--toon` output that would
+  carry a control character TOON cannot escape is printed as JSON (which escapes
+  it) with a note on stderr. Before, such text reached the terminal raw.
+- **The TUI no longer blocks on a query.** A submitted query runs on a
+  background task; the progress pane follows the driver's events (statement
+  handle, partitions fetched, rows), Esc on the pane cancels the statement
+  (remote cancel included), and a second submit while one runs is refused.
+- **Batches of reads.** `query run --allow-multiple-statements` (MCP
+  `allow_multiple_statements`) runs two or more read statements as one SQL API
+  request with `MULTI_STATEMENT_COUNT` set to the batch size, fetches each
+  statement's result by the handle Snowflake lists, and answers them in order
+  under `data.statements[]`. Every statement must pass the read guard;
+  bindings and empty statements are refused before any request.
+- **Published typed-rows schema.** `docs/protocol/typed_rows.v1.schema.json`
+  (JSON Schema 2020-12) describes `typed.v1` columns and one cell shape per
+  `json_repr`; `typed_rows.v1.example.json` is the codec fixture's exact
+  projection. A CLI test validates every representation against it cell by
+  cell and checks that naive shapes (a FIXED through a float, a DATE day count,
+  a TIMESTAMP_TZ without its offset) fail.
+- **A downstream adapter over the local store, and its conformance suite.**
+  `franken_snowflake_cli::adapter::LocalStoreAdapter` implements
+  `SnowflakeDataLakeAdapter` over what `catalog scan`, `query run` and
+  `export run` persisted (offline; profile diagnostics name env handles only).
+  `franken_snowflake_core::adapter::conformance::check_adapter_conformance`
+  checks any adapter: contract ids, provenance that matches the envelope's data
+  source (fixture data labeled live fails), typed errors for unknown ids,
+  content addresses, secret-free answers. The fixture adapter and the local
+  store adapter pass it; `examples/adapter_conformance.rs` runs it.
 - **Catalog search.** `catalog search <profile> "<words>"` (MCP
   `catalog_search`) ranks the newest snapshot's datasets by the words in their
   names, columns, comments and tags, with where each word matched; offline and

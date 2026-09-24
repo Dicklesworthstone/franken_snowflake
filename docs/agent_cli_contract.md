@@ -144,10 +144,11 @@ requested and always redact tokens / private keys (see `docs/security_model.md`)
 each read verb, plus `query_cancel` and `export_run`, as an MCP tool whose input
 schema (`additionalProperties: false`; unknown arguments are refused) maps onto
 the CLI flags, and each call runs the same CLI handler. `ctx.checkpoint()`
-provides cooperative cancel points before and after a call. Not yet wired: an
-Asupersync `web::request_region` per call, so an agent disconnect does not yet
-cancel an in-flight statement (it runs to completion or to the server-side
-statement timeout). `--http` requires a bearer token, refuses foreign `Host`
+provides cooperative cancel points before and after a call. Each call's
+statement polls a cancel probe tied to its MCP request (not an Asupersync
+`web::request_region`): a `notifications/cancelled` naming it (stdio or HTTP),
+a stdio client closing its input, or an HTTP client closing the call's
+connection cancels the statement, SQL API remote cancel included. `--http` requires a bearer token, refuses foreign `Host`
 and `Origin` headers, and exposes only read-only tools unless `--allow-tool`
 names more; data writes stay on the CLI `query write` ladder.
 
@@ -162,8 +163,17 @@ makes that dry-run/confirm ceremony mandatory (see
 `docs/write_intent_ladder.md`). Result rows are `typed.v1` by default: every
 column in `data.columns` carries a `json_repr` that holds for all of its cells
 (the mapping is in the README, "Result cells", and in
-`franken_snowflake_core::typed`); `--raw-cells` returns the jsonv2 wire strings
+`franken_snowflake_core::typed`; the JSON Schema is
+`docs/protocol/typed_rows.v1.schema.json`); `--raw-cells` returns the jsonv2 wire strings
 with `data.row_encoding = "jsonv2.wire"`. `query run` accepts only single read statements,
-with `MULTI_STATEMENT_COUNT=1` pinned on every submit. Capability rows are not
+with `MULTI_STATEMENT_COUNT=1` pinned on every submit, unless
+`--allow-multiple-statements` (MCP `allow_multiple_statements`) is passed: then a
+batch of two or more reads runs as one request with `MULTI_STATEMENT_COUNT` set to
+the batch size, each statement's rows come back in order under
+`data.statements[]` (index, statement handle, redacted SQL preview, columns, rows,
+counts; the envelope's `statement_handle` is the request's), and a mutation or a
+side-effecting call anywhere in the batch, bindings (Snowflake does not support
+them in multi-statement requests), or an empty statement is refused before any
+request. Capability rows are not
 wired, so read-only is enforced by the SQL guard and the write gate, not by the
 type system.

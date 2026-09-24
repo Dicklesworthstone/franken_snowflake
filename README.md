@@ -399,8 +399,12 @@ Asupersync dependency set; the pinned toolchain lives in `rust-toolchain.toml`.
 
 The canonical binary is `franken-snowflake`; `fsnow` is the identical alias.
 Read commands default to `--json`. Pass `--toon` for the alternate TOON
-encoding (available when the default `toon` feature is compiled in). `--no-color`
-is accepted and ignored. There is no `--version` flag; the compiled version and
+encoding (available when the default `toon` feature is compiled in); a payload
+holding a control character TOON cannot escape (Snowflake names, comments and
+cells are data and can carry terminal escapes) is printed as JSON instead, with
+a note on stderr. No output mode writes a raw control character: JSON escapes
+them, and `--mermaid`/`--svg` show them as visible symbols. The CLI never
+colors its output, so `--no-color` is accepted and ignored. There is no `--version` flag; the compiled version and
 feature set are reported inside the `capabilities` and `onboard` envelopes.
 
 Every command that takes `--profile` (or a positional `<profile>`) also reads
@@ -533,7 +537,7 @@ fsnow dataset profile events_daily --json
 |---|---|
 | `fsnow query plan --profile <profile> --sql <sql> --json` | Validate and explain a read plan without submitting it |
 | `fsnow query plan --dataset <id> [--entity <v>] [--from <t>] [--to <t>] [--as-of <t>] [--select a,b] [--filter <json>] [--limit <n>] --json` | Dataset mode: compile pushed-down SQL with positional typed bindings, Time Travel `AT(TIMESTAMP => ...)` for `--as-of`, and an enforced limit, offline from the local snapshot |
-| `fsnow query run --profile <profile> --sql <sql> [--limit <rows>] [--role <r>] [--warehouse <w>] [--statement-timeout <s>] [--require-live] [--raw-cells] --json` | Submit a single read statement (SELECT / WITH / SHOW / DESCRIBE / EXPLAIN); every flag is honored or rejected, never silently ignored. Rows are typed (`row_encoding: typed.v1`, see [Result cells](#result-cells)); `--raw-cells` returns the SQL API jsonv2 wire strings instead. Result partitions are fetched in a concurrent window and the fetch stops once `--limit` rows are assembled (`partitions_fetched` and a warning say so). `--require-live` hard-refuses with `FSNOW-3003` unless the envelope is backed by the live transport |
+| `fsnow query run --profile <profile> --sql <sql> [--limit <rows>] [--role <r>] [--warehouse <w>] [--statement-timeout <s>] [--require-live] [--raw-cells] [--allow-multiple-statements] --json` | Submit a single read statement (SELECT / WITH / SHOW / DESCRIBE / EXPLAIN); every flag is honored or rejected, never silently ignored. `--allow-multiple-statements` runs a batch of reads as one request (`MULTI_STATEMENT_COUNT` = the batch size) and answers each statement in order under `data.statements[]`; a mutation anywhere in the batch, bindings, or an empty statement is refused before any request. Rows are typed (`row_encoding: typed.v1`, see [Result cells](#result-cells)); `--raw-cells` returns the SQL API jsonv2 wire strings instead. Result partitions are fetched in a concurrent window and the fetch stops once `--limit` rows are assembled (`partitions_fetched` and a warning say so). `--require-live` hard-refuses with `FSNOW-3003` unless the envelope is backed by the live transport |
 | `fsnow query run --dataset <id> ... --json` | Dataset mode: plan as above, then execute live with the same bindings |
 | `fsnow query write --profile <profile> --sql <sql> [--dry-run \| --confirm <token>] --json` | Execute a mutation; direct once `WRITE_ENABLED` is set, with `--dry-run` as an optional preview (see [Writes](#writes)) |
 | `fsnow query --sql <sql> --profile <profile> --json` | Shorthand that maps to `query run` |
@@ -715,7 +719,7 @@ or `%APPDATA%\franken-snowflake`); `FRANKEN_SNOWFLAKE_DATA_DIR` overrides it.
 |---|---|
 | `fsnow mcp serve --stdio` | Serve the read verbs as MCP tools over stdio (requires the `mcp` feature) |
 | `fsnow mcp serve --http <addr> [--allow-origin <origin>]... [--allow-tool <tool>]... [--allow-remote]` | Serve over HTTP at `/mcp`; requires a bearer token in `FRANKEN_SNOWFLAKE_MCP_TOKEN` (at least 32 characters), checks `Host` and `Origin`, binds loopback only unless `--allow-remote`, and exposes only read-only tools unless `--allow-tool` names more |
-| `fsnow tui --profile <profile>` | Interactive catalog browser + query planner (FrankenTUI) over the profile's latest local snapshot; needs a build with `--features tui` and a real terminal (a non-TTY invocation refuses typed instead of hanging). With `--features live`, submitting a planned query executes it through the same live path as `query run` (results land in the log pane; v1 blocks the UI until the statement returns); without `live`, submit logs a typed pointer to `query run` |
+| `fsnow tui --profile <profile>` | Interactive catalog browser + query planner (FrankenTUI) over the profile's latest local snapshot; needs a build with `--features tui` and a real terminal (a non-TTY invocation refuses typed instead of hanging). With `--features live`, submitting a planned query executes it through the same live path as `query run` on a background task: the UI stays live, the progress pane follows the statement (handle, partitions, rows), Esc on the progress pane cancels it (SQL API remote cancel included), and results land in the log pane; without `live`, submit logs a typed pointer to `query run` |
 
 ```bash
 fsnow mcp serve --stdio
@@ -914,8 +918,9 @@ read verbs, plus `query_cancel` and `export_run`, as MCP tools backed by the sam
 CLI handlers and the same JSON envelope, so the CLI and the MCP server cannot
 diverge into two contracts. The server runs over stdio or HTTP and is
 stdio-first by design; data writes go through the CLI `query write` ladder. A
-`notifications/cancelled` for a running call, or a stdio client closing its
-input, cancels the statement it started, SQL API remote cancel included.
+`notifications/cancelled` for a running call, a stdio client closing its input,
+or an HTTP client closing its connection mid-call cancels the statement it
+started, SQL API remote cancel included.
 
 The exposed tools mirror the CLI read and discovery verbs:
 
@@ -1019,8 +1024,8 @@ confirmation required, `FSNOW-3009` DDL not opted in) with an exact next command
 - The TUI is opt-in (`--features tui`): it browses the persisted snapshot and
   plans raw SQL through the shared planner. Submitting a planned query from
   inside the session executes through the live path when `--features live` is
-  compiled (blocking v1: results land in the log pane when the statement
-  returns); without `live` it logs a typed pointer to `query run`. Any
+  compiled, on a background task with live progress and Esc-to-cancel; without
+  `live` it logs a typed pointer to `query run`. Any
   invocation without a real terminal answers a typed refusal.
 - The `--toon` encoding is byte-size-neutral rather than smaller for row
   payloads.
