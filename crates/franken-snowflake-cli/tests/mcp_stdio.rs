@@ -199,8 +199,14 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
         .expect("catalog_diff tool result carries the CLI envelope");
     let diff_envelope: serde_json::Value = serde_json::from_str(diff).expect("envelope JSON");
     assert_eq!(diff_envelope["ok"], false, "{diff_envelope}");
-    assert_eq!(diff_envelope["command_id"], "catalog.diff", "{diff_envelope}");
-    assert_eq!(diff_envelope["error"]["code"], "FSNOW-7002", "{diff_envelope}");
+    assert_eq!(
+        diff_envelope["command_id"], "catalog.diff",
+        "{diff_envelope}"
+    );
+    assert_eq!(
+        diff_envelope["error"]["code"], "FSNOW-7002",
+        "{diff_envelope}"
+    );
     assert!(
         diff_envelope
             .to_string()

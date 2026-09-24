@@ -615,15 +615,16 @@ fn scan_catalog(
     let mut warnings = Vec::new();
     let (drift, store_dir) = match local_store::open_store() {
         Ok(store) => {
-            let previous_snapshot = match store
-                .cache
-                .latest_catalog_snapshot(profile, Some(database), schema)
-            {
-                Ok(Some(record)) => {
-                    serde_json::from_str::<CatalogSnapshot>(&record.payload.canonical).ok()
-                }
-                _ => None,
-            };
+            let previous_snapshot =
+                match store
+                    .cache
+                    .latest_catalog_snapshot(profile, Some(database), schema)
+                {
+                    Ok(Some(record)) => {
+                        serde_json::from_str::<CatalogSnapshot>(&record.payload.canonical).ok()
+                    }
+                    _ => None,
+                };
             let drift = match previous_snapshot.as_ref() {
                 Some(prev) => franken_snowflake_catalog::diff::diff_snapshots(prev, &snapshot),
                 None => franken_snowflake_catalog::diff::CatalogDiff::initial_scan(&snapshot),
@@ -1032,11 +1033,13 @@ pub fn run_query_cancel_outcome(
             format!("cancel endpoint returned {status_label}: {preview}"),
             vec![json_string("live SQL API transport")],
         ));
-        envelope.repair_commands =
-            vec![format!("franken-snowflake profile doctor {profile} --online --json")];
+        envelope.repair_commands = vec![format!(
+            "franken-snowflake profile doctor {profile} --online --json"
+        )];
     }
-    envelope.safe_next_commands =
-        vec![format!("franken-snowflake profile doctor {profile} --online --json")];
+    envelope.safe_next_commands = vec![format!(
+        "franken-snowflake profile doctor {profile} --online --json"
+    )];
     crate::Outcome {
         status: if acknowledged {
             CoreExitCode::Success
@@ -1511,7 +1514,9 @@ fn probe_success(
     stamp_live(&mut envelope, &profile, rows, receipt_hash);
     envelope.warnings = warnings;
     envelope.safe_next_commands = vec![
-        format!("franken-snowflake catalog scan {profile} --database <db> --schema <schema> --json"),
+        format!(
+            "franken-snowflake catalog scan {profile} --database <db> --schema <schema> --json"
+        ),
         format!("franken-snowflake query run --profile {profile} --sql <sql> --json"),
     ];
     crate::Outcome {
@@ -1601,7 +1606,9 @@ impl LiveConn {
         if secret_env.is_none() {
             return Err(SnowflakeError::new(
                 SnowflakeErrorCode::ProfileInvalid,
-                format!("auth lane must be one of pat, oauth_bearer, key_pair_jwt, or workload_identity (got {lane})"),
+                format!(
+                    "auth lane must be one of pat, oauth_bearer, key_pair_jwt, or workload_identity (got {lane})"
+                ),
             ));
         }
 
@@ -2014,7 +2021,9 @@ fn build_auth_profile(prefix: &str, lane: &str) -> Result<AuthProfile, Snowflake
         }
         other => Err(SnowflakeError::new(
             SnowflakeErrorCode::ProfileInvalid,
-            format!("auth lane must be one of pat, oauth_bearer, key_pair_jwt, or workload_identity (got {other})"),
+            format!(
+                "auth lane must be one of pat, oauth_bearer, key_pair_jwt, or workload_identity (got {other})"
+            ),
         )),
     }
 }
@@ -3116,7 +3125,10 @@ mod tests {
         assert_eq!(datasets[0]["approx_row_count"], 1200, "{env}");
         assert_eq!(env["receipt_hash"].as_str().map(str::len), Some(64));
         assert_eq!(env["data"]["drift"]["summary"]["datasets_added"], 1);
-        assert_eq!(env["data"]["drift"]["summary"]["has_breaking_changes"], false);
+        assert_eq!(
+            env["data"]["drift"]["summary"]["has_breaking_changes"],
+            false
+        );
         let safe_cmds = env["safe_next_commands"]
             .as_array()
             .cloned()

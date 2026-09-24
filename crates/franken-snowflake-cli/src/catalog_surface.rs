@@ -1145,7 +1145,9 @@ pub fn catalog_diff_outcome(
         },
         None => {
             // Find the snapshot immediately preceding target in this scope.
-            let db_scope = database.as_deref().or(target_record.database_name.as_deref());
+            let db_scope = database
+                .as_deref()
+                .or(target_record.database_name.as_deref());
             let sch_scope = schema.as_deref().or(target_record.schema_name.as_deref());
             match store.cache.catalog_snapshots(&profile, db_scope, sch_scope) {
                 Ok(snapshots) => snapshots.into_iter().find(|s| {
@@ -1169,45 +1171,53 @@ pub fn catalog_diff_outcome(
     };
 
     // 3. Deserialize snapshots and compute diff.
-    let target_snapshot: CatalogSnapshot = match serde_json::from_str(&target_record.payload.canonical) {
-        Ok(s) => s,
-        Err(error) => {
-            return typed_error(
-                format,
-                "catalog.diff",
-                "fsnow.catalog.diff.v1",
-                request_id,
-                Some(profile),
-                SnowflakeErrorCode::MetadataError,
-                format!("Failed to parse target snapshot `{}`: {error}", target_record.snapshot_id),
-                vec![json_string("catalog snapshot")],
-                vec![],
-                vec![],
-                vec![],
-            );
-        }
-    };
+    let target_snapshot: CatalogSnapshot =
+        match serde_json::from_str(&target_record.payload.canonical) {
+            Ok(s) => s,
+            Err(error) => {
+                return typed_error(
+                    format,
+                    "catalog.diff",
+                    "fsnow.catalog.diff.v1",
+                    request_id,
+                    Some(profile),
+                    SnowflakeErrorCode::MetadataError,
+                    format!(
+                        "Failed to parse target snapshot `{}`: {error}",
+                        target_record.snapshot_id
+                    ),
+                    vec![json_string("catalog snapshot")],
+                    vec![],
+                    vec![],
+                    vec![],
+                );
+            }
+        };
 
     let diff = match &base_record {
         Some(base_rec) => {
-            let base_snapshot: CatalogSnapshot = match serde_json::from_str(&base_rec.payload.canonical) {
-                Ok(s) => s,
-                Err(error) => {
-                    return typed_error(
-                        format,
-                        "catalog.diff",
-                        "fsnow.catalog.diff.v1",
-                        request_id,
-                        Some(profile),
-                        SnowflakeErrorCode::MetadataError,
-                        format!("Failed to parse base snapshot `{}`: {error}", base_rec.snapshot_id),
-                        vec![json_string("catalog snapshot")],
-                        vec![],
-                        vec![],
-                        vec![],
-                    );
-                }
-            };
+            let base_snapshot: CatalogSnapshot =
+                match serde_json::from_str(&base_rec.payload.canonical) {
+                    Ok(s) => s,
+                    Err(error) => {
+                        return typed_error(
+                            format,
+                            "catalog.diff",
+                            "fsnow.catalog.diff.v1",
+                            request_id,
+                            Some(profile),
+                            SnowflakeErrorCode::MetadataError,
+                            format!(
+                                "Failed to parse base snapshot `{}`: {error}",
+                                base_rec.snapshot_id
+                            ),
+                            vec![json_string("catalog snapshot")],
+                            vec![],
+                            vec![],
+                            vec![],
+                        );
+                    }
+                };
             target_snapshot.diff_from(&base_snapshot)
         }
         None => CatalogDiff::initial_scan(&target_snapshot),
@@ -1222,12 +1232,10 @@ pub fn catalog_diff_outcome(
         )));
     }
 
-    let mut safe_next_commands = vec![
-        format!(
-            "franken-snowflake catalog graph {profile} --database {} --mermaid",
-            target_record.database_name.as_deref().unwrap_or("<db>")
-        ),
-    ];
+    let mut safe_next_commands = vec![format!(
+        "franken-snowflake catalog graph {profile} --database {} --mermaid",
+        target_record.database_name.as_deref().unwrap_or("<db>")
+    )];
     if let Some(first_ds) = target_snapshot.datasets.first() {
         safe_next_commands.push(format!(
             "franken-snowflake dataset inspect {} --json",
@@ -1243,8 +1251,14 @@ pub fn catalog_diff_outcome(
         request_id,
         json_object(vec![
             ("diff", Json::from_value(&diff)),
-            ("target_snapshot_id", json_string(diff.target_snapshot_id.clone())),
-            ("base_snapshot_id", option_json(diff.base_snapshot_id.clone())),
+            (
+                "target_snapshot_id",
+                json_string(diff.target_snapshot_id.clone()),
+            ),
+            (
+                "base_snapshot_id",
+                option_json(diff.base_snapshot_id.clone()),
+            ),
             ("has_changes", Json::Bool(diff.has_changes())),
             ("is_breaking", Json::Bool(diff.is_breaking())),
             ("summary_text", json_string(diff.summary_text())),
@@ -1337,7 +1351,9 @@ pub fn export_plan_outcome(
         Some("jsonl") | Some("json") => ExportFormat::Jsonl,
         Some("parquet") => ExportFormat::Parquet,
         Some(other) => {
-            return usage_err(format!("Unknown --format `{other}`; use csv, jsonl, or parquet."));
+            return usage_err(format!(
+                "Unknown --format `{other}`; use csv, jsonl, or parquet."
+            ));
         }
     };
     let compression = match spec

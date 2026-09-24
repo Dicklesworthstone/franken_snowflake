@@ -1,7 +1,7 @@
 //! Schema diff and drift detection between catalog snapshots.
 
-use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::model::{
     CatalogSnapshot, ColumnCatalogEntry, DatasetManifest, DtypeClass, RightsClass, same_identifier,
@@ -181,11 +181,8 @@ impl CatalogDiff {
 pub fn diff_snapshots(base: &CatalogSnapshot, target: &CatalogSnapshot) -> CatalogDiff {
     let base_datasets: BTreeMap<&str, &DatasetManifest> =
         base.datasets.iter().map(|d| (d.id.as_str(), d)).collect();
-    let target_datasets: BTreeMap<&str, &DatasetManifest> = target
-        .datasets
-        .iter()
-        .map(|d| (d.id.as_str(), d))
-        .collect();
+    let target_datasets: BTreeMap<&str, &DatasetManifest> =
+        target.datasets.iter().map(|d| (d.id.as_str(), d)).collect();
 
     let mut datasets_added = Vec::new();
     let mut datasets_removed = Vec::new();
@@ -221,14 +218,20 @@ pub fn diff_snapshots(base: &CatalogSnapshot, target: &CatalogSnapshot) -> Catal
 
             // Find added columns
             for t_col in &target_cols {
-                if !base_cols.iter().any(|b_col| same_identifier(&b_col.column, &t_col.column)) {
+                if !base_cols
+                    .iter()
+                    .any(|b_col| same_identifier(&b_col.column, &t_col.column))
+                {
                     cols_added.push((*t_col).clone());
                 }
             }
 
             // Find removed columns
             for b_col in &base_cols {
-                if !target_cols.iter().any(|t_col| same_identifier(&t_col.column, &b_col.column)) {
+                if !target_cols
+                    .iter()
+                    .any(|t_col| same_identifier(&t_col.column, &b_col.column))
+                {
                     cols_removed.push((*b_col).clone());
                 }
             }
@@ -274,7 +277,8 @@ pub fn diff_snapshots(base: &CatalogSnapshot, target: &CatalogSnapshot) -> Catal
 
                     let precision = if b_col.precision != t_col.precision {
                         // Narrowing precision is breaking
-                        if matches!((b_col.precision, t_col.precision), (Some(b), Some(t)) if t < b) {
+                        if matches!((b_col.precision, t_col.precision), (Some(b), Some(t)) if t < b)
+                        {
                             is_breaking = true;
                         }
                         Some(ValueChange {
@@ -327,14 +331,15 @@ pub fn diff_snapshots(base: &CatalogSnapshot, target: &CatalogSnapshot) -> Catal
                 }
             }
 
-            let approx_row_count = if base_manifest.approx_row_count != target_manifest.approx_row_count {
-                Some(MetricChange {
-                    old: base_manifest.approx_row_count,
-                    new: target_manifest.approx_row_count,
-                })
-            } else {
-                None
-            };
+            let approx_row_count =
+                if base_manifest.approx_row_count != target_manifest.approx_row_count {
+                    Some(MetricChange {
+                        old: base_manifest.approx_row_count,
+                        new: target_manifest.approx_row_count,
+                    })
+                } else {
+                    None
+                };
 
             let bytes = if base_manifest.bytes != target_manifest.bytes {
                 Some(MetricChange {
@@ -372,7 +377,8 @@ pub fn diff_snapshots(base: &CatalogSnapshot, target: &CatalogSnapshot) -> Catal
                 || rights_class.is_some();
 
             if has_dataset_changes {
-                let is_breaking = !cols_removed.is_empty() || cols_modified.iter().any(|c| c.is_breaking);
+                let is_breaking =
+                    !cols_removed.is_empty() || cols_modified.iter().any(|c| c.is_breaking);
                 total_columns_added += cols_added.len();
                 total_columns_removed += cols_removed.len();
                 total_columns_modified += cols_modified.len();
@@ -505,7 +511,10 @@ mod tests {
         assert_eq!(diff.summary.datasets_added, 0);
         assert_eq!(diff.summary.datasets_removed, 0);
         assert_eq!(diff.summary.datasets_modified, 0);
-        assert_eq!(diff.summary_text(), "No changes detected (identical catalog)");
+        assert_eq!(
+            diff.summary_text(),
+            "No changes detected (identical catalog)"
+        );
     }
 
     #[test]

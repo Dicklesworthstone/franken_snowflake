@@ -2965,7 +2965,9 @@ fn profile_diagnostics_data(
         Some(other) => check_json_owned(
             "auth_lane",
             "warn",
-            format!("auth lane `{other}` is not supported; use pat, key_pair_jwt, oauth_bearer, or workload_identity"),
+            format!(
+                "auth lane `{other}` is not supported; use pat, key_pair_jwt, oauth_bearer, or workload_identity"
+            ),
         ),
     };
     let live_probe_check = check_json(

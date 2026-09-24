@@ -264,21 +264,13 @@ mod fastmcp_surface {
                     open_world_hint: "offline",
                     read_only: true,
                     params: vec![
-                        ParamSpec::string(
-                            "profile",
-                            "Profile id to inspect.",
-                            true,
-                        ),
+                        ParamSpec::string("profile", "Profile id to inspect.", true),
                         ParamSpec::string(
                             "database",
                             "Snowflake database name scope filter.",
                             false,
                         ),
-                        ParamSpec::string(
-                            "schema",
-                            "Snowflake schema name scope filter.",
-                            false,
-                        ),
+                        ParamSpec::string("schema", "Snowflake schema name scope filter.", false),
                         ParamSpec::string(
                             "base_snapshot",
                             "Base (older) snapshot ID. Defaults to the snapshot preceding target.",
@@ -705,7 +697,12 @@ mod fastmcp_surface {
                 false,
             ),
             if plan {
-                ParamSpec::string_enum("format", "Output format.", false, &["csv", "jsonl", "parquet"])
+                ParamSpec::string_enum(
+                    "format",
+                    "Output format.",
+                    false,
+                    &["csv", "jsonl", "parquet"],
+                )
             } else {
                 ParamSpec::string_enum(
                     "format",
