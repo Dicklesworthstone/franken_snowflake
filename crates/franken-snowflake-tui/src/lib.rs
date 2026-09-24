@@ -802,8 +802,14 @@ mod ftui_surface {
     use ftui::{Cell, Cmd, Event, Frame, KeyCode, KeyEvent, KeyEventKind, Model, PackedRgba};
 
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::time::Duration;
 
-    use super::{FocusPane, SnowflakeTuiApp, StatementPhase, TuiAction, TuiEvent, TuiLogLine};
+    use super::{
+        FocusPane, ProgressTick, SnowflakeTuiApp, StatementPhase, TuiAction, TuiEvent, TuiLogLine,
+    };
     use franken_snowflake_catalog::planner::TypedBinding;
 
     /// FrankenTUI message wrapper for the app model.
@@ -813,6 +819,10 @@ mod ftui_surface {
         Key(KeyEvent),
         /// Terminal-independent app event.
         App(TuiEvent),
+        /// Runtime tick: drain the running statement's progress.
+        Tick,
+        /// A background query finished with these result lines.
+        Executed(Vec<ExecutorLine>),
         /// Ignore key-release and unsupported terminal events.
         Ignore,
     }
@@ -820,7 +830,7 @@ mod ftui_surface {
     impl From<Event> for TuiMessage {
         fn from(event: Event) -> Self {
             match event {
-                Event::Tick => Self::Ignore,
+                Event::Tick => Self::Tick,
                 Event::Key(key) if key.kind == KeyEventKind::Release => Self::Ignore,
                 Event::Key(key) => Self::Key(key),
                 _ => Self::Ignore,
@@ -846,7 +856,7 @@ mod ftui_surface {
                     let _ = self.apply_event(event);
                     Cmd::none()
                 }
-                TuiMessage::Ignore => Cmd::none(),
+                TuiMessage::Tick | TuiMessage::Executed(_) | TuiMessage::Ignore => Cmd::none(),
             }
         }
 
@@ -941,60 +951,173 @@ mod ftui_surface {
         pub message: String,
     }
 
+    /// What a running query gets from the TUI (bead w0i.11): a channel for
+    /// live progress, and a flag the operator sets to cancel it.
+    pub struct ExecutionHooks {
+        /// Progress ticks for the progress pane, in order.
+        pub progress: Sender<ProgressTick>,
+        /// Set when the operator cancels the statement (Esc on the progress pane).
+        pub cancel: Arc<AtomicBool>,
+    }
+
     /// Host-injected executor: runs the planned SQL through the host's live
-    /// path and returns rendered lines for the log pane. The tui crate cannot
+    /// path on a background thread, reporting progress and honoring the cancel
+    /// flag, and returns rendered lines for the log pane. The tui crate cannot
     /// depend on the CLI, so the CLI embeds its own closure.
-    pub type QueryExecutor =
-        Box<dyn FnMut(&str, &BTreeMap<String, TypedBinding>) -> Vec<ExecutorLine>>;
+    pub type QueryExecutor = Arc<
+        dyn Fn(&str, &BTreeMap<String, TypedBinding>, ExecutionHooks) -> Vec<ExecutorLine>
+            + Send
+            + Sync,
+    >;
+
+    /// How often the progress pane is refreshed while a statement runs.
+    const PROGRESS_TICK: Duration = Duration::from_millis(100);
+    /// Once idle, ticks slow to this (FrankenTUI cannot stop a tick rate).
+    const IDLE_TICK: Duration = Duration::from_secs(60);
+
+    struct Running {
+        progress: Receiver<ProgressTick>,
+        cancel: Arc<AtomicBool>,
+    }
 
     /// The app model plus an optional executor: identical rendering and key
     /// handling to the bare model, except a planned query is executed through
-    /// the injected live path (blocking v1: the UI redraws when the result
-    /// lines land). Without an executor, submit logs a typed pointer to
+    /// the injected live path on a background task while the UI stays live:
+    /// the progress pane follows the driver's events and Esc on it cancels the
+    /// statement. Without an executor, submit logs a typed pointer to
     /// `fsnow query run` instead of silently doing nothing.
     pub struct ExecutorModel {
         app: SnowflakeTuiApp,
         executor: Option<QueryExecutor>,
+        running: Option<Running>,
     }
 
     impl ExecutorModel {
         /// Wrap an app model with an optional query executor.
         #[must_use]
         pub fn new(app: SnowflakeTuiApp, executor: Option<QueryExecutor>) -> Self {
-            Self { app, executor }
+            Self {
+                app,
+                executor,
+                running: None,
+            }
         }
 
-        fn execute_if_planned(&mut self, action: TuiAction) {
-            let TuiAction::PlanQuery(plan) = action else {
+        fn log(&mut self, outcome: &str, message: String) {
+            self.app.logs.push(TuiLogLine {
+                event: "query_run".to_owned(),
+                outcome: outcome.to_owned(),
+                message,
+                code: None,
+            });
+        }
+
+        /// Apply an operator event. While a query runs, a submit is refused
+        /// before it can reset the running statement's progress, and Esc
+        /// raises the cancel flag at once, even before the handle is known.
+        fn apply(&mut self, event: TuiEvent) -> Cmd<TuiMessage> {
+            if let Some(running) = &self.running {
+                match event {
+                    TuiEvent::QuerySubmit => {
+                        self.log(
+                            "refusal",
+                            "a statement is already running; Esc on the progress pane cancels it"
+                                .to_owned(),
+                        );
+                        return Cmd::none();
+                    }
+                    TuiEvent::CancelStatement => {
+                        running.cancel.store(true, Ordering::SeqCst);
+                        self.app.progress.phase = StatementPhase::Cancelled;
+                        self.app.logs.push(TuiLogLine {
+                            event: "statement_cancel".to_owned(),
+                            outcome: "cancelled".to_owned(),
+                            message: "cancel requested".to_owned(),
+                            code: None,
+                        });
+                        return Cmd::none();
+                    }
+                    _ => {}
+                }
+            }
+            let action = self.app.apply_event(event);
+            self.act(action)
+        }
+
+        fn act(&mut self, action: TuiAction) -> Cmd<TuiMessage> {
+            match action {
+                TuiAction::PlanQuery(plan) => {
+                    let Some(executor) = self.executor.clone() else {
+                        self.log(
+                            "refusal",
+                            "query execution is not wired in this build (rebuild with --features \
+                             live); use `fsnow query run`"
+                                .to_owned(),
+                        );
+                        return Cmd::none();
+                    };
+                    if self.running.is_some() {
+                        self.log(
+                            "refusal",
+                            "a statement is already running; Esc on the progress pane cancels it"
+                                .to_owned(),
+                        );
+                        return Cmd::none();
+                    }
+                    let (progress, ticks) = channel();
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    self.running = Some(Running {
+                        progress: ticks,
+                        cancel: Arc::clone(&cancel),
+                    });
+                    self.app.progress = super::StatementProgress::default();
+                    self.app.progress.phase = StatementPhase::Submitted;
+                    let hooks = ExecutionHooks { progress, cancel };
+                    Cmd::batch(vec![
+                        Cmd::task(move || {
+                            TuiMessage::Executed(executor(plan.sql.as_str(), &plan.bindings, hooks))
+                        }),
+                        Cmd::tick(PROGRESS_TICK),
+                    ])
+                }
+                TuiAction::CancelStatement(_) => {
+                    if let Some(running) = &self.running {
+                        running.cancel.store(true, Ordering::SeqCst);
+                    }
+                    Cmd::none()
+                }
+                _ => Cmd::none(),
+            }
+        }
+
+        fn drain_progress(&mut self) {
+            let Some(running) = &self.running else {
                 return;
             };
-            let Some(executor) = self.executor.as_mut() else {
-                self.app.logs.push(TuiLogLine {
-                    event: "query_run".to_owned(),
-                    outcome: "refusal".to_owned(),
-                    message: "query execution is not wired in this build (rebuild with --features \
-                         live); use `fsnow query run`"
-                        .to_owned(),
-                    code: None,
-                });
-                return;
-            };
-            self.app.progress.phase = StatementPhase::Submitted;
-            let lines = executor(plan.sql.as_str(), &plan.bindings);
+            let ticks: Vec<ProgressTick> = running.progress.try_iter().collect();
+            for tick in ticks {
+                self.app.progress.apply_tick(tick);
+            }
+        }
+
+        fn finish(&mut self, lines: Vec<ExecutorLine>) -> Cmd<TuiMessage> {
+            self.drain_progress();
+            let cancelled = self
+                .running
+                .take()
+                .is_some_and(|running| running.cancel.load(Ordering::SeqCst));
             let failed = lines.iter().any(|line| line.outcome != "ok");
             for line in lines {
-                self.app.logs.push(TuiLogLine {
-                    event: "query_run".to_owned(),
-                    outcome: line.outcome,
-                    message: line.message,
-                    code: None,
-                });
+                self.log(&line.outcome, line.message);
             }
-            self.app.progress.phase = if failed {
+            self.app.progress.phase = if cancelled {
+                StatementPhase::Cancelled
+            } else if failed {
                 StatementPhase::Refused
             } else {
                 StatementPhase::Complete
             };
+            Cmd::tick(IDLE_TICK)
         }
 
         /// Read-only access to the wrapped app (test and overlay support).
@@ -1013,18 +1136,15 @@ mod ftui_surface {
                 TuiMessage::App(TuiEvent::Quit) => Cmd::quit(),
                 TuiMessage::Key(key) => match event_for_key(self.app.focus, key) {
                     Some(TuiEvent::Quit) => Cmd::quit(),
-                    Some(event) => {
-                        let action = self.app.apply_event(event);
-                        self.execute_if_planned(action);
-                        Cmd::none()
-                    }
+                    Some(event) => self.apply(event),
                     None => Cmd::none(),
                 },
-                TuiMessage::App(event) => {
-                    let action = self.app.apply_event(event);
-                    self.execute_if_planned(action);
+                TuiMessage::App(event) => self.apply(event),
+                TuiMessage::Tick => {
+                    self.drain_progress();
                     Cmd::none()
                 }
+                TuiMessage::Executed(lines) => self.finish(lines),
                 TuiMessage::Ignore => Cmd::none(),
             }
         }
@@ -1052,8 +1172,8 @@ mod ftui_surface {
 
 #[cfg(feature = "tui")]
 pub use ftui_surface::{
-    ExecutorLine, FrankenSnowflakeTuiModel, QueryExecutor, TuiMessage, run_terminal,
-    run_terminal_with_executor,
+    ExecutionHooks, ExecutorLine, FrankenSnowflakeTuiModel, QueryExecutor, TuiMessage,
+    run_terminal, run_terminal_with_executor,
 };
 #[cfg(test)]
 mod tests {
@@ -1409,23 +1529,48 @@ mod tests {
         use std::collections::BTreeMap;
 
         use super::*;
-        use crate::ftui_surface::{ExecutorLine, ExecutorModel};
+        use crate::ftui_surface::{ExecutionHooks, ExecutorLine, ExecutorModel, TuiMessage};
         use franken_snowflake_catalog::planner::TypedBinding;
-        use ftui::Model;
+        use ftui::{Cmd, Model};
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
 
         fn ok_executor() -> crate::ftui_surface::QueryExecutor {
-            Box::new(|sql: &str, _: &BTreeMap<String, TypedBinding>| {
-                vec![ExecutorLine {
-                    outcome: "ok".to_owned(),
-                    message: format!("ran {sql}"),
-                }]
-            })
+            Arc::new(
+                |sql: &str, _: &BTreeMap<String, TypedBinding>, _: ExecutionHooks| {
+                    vec![ExecutorLine {
+                        outcome: "ok".to_owned(),
+                        message: format!("ran {sql}"),
+                    }]
+                },
+            )
+        }
+
+        /// The background tasks a command starts, in order (the runtime would
+        /// run each on its own thread and send its message back).
+        fn tasks(cmd: Cmd<TuiMessage>) -> Vec<Box<dyn FnOnce() -> TuiMessage + Send>> {
+            match cmd {
+                Cmd::Task(_, task) => vec![task],
+                Cmd::Batch(cmds) | Cmd::Sequence(cmds) => {
+                    cmds.into_iter().flat_map(tasks).collect()
+                }
+                _ => Vec::new(),
+            }
+        }
+
+        /// Submit, then run the background task and hand its message back.
+        fn submit_and_finish(model: &mut ExecutorModel) {
+            let cmd = model.update(TuiMessage::App(TuiEvent::QuerySubmit));
+            for task in tasks(cmd) {
+                let message = task();
+                let _ = model.update(message);
+            }
         }
 
         #[test]
         fn submit_runs_the_planned_query_through_the_injected_executor() -> Result<(), String> {
             let mut model = ExecutorModel::new(SnowflakeTuiApp::default(), Some(ok_executor()));
-            let _ = model.update(crate::ftui_surface::TuiMessage::App(TuiEvent::QuerySubmit));
+            submit_and_finish(&mut model);
             let app = model.app();
             assert_eq!(app.progress.phase, StatementPhase::Complete);
             let run_line = app
@@ -1443,8 +1588,8 @@ mod tests {
 
         #[test]
         fn executor_error_lines_flip_the_progress_phase_to_refused() {
-            let executor: crate::ftui_surface::QueryExecutor =
-                Box::new(|sql: &str, _: &BTreeMap<String, TypedBinding>| {
+            let executor: crate::ftui_surface::QueryExecutor = Arc::new(
+                |sql: &str, _: &BTreeMap<String, TypedBinding>, _: ExecutionHooks| {
                     vec![
                         ExecutorLine {
                             outcome: "error".to_owned(),
@@ -1455,9 +1600,10 @@ mod tests {
                             message: "FSNOW-4001: statement failed".to_owned(),
                         },
                     ]
-                });
+                },
+            );
             let mut model = ExecutorModel::new(SnowflakeTuiApp::default(), Some(executor));
-            let _ = model.update(crate::ftui_surface::TuiMessage::App(TuiEvent::QuerySubmit));
+            submit_and_finish(&mut model);
             assert_eq!(model.app().progress.phase, StatementPhase::Refused);
             assert_eq!(
                 model
@@ -1474,7 +1620,8 @@ mod tests {
         fn without_an_executor_submit_logs_a_typed_pointer_instead_of_no_op() -> Result<(), String>
         {
             let mut model = ExecutorModel::new(SnowflakeTuiApp::default(), None);
-            let _ = model.update(crate::ftui_surface::TuiMessage::App(TuiEvent::QuerySubmit));
+            let cmd = model.update(TuiMessage::App(TuiEvent::QuerySubmit));
+            assert!(tasks(cmd).is_empty(), "nothing runs without an executor");
             let app = model.app();
             let pointer = app
                 .logs
@@ -1488,6 +1635,93 @@ mod tests {
                 pointer.message
             );
             Ok(())
+        }
+
+        /// Bead w0i.11: submit returns at once (the query runs on a task), the
+        /// progress pane follows the executor's ticks while it runs, Esc on
+        /// the pane raises the cancel flag the executor sees, a second submit
+        /// meanwhile is refused, and the run ends as cancelled.
+        #[test]
+        fn a_running_query_streams_progress_and_can_be_cancelled() {
+            let (started, running) = std::sync::mpsc::channel::<ExecutionHooks>();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let released = std::sync::Mutex::new(released);
+            let executor: crate::ftui_surface::QueryExecutor = Arc::new(
+                move |_: &str, _: &BTreeMap<String, TypedBinding>, hooks: ExecutionHooks| {
+                    let cancel = Arc::clone(&hooks.cancel);
+                    let _ = started.send(hooks);
+                    if let Ok(released) = released.lock() {
+                        let _ = released.recv();
+                    }
+                    vec![ExecutorLine {
+                        outcome: "error".to_owned(),
+                        message: format!("cancelled={}", cancel.load(Ordering::SeqCst)),
+                    }]
+                },
+            );
+            let mut model = ExecutorModel::new(SnowflakeTuiApp::default(), Some(executor));
+            let cmd = model.update(TuiMessage::App(TuiEvent::QuerySubmit));
+            assert_eq!(model.app().progress.phase, StatementPhase::Submitted);
+            let mut background = tasks(cmd);
+            assert_eq!(background.len(), 1, "the query runs on one background task");
+            let task = background.remove(0);
+            let worker = std::thread::spawn(task);
+            let hooks = running.recv().expect("the executor started");
+
+            let budget = ProgressBudget::from_budget(&query_budget(None, 10, None, 100));
+            let tick = |handle: Option<&str>, partitions_fetched_delta, rows_delta| ProgressTick {
+                statement_handle: handle.map(str::to_owned),
+                partitions_total: Some(4),
+                partitions_fetched_delta,
+                rows_delta,
+                budget,
+            };
+            hooks
+                .progress
+                .send(tick(Some("01b2-handle"), 0, 0))
+                .expect("send");
+            hooks.progress.send(tick(None, 1, 25)).expect("send");
+            let _ = model.update(TuiMessage::Tick);
+            let progress = &model.app().progress;
+            assert_eq!(progress.statement_handle.as_deref(), Some("01b2-handle"));
+            assert_eq!(progress.partitions_fetched, 1);
+            assert_eq!(progress.rows_streamed, 25);
+            assert_eq!(progress.phase, StatementPhase::FetchingPartitions);
+
+            // One statement at a time.
+            let again = model.update(TuiMessage::App(TuiEvent::QuerySubmit));
+            assert!(tasks(again).is_empty());
+            assert!(
+                model
+                    .app()
+                    .logs
+                    .iter()
+                    .any(|line| line.message.contains("already running"))
+            );
+            // The refused submit left the running statement's progress alone.
+            assert_eq!(
+                model.app().progress.statement_handle.as_deref(),
+                Some("01b2-handle")
+            );
+            assert_eq!(model.app().progress.rows_streamed, 25);
+
+            assert!(!hooks.cancel.load(Ordering::SeqCst));
+            let _ = model.update(TuiMessage::App(TuiEvent::CancelStatement));
+            assert!(
+                hooks.cancel.load(Ordering::SeqCst),
+                "Esc reached the executor"
+            );
+
+            release.send(()).expect("release");
+            let message = worker.join().expect("the task returns");
+            let _ = model.update(message);
+            let app = model.app();
+            assert_eq!(app.progress.phase, StatementPhase::Cancelled);
+            assert!(
+                app.logs.iter().any(|line| line.message == "cancelled=true"),
+                "{:?}",
+                app.logs
+            );
         }
     }
 }
