@@ -1243,20 +1243,43 @@ fn escape_mermaid_label(value: &str) -> String {
             '(' => escaped.push_str("&#40;"),
             ')' => escaped.push_str("&#41;"),
             '|' => escaped.push_str("&#124;"),
-            '\n' | '\r' | '\u{2028}' | '\u{2029}' => escaped.push(' '),
+            '\n' | '\r' | '\t' | '\u{2028}' | '\u{2029}' => escaped.push(' '),
+            control if control.is_control() => escaped.push(visible_control(control)),
             other => escaped.push(other),
         }
     }
     escaped
 }
 
+/// XML text: the five markup characters as entities, and every control
+/// character (most are illegal in XML 1.0, and all of them can drive the
+/// terminal that prints the SVG) as its visible symbol.
 fn escape_xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            control if control.is_control() => escaped.push(visible_control(control)),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+/// A control character as its Unicode "Control Pictures" symbol (NUL -> U+2400,
+/// ESC -> U+241B, DEL -> U+2421), or U+FFFD for the C1 range: catalog names are
+/// data, and a printed diagram must never carry a terminal escape
+/// (reality-check bead oj0.42).
+fn visible_control(control: char) -> char {
+    match u32::from(control) {
+        code @ 0x00..=0x1F => char::from_u32(0x2400 + code).unwrap_or('\u{FFFD}'),
+        0x7F => '\u{2421}',
+        _ => '\u{FFFD}',
+    }
 }
 
 fn truncate_label(value: &str, max_chars: usize) -> String {
@@ -1647,6 +1670,25 @@ mod tests {
         assert!(svg.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\""));
         assert!(svg.contains("Catalog lineage graph"));
         assert!(svg.contains("dataset:events_daily"));
+    }
+
+    /// Reality-check bead oj0.42: a catalog name carrying terminal escapes
+    /// (an OSC 52 clipboard write, a screen clear) renders as visible symbols
+    /// in both diagram formats.
+    #[test]
+    fn control_characters_in_names_render_as_visible_symbols() {
+        let hostile = "EV\u{1b}]52;c;cHduZWQ=\u{7}\u{1b}[2JIL\u{9b}\u{7f}";
+        for escaped in [escape_mermaid_label(hostile), escape_xml(hostile)] {
+            assert!(
+                !escaped.chars().any(char::is_control),
+                "a control character survived: {escaped:?}"
+            );
+            assert!(escaped.contains('\u{241B}'), "{escaped}");
+            assert!(escaped.contains('\u{2407}'), "{escaped}");
+            assert!(escaped.contains('\u{2421}'), "{escaped}");
+            assert!(escaped.contains('\u{FFFD}'), "{escaped}");
+        }
+        assert_eq!(escape_mermaid_label("a\tb"), "a b");
     }
 
     #[test]
