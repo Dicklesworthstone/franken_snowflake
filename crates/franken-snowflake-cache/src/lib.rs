@@ -2136,7 +2136,10 @@ mod tests {
 
         let all = cache.catalog_snapshots("demo", None, None)?;
         let all_ids: Vec<_> = all.into_iter().map(|s| s.snapshot_id).collect();
-        assert_eq!(all_ids, vec!["snap-new", "snap-other", "snap-mid", "snap-old"]);
+        assert_eq!(
+            all_ids,
+            vec!["snap-new", "snap-other", "snap-mid", "snap-old"]
+        );
         Ok(())
     }
 
@@ -2661,7 +2664,10 @@ mod frankensqlite_tests {
 
         let all = cache.catalog_snapshots("demo", None, None)?;
         let all_ids: Vec<_> = all.into_iter().map(|s| s.snapshot_id).collect();
-        assert_eq!(all_ids, vec!["snap-new", "snap-other", "snap-mid", "snap-old"]);
+        assert_eq!(
+            all_ids,
+            vec!["snap-new", "snap-other", "snap-mid", "snap-old"]
+        );
         Ok(())
     }
 

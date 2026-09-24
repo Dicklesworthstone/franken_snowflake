@@ -614,7 +614,11 @@ pub(crate) mod frankenpandas {
         )
     }
 
-    pub(crate) fn seconds_to_nanos(seconds: i64, nanos: u32, source: &SnowflakeColumn) -> FrameResult<i64> {
+    pub(crate) fn seconds_to_nanos(
+        seconds: i64,
+        nanos: u32,
+        source: &SnowflakeColumn,
+    ) -> FrameResult<i64> {
         checked_i128_to_i64(
             i128::from(seconds) * NANOS_PER_SECOND + i128::from(nanos),
             source,

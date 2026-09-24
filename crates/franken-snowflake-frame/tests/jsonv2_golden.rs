@@ -187,7 +187,10 @@ fn canonical_codec_cells_fixture_decodes_through_the_frame_codec() -> Result<(),
                 .unwrap_or_default()
                 .to_owned(),
             scale: col.get("scale").and_then(Value::as_i64).map(|s| s as i32),
-            precision: col.get("precision").and_then(Value::as_i64).map(|p| p as i32),
+            precision: col
+                .get("precision")
+                .and_then(Value::as_i64)
+                .map(|p| p as i32),
             nullable: col.get("nullable").and_then(Value::as_bool).unwrap_or(true),
         })
         .collect();
@@ -199,7 +202,9 @@ fn canonical_codec_cells_fixture_decodes_through_the_frame_codec() -> Result<(),
 
     let mut row_data = Vec::with_capacity(data.len());
     for row in data {
-        let row_array = row.as_array().ok_or_else(|| "row is not an array".to_string())?;
+        let row_array = row
+            .as_array()
+            .ok_or_else(|| "row is not an array".to_string())?;
         row_data.push(
             row_array
                 .iter()
@@ -258,10 +263,7 @@ fn canonical_codec_cells_fixture_decodes_through_the_frame_codec() -> Result<(),
         .find(|c| c.metadata.name == "REAL_VALUE")
         .unwrap();
     assert_eq!(real_col.column.dtype(), DType::Float64);
-    assert_eq!(
-        real_col.column.value(0),
-        Some(&Scalar::Float64(1.25))
-    );
+    assert_eq!(real_col.column.value(0), Some(&Scalar::Float64(1.25)));
 
     // 5. TIMESTAMP_NTZ = "1611871777.123456789" -> 1611871777123456789 nanos
     let ts_ntz = frame
@@ -323,4 +325,3 @@ fn canonical_codec_cells_fixture_decodes_through_the_frame_codec() -> Result<(),
 
     Ok(())
 }
-

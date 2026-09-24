@@ -1,8 +1,8 @@
 #![cfg(feature = "frankenpandas")]
 
 use franken_snowflake_frame::{
-    materialize_partition_bytes, materialize_partitions, materialize_raw_partitions,
-    FrameMissingKind, ResultPartition, SnowflakeColumn,
+    FrameMissingKind, ResultPartition, SnowflakeColumn, materialize_partition_bytes,
+    materialize_partitions, materialize_raw_partitions,
 };
 
 fn col(name: &str, snowflake_type: &str) -> SnowflakeColumn {
@@ -14,8 +14,14 @@ fn zero_copy_bitwise_parity_across_all_types() -> Result<(), String> {
     let columns = vec![
         col("ID", "FIXED").with_scale(0).nullable(false),
         col("NULLABLE_ID", "NUMBER").with_scale(0).nullable(true),
-        col("AMOUNT", "FIXED").with_scale(2).with_precision(38).nullable(false),
-        col("BIG_NUM", "NUMBER").with_scale(0).with_precision(38).nullable(true),
+        col("AMOUNT", "FIXED")
+            .with_scale(2)
+            .with_precision(38)
+            .nullable(false),
+        col("BIG_NUM", "NUMBER")
+            .with_scale(0)
+            .with_precision(38)
+            .nullable(true),
         col("RATE", "REAL").nullable(true),
         col("FLAG", "BOOLEAN").nullable(true),
         col("EVENT_DATE", "DATE").nullable(false),
@@ -173,10 +179,7 @@ fn zero_copy_multi_partition_streaming() -> Result<(), String> {
         name_col.column.value(2),
         Some(&fp_types::Scalar::Utf8("Charlie".to_string()))
     );
-    assert_eq!(
-        name_col.missing_kinds[3],
-        Some(FrameMissingKind::SqlNull)
-    );
+    assert_eq!(name_col.missing_kinds[3], Some(FrameMissingKind::SqlNull));
 
     Ok(())
 }
@@ -194,7 +197,10 @@ fn zero_copy_fuzz_malformed_and_truncated_inputs() {
     for i in 0..valid.len() - 1 {
         let truncated = &valid[..i];
         let res = materialize_partition_bytes(&columns, truncated);
-        assert!(res.is_err(), "expected error for truncated prefix length {i}");
+        assert!(
+            res.is_err(),
+            "expected error for truncated prefix length {i}"
+        );
     }
 
     // Malformed inputs:
@@ -203,16 +209,16 @@ fn zero_copy_fuzz_malformed_and_truncated_inputs() {
         b"not json",
         b"{ \"not\": \"array\" }",
         b"[ \"not a row array\" ]",
-        b"[ [ 1, 2 ] ]", // unquoted number
-        b"[ [ \"1\", \"2.5\" ], ]", // trailing comma
-        b"[ [ \"1\", \"2.5\" ] ] extra", // trailing garbage
+        b"[ [ 1, 2 ] ]",                          // unquoted number
+        b"[ [ \"1\", \"2.5\" ], ]",               // trailing comma
+        b"[ [ \"1\", \"2.5\" ] ] extra",          // trailing garbage
         b"[ [ \"1\", \"2.5\", \"extra_col\" ] ]", // row width mismatch > 2
-        b"[ [ \"1\" ] ]", // row width mismatch < 2
-        b"[ [ \"not_an_int\", \"2.5\" ] ]", // bad integer
-        b"[ [ \"1\", \"not_a_float\" ] ]", // bad float
-        b"[ [ \"1\", \"\\uD800\" ] ]", // lone surrogate
-        b"[ [ \"1\", \"\\uZZZZ\" ] ]", // bad hex in unicode escape
-        b"[ [ \"1\", \"\\x00\" ] ]", // invalid escape sequence
+        b"[ [ \"1\" ] ]",                         // row width mismatch < 2
+        b"[ [ \"not_an_int\", \"2.5\" ] ]",       // bad integer
+        b"[ [ \"1\", \"not_a_float\" ] ]",        // bad float
+        b"[ [ \"1\", \"\\uD800\" ] ]",            // lone surrogate
+        b"[ [ \"1\", \"\\uZZZZ\" ] ]",            // bad hex in unicode escape
+        b"[ [ \"1\", \"\\x00\" ] ]",              // invalid escape sequence
         b"[ [ \"1\", \"unclosed string ] ]",
     ];
 
@@ -227,7 +233,10 @@ fn zero_copy_high_throughput_benchmark_exceeds_350_mb_s() -> Result<(), String> 
     let columns = vec![
         col("ID", "FIXED").with_scale(0).nullable(false),
         col("CUSTOMER_ID", "NUMBER").with_scale(0).nullable(true),
-        col("AMOUNT", "FIXED").with_scale(2).with_precision(38).nullable(false),
+        col("AMOUNT", "FIXED")
+            .with_scale(2)
+            .with_precision(38)
+            .nullable(false),
         col("FLAG", "BOOLEAN").nullable(false),
         col("EVENT_DATE", "DATE").nullable(false),
         col("TS_TZ", "TIMESTAMP_TZ").nullable(false),
@@ -251,7 +260,9 @@ fn zero_copy_high_throughput_benchmark_exceeds_350_mb_s() -> Result<(), String> 
         } else {
             format!(
                 "[\"{}\",\"{}\",\"9876543210.99\",\"false\",\"18263\",\"1616173620.000000000 1440\",\"Customer payment {}\"]",
-                i, i * 2, i
+                i,
+                i * 2,
+                i
             )
         };
         payload.extend_from_slice(row_str.as_bytes());
@@ -286,9 +297,7 @@ fn zero_copy_high_throughput_benchmark_exceeds_350_mb_s() -> Result<(), String> 
     let throughput_mb_s = payload_len_mb / seconds;
     let rows_per_sec = num_rows as f64 / seconds;
 
-    println!(
-        "\n--- JSONV2 ZERO-COPY DECODER BENCHMARK ---"
-    );
+    println!("\n--- JSONV2 ZERO-COPY DECODER BENCHMARK ---");
     println!(
         "Processed {} rows ({:.2} MB) in {:.3} ms",
         num_rows,
@@ -323,7 +332,8 @@ fn zero_copy_decodes_envelope_objects_with_bitwise_parity() -> Result<(), String
     ];
 
     let bare_json = b"[[\"1\",\"Alice\",\"100.50\",\"true\"],[\"2\",\"Bob\",\"-20.00\",\"false\"]]";
-    let envelope_json = b"{\"data\": [[\"1\",\"Alice\",\"100.50\",\"true\"],[\"2\",\"Bob\",\"-20.00\",\"false\"]]}";
+    let envelope_json =
+        b"{\"data\": [[\"1\",\"Alice\",\"100.50\",\"true\"],[\"2\",\"Bob\",\"-20.00\",\"false\"]]}";
     let full_response_json = br#"{
         "code": "090001",
         "message": "Statement executed successfully.",
@@ -350,7 +360,10 @@ fn zero_copy_decodes_envelope_objects_with_bitwise_parity() -> Result<(), String
     assert_eq!(ext1, bare_json);
 
     let ext2 = extract_jsonv2_data_array(envelope_json).map_err(|e| e.to_string())?;
-    assert_eq!(ext2, b"[[\"1\",\"Alice\",\"100.50\",\"true\"],[\"2\",\"Bob\",\"-20.00\",\"false\"]]");
+    assert_eq!(
+        ext2,
+        b"[[\"1\",\"Alice\",\"100.50\",\"true\"],[\"2\",\"Bob\",\"-20.00\",\"false\"]]"
+    );
 
     // Test materialization parity
     let frame_bare = materialize_partition_bytes(&columns, bare_json)

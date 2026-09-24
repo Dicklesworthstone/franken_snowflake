@@ -12,7 +12,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::local::{ExportByteSink, ExportColumn, LocalExportArtifact, LocalExportInput, ResultPartition};
+use crate::local::{
+    ExportByteSink, ExportColumn, LocalExportArtifact, LocalExportInput, ResultPartition,
+};
 use crate::{
     ExportError, ExportFormat, ExportLogEvent, ExportReceipt, ExportReceiptKind, ExportResult,
 };
@@ -518,7 +520,8 @@ pub fn snappy_compress(input: &[u8]) -> Vec<u8> {
 
             let mut match_len = 4_usize;
             while pos.saturating_add(match_len) < input.len()
-                && input[pos.saturating_add(match_len)] == input[candidate.saturating_add(match_len)]
+                && input[pos.saturating_add(match_len)]
+                    == input[candidate.saturating_add(match_len)]
                 && match_len < 64
             {
                 match_len = match_len.saturating_add(1);
@@ -559,7 +562,9 @@ fn emit_snappy_literal(lit: &[u8], out: &mut Vec<u8>) {
 
 fn emit_snappy_copy(offset: usize, len: usize, out: &mut Vec<u8>) {
     if (4..=11).contains(&len) && offset < 2048 {
-        let tag = 0x01 | (((len.saturating_sub(4) as u8) & 0x07) << 2) | (((offset >> 8) as u8 & 0x07) << 5);
+        let tag = 0x01
+            | (((len.saturating_sub(4) as u8) & 0x07) << 2)
+            | (((offset >> 8) as u8 & 0x07) << 5);
         out.push(tag);
         out.push((offset & 0xFF) as u8);
     } else {
@@ -650,9 +655,11 @@ pub fn gzip_compress(input: &[u8]) -> ExportResult<Vec<u8>> {
     use asupersync::http::compress::{Compressor, GzipCompressor};
     let mut compressor = GzipCompressor::new();
     let mut out = Vec::new();
-    compressor.compress(input, &mut out).map_err(|e| ExportError::Sink {
-        message: format!("gzip compression error: {e}"),
-    })?;
+    compressor
+        .compress(input, &mut out)
+        .map_err(|e| ExportError::Sink {
+            message: format!("gzip compression error: {e}"),
+        })?;
     compressor.finish(&mut out).map_err(|e| ExportError::Sink {
         message: format!("gzip finish error: {e}"),
     })?;
@@ -669,9 +676,11 @@ pub fn gzip_decompress(compressed: &[u8]) -> ExportResult<Vec<u8>> {
         .map_err(|e| ExportError::Sink {
             message: format!("gzip decompression error: {e}"),
         })?;
-    decompressor.finish(&mut out).map_err(|e| ExportError::Sink {
-        message: format!("gzip finish error: {e}"),
-    })?;
+    decompressor
+        .finish(&mut out)
+        .map_err(|e| ExportError::Sink {
+            message: format!("gzip finish error: {e}"),
+        })?;
     Ok(out)
 }
 
@@ -745,7 +754,11 @@ impl ParquetColumnDescriptor {
             "NUMBER" | "FIXED" | "DECIMAL" | "NUMERIC" => {
                 // If scale is specified and non-zero, map to Double; otherwise Int64.
                 if let Some(scale_str) = snowflake_type.split(',').nth(1) {
-                    let scale = scale_str.trim().trim_end_matches(')').parse::<i32>().unwrap_or(0);
+                    let scale = scale_str
+                        .trim()
+                        .trim_end_matches(')')
+                        .parse::<i32>()
+                        .unwrap_or(0);
                     if scale > 0 {
                         return Self {
                             physical: ParquetType::Double,
@@ -811,7 +824,10 @@ pub fn encode_definition_levels(defs: &[u8]) -> Vec<u8> {
 }
 
 /// Decode definition levels from a DataPage v1 buffer.
-pub fn decode_definition_levels(data: &[u8], total_values: usize) -> ExportResult<(Vec<u8>, usize)> {
+pub fn decode_definition_levels(
+    data: &[u8],
+    total_values: usize,
+) -> ExportResult<(Vec<u8>, usize)> {
     if total_values == 0 {
         return Ok((Vec::new(), 0));
     }
@@ -943,7 +959,8 @@ pub fn encode_column_plain(
                         values.extend_from_slice(&val.to_bits().to_le_bytes());
                     }
                     ParquetType::Boolean => {
-                        let val = matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "t");
+                        let val =
+                            matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "t");
                         bool_bits.push(val);
                     }
                     ParquetType::ByteArray => {
@@ -1472,7 +1489,8 @@ pub fn export_parquet(
 ) -> ExportResult<LocalExportArtifact> {
     let opts = options.unwrap_or_default();
     let mut sink = crate::local::AddressingSink::new(Vec::new());
-    let row_count = write_parquet_stream(&input.columns, input.partitions.iter(), &mut sink, &opts)?;
+    let row_count =
+        write_parquet_stream(&input.columns, input.partitions.iter(), &mut sink, &opts)?;
     let (bytes, address) = sink.finish();
     address.verify(&bytes)?;
 
@@ -1490,7 +1508,10 @@ pub fn export_parquet(
         Some(schema_digest),
         None,
         created_at_ms,
-        vec![format!("codec:{}", serde_json::to_string(&opts.compression)?)],
+        vec![format!(
+            "codec:{}",
+            serde_json::to_string(&opts.compression)?
+        )],
     );
     let log_line = ExportLogEvent::from_receipt(&receipt)?.to_json_line()?;
 
@@ -1528,7 +1549,9 @@ pub fn validate_parquet(bytes: &[u8]) -> ExportResult<ParquetInspection> {
 
     if !header_valid || !footer_valid {
         return Err(ExportError::Sink {
-            message: format!("invalid Parquet magic bytes: header={header_valid}, footer={footer_valid}"),
+            message: format!(
+                "invalid Parquet magic bytes: header={header_valid}, footer={footer_valid}"
+            ),
         });
     }
 
@@ -1628,7 +1651,8 @@ pub fn read_parquet_records(bytes: &[u8]) -> ExportResult<LocalExportInput> {
 
     let mut reader = ThriftCompactReader::new(footer_slice);
     let mut columns = Vec::new();
-    let mut chunk_offsets: Vec<(i64, i32, ParquetType, Option<ParquetConvertedType>, bool)> = Vec::new();
+    let mut chunk_offsets: Vec<(i64, i32, ParquetType, Option<ParquetConvertedType>, bool)> =
+        Vec::new();
 
     loop {
         let (field_opt, type_code) = reader.read_field_header()?;
@@ -1722,7 +1746,8 @@ pub fn read_parquet_records(bytes: &[u8]) -> ExportResult<LocalExportInput> {
                                     let mut codec = 0_i32;
 
                                     loop {
-                                        let (chunk_field, chunk_type) = reader.read_field_header()?;
+                                        let (chunk_field, chunk_type) =
+                                            reader.read_field_header()?;
                                         match chunk_field {
                                             None => break,
                                             Some(3) => {
@@ -1751,21 +1776,35 @@ pub fn read_parquet_records(bytes: &[u8]) -> ExportResult<LocalExportInput> {
                                             }
                                         }
                                     }
-                                    let ptype = match columns.get(col_idx).map(|c| c.snowflake_type.as_str()) {
+                                    let ptype = match columns
+                                        .get(col_idx)
+                                        .map(|c| c.snowflake_type.as_str())
+                                    {
                                         Some("BOOLEAN") => ParquetType::Boolean,
                                         Some("DATE") => ParquetType::Int32,
                                         Some("FLOAT") => ParquetType::Double,
                                         Some("TEXT") => ParquetType::ByteArray,
                                         _ => ParquetType::Int64,
                                     };
-                                    let conv = match columns.get(col_idx).map(|c| c.snowflake_type.as_str()) {
+                                    let conv = match columns
+                                        .get(col_idx)
+                                        .map(|c| c.snowflake_type.as_str())
+                                    {
                                         Some("DATE") => Some(ParquetConvertedType::Date),
-                                        Some("TIMESTAMP_NTZ") => Some(ParquetConvertedType::TimestampMicros),
+                                        Some("TIMESTAMP_NTZ") => {
+                                            Some(ParquetConvertedType::TimestampMicros)
+                                        }
                                         Some("TEXT") => Some(ParquetConvertedType::Utf8),
                                         _ => None,
                                     };
                                     let nullable = columns.get(col_idx).is_none_or(|c| c.nullable);
-                                    chunk_offsets.push((data_page_offset, codec, ptype, conv, nullable));
+                                    chunk_offsets.push((
+                                        data_page_offset,
+                                        codec,
+                                        ptype,
+                                        conv,
+                                        nullable,
+                                    ));
                                 }
                             }
                             Some(_) => {
@@ -1925,5 +1964,8 @@ pub fn read_parquet_records(bytes: &[u8]) -> ExportResult<LocalExportInput> {
         }
     }
 
-    Ok(LocalExportInput::new(columns, vec![ResultPartition::new(0, rows)]))
+    Ok(LocalExportInput::new(
+        columns,
+        vec![ResultPartition::new(0, rows)],
+    ))
 }

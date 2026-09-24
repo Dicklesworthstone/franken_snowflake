@@ -11,8 +11,8 @@
 //!    and BLAKE3 content-addressed receipts.
 
 use franken_snowflake_export::parquet::{
-    export_parquet, read_parquet_records, validate_parquet, ParquetCompression,
-    ParquetWriterOptions, PARQUET_MAGIC,
+    PARQUET_MAGIC, ParquetCompression, ParquetWriterOptions, export_parquet, read_parquet_records,
+    validate_parquet,
 };
 use franken_snowflake_export::{ExportColumn, LocalExportInput, ResultPartition};
 
@@ -53,14 +53,7 @@ fn build_test_rows() -> Vec<Vec<Option<String>>> {
             Some("-1000.500000".to_owned()),
             Some("".to_owned()),
         ],
-        vec![
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ],
+        vec![None, None, None, None, None, None],
         vec![
             Some("0".to_owned()),
             Some("0.0".to_owned()),
@@ -107,7 +100,11 @@ fn test_parquet_round_trip_all_dtypes() {
     assert_eq!(re_read.partitions.len(), 1);
     assert_eq!(re_read.partitions[0].rows.len(), rows.len());
 
-    for (row_idx, (orig_row, read_row)) in rows.iter().zip(re_read.partitions[0].rows.iter()).enumerate() {
+    for (row_idx, (orig_row, read_row)) in rows
+        .iter()
+        .zip(re_read.partitions[0].rows.iter())
+        .enumerate()
+    {
         for (col_idx, (orig_val, read_val)) in orig_row.iter().zip(read_row.iter()).enumerate() {
             match (orig_val, read_val) {
                 (None, None) => {}
@@ -134,7 +131,9 @@ fn test_parquet_round_trip_all_dtypes() {
                     }
                 }
                 (other_o, other_r) => {
-                    panic!("nullability mismatch at row {row_idx}, col {col_idx}: expected {other_o:?}, got {other_r:?}");
+                    panic!(
+                        "nullability mismatch at row {row_idx}, col {col_idx}: expected {other_o:?}, got {other_r:?}"
+                    );
                 }
             }
         }
@@ -170,7 +169,10 @@ fn test_parquet_compression_modes() {
         assert!(inspection.magic_footer_valid);
         assert_eq!(inspection.row_count, 5);
         assert_eq!(inspection.column_count, 6);
-        assert_eq!(inspection.created_by.as_deref(), Some("franken_snowflake_test"));
+        assert_eq!(
+            inspection.created_by.as_deref(),
+            Some("franken_snowflake_test")
+        );
 
         let re_read = read_parquet_records(&artifact.bytes).expect("read_parquet_records failed");
         assert_eq!(re_read.partitions[0].rows.len(), 5);
@@ -269,12 +271,7 @@ fn test_parquet_external_pyarrow_and_duckdb_validation() {
             Some("false".to_owned()),
             Some("widget-b".to_owned()),
         ],
-        vec![
-            Some("103".to_owned()),
-            None,
-            None,
-            None,
-        ],
+        vec![Some("103".to_owned()), None, None, None],
         vec![
             Some("104".to_owned()),
             Some("99.95".to_owned()),
@@ -322,7 +319,14 @@ print("DuckDB validation PASSED")
     );
 
     let output = std::process::Command::new(uv_bin)
-        .args(["run", "--with", "pyarrow,duckdb", "python3", "-c", &python_code])
+        .args([
+            "run",
+            "--with",
+            "pyarrow,duckdb",
+            "python3",
+            "-c",
+            &python_code,
+        ])
         .output()
         .expect("failed to execute uv command");
 

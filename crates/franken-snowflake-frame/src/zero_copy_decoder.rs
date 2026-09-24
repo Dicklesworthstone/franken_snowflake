@@ -2,9 +2,9 @@ use fp_columnar::{Column, ValidityMask};
 use fp_types::{DType, Scalar};
 
 use crate::frankenpandas::{
-    days_to_nanos, decode_error, is_even_hex, is_fixed_decimal, seconds_to_nanos,
-    FrameColumn, FrameColumnMeta, FrameError, FrameMissingKind, FrameResult,
-    FrameStorageKind, FrankenPandasFrame, SnowflakeColumn, SnowflakeLogicalType,
+    FrameColumn, FrameColumnMeta, FrameError, FrameMissingKind, FrameResult, FrameStorageKind,
+    FrankenPandasFrame, SnowflakeColumn, SnowflakeLogicalType, days_to_nanos, decode_error,
+    is_even_hex, is_fixed_decimal, seconds_to_nanos,
 };
 
 /// A raw result partition referencing uncompressed `jsonv2` bytes directly.
@@ -128,13 +128,13 @@ pub fn extract_jsonv2_data_array(bytes: &[u8]) -> FrameResult<&[u8]> {
                             while curr < len && arr_depth > 0 {
                                 match bytes[curr] {
                                     b'"' => {
-                                        curr = skip_json_string(bytes, curr + 1).ok_or_else(|| {
-                                            FrameError::Decode {
+                                        curr = skip_json_string(bytes, curr + 1).ok_or_else(
+                                            || FrameError::Decode {
                                                 column: String::new(),
                                                 snowflake_type: String::new(),
                                                 reason: "unterminated string inside 'data' array",
-                                            }
-                                        })?;
+                                            },
+                                        )?;
                                     }
                                     b'[' => {
                                         arr_depth += 1;
@@ -339,13 +339,14 @@ impl ZeroCopyJsonv2Scanner {
                                 self.scratch.extend_from_slice(&bytes[start..pos + rel_hit]);
                                 pos += rel_hit;
                                 pos = decode_escapes_into(bytes, pos, &mut self.scratch)?;
-                                let cell_str = core::str::from_utf8(&self.scratch).map_err(|_| {
-                                    FrameError::Decode {
-                                        column: String::new(),
-                                        snowflake_type: String::new(),
-                                        reason: "invalid UTF-8 after unescaping cell string",
-                                    }
-                                })?;
+                                let cell_str =
+                                    core::str::from_utf8(&self.scratch).map_err(|_| {
+                                        FrameError::Decode {
+                                            column: String::new(),
+                                            snowflake_type: String::new(),
+                                            reason: "invalid UTF-8 after unescaping cell string",
+                                        }
+                                    })?;
                                 CellSlice::Unescaped(cell_str)
                             }
                         }
@@ -940,8 +941,9 @@ fn feed_cell(
 
     match (builder, meta.logical_type) {
         (ColumnBuilderKind::Int64(b), SnowflakeLogicalType::Fixed) => {
-            let val = parse_scale0_int_fast(text)
-                .ok_or_else(|| decode_error(source, "FIXED/NUMBER scale 0 must be an integer decimal"))?;
+            let val = parse_scale0_int_fast(text).ok_or_else(|| {
+                decode_error(source, "FIXED/NUMBER scale 0 must be an integer decimal")
+            })?;
             b.push_value(val);
         }
         (ColumnBuilderKind::Float64(b), SnowflakeLogicalType::Real) => {
@@ -957,7 +959,12 @@ fn feed_cell(
         (ColumnBuilderKind::Bool(b), SnowflakeLogicalType::Boolean) => match text {
             "true" => b.push_value(true),
             "false" => b.push_value(false),
-            _ => return Err(decode_error(source, "BOOLEAN must be \"true\" or \"false\"")),
+            _ => {
+                return Err(decode_error(
+                    source,
+                    "BOOLEAN must be \"true\" or \"false\"",
+                ));
+            }
         },
         (ColumnBuilderKind::Datetime(b), SnowflakeLogicalType::Date) => {
             let days = text
@@ -994,7 +1001,10 @@ fn feed_cell(
         }
         (ColumnBuilderKind::Utf8(b), SnowflakeLogicalType::Fixed) => {
             if !is_fixed_decimal(text, meta.scale) {
-                return Err(decode_error(source, "FIXED/NUMBER must be a decimal string"));
+                return Err(decode_error(
+                    source,
+                    "FIXED/NUMBER must be a decimal string",
+                ));
             }
             b.push_str(text);
         }
@@ -1135,11 +1145,7 @@ fn find_quote_or_escape(bytes: &[u8]) -> Option<usize> {
     None
 }
 
-fn decode_escapes_into(
-    bytes: &[u8],
-    mut pos: usize,
-    scratch: &mut Vec<u8>,
-) -> FrameResult<usize> {
+fn decode_escapes_into(bytes: &[u8], mut pos: usize, scratch: &mut Vec<u8>) -> FrameResult<usize> {
     let len = bytes.len();
     loop {
         if pos >= len {
@@ -1219,13 +1225,12 @@ fn decode_escapes_into(
                                 });
                             }
                         };
-                        let low_str = core::str::from_utf8(low_slice).map_err(|_| {
-                            FrameError::Decode {
+                        let low_str =
+                            core::str::from_utf8(low_slice).map_err(|_| FrameError::Decode {
                                 column: String::new(),
                                 snowflake_type: String::new(),
                                 reason: "invalid UTF-8 in low surrogate",
-                            }
-                        })?;
+                            })?;
                         let low_code =
                             u16::from_str_radix(low_str, 16).map_err(|_| FrameError::Decode {
                                 column: String::new(),

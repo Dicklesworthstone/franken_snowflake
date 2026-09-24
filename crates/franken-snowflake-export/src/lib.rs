@@ -989,11 +989,11 @@ pub mod parquet;
 
 #[cfg(feature = "parquet")]
 pub use parquet::{
-    decode_definition_levels, encode_column_plain, encode_definition_levels, export_parquet,
-    gzip_compress, gzip_decompress, read_parquet_records, snappy_compress, snappy_decompress,
-    validate_parquet, write_parquet_stream, ParquetColumnDescriptor, ParquetCompression,
-    ParquetInspection, ParquetType, ParquetWriterOptions, ThriftCompactReader, ThriftCompactWriter,
-    PARQUET_MAGIC,
+    PARQUET_MAGIC, ParquetColumnDescriptor, ParquetCompression, ParquetInspection, ParquetType,
+    ParquetWriterOptions, ThriftCompactReader, ThriftCompactWriter, decode_definition_levels,
+    encode_column_plain, encode_definition_levels, export_parquet, gzip_compress, gzip_decompress,
+    read_parquet_records, snappy_compress, snappy_decompress, validate_parquet,
+    write_parquet_stream,
 };
 
 /// Convenient re-exports for callers.
@@ -1016,9 +1016,9 @@ pub mod prelude {
 
     #[cfg(feature = "parquet")]
     pub use super::{
+        PARQUET_MAGIC, ParquetCompression, ParquetInspection, ParquetWriterOptions,
         decode_definition_levels, encode_definition_levels, export_parquet, read_parquet_records,
-        validate_parquet, write_parquet_stream, ParquetCompression, ParquetInspection,
-        ParquetWriterOptions, PARQUET_MAGIC,
+        validate_parquet, write_parquet_stream,
     };
 }
 
