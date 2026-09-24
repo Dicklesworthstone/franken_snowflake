@@ -549,6 +549,15 @@ mod local {
         pub snowflake_type: String,
         /// Whether Snowflake reports the column as nullable.
         pub nullable: bool,
+        /// Declared precision (`rowType[].precision`) for `FIXED`/`NUMBER`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub precision: Option<u32>,
+        /// Declared scale (`rowType[].scale`): decimal digits for `FIXED`/`NUMBER`,
+        /// fractional-second digits for `TIME`/`TIMESTAMP_*`. The SQL API reports
+        /// these separately from the bare type name (`"fixed"`), so typed writers
+        /// must use them rather than parse `NUMBER(p,s)` out of the type string.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub scale: Option<u32>,
     }
 
     impl ExportColumn {
@@ -559,6 +568,8 @@ mod local {
                 name: name.into(),
                 snowflake_type: snowflake_type.into(),
                 nullable: true,
+                precision: None,
+                scale: None,
             }
         }
 
@@ -566,6 +577,14 @@ mod local {
         #[must_use]
         pub const fn nullable(mut self, nullable: bool) -> Self {
             self.nullable = nullable;
+            self
+        }
+
+        /// Set the result-metadata precision and scale.
+        #[must_use]
+        pub const fn precision_scale(mut self, precision: Option<u32>, scale: Option<u32>) -> Self {
+            self.precision = precision;
+            self.scale = scale;
             self
         }
     }
@@ -989,11 +1008,12 @@ pub mod parquet;
 
 #[cfg(feature = "parquet")]
 pub use parquet::{
-    PARQUET_MAGIC, ParquetColumnDescriptor, ParquetCompression, ParquetInspection, ParquetType,
-    ParquetWriterOptions, ThriftCompactReader, ThriftCompactWriter, decode_definition_levels,
-    encode_column_plain, encode_definition_levels, export_parquet, gzip_compress, gzip_decompress,
-    read_parquet_records, snappy_compress, snappy_decompress, validate_parquet,
-    write_parquet_stream,
+    CellCodec, PARQUET_MAGIC, ParquetColumnDescriptor, ParquetColumnPlan, ParquetCompression,
+    ParquetInspection, ParquetLogicalType, ParquetType, ParquetWriterOptions, TZ_OFFSET_SUFFIX,
+    ThriftCompactReader, ThriftCompactWriter, TimeUnit, decimal_byte_width,
+    decode_definition_levels, encode_column_plain, encode_definition_levels, export_parquet,
+    gzip_compress, gzip_decompress, plan_parquet_columns, read_parquet_records, snappy_compress,
+    snappy_decompress, validate_parquet, write_parquet_stream,
 };
 
 /// Convenient re-exports for callers.
