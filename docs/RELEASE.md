@@ -114,6 +114,32 @@ runner). Runs on 2026-09-12/13 did execute and failed on real defects (a
 `9297728`, and a macOS installer step exiting 127); Actions were then disabled.
 Any "CI proof" wording older than this note is unbacked.
 
+### Cross-OS test runs
+
+2026-09-24, on the dsr build hosts, native toolchain `nightly-2026-08-31`,
+tree = commit `f374716` plus the two Windows fixes below (verified by file
+SHA-256 on each host). macOS got the tree through
+`dsr build franken_snowflake --target darwin/arm64 --sync-only`; dsr's rsync to
+the Windows host failed on a path-conversion bug, so Windows got it through
+`git archive HEAD` over ssh into the same buildroot. mmini's cargo is an rch
+shim, so the macOS runs set `RCH_SHIM_LOCAL_IDE=1 RCH_CARGO_WRAPPER_BYPASS=1
+RCH_REAL_CARGO=<toolchain>/bin/cargo-rch-real` to build locally; Windows ran
+inside `VsDevCmd.bat -arch=amd64`.
+
+| host | OS | lanes | result |
+|---|---|---|---|
+| mmini | macOS 26.2 arm64 | `cargo test --workspace --locked` and every feature lane above, including `franken-snowflake-cache --features frankensqlite`; `socket_e2e` + `mcp_http` with `live,mcp,testkit-endpoint,frankenpandas` | all green (socket 24/24, mcp_http 3/3) |
+| wlap | Windows 10.0.26220 x64 | the same, minus the Unix-only `frankensqlite` lane | all green after the fixes (socket 23/23; the SIGINT scenario is Unix-only; mcp_http 3/3) |
+
+The first Windows run failed 20 of 23 socket scenarios and 2 of 3 MCP HTTP
+tests. Two defects, both fixed: every live command and `mcp serve` overflowed
+the 1 MiB Windows main-thread stack in a debug build (the CLI build script now
+links the binaries with an 8 MiB stack, the Unix default), and the MCP HTTP test
+scrubbed `SYSTEMROOT`, which Windows sockets need. Not covered: Ctrl-C on
+Windows, the `frankensqlite` lane on Windows, and a release-profile live run on
+Windows (whether the published v0.0.4 Windows binary also overflows on the live
+path is unknown).
+
 ## Cross-Compile Status (2026-09-03, local, `--features live,mcp --locked`)
 
 | target | result | how |
