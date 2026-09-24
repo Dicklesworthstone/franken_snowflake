@@ -22,6 +22,7 @@ use franken_snowflake_core::error::SnowflakeErrorCode;
 use franken_snowflake_core::exit::ExitCode as CoreExitCode;
 use franken_snowflake_core::ids::RequestId;
 use franken_snowflake_core::redact::redact;
+use franken_snowflake_core::sql_lexer::{self, SqlTokenKind};
 use franken_snowflake_core::write_intent::{
     ConfirmationToken, StatementAllowlistEntry, WriteIntentDecision, WriteIntentMode,
     WriteIntentPlan, WriteIntentPolicy, WriteIntentRefusal, WriteIntentRefusalCode,
@@ -3177,6 +3178,19 @@ fn query_plan_outcome(
         );
     };
 
+    if let Some(reason) = ambiguous_sql_reason(&sql_text) {
+        return refusal(
+            format,
+            "query.plan",
+            "fsnow.query.plan.v1",
+            request_id,
+            profile.clone(),
+            SnowflakeErrorCode::MultiStatementRefused,
+            reason,
+            vec![plan_example(profile.as_deref())],
+        );
+    }
+
     if has_multiple_statements(&sql_text) {
         return refusal(
             format,
@@ -3186,6 +3200,19 @@ fn query_plan_outcome(
             profile.clone(),
             SnowflakeErrorCode::MultiStatementRefused,
             "Multiple SQL statements are refused by default.",
+            vec![plan_example(profile.as_deref())],
+        );
+    }
+
+    if let Some(function) = read_side_effect(&sql_text) {
+        return refusal(
+            format,
+            "query.plan",
+            "fsnow.query.plan.v1",
+            request_id,
+            profile.clone(),
+            SnowflakeErrorCode::MutationRefused,
+            side_effect_refusal_message(&function),
             vec![plan_example(profile.as_deref())],
         );
     }
@@ -3295,9 +3322,22 @@ fn query_run_outcome(
         );
     };
 
-    // a3y: distinguish the two refusal reasons instead of one conflated message.
-    // A multi-statement request and an unrecognized/typo'd SELECT are different
-    // problems and an agent needs to know which one it hit.
+    // a3y: distinguish the refusal reasons instead of one conflated message.
+    // Ambiguous structure, a multi-statement request, a side-effecting call and
+    // an unrecognized/typo'd SELECT are different problems and an agent needs to
+    // know which one it hit.
+    if let Some(reason) = ambiguous_sql_reason(&sql_text) {
+        return refusal(
+            format,
+            "query.run",
+            "fsnow.query.run.v1",
+            request_id,
+            profile.clone(),
+            SnowflakeErrorCode::MultiStatementRefused,
+            reason,
+            vec![plan_hint(profile.as_deref(), &sql_text)],
+        );
+    }
     if has_multiple_statements(&sql_text) {
         return refusal(
             format,
@@ -3307,6 +3347,18 @@ fn query_run_outcome(
             profile.clone(),
             SnowflakeErrorCode::MultiStatementRefused,
             "Multiple SQL statements are refused by default; submit exactly one read-only statement.",
+            vec![plan_hint(profile.as_deref(), &sql_text)],
+        );
+    }
+    if let Some(function) = read_side_effect(&sql_text) {
+        return refusal(
+            format,
+            "query.run",
+            "fsnow.query.run.v1",
+            request_id,
+            profile.clone(),
+            SnowflakeErrorCode::MutationRefused,
+            side_effect_refusal_message(&function),
             vec![plan_hint(profile.as_deref(), &sql_text)],
         );
     }
@@ -3439,6 +3491,18 @@ fn query_write_outcome(
         );
     };
 
+    if let Some(reason) = ambiguous_sql_reason(&sql_text) {
+        return refusal(
+            format,
+            "query.write",
+            "fsnow.query.write.v1",
+            request_id,
+            Some(profile.clone()),
+            SnowflakeErrorCode::MultiStatementRefused,
+            reason,
+            vec![write_hint(Some(&profile), &sql_text)],
+        );
+    }
     if has_multiple_statements(&sql_text) {
         return refusal(
             format,
@@ -3917,7 +3981,7 @@ fn refusal(
     request_id: String,
     profile_id: Option<String>,
     code: SnowflakeErrorCode,
-    message: &'static str,
+    message: impl Into<String>,
     safe_next_commands: Vec<String>,
 ) -> Outcome {
     let mut envelope = base_envelope(
@@ -4567,353 +4631,60 @@ fn positional_profile(args: &[String]) -> Option<String> {
     args.get(2).filter(|value| !value.starts_with('-')).cloned()
 }
 
+/// Statement-boundary check on the shared core lexer
+/// (`franken_snowflake_core::sql_lexer`), which understands `$$`-quoted strings,
+/// quoted identifiers, `--`/`//`/`/* */` comments and `$`-bearing identifiers.
+/// True for two or more statements, or a second top-level separator
+/// (`select 1;;`, an empty statement). A single trailing `;` is allowed.
+/// Structurally ambiguous SQL is refused separately by
+/// [`ambiguous_sql_reason`], which callers check first.
 fn has_multiple_statements(sql: &str) -> bool {
-    // A bare `.contains(';')` over-refuses valid single statements whose text
-    // legitimately holds a semicolon inside a string literal (`select ';'`), a
-    // line comment (`select 1 -- a; b`), or a block comment (`/* a; b */ select`).
-    // Scan with the same quote/comment state machine as `skip_balanced_sql_parens`
-    // and only treat a *top-level* `;` as a separator. A single trailing separator
-    // (optionally followed by whitespace/comments) is allowed; a second top-level
-    // `;`, or any real content after one, means multiple statements.
-    let bytes = sql.as_bytes();
-    let mut cursor = 0usize;
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut in_line_comment = false;
-    let mut block_comment_depth = 0usize;
-    let mut separator_seen = false;
-
-    while cursor < bytes.len() {
-        if in_line_comment {
-            in_line_comment = bytes[cursor] != b'\n';
-            cursor += 1;
-            continue;
-        }
-        if block_comment_depth > 0 {
-            if bytes[cursor] == b'/' && bytes.get(cursor + 1) == Some(&b'*') {
-                block_comment_depth += 1;
-                cursor += 2;
-            } else if bytes[cursor] == b'*' && bytes.get(cursor + 1) == Some(&b'/') {
-                block_comment_depth -= 1;
-                cursor += 2;
-            } else {
-                cursor += 1;
-            }
-            continue;
-        }
-        if in_single_quote {
-            if bytes[cursor] == b'\\' {
-                cursor = (cursor + 2).min(bytes.len());
-            } else if bytes[cursor] == b'\'' {
-                if bytes.get(cursor + 1) == Some(&b'\'') {
-                    cursor += 2;
-                } else {
-                    in_single_quote = false;
-                    cursor += 1;
-                }
-            } else {
-                cursor += 1;
-            }
-            continue;
-        }
-        if in_double_quote {
-            if bytes[cursor] == b'"' {
-                if bytes.get(cursor + 1) == Some(&b'"') {
-                    cursor += 2;
-                } else {
-                    in_double_quote = false;
-                    cursor += 1;
-                }
-            } else {
-                cursor += 1;
-            }
-            continue;
-        }
-        match bytes[cursor] {
-            b'\'' => {
-                in_single_quote = true;
-                cursor += 1;
-            }
-            b'"' => {
-                in_double_quote = true;
-                cursor += 1;
-            }
-            b'-' if bytes.get(cursor + 1) == Some(&b'-') => {
-                in_line_comment = true;
-                cursor += 2;
-            }
-            b'/' if bytes.get(cursor + 1) == Some(&b'*') => {
-                block_comment_depth = 1;
-                cursor += 2;
-            }
-            b';' => {
-                if separator_seen {
-                    return true;
-                }
-                separator_seen = true;
-                cursor += 1;
-            }
-            other => {
-                if separator_seen && !other.is_ascii_whitespace() {
-                    return true;
-                }
-                cursor += 1;
-            }
-        }
-    }
-    false
+    let lexed = sql_lexer::lex(sql);
+    let separators = lexed
+        .significant()
+        .filter(|token| token.kind == SqlTokenKind::Semicolon)
+        .count();
+    lexed.is_unreliable() || lexed.statement_count() > 1 || separators > 1
 }
 
+/// Why the SQL's statement boundaries cannot be trusted, if they cannot: an
+/// unterminated quote/comment, or a nested block comment (whether Snowflake
+/// nests `/* */` is undocumented, and the two readings disagree about where
+/// statements start). Guards refuse such input instead of guessing.
+fn ambiguous_sql_reason(sql: &str) -> Option<&'static str> {
+    let lexed = sql_lexer::lex(sql);
+    if lexed.unterminated {
+        Some(
+            "The SQL has an unterminated string, quoted identifier, `$$` string or block comment, so its statement boundaries are ambiguous; it is refused. Close every quote and comment.",
+        )
+    } else if lexed.ambiguous {
+        Some(
+            "The SQL nests a block comment (`/* ... /* ... */`); Snowflake's handling of nested comments is undocumented and the two readings disagree about which statements run, so it is refused. Remove the inner `/*`.",
+        )
+    } else {
+        None
+    }
+}
+
+/// A read-path side effect (a non-allowlisted `SYSTEM$` function such as
+/// `SYSTEM$CANCEL_ALL_QUERIES`, or a sequence `NEXTVAL`), if the SQL has one.
+fn read_side_effect(sql: &str) -> Option<String> {
+    sql_lexer::read_side_effect(&sql_lexer::lex(sql))
+}
+
+fn side_effect_refusal_message(function: &str) -> String {
+    format!(
+        "`{}` has side effects (system functions outside the read-only allowlist can cancel queries, abort sessions or change objects, and NEXTVAL advances a sequence), so the read path refuses it. The allowlisted read-only SYSTEM$ functions (e.g. SYSTEM$TYPEOF, SYSTEM$CLUSTERING_INFORMATION, SYSTEM$WAIT) are accepted.",
+        function.to_ascii_uppercase()
+    )
+}
+
+/// True for a single trustworthy read statement with no side-effecting call.
 fn is_select_like(sql: &str) -> bool {
-    let start = skip_sql_ws_and_comments(sql, 0);
-    if consume_sql_keyword(sql, start, "with").is_some() {
-        return cte_select_tail_is_read(sql, start);
-    }
-    ["select", "show", "describe", "desc", "explain"]
-        .iter()
-        .any(|keyword| consume_sql_keyword(sql, start, keyword).is_some())
-}
-
-fn cte_select_tail_is_read(sql: &str, start: usize) -> bool {
-    let Some(mut index) = consume_sql_keyword(sql, start, "with") else {
-        return false;
-    };
-    index = skip_sql_ws_and_comments(sql, index);
-    if let Some(after_recursive) = consume_sql_keyword(sql, index, "recursive") {
-        index = skip_sql_ws_and_comments(sql, after_recursive);
-    }
-
-    loop {
-        let Some(after_name) = consume_sql_identifier(sql, index) else {
-            return false;
-        };
-        index = skip_sql_ws_and_comments(sql, after_name);
-
-        if sql[index..].starts_with('(') {
-            let Some(after_columns) = skip_balanced_sql_parens(sql, index) else {
-                return false;
-            };
-            index = skip_sql_ws_and_comments(sql, after_columns);
-        }
-
-        let Some(after_as) = consume_sql_keyword(sql, index, "as") else {
-            return false;
-        };
-        index = skip_sql_ws_and_comments(sql, after_as);
-
-        let Some(after_cte_query) = skip_balanced_sql_parens(sql, index) else {
-            return false;
-        };
-        index = skip_sql_ws_and_comments(sql, after_cte_query);
-
-        if sql[index..].starts_with(',') {
-            index = skip_sql_ws_and_comments(sql, index + 1);
-            continue;
-        }
-
-        return consume_sql_keyword(sql, index, "select").is_some();
-    }
-}
-
-fn skip_sql_ws_and_comments(sql: &str, mut index: usize) -> usize {
-    loop {
-        while let Some(ch) = sql[index..].chars().next() {
-            if !ch.is_whitespace() {
-                break;
-            }
-            index += ch.len_utf8();
-        }
-
-        if sql[index..].starts_with("--") {
-            match sql[index..].find('\n') {
-                Some(line_end) => {
-                    index += line_end + 1;
-                    continue;
-                }
-                None => return sql.len(),
-            }
-        }
-
-        if sql[index..].starts_with("/*") {
-            // Block comments nest in Snowflake (`/* /* inner */ outer */`), so
-            // the guard must track depth. Ending at the first `*/` let a
-            // mutation hidden after an inner comment (`/* /* x */ select 1 */
-            // delete from t`) classify as a read (the `selftest` read_only_guard
-            // fixture caught this). An unterminated comment consumes the rest.
-            let mut depth = 0usize;
-            let mut cursor = index;
-            loop {
-                if sql[cursor..].starts_with("/*") {
-                    depth += 1;
-                    cursor += 2;
-                } else if sql[cursor..].starts_with("*/") {
-                    depth -= 1;
-                    cursor += 2;
-                    if depth == 0 {
-                        break;
-                    }
-                } else {
-                    match sql[cursor..].chars().next() {
-                        Some(ch) => cursor += ch.len_utf8(),
-                        None => return sql.len(),
-                    }
-                }
-            }
-            index = cursor;
-            continue;
-        }
-
-        return index;
-    }
-}
-
-fn consume_sql_keyword(sql: &str, index: usize, keyword: &str) -> Option<usize> {
-    let rest = sql.get(index..)?;
-    // `rest.get(..keyword.len())` yields `None` when `keyword.len()` is past the
-    // end *or* lands inside a multi-byte UTF-8 char, so a non-ASCII statement
-    // (e.g. `query plan --sql "€€"`) can never panic on a non-char-boundary
-    // slice — the prior `rest[..keyword.len()]` did exactly that.
-    let head = rest.get(..keyword.len())?;
-    if !head.eq_ignore_ascii_case(keyword) {
-        return None;
-    }
-    let end = index + keyword.len();
-    match sql[end..].chars().next() {
-        Some(ch) if is_sql_identifier_continue(ch) => None,
-        _ => Some(end),
-    }
-}
-
-fn consume_sql_identifier(sql: &str, index: usize) -> Option<usize> {
-    let rest = sql.get(index..)?;
-    if rest.starts_with('"') {
-        let bytes = sql.as_bytes();
-        let mut cursor = index + 1;
-        while cursor < bytes.len() {
-            if bytes[cursor] == b'"' {
-                if bytes.get(cursor + 1) == Some(&b'"') {
-                    cursor += 2;
-                    continue;
-                }
-                return Some(cursor + 1);
-            }
-            cursor += 1;
-        }
-        return None;
-    }
-
-    let mut end = index;
-    let mut saw_char = false;
-    for (offset, ch) in rest.char_indices() {
-        if !is_sql_identifier_continue(ch) {
-            break;
-        }
-        saw_char = true;
-        end = index + offset + ch.len_utf8();
-    }
-    saw_char.then_some(end)
-}
-
-fn is_sql_identifier_continue(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$')
-}
-
-fn skip_balanced_sql_parens(sql: &str, index: usize) -> Option<usize> {
-    if !sql[index..].starts_with('(') {
-        return None;
-    }
-
-    let bytes = sql.as_bytes();
-    let mut cursor = index;
-    let mut depth = 0usize;
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut in_line_comment = false;
-    let mut block_comment_depth = 0usize;
-
-    while cursor < bytes.len() {
-        if in_line_comment {
-            in_line_comment = bytes[cursor] != b'\n';
-            cursor += 1;
-            continue;
-        }
-
-        if block_comment_depth > 0 {
-            if bytes[cursor] == b'/' && bytes.get(cursor + 1) == Some(&b'*') {
-                block_comment_depth += 1;
-                cursor += 2;
-            } else if bytes[cursor] == b'*' && bytes.get(cursor + 1) == Some(&b'/') {
-                block_comment_depth -= 1;
-                cursor += 2;
-            } else {
-                cursor += 1;
-            }
-            continue;
-        }
-
-        if in_single_quote {
-            if bytes[cursor] == b'\\' {
-                cursor = (cursor + 2).min(bytes.len());
-            } else if bytes[cursor] == b'\'' {
-                if bytes.get(cursor + 1) == Some(&b'\'') {
-                    cursor += 2;
-                } else {
-                    in_single_quote = false;
-                    cursor += 1;
-                }
-            } else {
-                cursor += 1;
-            }
-            continue;
-        }
-
-        if in_double_quote {
-            if bytes[cursor] == b'"' {
-                if bytes.get(cursor + 1) == Some(&b'"') {
-                    cursor += 2;
-                } else {
-                    in_double_quote = false;
-                    cursor += 1;
-                }
-            } else {
-                cursor += 1;
-            }
-            continue;
-        }
-
-        match bytes[cursor] {
-            b'\'' => {
-                in_single_quote = true;
-                cursor += 1;
-            }
-            b'"' => {
-                in_double_quote = true;
-                cursor += 1;
-            }
-            b'-' if bytes.get(cursor + 1) == Some(&b'-') => {
-                in_line_comment = true;
-                cursor += 2;
-            }
-            b'/' if bytes.get(cursor + 1) == Some(&b'*') => {
-                block_comment_depth = 1;
-                cursor += 2;
-            }
-            b'(' => {
-                depth += 1;
-                cursor += 1;
-            }
-            b')' => {
-                depth = depth.checked_sub(1)?;
-                cursor += 1;
-                if depth == 0 {
-                    return Some(cursor);
-                }
-            }
-            _ => cursor += 1,
-        }
-    }
-
-    None
+    let lexed = sql_lexer::lex(sql);
+    !lexed.is_unreliable()
+        && sql_lexer::is_read_statement(&lexed)
+        && sql_lexer::read_side_effect(&lexed).is_none()
 }
 
 fn compact_sql(sql: &str) -> String {
@@ -5937,12 +5708,12 @@ mod tests {
             "select ';'",
             "where name = 'a;b'",
             "select 1 -- trailing; comment",
+            "select 1 // trailing; comment",
             "select /* a; b */ 1",
-            "select /* /* inner; */ outer */ 1",
-            "select /* /* inner */ ; outer */ 1",
             "select 'don\\'t; do that' from t",
             "select 1; -- trailing comment only",
             "select \"weird;col\" from t",
+            "select $$a;b$$ from t",
         ] {
             assert!(
                 !has_multiple_statements(sql),
@@ -5950,12 +5721,16 @@ mod tests {
             );
         }
         // Genuine separators (real content after a top-level `;`, or an empty
-        // statement) must still be detected.
+        // statement) must still be detected, and so must nested block comments,
+        // whose statement boundaries are ambiguous (fail closed; these two used
+        // to be accepted on the unverified assumption that comments nest).
         for sql in [
             "select 1; select 2",
             "select 1;;",
             "select 1; -- c\nselect 2",
             "insert into t values (1); select 1",
+            "select /* /* inner; */ outer */ 1",
+            "select /* /* inner */ ; outer */ 1",
         ] {
             assert!(
                 has_multiple_statements(sql),
@@ -5965,9 +5740,15 @@ mod tests {
     }
 
     #[test]
-    fn skip_balanced_sql_parens_handles_nested_comments_and_escapes() {
-        let sql = "(a, /* /* inner */ outer */ b, 'don\\'t', c)";
-        assert_eq!(skip_balanced_sql_parens(sql, 0), Some(sql.len()));
+    fn cte_reads_with_column_lists_and_escapes_stay_reads() {
+        // Replaces the old paren-skipper unit test: the shared lexer handles the
+        // same escapes inside CTE bodies.
+        assert!(is_select_like(
+            "with x (a, b) as (select 'don\\'t', /* c; */ 1) select * from x"
+        ));
+        assert!(!is_select_like(
+            "with x (a, b) as (select 'don\\'t', 1) delete from t"
+        ));
     }
 
     #[cfg(feature = "toon")]
@@ -6704,13 +6485,95 @@ mod tests {
 
     #[test]
     fn read_guard_handles_nested_block_comments_fail_closed() {
-        // Snowflake nests block comments, so the mutation after the outer
-        // comment is what actually runs. The guard must not stop at the first
-        // `*/` (the selftest fixture that found this stays in place).
+        // Whether Snowflake nests block comments is undocumented, and the two
+        // readings disagree about what runs: `/* /* nested */ select 1 */ delete
+        // from t` is a DELETE if comments nest. The guard refuses every nested
+        // comment (tightened 2026-09-24: the last two used to be accepted as
+        // reads on the unverified nesting assumption; the reality-check live
+        // probe D5 can relax this with evidence).
         assert!(!is_select_like("/* /* nested */ select 1 */ delete from t"));
-        assert!(is_select_like("/* /* nested */ delete from t */ select 1"));
-        assert!(is_select_like("select /* /* a */ b */ 1"));
+        assert!(!is_select_like("/* /* nested */ delete from t */ select 1"));
+        assert!(!is_select_like("select /* /* a */ b */ 1"));
         assert!(!is_select_like("/* unterminated select 1"));
+        assert!(ambiguous_sql_reason("select /* /* a */ b */ 1").is_some());
+        assert!(ambiguous_sql_reason("/* unterminated select 1").is_some());
+        // Non-nested comments stay fine.
+        assert!(is_select_like("/* hint */ select /* a */ 1"));
+        assert!(ambiguous_sql_reason("/* hint */ select /* a */ 1").is_none());
+    }
+
+    #[test]
+    fn read_guard_closes_the_dollar_quote_bypass_and_side_effects() {
+        // 2026-09-23 audit: an apostrophe inside `$$...$$` opened a phantom
+        // quoted string that hid the real separator on the read AND write paths.
+        let drop = ["DR", "OP TABLE t"].concat();
+        assert!(has_multiple_statements(&format!(
+            "SELECT $$ it's $$; {drop}"
+        )));
+        assert!(has_multiple_statements(&format!(
+            "INSERT INTO t VALUES ($$it's$$); {drop}"
+        )));
+        assert!(!has_multiple_statements("SELECT $$ ; not a separator $$"));
+        // `$` inside identifiers and positional/variable refs is not a quote.
+        assert!(is_select_like("select system$typeof(1), a$b, $1 from @s"));
+        assert!(!has_multiple_statements("select $1, a$b from @s"));
+        // Side-effecting system functions and NEXTVAL are refused on the read path.
+        assert_eq!(
+            read_side_effect("SELECT SYSTEM$CANCEL_ALL_QUERIES(1)").as_deref(),
+            Some("system$cancel_all_queries")
+        );
+        assert!(!is_select_like("SELECT SYSTEM$CANCEL_ALL_QUERIES(1)"));
+        assert!(!is_select_like("select seq1.nextval"));
+        assert!(is_select_like("select system$wait(1)"));
+        // A parenthesized query is a read; leading garbage is not.
+        assert!(is_select_like("(select 1)"));
+        assert!(!is_select_like("€€ select 1"));
+    }
+
+    #[test]
+    fn query_plan_names_the_refusal_reason() {
+        let ambiguous = render_json(&envelope_for(&[
+            "query",
+            "plan",
+            "--profile",
+            "demo",
+            "--sql",
+            "select /* /* a */ b */ 1",
+            "--json",
+        ]));
+        assert!(ambiguous.contains("\"code\":\"FSNOW-3002\""), "{ambiguous}");
+        assert!(ambiguous.contains("nests a block comment"), "{ambiguous}");
+        assert!(
+            !ambiguous.contains("Multiple SQL statements"),
+            "{ambiguous}"
+        );
+        let side_effect = render_json(&envelope_for(&[
+            "query",
+            "plan",
+            "--profile",
+            "demo",
+            "--sql",
+            "select system$abort_session(1)",
+            "--json",
+        ]));
+        assert!(
+            side_effect.contains("\"code\":\"FSNOW-3001\""),
+            "{side_effect}"
+        );
+        assert!(
+            side_effect.contains("SYSTEM$ABORT_SESSION"),
+            "{side_effect}"
+        );
+        let benign = render_json(&envelope_for(&[
+            "query",
+            "plan",
+            "--profile",
+            "demo",
+            "--sql",
+            "select system$typeof(1)",
+            "--json",
+        ]));
+        assert!(benign.contains("\"ok\":true"), "{benign}");
     }
 
     #[cfg(not(feature = "live"))]

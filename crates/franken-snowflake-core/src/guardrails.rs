@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{SnowflakeError, SnowflakeErrorCode};
 use crate::outcome::{DataSource, OutcomeKind};
 use crate::redact::{contains_secret, redact, redact_with_account};
+use crate::sql_lexer;
 
 /// Guardrail structured log schema version.
 pub const GUARDRAIL_LOG_SCHEMA_VERSION: u16 = 1;
@@ -442,141 +443,26 @@ pub fn scan_canary_outputs(outputs: &[(OutputChannel, &str)]) -> Vec<CanaryLeakF
 }
 
 /// Classify a SQL string enough to enforce read-only by default.
+///
+/// Built on the shared [`crate::sql_lexer`]. Fails closed: SQL whose structure
+/// the lexer cannot trust (unterminated quotes/comments, nested block comments)
+/// classifies as mutating, as does any `WITH` statement whose main verb is not
+/// `SELECT`.
 #[must_use]
 pub fn classify_sql_operation(sql: &str) -> SqlOperationClass {
-    let words = executable_sql_words(sql);
-    let first = words.first().map(String::as_str);
-    match first {
-        Some(kw) if is_mutating_keyword(kw) => SqlOperationClass::Mutating,
-        Some("with") => {
-            // A common table expression (CTE) statement may be a SELECT (read), or
-            // may drive a DML statement (INSERT/UPDATE/DELETE/MERGE). If any executable
-            // token outside comments/literals is a mutating keyword, classify as mutating.
-            if words.iter().any(|word| is_mutating_keyword(word.as_str())) {
-                SqlOperationClass::Mutating
-            } else {
-                SqlOperationClass::Read
-            }
-        }
+    let lexed = sql_lexer::lex(sql);
+    if lexed.is_unreliable() {
+        return SqlOperationClass::Mutating;
+    }
+    match lexed.first_word().as_deref() {
+        Some(verb) if sql_lexer::is_mutating_verb(verb) => SqlOperationClass::Mutating,
+        Some("with") if !sql_lexer::is_read_statement(&lexed) => SqlOperationClass::Mutating,
         _ => SqlOperationClass::Read,
     }
 }
 
-fn is_mutating_keyword(kw: &str) -> bool {
-    matches!(
-        kw,
-        "alter"
-            | "call"
-            | "copy"
-            | "create"
-            | "delete"
-            | "drop"
-            | "execute"
-            | "grant"
-            | "insert"
-            | "merge"
-            | "put"
-            | "remove"
-            | "revoke"
-            | "rm"
-            | "truncate"
-            | "undrop"
-            | "update"
-            | "use"
-    )
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SqlTokenScanState {
-    Normal,
-    SingleQuoted,
-    DoubleQuoted,
-    LineComment,
-    BlockComment,
-}
-
-fn flush_token_word(word: &mut String, words: &mut Vec<String>) {
-    if !word.is_empty() {
-        words.push(std::mem::take(word));
-    }
-}
-
-fn executable_sql_words(sql: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut word = String::new();
-    let mut chars = sql.chars().peekable();
-    let mut comment_depth = 0usize;
-    let mut state = SqlTokenScanState::Normal;
-
-    while let Some(ch) = chars.next() {
-        match state {
-            SqlTokenScanState::Normal => match ch {
-                '-' if chars.peek() == Some(&'-') => {
-                    chars.next();
-                    flush_token_word(&mut word, &mut words);
-                    state = SqlTokenScanState::LineComment;
-                }
-                '/' if chars.peek() == Some(&'*') => {
-                    chars.next();
-                    flush_token_word(&mut word, &mut words);
-                    comment_depth = 1;
-                    state = SqlTokenScanState::BlockComment;
-                }
-                '\'' => {
-                    flush_token_word(&mut word, &mut words);
-                    state = SqlTokenScanState::SingleQuoted;
-                }
-                '"' => {
-                    flush_token_word(&mut word, &mut words);
-                    state = SqlTokenScanState::DoubleQuoted;
-                }
-                _ if ch.is_ascii_alphanumeric() || ch == '_' => {
-                    word.push(ch.to_ascii_lowercase());
-                }
-                _ => flush_token_word(&mut word, &mut words),
-            },
-            SqlTokenScanState::SingleQuoted => match ch {
-                '\\' => {
-                    chars.next();
-                }
-                '\'' if chars.peek() == Some(&'\'') => {
-                    chars.next();
-                }
-                '\'' => state = SqlTokenScanState::Normal,
-                _ => {}
-            },
-            SqlTokenScanState::DoubleQuoted => match ch {
-                '"' if chars.peek() == Some(&'"') => {
-                    chars.next();
-                }
-                '"' => state = SqlTokenScanState::Normal,
-                _ => {}
-            },
-            SqlTokenScanState::LineComment => {
-                if matches!(ch, '\n' | '\r') {
-                    state = SqlTokenScanState::Normal;
-                }
-            }
-            SqlTokenScanState::BlockComment => {
-                if ch == '/' && chars.peek() == Some(&'*') {
-                    chars.next();
-                    comment_depth += 1;
-                } else if ch == '*' && chars.peek() == Some(&'/') {
-                    chars.next();
-                    comment_depth -= 1;
-                    if comment_depth == 0 {
-                        state = SqlTokenScanState::Normal;
-                    }
-                }
-            }
-        }
-    }
-    flush_token_word(&mut word, &mut words);
-    words
-}
-
 fn looks_unconstrained(sql: &str) -> bool {
-    let words = executable_sql_words(sql);
+    let words = sql_lexer::lex(sql).words();
     words.iter().any(|w| w == "select")
         && !words
             .iter()
@@ -673,14 +559,16 @@ mod tests {
 
     #[test]
     fn nested_block_comment_hiding_mutation_is_classified_mutating() {
-        // Snowflake nests `/* */`, so `/* /* */ */ delete ...` runs the DELETE. A
-        // first-match `*/` scan would close the outer comment at the inner `*/`,
-        // mis-read the leftover `*/ delete` as having no keyword, and fail OPEN to
-        // `Read`. Depth-aware skipping must surface the real `delete`/`drop`.
+        // Whether Snowflake nests `/* */` is undocumented, and the two readings
+        // disagree: `/* /* */ select 1 */ delete from t` is a DELETE if comments
+        // nest and a SELECT if they do not. Either way a mutation hidden behind a
+        // nested comment must classify as mutating.
         for sql in [
             "/* /* */ */ delete from table_x",
             "/*outer /*inner*/ still outer*/ drop table t",
             "/* a /* b /* c */ d */ e */ update t set x = 1",
+            "/* /* */ select 1 */ delete from t",
+            "/* /* */ DELETE FROM t WHERE a <> '*/ SELECT 1 --'",
         ] {
             assert_eq!(
                 classify_sql_operation(sql),
@@ -688,9 +576,35 @@ mod tests {
                 "nested-comment-wrapped mutation must classify as mutating: {sql}"
             );
         }
-        // A nested comment in front of a genuine read stays a read.
+        // Fail closed: because the reading is ambiguous, even a read behind a
+        // nested comment is refused (tightened 2026-09-24 from "stays a read",
+        // which rested on the undocumented nesting assumption; a live probe in
+        // the reality-check bead D5 can relax this with evidence).
         assert_eq!(
             classify_sql_operation("/* /* hint */ */ select 1"),
+            SqlOperationClass::Mutating
+        );
+        // A plain (non-nested) comment in front of a read stays a read.
+        assert_eq!(
+            classify_sql_operation("/* hint */ select 1"),
+            SqlOperationClass::Read
+        );
+    }
+
+    #[test]
+    fn dollar_quoted_strings_cannot_hide_a_mutation() {
+        // Regression for the 2026-09-23 audit: an apostrophe inside `$$...$$`
+        // used to open a phantom quoted string in every hand-rolled scanner.
+        assert_eq!(
+            classify_sql_operation("with x as (select $$it's$$ as v) delete from t"),
+            SqlOperationClass::Mutating
+        );
+        assert_eq!(
+            classify_sql_operation("with x as (select $$it's$$ as v) select * from x"),
+            SqlOperationClass::Read
+        );
+        assert_eq!(
+            classify_sql_operation("select get(v, 0) from t"),
             SqlOperationClass::Read
         );
     }

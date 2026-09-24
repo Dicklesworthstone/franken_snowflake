@@ -1869,6 +1869,12 @@ fn apply_session(conn: &LiveConn, request: &mut SubmitStatementRequest) {
     if let Some(existing) = request.parameters.take() {
         parameters.extend(existing);
     }
+    // Server-side backstop for the client's one-statement guard: with an
+    // explicit count of 1, Snowflake rejects a request whose statement count
+    // differs instead of running it, whatever the account/user default is (the
+    // documented request default is 1, but a MULTI_STATEMENT_COUNT parameter can
+    // be set at account level). Inserted last so nothing can override it.
+    parameters.insert("MULTI_STATEMENT_COUNT".to_owned(), "1".to_owned());
     request.parameters = Some(parameters);
 }
 
@@ -3034,6 +3040,10 @@ mod tests {
         assert_eq!(
             request["parameters"]["QUERY_TAG"], "fsnow.test.1",
             "{request}"
+        );
+        assert_eq!(
+            request["parameters"]["MULTI_STATEMENT_COUNT"], "1",
+            "every live submit pins the one-statement backstop: {request}"
         );
         assert_eq!(script.remaining(), 0);
         assert_eq!(

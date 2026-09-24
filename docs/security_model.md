@@ -100,6 +100,49 @@ derivable without leaking the secret, instead of a surprise 401 mid-poll.
 - Rights and sensitivity metadata travel with dataset manifests
   (`docs/dataset_manifest_contract.md`).
 
+## SQL Statement Guard
+
+Every guard that reasons about SQL text — statement counting, the read-path
+classifier (`query plan` / `query run` / export / TUI), write classification, and
+refusal messages — runs on one lexer, `franken_snowflake_core::sql_lexer`
+(before 2026-09-24 there were four hand-rolled scanners, none of which knew
+dollar-quoted strings, so `SELECT $$ it's $$; DROP ...` counted as one read).
+
+Lexical rules (Snowflake docs consulted 2026-09-24:
+[string constants](https://docs.snowflake.com/en/sql-reference/data-types-text#string-constants),
+[identifiers](https://docs.snowflake.com/en/sql-reference/identifiers-syntax),
+[comments](https://docs.snowflake.com/en/sql-reference/constructs/comments)):
+
+- single-quoted strings with `''` and backslash escapes; `$$ ... $$` strings;
+  double-quoted identifiers with `""`; `--` and `//` line comments; `/* */`
+  block comments;
+- `$` inside an unquoted identifier (`SYSTEM$TYPEOF`, `a$b`) is part of the
+  identifier, and `$1` / `$name` are positional columns / session variables,
+  never string openers.
+
+Fail-closed decisions:
+
+- **Nested block comments are refused.** Whether Snowflake nests `/* */` is not
+  documented, and the readings disagree (`/* /* */ select 1 */ delete from t` is a
+  DELETE if comments nest, a SELECT if not). Unterminated quotes, `$$` strings and
+  comments are refused too. A live probe (reality-check bead D5) can relax this
+  with evidence.
+- **Read-path side effects are refused**: any `SYSTEM$` function outside a
+  read-only allowlist (e.g. `SYSTEM$CANCEL_ALL_QUERIES`, `SYSTEM$ABORT_SESSION`)
+  and sequence `NEXTVAL`. Allowlisted: `SYSTEM$TYPEOF`, `SYSTEM$WAIT`,
+  `SYSTEM$CLUSTERING_*`, `SYSTEM$EXPLAIN_*`, `SYSTEM$GET_TAG*`,
+  `SYSTEM$PIPE_STATUS`, `SYSTEM$STREAM_*` and a few other read-only functions
+  (the list lives in `sql_lexer.rs`).
+- **Server-side backstop:** every live submit sets `MULTI_STATEMENT_COUNT = "1"`,
+  so Snowflake rejects a request whose statement count differs instead of
+  running it, whatever the account-level default is. (The request default is 1
+  per the [SQL API reference](https://docs.snowflake.com/en/developer-guide/sql-api/reference);
+  the parameter can also be set at account level, so it is pinned explicitly.)
+
+The strongest read-only guarantee is still Snowflake RBAC: give read profiles a
+role that cannot write (reality-check bead L4 adds a `profile doctor --online`
+check for this).
+
 ## Cost Safety
 
 The enforceable guardrail is **server-side**: every query sets

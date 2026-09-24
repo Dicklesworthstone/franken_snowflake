@@ -357,18 +357,22 @@ fn redaction_fixture() -> Json {
 }
 
 fn read_only_guard_fixture() -> Json {
-    let cases: [(&str, bool); 8] = [
+    let cases: [(&str, bool); 11] = [
         ("select 1", true),
         ("WITH x AS (SELECT 1) SELECT * FROM x", true),
         ("SELECT /* delete from t */ 1", true),
         ("-- delete from t\nselect 1", true),
+        ("select $$ a;b $$, a$b, $1 from @s", true),
         ("delete from t", false),
         ("with x as (select 1) delete from t", false),
-        // Snowflake nests block comments: the outer comment swallows the inner
-        // one, so what remains is the mutation. A guard that stops at the first
-        // `*/` would classify this as a read.
+        // If Snowflake nests block comments, the outer comment swallows the
+        // inner one and what remains is the mutation; nesting is undocumented,
+        // so any nested comment is refused.
         ("/* /* nested */ select 1 */ delete from t", false),
         ("select 1; select 2", false),
+        // An apostrophe inside a `$$` string must not hide the separator.
+        ("select $$ it's $$; delete from t", false),
+        ("select system$cancel_all_queries(1)", false),
     ];
     let mut wrong = Vec::new();
     for (sql, expected_read) in cases {

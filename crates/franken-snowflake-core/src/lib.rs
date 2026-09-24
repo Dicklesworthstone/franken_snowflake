@@ -54,6 +54,7 @@ pub mod guardrails;
 pub mod ids;
 pub mod outcome;
 pub mod redact;
+pub mod sql_lexer;
 pub mod write_intent;
 
 /// Crate version string, surfaced in the `capabilities` / `agent-handbook`
