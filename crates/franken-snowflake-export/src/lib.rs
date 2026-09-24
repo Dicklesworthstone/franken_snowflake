@@ -717,6 +717,127 @@ mod local {
         }
     }
 
+    /// One CSV record with temporal cells in their typed text form.
+    fn csv_text_record(columns: &[ExportColumn], row: &[Option<String>]) -> ExportResult<String> {
+        let cells = columns
+            .iter()
+            .zip(row)
+            .map(|(column, cell)| match cell {
+                Some(value) => Ok(Some(
+                    temporal_text(column, value)?.unwrap_or_else(|| value.clone()),
+                )),
+                None => Ok(None),
+            })
+            .collect::<ExportResult<Vec<Option<String>>>>()?;
+        Ok(csv_record(cells.iter().map(Option::as_deref)))
+    }
+
+    /// The streamable local formats.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TextFormat {
+        /// RFC 4180 CSV with a header row.
+        Csv,
+        /// One JSON object per line.
+        Jsonl,
+    }
+
+    /// Writes a CSV or JSONL export incrementally (reality-check bead E5): rows
+    /// arrive batch by batch and go straight to the sink, hashed as they pass,
+    /// so memory stays bounded by one batch. The bytes are identical to
+    /// [`export_csv`] / [`export_jsonl`] over the same rows.
+    pub struct StreamingTextExport<S: ExportByteSink> {
+        format: TextFormat,
+        columns: Vec<ExportColumn>,
+        sink: AddressingSink<S>,
+        rows: u64,
+        batches: u32,
+    }
+
+    impl<S: ExportByteSink> StreamingTextExport<S> {
+        /// Start an export into `inner` (the CSV header is written now).
+        ///
+        /// # Errors
+        /// An empty or duplicated schema, or a sink failure.
+        pub fn new(format: TextFormat, columns: Vec<ExportColumn>, inner: S) -> ExportResult<Self> {
+            validate_columns(&columns)?;
+            let mut sink = AddressingSink::new(inner);
+            if format == TextFormat::Csv {
+                let header = csv_record(columns.iter().map(|column| Some(column.name.as_str())));
+                sink.write_chunk(header.as_bytes())?;
+            }
+            Ok(Self {
+                format,
+                columns,
+                sink,
+                rows: 0,
+                batches: 0,
+            })
+        }
+
+        /// Append the next rows, in result order.
+        ///
+        /// # Errors
+        /// A row whose width differs from the schema, a malformed temporal
+        /// cell, or a sink failure.
+        pub fn write_rows(&mut self, rows: &[Vec<Option<String>>]) -> ExportResult<()> {
+            for (row_index, row) in rows.iter().enumerate() {
+                if row.len() != self.columns.len() {
+                    return Err(ExportError::RowWidthMismatch {
+                        partition_index: self.batches,
+                        row_index,
+                        expected: self.columns.len(),
+                        actual: row.len(),
+                    });
+                }
+                let record = match self.format {
+                    TextFormat::Csv => csv_text_record(&self.columns, row)?,
+                    TextFormat::Jsonl => jsonl_record(&self.columns, row)?,
+                };
+                self.sink.write_chunk(record.as_bytes())?;
+                self.rows = self.rows.saturating_add(1);
+            }
+            self.batches = self.batches.saturating_add(1);
+            Ok(())
+        }
+
+        /// Rows written so far.
+        #[must_use]
+        pub const fn rows_written(&self) -> u64 {
+            self.rows
+        }
+
+        /// Finish: the inner sink, the content-addressed receipt, and its log line.
+        ///
+        /// # Errors
+        /// Serialization of the schema hash or the log line.
+        pub fn finish(
+            self,
+            target_uri_redacted: impl Into<String>,
+            created_at_ms: u64,
+        ) -> ExportResult<(S, ExportReceipt, String)> {
+            let schema = schema_hash(&self.columns)?;
+            let (inner, address) = self.sink.finish();
+            let (kind, format) = match self.format {
+                TextFormat::Csv => (ExportReceiptKind::LocalCsv, ExportFormat::Csv),
+                TextFormat::Jsonl => (ExportReceiptKind::LocalJsonl, ExportFormat::Jsonl),
+            };
+            let target = target_uri_redacted.into();
+            let receipt = ExportReceipt::new(
+                kind,
+                Some(format),
+                redact_to_owned(&target),
+                address,
+                Some(self.rows),
+                Some(schema),
+                None,
+                created_at_ms,
+                Vec::new(),
+            );
+            let log_line = ExportLogEvent::from_receipt(&receipt)?.to_json_line()?;
+            Ok((inner, receipt, log_line))
+        }
+    }
+
     /// Local export artifact held in memory by the convenience helpers.
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct LocalExportArtifact {
@@ -742,17 +863,7 @@ mod local {
         let header = csv_record(columns.iter().map(|column| Some(column.name.as_str())));
         sink.write_chunk(header.as_bytes())?;
         stream_rows(columns, partitions, sink, |row, sink| {
-            let cells = columns
-                .iter()
-                .zip(row)
-                .map(|(column, cell)| match cell {
-                    Some(value) => Ok(Some(
-                        temporal_text(column, value)?.unwrap_or_else(|| value.clone()),
-                    )),
-                    None => Ok(None),
-                })
-                .collect::<ExportResult<Vec<Option<String>>>>()?;
-            let record = csv_record(cells.iter().map(Option::as_deref));
+            let record = csv_text_record(columns, row)?;
             sink.write_chunk(record.as_bytes())
         })
     }
@@ -1054,7 +1165,9 @@ pub use local::{
 };
 
 #[cfg(feature = "export")]
-pub use local::{export_csv, export_jsonl, write_csv_stream, write_jsonl_stream};
+pub use local::{
+    StreamingTextExport, TextFormat, export_csv, export_jsonl, write_csv_stream, write_jsonl_stream,
+};
 
 #[cfg(feature = "parquet")]
 pub mod parquet;
@@ -1677,6 +1790,52 @@ mod tests {
             assert!(message.contains("column `d`"), "{message}");
             assert!(!message.contains("secret-looking-value"), "{message}");
         }
+        Ok(())
+    }
+
+    /// Reality-check bead E5: the streaming writer produces the same bytes and
+    /// content address as the in-memory export, however the rows are batched,
+    /// and refuses a row of the wrong width.
+    #[test]
+    fn streaming_text_export_matches_the_in_memory_bytes() -> Result<(), String> {
+        let input = fixture_input();
+        let rows: Vec<Vec<Option<String>>> = input
+            .partitions
+            .iter()
+            .flat_map(|partition| partition.rows.clone())
+            .collect();
+        for (format, reference) in [
+            (
+                TextFormat::Csv,
+                export_csv(&input, "a", 7).map_err(|e| e.to_string())?,
+            ),
+            (
+                TextFormat::Jsonl,
+                export_jsonl(&input, "a", 7).map_err(|e| e.to_string())?,
+            ),
+        ] {
+            let mut streaming = StreamingTextExport::new(format, input.columns.clone(), Vec::new())
+                .map_err(|e| e.to_string())?;
+            // One row per batch: batching must not change the bytes.
+            for row in &rows {
+                streaming
+                    .write_rows(std::slice::from_ref(row))
+                    .map_err(|e| e.to_string())?;
+            }
+            assert_eq!(streaming.rows_written(), 3);
+            let (bytes, receipt, log_line) = streaming.finish("a", 7).map_err(|e| e.to_string())?;
+            assert_eq!(bytes, reference.bytes, "{format:?}");
+            assert_eq!(receipt.content_address, reference.receipt.content_address);
+            assert_eq!(receipt.row_count, Some(3));
+            assert!(log_line.ends_with('\n'));
+        }
+        let mut narrow =
+            StreamingTextExport::new(TextFormat::Csv, input.columns.clone(), Vec::new())
+                .map_err(|e| e.to_string())?;
+        assert!(matches!(
+            narrow.write_rows(&[vec![Some("1".to_owned())]]),
+            Err(ExportError::RowWidthMismatch { .. })
+        ));
         Ok(())
     }
 
