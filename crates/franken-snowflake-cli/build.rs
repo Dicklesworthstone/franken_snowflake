@@ -96,6 +96,19 @@ fn main() {
             println!("cargo:rerun-if-changed={path}");
         }
     }
+    // Windows gives a program's main thread 1 MiB of stack, where Linux and
+    // macOS give 8 MiB. The live statement path's futures overflow 1 MiB in a
+    // debug build, which crashed every live command and `mcp serve` on Windows
+    // (found by the socket e2e on the dsr Windows host, 2026-09-24): give the
+    // binaries the Unix default.
+    match (
+        std::env::var("CARGO_CFG_TARGET_OS").as_deref(),
+        std::env::var("CARGO_CFG_TARGET_ENV").as_deref(),
+    ) {
+        (Ok("windows"), Ok("msvc")) => println!("cargo:rustc-link-arg-bins=/STACK:8388608"),
+        (Ok("windows"), Ok("gnu")) => println!("cargo:rustc-link-arg-bins=-Wl,--stack,8388608"),
+        _ => {}
+    }
     let unknown = || "unknown".to_owned();
     let git_sha = env("FSNOW_BUILD_SHA")
         .or_else(|| command_stdout("git", &["rev-parse", "HEAD"]))
