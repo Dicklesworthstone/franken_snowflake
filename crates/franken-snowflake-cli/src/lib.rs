@@ -24,10 +24,10 @@ use franken_snowflake_core::ids::RequestId;
 use franken_snowflake_core::redact::redact;
 use franken_snowflake_core::sql_lexer::{self, SqlTokenKind};
 use franken_snowflake_core::write_intent::{
-    ConfirmationToken, StatementAllowlistEntry, WriteIntentDecision, WriteIntentMode,
-    WriteIntentPlan, WriteIntentPolicy, WriteIntentRefusal, WriteIntentRefusalCode,
-    WriteIntentRequest, WriteSafetyClass, WriteStatementKind, classify_write_statement,
-    evaluate_write_intent,
+    AppendOnlyAuditIntent, ConfirmationToken, StatementAllowlistEntry, WriteIntentDecision,
+    WriteIntentMode, WriteIntentPlan, WriteIntentPolicy, WriteIntentRefusal,
+    WriteIntentRefusalCode, WriteIntentRequest, WriteSafetyClass, WriteStatementKind,
+    classify_write_statement, evaluate_write_intent,
 };
 
 use std::env;
@@ -3761,7 +3761,7 @@ fn query_write_outcome(
             format,
             "query.write",
             "fsnow.query.write.v1",
-            "`query write` expects a mutating statement (INSERT/UPDATE/DELETE/MERGE/COPY INTO/PUT/...). For reads use `query run`.",
+            "`query write` expects a mutating statement (INSERT/UPDATE/DELETE/MERGE/COPY INTO/...). For reads use `query run`.",
             vec![run_hint(Some(&profile), &sql_text)],
             vec![],
         );
@@ -3795,27 +3795,61 @@ fn query_write_outcome(
         WriteIntentMode::PrepareExecution
     };
 
-    let mut policy = write_policy_for_profile(&profile, statement_kind);
+    let mut policy = match write_policy_for_profile(&profile, statement_kind) {
+        Ok(policy) => policy,
+        Err(message) => {
+            return refusal(
+                format,
+                "query.write",
+                "fsnow.query.write.v1",
+                request_id,
+                Some(profile.clone()),
+                SnowflakeErrorCode::ProfileInvalid,
+                message,
+                vec![format!(
+                    "franken-snowflake profile validate {profile} --json"
+                )],
+            );
+        }
+    };
     // A supplied token is always checked (reality-check bead B4): in the
     // frictionless default a wrong or stale `--confirm` must not execute.
     if confirm.is_some() {
         policy.require_exact_confirmation = true;
     }
     let allowlist_id = cli_allowlist_id(statement_kind);
+    let store = local_store::open_store().ok();
 
-    // Deterministic idempotency id bound to (profile, compacted SQL): the dry-run
-    // confirmation token only validates a re-run of the *same* statement.
-    let ladder_request_id = stable_request_id(&format!(
-        "write\u{1f}{profile}\u{1f}{}",
-        compact_sql(&sql_text)
-    ));
+    // The ladder's request id. A confirmed write reuses the random id its dry
+    // run issued, after the token is checked against the audit log (same
+    // profile and statement, unexpired, not yet used), so a replay submits the
+    // same SQL API requestId; a dry run or a bare write gets a fresh random id.
+    // Tokens are no longer derived from the SQL, so they reveal nothing about it.
+    let ladder_request_id = match &confirm {
+        Some(token) => {
+            match verify_confirmation(store.as_ref(), &profile, &sql_text, statement_kind, token) {
+                Ok(id) => id,
+                Err(reason) => {
+                    return confirmation_refusal(format, request_id, profile, &sql_text, &reason);
+                }
+            }
+        }
+        None => local_store::random_id().unwrap_or_else(|_| local_store::invocation_id(&sql_text)),
+    };
 
     let mut intent = WriteIntentRequest::new(mode, &sql_text);
     intent.dry_run = true;
     intent.allowlist_id = Some(allowlist_id);
-    intent.request_id = Some(RequestId::new(ladder_request_id));
+    intent.request_id = Some(RequestId::new(ladder_request_id.clone()));
     if let Some(token) = &confirm {
         intent.confirmation_token = Some(ConfirmationToken::new(token.clone()));
+    }
+    // The append-only audit rung is real: every write attempt is recorded, so
+    // a write only proceeds when the local store can take the record.
+    if let Some(store) = &store {
+        intent.audit_intent = Some(AppendOnlyAuditIntent::append_only(
+            store.dir.join("audit").display().to_string(),
+        ));
     }
 
     match evaluate_write_intent(&intent, &policy) {
@@ -3823,12 +3857,155 @@ fn query_write_outcome(
             write_refusal_outcome(format, request_id, profile, &sql_text, &detail)
         }
         WriteIntentDecision::DryRunPlanned { plan } => {
-            write_plan_outcome(format, request_id, profile, &sql_text, &plan)
+            let recorded = match &store {
+                Some(store) => record_issued_confirmation(
+                    store,
+                    &request_id,
+                    &profile,
+                    &sql_text,
+                    statement_kind,
+                    &ladder_request_id,
+                ),
+                None => Err("the local store is unavailable".to_owned()),
+            };
+            let mut outcome = write_plan_outcome(format, request_id, profile, &sql_text, &plan);
+            if let (Err(reason), Body::Envelope { envelope, .. }) = (recorded, &mut outcome.body) {
+                envelope.warnings.push(json_string(format!(
+                    "the confirmation token was not recorded, so --confirm cannot use it: {reason}"
+                )));
+            }
+            outcome
         }
-        WriteIntentDecision::ExecutionAuthorized { plan } => {
-            query_write_execute_dispatch(format, request_id, profile, &sql_text, &plan)
+        WriteIntentDecision::ExecutionAuthorized { plan } => query_write_execute_dispatch(
+            format,
+            request_id,
+            profile,
+            &sql_text,
+            &plan,
+            confirm.is_some(),
+        ),
+    }
+}
+
+/// Default lifetime of a confirmation token (`<PREFIX>_WRITE_TOKEN_TTL_SECONDS`).
+const DEFAULT_WRITE_TOKEN_TTL_SECONDS: u64 = 900;
+
+fn record_issued_confirmation(
+    store: &local_store::Store,
+    trace_id: &str,
+    profile: &str,
+    sql: &str,
+    statement_kind: WriteStatementKind,
+    confirm_id: &str,
+) -> Result<(), String> {
+    let issued = local_store::IssuedConfirmation {
+        confirm_id: confirm_id.to_owned(),
+        profile: profile.to_owned(),
+        sql_digest: local_store::keyed_sql_digest(store, profile, &compact_sql(sql))?,
+        statement_kind: statement_kind.as_token().to_owned(),
+        issued_at_ms: local_store::now_unix_ms(),
+    };
+    local_store::record_dry_run(store, trace_id, &issued)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Check a supplied `--confirm` against the dry run it names (reality-check
+/// bead B4): issued by this data directory, for this profile and exactly this
+/// statement and kind, within its lifetime, and not already used by a
+/// completed write. Returns the confirmation id.
+fn verify_confirmation(
+    store: Option<&local_store::Store>,
+    profile: &str,
+    sql: &str,
+    statement_kind: WriteStatementKind,
+    token: &str,
+) -> Result<String, String> {
+    let Some(store) = store else {
+        return Err("the local store is unavailable, so the token cannot be verified".to_owned());
+    };
+    let kind = statement_kind.as_token();
+    let Some(id) = token.strip_prefix(&format!("confirm:{kind}:")) else {
+        return Err(format!(
+            "the token is not a `{kind}` confirmation (expected confirm:{kind}:<id> from a dry run of this statement)"
+        ));
+    };
+    let Some(issued) = local_store::find_dry_run(store, id) else {
+        return Err(
+            "the token names no dry run recorded in this data directory; run `query write --dry-run` first"
+                .to_owned(),
+        );
+    };
+    let digest = local_store::keyed_sql_digest(store, profile, &compact_sql(sql))?;
+    if issued.profile != profile || issued.sql_digest != digest || issued.statement_kind != kind {
+        return Err("the token was issued for a different statement or profile".to_owned());
+    }
+    let ttl_seconds = profile_env_u64(profile, "WRITE_TOKEN_TTL_SECONDS")
+        .unwrap_or(DEFAULT_WRITE_TOKEN_TTL_SECONDS);
+    let age_ms = local_store::now_unix_ms().saturating_sub(issued.issued_at_ms);
+    if age_ms >= ttl_seconds.saturating_mul(1000) {
+        return Err(format!(
+            "the token expired: issued {} s ago, lifetime {ttl_seconds} s; dry-run again",
+            age_ms / 1000
+        ));
+    }
+    if let Some(receipt) = local_store::confirmation_consumed_by(store, id) {
+        return Err(format!(
+            "the token was already used by a completed write (receipt {receipt}); dry-run again for a new one"
+        ));
+    }
+    Ok(id.to_owned())
+}
+
+/// A `--confirm` that fails verification: FSNOW-3008, recorded on the audit log.
+fn confirmation_refusal(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    sql: &str,
+    reason: &str,
+) -> Outcome {
+    let mut outcome = refusal(
+        format,
+        "query.write",
+        "fsnow.query.write.v1",
+        request_id.clone(),
+        Some(profile.clone()),
+        SnowflakeErrorCode::WriteConfirmationRequired,
+        format!("confirmation token refused: {reason}"),
+        vec![write_hint(Some(&profile), sql)],
+    );
+    if let Ok(store) = local_store::open_store() {
+        let event = serde_json::json!({
+            "profile_id": profile,
+            "refusal_code": SnowflakeErrorCode::WriteConfirmationRequired.stable_code(),
+            "stage": "ConfirmationMatched",
+            "reason": reason,
+            "sql_preview_redacted": compact_sql(&redact(sql)),
+        });
+        let recorded = local_store::append_audit(
+            &store,
+            "query.write",
+            &request_id,
+            "write_refused",
+            &event,
+            None,
+        );
+        if let (Err(error), Body::Envelope { envelope, .. }) = (recorded, &mut outcome.body) {
+            envelope
+                .warnings
+                .push(json_string(format!("audit log append failed: {error}")));
         }
     }
+    outcome
+}
+
+/// Read a numeric profile env handle (`<PREFIX>_<KEY>`).
+fn profile_env_u64(profile: &str, key: &str) -> Option<u64> {
+    let prefix = profile_env_prefix(profile);
+    env::var(format!("{prefix}_{key}"))
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
 }
 
 /// Build the per-profile write-intent policy from env handles. By default a
@@ -3841,13 +4018,58 @@ fn query_write_outcome(
 fn write_policy_for_profile(
     profile: &str,
     statement_kind: WriteStatementKind,
-) -> WriteIntentPolicy {
-    write_policy_from_flags(
+) -> Result<WriteIntentPolicy, String> {
+    let mut policy = write_policy_from_flags(
         profile_env_flag(profile, "WRITE_ENABLED"),
         profile_env_flag(profile, "WRITE_ALLOW_DDL"),
         profile_env_flag(profile, "WRITE_REQUIRE_CONFIRM"),
         statement_kind,
-    )
+    );
+    policy.allow_procedures = profile_env_flag(profile, "WRITE_ALLOW_PROCEDURES");
+    policy.allow_external_unload = profile_env_flag(profile, "WRITE_ALLOW_EXTERNAL");
+    let prefix = profile_env_prefix(profile);
+    if let Ok(kinds) = env::var(format!("{prefix}_WRITE_ALLOWED_KINDS")) {
+        policy.allowed_kinds = Some(parse_allowed_kinds(&kinds).map_err(|unknown| {
+            format!(
+                "{prefix}_WRITE_ALLOWED_KINDS names unknown statement kind `{unknown}`; use tokens such as insert, merge, update, delete, copy_into_table"
+            )
+        })?);
+    }
+    Ok(policy)
+}
+
+/// Parse `WRITE_ALLOWED_KINDS` (comma-separated kind tokens). An unknown token
+/// is an error, never silently ignored.
+fn parse_allowed_kinds(raw: &str) -> Result<Vec<WriteStatementKind>, String> {
+    const KINDS: &[WriteStatementKind] = &[
+        WriteStatementKind::Insert,
+        WriteStatementKind::Merge,
+        WriteStatementKind::Update,
+        WriteStatementKind::Delete,
+        WriteStatementKind::CopyIntoTable,
+        WriteStatementKind::CopyIntoStage,
+        WriteStatementKind::CopyIntoExternal,
+        WriteStatementKind::Create,
+        WriteStatementKind::Alter,
+        WriteStatementKind::Drop,
+        WriteStatementKind::Truncate,
+        WriteStatementKind::Grant,
+        WriteStatementKind::Revoke,
+        WriteStatementKind::Call,
+        WriteStatementKind::Execute,
+        WriteStatementKind::Remove,
+    ];
+    raw.split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            KINDS
+                .iter()
+                .copied()
+                .find(|kind| kind.as_token().eq_ignore_ascii_case(token))
+                .ok_or_else(|| token.to_owned())
+        })
+        .collect()
 }
 
 /// Pure write-intent policy assembly from the resolved boolean flags (env-free, so
@@ -3866,11 +4088,14 @@ fn write_policy_from_flags(
         require_dry_run: require_confirm,
         require_exact_confirmation: require_confirm,
         require_idempotency_request_id: true,
-        require_append_only_audit: false,
+        // Every attempt is recorded on the append-only local audit log; a write
+        // proceeds only when the store can take the record (bead B4).
+        require_append_only_audit: true,
         statement_allowlist: vec![StatementAllowlistEntry::new(
             cli_allowlist_id(statement_kind),
             statement_kind,
         )],
+        ..WriteIntentPolicy::default()
     }
 }
 
@@ -4020,6 +4245,9 @@ fn write_refusal_code(code: WriteIntentRefusalCode) -> SnowflakeErrorCode {
         | WriteIntentRefusalCode::MissingIdempotencyRequestId
         | WriteIntentRefusalCode::MissingAppendOnlyAudit
         | WriteIntentRefusalCode::ExecutionUnavailable => SnowflakeErrorCode::MutationRefused,
+        WriteIntentRefusalCode::StatementUnsupported => SnowflakeErrorCode::StatementUnsupported,
+        WriteIntentRefusalCode::ProceduresRefused
+        | WriteIntentRefusalCode::ExternalUnloadRefused => SnowflakeErrorCode::WriteOptInRequired,
     }
 }
 
@@ -4033,6 +4261,20 @@ fn write_refusal_repair(code: WriteIntentRefusalCode, profile: &str) -> Vec<Stri
         WriteIntentRefusalCode::DdlRefused => {
             vec![format!("export {prefix}_WRITE_ALLOW_DDL=true")]
         }
+        WriteIntentRefusalCode::ProceduresRefused => {
+            vec![format!("export {prefix}_WRITE_ALLOW_PROCEDURES=true")]
+        }
+        WriteIntentRefusalCode::ExternalUnloadRefused => {
+            vec![format!("export {prefix}_WRITE_ALLOW_EXTERNAL=true")]
+        }
+        WriteIntentRefusalCode::StatementUnsupported => vec![],
+        WriteIntentRefusalCode::MissingAppendOnlyAudit => vec![
+            "franken-snowflake doctor --json".to_owned(),
+            format!(
+                "export {}=<writable directory>",
+                franken_snowflake_cache::DATA_DIR_ENV
+            ),
+        ],
         _ => vec![write_dry_run_example(Some(profile))],
     }
 }
@@ -4093,12 +4335,18 @@ fn query_write_execute_dispatch(
     profile: String,
     sql: &str,
     plan: &WriteIntentPlan,
+    confirmed: bool,
 ) -> Outcome {
+    let idempotency_request_id = plan.receipt.request_id.as_str().to_string();
     let write = live::AuthorizedWrite {
         sql,
         statement_kind: plan.statement_kind.as_token(),
         safety_class: safety_class_token(plan.safety_class),
-        idempotency_request_id: plan.receipt.request_id.as_str().to_string(),
+        // A confirmed write submits its dry run's id as the SQL API requestId
+        // (with retry=true), so replaying the same --confirm after an
+        // indeterminate outcome returns the first result instead of writing twice.
+        confirmed_request_id: confirmed.then(|| idempotency_request_id.clone()),
+        idempotency_request_id,
         database: None,
         schema: None,
     };
@@ -4114,6 +4362,7 @@ fn query_write_execute_dispatch(
     profile: String,
     _sql: &str,
     plan: &WriteIntentPlan,
+    _confirmed: bool,
 ) -> Outcome {
     live_transport_required_with_data(
         format,
@@ -5076,29 +5325,6 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b_len]
 }
 
-fn stable_request_id(seed: &str) -> String {
-    let h1 = fnv1a64(seed.as_bytes(), 0xcbf29ce484222325);
-    let h2 = fnv1a64(seed.as_bytes(), 0x84222325cbf29ce4);
-    let hex = format!("{h1:016x}{h2:016x}");
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    )
-}
-
-fn fnv1a64(bytes: &[u8], seed: u64) -> u64 {
-    let mut hash = seed;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
 fn json_string(value: impl Into<String>) -> Json {
     Json::String(value.into())
 }
@@ -5337,6 +5563,10 @@ fn build_identity_json(exe_hash: bool) -> Json {
     let mut fields = vec![
         ("version", json_string(env!("CARGO_PKG_VERSION"))),
         ("git_sha", json_string(BUILD_GIT_SHA)),
+        (
+            "source_digest",
+            json_string(env!("FSNOW_BUILD_SOURCE_DIGEST")),
+        ),
         (
             "dirty",
             match env!("FSNOW_BUILD_DIRTY") {
@@ -7362,6 +7592,7 @@ mod tests {
             require_idempotency_request_id: true,
             require_append_only_audit: false,
             statement_allowlist: vec![StatementAllowlistEntry::new(cli_allowlist_id(kind), kind)],
+            ..WriteIntentPolicy::default()
         }
     }
 
@@ -7532,6 +7763,22 @@ mod tests {
         req.dry_run = true;
         req.allowlist_id = Some(cli_allowlist_id(WriteStatementKind::Insert));
         req.request_id = Some(RequestId::new("direct-req"));
+        // The audit rung is real (bead B4): without an append-only audit
+        // intent (no writable local store) the write does not proceed.
+        let unaudited = evaluate_write_intent(&req, &policy);
+        assert!(
+            matches!(
+                unaudited,
+                WriteIntentDecision::Refused {
+                    refusal: WriteIntentRefusal {
+                        code: WriteIntentRefusalCode::MissingAppendOnlyAudit,
+                        ..
+                    }
+                }
+            ),
+            "{unaudited:?}"
+        );
+        req.audit_intent = Some(AppendOnlyAuditIntent::append_only("test-audit"));
         // No confirmation token supplied — the default path needs none.
         let decision = evaluate_write_intent(&req, &policy);
         assert!(
@@ -7555,6 +7802,7 @@ mod tests {
         req.dry_run = true;
         req.allowlist_id = Some(cli_allowlist_id(WriteStatementKind::Insert));
         req.request_id = Some(RequestId::new("confirm-req"));
+        req.audit_intent = Some(AppendOnlyAuditIntent::append_only("test-audit"));
 
         let refused = evaluate_write_intent(&req, &policy);
         assert!(
@@ -7588,14 +7836,35 @@ mod tests {
         assert!(!off.allow_ddl);
         assert!(!off.require_dry_run);
         assert!(!off.require_exact_confirmation);
-        assert!(!off.require_append_only_audit);
+        assert!(off.require_append_only_audit);
+        assert!(!off.allow_procedures && !off.allow_external_unload);
+        assert_eq!(off.allowed_kinds, None);
 
         let strict = write_policy_from_flags(true, true, true, WriteStatementKind::Create);
         assert!(strict.enabled);
         assert!(strict.allow_ddl);
         assert!(strict.require_dry_run);
         assert!(strict.require_exact_confirmation);
-        assert!(!strict.require_append_only_audit);
+        assert!(strict.require_append_only_audit);
+    }
+
+    #[test]
+    fn write_allowed_kinds_parse_strictly() {
+        assert_eq!(
+            parse_allowed_kinds("insert, MERGE,copy_into_table"),
+            Ok(vec![
+                WriteStatementKind::Insert,
+                WriteStatementKind::Merge,
+                WriteStatementKind::CopyIntoTable
+            ])
+        );
+        // An unknown kind is an error, never silently dropped.
+        assert_eq!(
+            parse_allowed_kinds("insert,upsert"),
+            Err("upsert".to_owned())
+        );
+        // Kinds the SQL API cannot run alone are not allowlistable at all.
+        assert_eq!(parse_allowed_kinds("put"), Err("put".to_owned()));
     }
 
     #[test]
@@ -7640,6 +7909,7 @@ mod tests {
             "demo".to_string(),
             "insert into t values (1)",
             &plan,
+            false,
         );
         assert_ne!(outcome.status.code(), 0, "no-transport build must refuse");
         let rendered = render_outcome(outcome);
@@ -7664,6 +7934,7 @@ mod tests {
             "no_creds_profile".to_string(),
             "insert into t values (1)",
             &plan,
+            false,
         );
         assert_ne!(
             outcome.status.code(),

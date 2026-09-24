@@ -220,12 +220,9 @@ fn discovery_commands_run_offline_with_exit_zero() {
     // A fixture whose subject is not compiled in says `skipped` (reality-check
     // bead C4); every other fixture really passes.
     let expected = |name: &str| {
-        let compiled = match name {
-            "frame_codec_mapping" => cfg!(feature = "frankenpandas"),
-            "text_indexing_provenance" => cfg!(feature = "frankensearch"),
-            _ => true,
-        };
-        if compiled { "pass" } else { "skipped" }
+        let uncompiled = (name == "frame_codec_mapping" && !cfg!(feature = "frankenpandas"))
+            || (name == "text_indexing_provenance" && !cfg!(feature = "frankensearch"));
+        if uncompiled { "skipped" } else { "pass" }
     };
     for fixture in fixtures {
         let name = fixture["name"].as_str().unwrap_or_default();
@@ -881,6 +878,28 @@ fn capabilities_reports_build_identity_and_self_hash() {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     assert_eq!(build["exe_sha256"], expected.as_str(), "{build}");
+    // The source digest uses the exact recipe the live-proof scripts
+    // recompute from the working tree, so a stale .git on a build worker
+    // cannot make a binary look like a build of these sources.
+    let digest = build["source_digest"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(digest.len(), 64, "{build}");
+    if cfg!(unix) && Command::new("sha256sum").arg("--version").output().is_ok() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+        let recipe = "{ find crates -type f \\( -name '*.rs' -o -name Cargo.toml \\) -not -path '*/target/*'; echo Cargo.toml; echo Cargo.lock; } | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1";
+        let out = Command::new("sh")
+            .args(["-c", recipe])
+            .current_dir(root)
+            .output()
+            .expect("run the digest recipe");
+        let tree = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        assert_eq!(
+            digest, tree,
+            "build.rs and the scripts must agree on the recipe"
+        );
+    }
     // Hashing reads the whole binary, so it is opt-in.
     let plain = h.run(&["capabilities", "--json"]);
     let plain = assert_envelope(&plain, "capabilities");
@@ -1095,4 +1114,150 @@ fn workload_identity_lane_is_refused_before_any_request() {
         assert!(run.stdout.contains("quarantined"), "{}", run.stdout);
         assert!(!run.stdout.contains("not canonical"), "{}", run.stdout);
     }
+}
+
+/// Reality-check bead B4: confirmation tokens are random per dry run (never
+/// derived from the SQL), bound in the store to one statement and profile,
+/// and expire; a forged or foreign token is refused.
+#[test]
+fn confirmation_tokens_are_random_bound_and_expiring() {
+    let h = Harness::new("confirm-bound");
+    let sql = "insert into t values (1)";
+    let token = |run: &Run| {
+        run.json()["data"]["required_confirmation_token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let dry = || {
+        h.run(&[
+            "query",
+            "write",
+            "--profile",
+            "e2e",
+            "--sql",
+            sql,
+            "--dry-run",
+            "--json",
+        ])
+    };
+    let (first, second) = (dry(), dry());
+    let (t1, t2) = (token(&first), token(&second));
+    assert!(t1.starts_with("confirm:insert:"), "{}", first.stdout);
+    assert_ne!(t1, t2, "tokens are random, not a hash of the statement");
+    let confirm = |token: &str, profile: &str, env: &[(&str, &str)]| {
+        h.run_with(
+            &[
+                "query",
+                "write",
+                "--profile",
+                profile,
+                "--sql",
+                sql,
+                "--confirm",
+                token,
+                "--json",
+            ],
+            env,
+        )
+    };
+    // The matching token passes the ladder (the transport then refuses the
+    // loopback account, or the build has no live transport).
+    let ok = confirm(&t1, "e2e", &[]);
+    assert_ne!(ok.code(), "FSNOW-3008", "{}", ok.stdout);
+    if cfg!(feature = "live") {
+        // Authorized but never submitted (the loopback account is refused
+        // before any socket): still an attempt on the ledger.
+        let ledger: String = files_under(&h.data_dir)
+            .iter()
+            .map(|path| String::from_utf8_lossy(&fs::read(path).unwrap_or_default()).into_owned())
+            .collect();
+        assert!(ledger.contains("write_not_submitted"), "{}", ok.stdout);
+        assert!(ledger.contains("write_dry_run"), "{}", ok.stdout);
+    }
+    let forged = confirm(
+        "confirm:insert:00000000-0000-4000-8000-000000000000",
+        "e2e",
+        &[],
+    );
+    assert_eq!(forged.code(), "FSNOW-3008", "{}", forged.stdout);
+    assert!(
+        forged.stdout.contains("names no dry run"),
+        "{}",
+        forged.stdout
+    );
+    let other = confirm(
+        &t1,
+        "other",
+        &[("FRANKEN_SNOWFLAKE_OTHER_WRITE_ENABLED", "true")],
+    );
+    assert_eq!(other.code(), "FSNOW-3008", "{}", other.stdout);
+    assert!(
+        other.stdout.contains("different statement or profile"),
+        "{}",
+        other.stdout
+    );
+    let expired = confirm(
+        &t2,
+        "e2e",
+        &[("FRANKEN_SNOWFLAKE_E2E_WRITE_TOKEN_TTL_SECONDS", "0")],
+    );
+    assert_eq!(expired.code(), "FSNOW-3008", "{}", expired.stdout);
+    assert!(expired.stdout.contains("expired"), "{}", expired.stdout);
+}
+
+/// Reality-check bead B4: statements the SQL API cannot run alone are refused
+/// typed (FSNOW-3010); procedures and external unloads need their own opt-in
+/// (FSNOW-3011); a profile kind allowlist is enforced and parsed strictly.
+#[test]
+fn write_ladder_gates_unsupported_procedure_and_external_statements() {
+    let h = Harness::new("write-gates");
+    let write = |sql: &str, env: &[(&str, &str)]| {
+        h.run_with(
+            &["query", "write", "--profile", "e2e", "--sql", sql, "--json"],
+            env,
+        )
+    };
+    for sql in [
+        "put file:///etc/hosts @s",
+        "get @s file:///tmp/",
+        "use role accountadmin",
+        "alter session set query_tag = 'x'",
+        "begin",
+        "set v = 1",
+    ] {
+        let run = write(sql, &[]);
+        assert_eq!(run.exit, 2, "{sql}: {}", run.stdout);
+        assert_eq!(run.code(), "FSNOW-3010", "{sql}: {}", run.stdout);
+    }
+    let call = write("call my_proc()", &[]);
+    assert_eq!(call.code(), "FSNOW-3011", "{}", call.stdout);
+    assert!(
+        call.stdout.contains("WRITE_ALLOW_PROCEDURES"),
+        "{}",
+        call.stdout
+    );
+    let allowed = write(
+        "call my_proc()",
+        &[("FRANKEN_SNOWFLAKE_E2E_WRITE_ALLOW_PROCEDURES", "true")],
+    );
+    assert_ne!(allowed.code(), "FSNOW-3011", "{}", allowed.stdout);
+    let unload = write("copy into 's3://bucket/x' from t", &[]);
+    assert_eq!(unload.code(), "FSNOW-3011", "{}", unload.stdout);
+    assert!(
+        unload.stdout.contains("WRITE_ALLOW_EXTERNAL"),
+        "{}",
+        unload.stdout
+    );
+    let not_listed = write(
+        "delete from t",
+        &[("FRANKEN_SNOWFLAKE_E2E_WRITE_ALLOWED_KINDS", "insert")],
+    );
+    assert_eq!(not_listed.code(), "FSNOW-3001", "{}", not_listed.stdout);
+    let bad_list = write(
+        "insert into t values (1)",
+        &[("FRANKEN_SNOWFLAKE_E2E_WRITE_ALLOWED_KINDS", "insert,upsert")],
+    );
+    assert_eq!(bad_list.code(), "FSNOW-2002", "{}", bad_list.stdout);
+    assert!(bad_list.stdout.contains("upsert"), "{}", bad_list.stdout);
 }

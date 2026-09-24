@@ -96,6 +96,8 @@ const CANCEL_BODY_PREVIEW_BYTES: usize = 512;
 
 #[derive(Default)]
 struct QueryRequestOptions {
+    /// A fixed SQL API `requestId` (confirmed writes); a fresh one otherwise.
+    sql_api_request_id: Option<String>,
     bindings: Option<BTreeMap<String, Binding>>,
     query_tag: Option<String>,
     /// Stop fetching partitions once this many rows are assembled (the
@@ -310,6 +312,7 @@ pub fn run_dataset_query_outcome(
         row_cap: None,
         bindings: (!bindings.is_empty()).then_some(bindings),
         query_tag: Some(planned.plan.guardrails.query_tag.clone()),
+        sql_api_request_id: None,
     };
     let rows = match execute(&conn, &planned.plan.sql, request_options) {
         Ok(rows) => {
@@ -382,6 +385,9 @@ pub struct AuthorizedWrite<'a> {
     pub safety_class: &'a str,
     /// The write-intent ladder receipt / idempotency id (non-secret).
     pub idempotency_request_id: String,
+    /// For a confirmed write: the dry run's id, submitted as the SQL API
+    /// `requestId` with `retry=true` so a replay cannot write twice.
+    pub confirmed_request_id: Option<String>,
     /// Optional session database/schema overrides (else the profile env applies).
     pub database: Option<String>,
     /// Optional session schema override.
@@ -408,6 +414,23 @@ pub fn run_write_outcome(
     let conn = match LiveConn::resolve(&profile, &overrides) {
         Ok(conn) => conn.tagged("query.write", &request_id),
         Err(error) => {
+            // An authorized write that never reached Snowflake is still an
+            // attempt on the ledger (bead B4: audit every attempt).
+            if let Ok(store) = local_store::open_store() {
+                let _ = local_store::append_audit(
+                    &store,
+                    "query.write",
+                    &request_id,
+                    "write_not_submitted",
+                    &serde_json::json!({
+                        "profile_id": profile,
+                        "statement_kind": write.statement_kind,
+                        "idempotency_request_id": write.idempotency_request_id,
+                        "error_code": error.stable_code(),
+                    }),
+                    None,
+                );
+            }
             return failure_outcome(
                 format,
                 "query.write",
@@ -418,9 +441,31 @@ pub fn run_write_outcome(
             );
         }
     };
-    match execute(&conn, write.sql, QueryRequestOptions::default()) {
+    // Audit every attempt before it leaves the process, so an indeterminate
+    // outcome (a killed process, a lost response) still leaves a record.
+    if let Ok(store) = local_store::open_store() {
+        let _ = local_store::append_audit(
+            &store,
+            "query.write",
+            &request_id,
+            "write_submitted",
+            &serde_json::json!({
+                "profile_id": profile,
+                "statement_kind": write.statement_kind,
+                "idempotency_request_id": write.idempotency_request_id,
+                "sql_api_request_id": write.confirmed_request_id,
+                "sql_preview_redacted": crate::compact_sql(&redact(write.sql)),
+            }),
+            None,
+        );
+    }
+    let options = QueryRequestOptions {
+        sql_api_request_id: write.confirmed_request_id.clone(),
+        ..QueryRequestOptions::default()
+    };
+    match execute(&conn, write.sql, options) {
         Ok(rows) => {
-            let (receipt_hash, warnings) = record_receipt(
+            let (receipt_hash, mut warnings) = record_receipt(
                 "query.write",
                 &conn,
                 &request_id,
@@ -434,6 +479,25 @@ pub fn run_write_outcome(
                     "rows_affected": dml_rows_affected(&rows),
                 }),
             );
+            // The confirmation is single-use once its write completed.
+            if let Some(confirm_id) = &write.confirmed_request_id {
+                let consumed = local_store::open_store()
+                    .map_err(|error| error.message())
+                    .and_then(|store| {
+                        local_store::record_confirmation_consumed(
+                            &store,
+                            &request_id,
+                            confirm_id,
+                            receipt_hash.as_deref(),
+                        )
+                        .map_err(|error| error.to_string())
+                    });
+                if let Err(message) = consumed {
+                    warnings.push(json_string(format!(
+                        "the confirmation could not be marked used: {message}"
+                    )));
+                }
+            }
             write_success(
                 format,
                 request_id,
@@ -608,7 +672,7 @@ fn scan_catalog(
         }
         let mut request = discovery.request;
         apply_session(conn, &mut request);
-        let (completed, stats, sql_api_request_id) = execute_request(conn, request, None)?;
+        let (completed, stats, sql_api_request_id) = execute_request(conn, request, None, None)?;
         let rows = into_rows(completed, stats, sql_api_request_id);
         match discovery.kind {
             DiscoveryStatementKind::Tables => tables = Some(rows),
@@ -1942,12 +2006,13 @@ fn execute_request(
     conn: &LiveConn,
     request: SubmitStatementRequest,
     row_cap: Option<usize>,
+    fixed_request_id: Option<String>,
 ) -> Result<(CompletedStatement, DriverStats, String), SnowflakeError> {
+    let sql_api_request_id = fixed_request_id.unwrap_or_else(unique_request_id);
     #[cfg(test)]
     if let Some(script) = &conn.script {
-        return script.execute(request, row_cap);
+        return script.execute(request, row_cap, &sql_api_request_id);
     }
-    let sql_api_request_id = unique_request_id();
     let params = SubmitQueryParams {
         request_id: Some(sql_api_request_id.clone()),
         retry: true,
@@ -2009,13 +2074,15 @@ fn execute(
     options: QueryRequestOptions,
 ) -> Result<LiveRows, SnowflakeError> {
     let row_cap = options.row_cap;
+    let fixed_request_id = options.sql_api_request_id.clone();
     let request = build_request(conn, sql, options);
     let query_tag = request
         .parameters
         .as_ref()
         .and_then(|parameters| parameters.get("QUERY_TAG"))
         .cloned();
-    let (done, stats, sql_api_request_id) = execute_request(conn, request, row_cap)?;
+    let (done, stats, sql_api_request_id) =
+        execute_request(conn, request, row_cap, fixed_request_id)?;
     let mut rows = into_rows(done, stats, sql_api_request_id);
     rows.query_tag = query_tag;
     Ok(rows)
@@ -2310,6 +2377,7 @@ fn query_request_options(
         row_cap: None,
         bindings,
         query_tag,
+        sql_api_request_id: None,
     })
 }
 
@@ -2792,6 +2860,8 @@ mod test_support {
         responses: VecDeque<Result<CompletedStatement, SnowflakeError>>,
         submitted: Vec<SubmitStatementRequest>,
         row_caps: Vec<Option<usize>>,
+        /// The SQL API `requestId` each statement was submitted with.
+        request_ids: Vec<String>,
     }
 
     /// Shared handle to the script: the test keeps one to inspect what was
@@ -2804,10 +2874,12 @@ mod test_support {
             &self,
             request: SubmitStatementRequest,
             row_cap: Option<usize>,
+            sql_api_request_id: &str,
         ) -> Result<(CompletedStatement, DriverStats, String), SnowflakeError> {
             let mut state = self.0.borrow_mut();
             state.submitted.push(request);
             state.row_caps.push(row_cap);
+            state.request_ids.push(sql_api_request_id.to_owned());
             let ordinal = state.submitted.len();
             match state.responses.pop_front() {
                 Some(Ok(done)) => Ok((
@@ -2838,6 +2910,11 @@ mod test_support {
         pub(super) fn row_caps(&self) -> Vec<Option<usize>> {
             self.0.borrow().row_caps.clone()
         }
+
+        /// The SQL API `requestId` each submitted statement carried.
+        pub(super) fn request_ids(&self) -> Vec<String> {
+            self.0.borrow().request_ids.clone()
+        }
     }
 
     struct ScriptedProfile {
@@ -2864,6 +2941,7 @@ mod test_support {
             responses: responses.into(),
             submitted: Vec::new(),
             row_caps: Vec::new(),
+            request_ids: Vec::new(),
         })));
         SCRIPTED.with(|slot| {
             *slot.borrow_mut() = Some(ScriptedProfile {
@@ -2994,6 +3072,7 @@ mod tests {
                 row_cap: None,
                 bindings: Some(bindings.clone()),
                 query_tag: Some("acme.trace.123".to_owned()),
+                sql_api_request_id: None,
             },
         );
 
@@ -3775,6 +3854,59 @@ mod tests {
         ))
         .to_string();
         assert!(shown.contains("fsnow:query.run:req-tag-1"), "{shown}");
+    }
+
+    /// Reality-check bead B4: a confirmed write submits its dry run's id as the
+    /// SQL API requestId (with retry=true a replay returns the first result
+    /// instead of writing twice) and marks the confirmation used once it
+    /// completes; a bare write gets a fresh id and consumes nothing.
+    #[test]
+    fn confirmed_write_submits_its_dry_run_id_and_consumes_it() {
+        let rows_inserted = || {
+            Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000aa71",
+                &[("number of rows inserted", "FIXED")],
+                &[vec![Some("1")]],
+            ))
+        };
+        let script = install("demo", None, None, vec![rows_inserted(), rows_inserted()]);
+        let confirm_id = local_store::random_id().unwrap();
+        let write = |confirmed: Option<String>| AuthorizedWrite {
+            sql: "insert into t values (1)",
+            statement_kind: "insert",
+            safety_class: "dml",
+            idempotency_request_id: confirm_id.clone(),
+            confirmed_request_id: confirmed,
+            database: None,
+            schema: None,
+        };
+        let confirmed = envelope(run_write_outcome(
+            OutputFormat::Json,
+            "req-write-1".to_owned(),
+            "demo".to_owned(),
+            &write(Some(confirm_id.clone())),
+        ));
+        assert_eq!(confirmed["ok"], true, "{confirmed}");
+        let bare = envelope(run_write_outcome(
+            OutputFormat::Json,
+            "req-write-2".to_owned(),
+            "demo".to_owned(),
+            &write(None),
+        ));
+        assert_eq!(bare["ok"], true, "{bare}");
+        let ids = script.request_ids();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(
+            ids[0], confirm_id,
+            "the confirmed write reuses its dry run's id"
+        );
+        assert_ne!(ids[1], confirm_id, "a bare write gets a fresh id");
+        let store = local_store::open_store().unwrap();
+        assert_eq!(
+            local_store::confirmation_consumed_by(&store, &confirm_id).as_deref(),
+            confirmed["receipt_hash"].as_str(),
+            "the completed confirmed write is recorded against its receipt"
+        );
     }
 
     #[test]

@@ -73,19 +73,25 @@ else
 fi
 
 # --- binary identity (reality-check bead H1) --------------------------------
-# A reused binary must be a build of HEAD (its self-reported build.git_sha);
-# FSNOW_ALLOW_STALE_BIN=1 captures with a mismatched one and records that.
-HEAD_SHA=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+# A reused binary must be built from this tree: its self-reported
+# build.source_digest (same recipe as crates/franken-snowflake-cli/build.rs)
+# must equal the tree's. FSNOW_ALLOW_STALE_BIN=1 captures with a mismatched one
+# and records that.
+HASHER=sha256sum
+command -v sha256sum >/dev/null 2>&1 || HASHER="shasum -a 256"
+# $HASHER is split on purpose ("shasum -a 256").
+TREE_DIGEST=$({ find crates -type f \( -name '*.rs' -o -name Cargo.toml \) -not -path '*/target/*'; echo Cargo.toml; echo Cargo.lock; } \
+  | LC_ALL=C sort | xargs $HASHER | $HASHER | cut -d' ' -f1)
 "$BIN" capabilities --with-exe-hash --json >"$ARTIFACTS/binary-identity.json" 2>/dev/null
-BIN_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["data"]["build"]["git_sha"])' \
+BIN_DIGEST=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["data"]["build"]["source_digest"])' \
   "$ARTIFACTS/binary-identity.json" 2>/dev/null || echo unknown)
-if [ "$BIN_SHA" != "$HEAD_SHA" ] || [ "$HEAD_SHA" = unknown ]; then
+if [ "$BIN_DIGEST" != "$TREE_DIGEST" ] || [ "$BIN_DIGEST" = unknown ]; then
   if [ "${FSNOW_ALLOW_STALE_BIN:-0}" != 1 ]; then
-    emit refused ",\"reason\":\"binary built from $BIN_SHA, HEAD is $HEAD_SHA\""
-    echo "refusing: $BIN was built from $BIN_SHA, not HEAD $HEAD_SHA (rebuild it, or set FSNOW_ALLOW_STALE_BIN=1)"
+    emit refused ",\"reason\":\"binary sources $BIN_DIGEST differ from the tree $TREE_DIGEST\""
+    echo "refusing: $BIN was not built from these sources (rebuild it, or set FSNOW_ALLOW_STALE_BIN=1)"
     exit 1
   fi
-  emit stale_binary ",\"bin_sha\":\"$BIN_SHA\",\"head_sha\":\"$HEAD_SHA\""
+  emit stale_binary ",\"bin_digest\":\"$BIN_DIGEST\",\"tree_digest\":\"$TREE_DIGEST\""
 fi
 
 export FRANKEN_SNOWFLAKE_DATA_DIR="${FRANKEN_SNOWFLAKE_DATA_DIR:-$ARTIFACTS/data}"

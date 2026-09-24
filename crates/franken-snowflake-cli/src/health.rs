@@ -552,9 +552,35 @@ fn export_plan_fixture() -> Json {
 fn frame_codec_mapping_fixture() -> Json {
     #[cfg(feature = "frankenpandas")]
     {
-        use franken_snowflake_frame::{
-            FrameStorageKind, ResultPartition, SnowflakeColumn, materialize_partitions,
-        };
+        use franken_snowflake_frame::FrameStorageKind;
+        frame_codec_check(&[
+            ("ID", FrameStorageKind::Int64),
+            ("AMOUNT", FrameStorageKind::DecimalString),
+            ("FLAG", FrameStorageKind::Bool),
+            ("VAL", FrameStorageKind::Float64),
+            ("NOTE", FrameStorageKind::Utf8),
+        ])
+    }
+    #[cfg(not(feature = "frankenpandas"))]
+    {
+        // Nothing to execute: the frame codec is not linked into this binary.
+        // Reporting `pass` here (as before 2026-09-24) certified code that
+        // was never run.
+        check_json(
+            "frame_codec_mapping",
+            "skipped",
+            "frame codec not compiled into this binary (build with --features frankenpandas to run this check)",
+        )
+    }
+}
+
+/// Decode a fixed five-column row through the frame codec and compare each
+/// column's storage kind with `expected` (a test feeds a wrong expectation to
+/// prove the check can fail).
+#[cfg(feature = "frankenpandas")]
+fn frame_codec_check(expected: &[(&str, franken_snowflake_frame::FrameStorageKind)]) -> Json {
+    use franken_snowflake_frame::{ResultPartition, SnowflakeColumn, materialize_partitions};
+    {
         let columns = vec![
             SnowflakeColumn::new("ID", "FIXED")
                 .with_scale(0)
@@ -579,13 +605,6 @@ fn frame_codec_mapping_fixture() -> Json {
         match materialize_partitions(&columns, partitions) {
             Ok(frame) => {
                 let kind = |name: &str| frame.column(name).map(|c| c.metadata.storage_kind);
-                let expected = [
-                    ("ID", FrameStorageKind::Int64),
-                    ("AMOUNT", FrameStorageKind::DecimalString),
-                    ("FLAG", FrameStorageKind::Bool),
-                    ("VAL", FrameStorageKind::Float64),
-                    ("NOTE", FrameStorageKind::Utf8),
-                ];
                 let wrong: Vec<String> = expected
                     .iter()
                     .filter(|(name, want)| kind(name) != Some(*want))
@@ -615,21 +634,31 @@ fn frame_codec_mapping_fixture() -> Json {
             ),
         }
     }
-    #[cfg(not(feature = "frankenpandas"))]
-    {
-        // Nothing to execute: the frame codec is not linked into this binary.
-        // Reporting `pass` here (as before 2026-09-24) certified code that
-        // was never run.
-        check_json(
-            "frame_codec_mapping",
-            "skipped",
-            "frame codec not compiled into this binary (build with --features frankenpandas to run this check)",
-        )
-    }
 }
 
 fn text_indexing_provenance_fixture() -> Json {
     #[cfg(feature = "frankensearch")]
+    {
+        text_provenance_check("receipt-123")
+    }
+    #[cfg(not(feature = "frankensearch"))]
+    {
+        // Nothing to execute: text indexing is not linked into this binary.
+        // (Before 2026-09-24 this branch formatted a string and then "verified"
+        // its own prefix, reporting `pass`.)
+        check_json(
+            "text_indexing_provenance",
+            "skipped",
+            "text indexing not compiled into this binary (build with --features frankensearch to run this check)",
+        )
+    }
+}
+
+/// Derive a document handle and chunk for a query-result source with this
+/// receipt hash and verify provenance (a test feeds an empty hash to prove the
+/// check can fail).
+#[cfg(feature = "frankensearch")]
+fn text_provenance_check(receipt_hash: &str) -> Json {
     {
         use franken_snowflake_core::guardrails::RightsClass;
         use franken_snowflake_core::ids::ReceiptHash;
@@ -637,7 +666,7 @@ fn text_indexing_provenance_fixture() -> Json {
             TEXT_INDEX_SCHEMA_VERSION, TextChunk, TextDocumentHandle, TextSourceRef,
         };
         let source = TextSourceRef::QueryResult {
-            receipt_hash: ReceiptHash::new("receipt-123"),
+            receipt_hash: ReceiptHash::new(receipt_hash),
             statement_handle: None,
             query_id: None,
             dataset_id: None,
@@ -670,17 +699,6 @@ fn text_indexing_provenance_fixture() -> Json {
                 "text indexing provenance verification failed",
             )
         }
-    }
-    #[cfg(not(feature = "frankensearch"))]
-    {
-        // Nothing to execute: text indexing is not linked into this binary.
-        // (Before 2026-09-24 this branch formatted a string and then "verified"
-        // its own prefix, reporting `pass`.)
-        check_json(
-            "text_indexing_provenance",
-            "skipped",
-            "text indexing not compiled into this binary (build with --features frankensearch to run this check)",
-        )
     }
 }
 
@@ -805,4 +823,37 @@ pub fn supported_auth_lanes() -> Json {
         "key_pair_jwt".to_string(),
         "oauth_bearer".to_string(),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    /// Reality-check bead C4: the frame fixture can fail. A wrong expected
+    /// storage kind (scaled NUMBER as a float) must report `fail`.
+    #[cfg(feature = "frankenpandas")]
+    #[test]
+    fn frame_codec_check_fails_on_a_wrong_expectation() {
+        use franken_snowflake_frame::FrameStorageKind;
+        let wrong = crate::render_json(&super::frame_codec_check(&[(
+            "AMOUNT",
+            FrameStorageKind::Float64,
+        )]));
+        assert!(wrong.contains("\"status\":\"fail\""), "{wrong}");
+        assert!(wrong.contains("AMOUNT"), "{wrong}");
+        let right = crate::render_json(&super::frame_codec_check(&[(
+            "AMOUNT",
+            FrameStorageKind::DecimalString,
+        )]));
+        assert!(right.contains("\"status\":\"pass\""), "{right}");
+    }
+
+    /// Reality-check bead C4: the text-indexing fixture can fail. A source
+    /// without a receipt hash has no provenance and must report `fail`.
+    #[cfg(feature = "frankensearch")]
+    #[test]
+    fn text_provenance_check_fails_without_a_receipt_hash() {
+        let missing = crate::render_json(&super::text_provenance_check(""));
+        assert!(missing.contains("\"status\":\"fail\""), "{missing}");
+        let present = crate::render_json(&super::text_provenance_check("receipt-123"));
+        assert!(present.contains("\"status\":\"pass\""), "{present}");
+    }
 }

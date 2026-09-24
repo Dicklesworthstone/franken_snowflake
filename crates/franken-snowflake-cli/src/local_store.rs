@@ -327,6 +327,7 @@ pub fn record_execution(store: &Store, facts: &ExecutionFacts<'_>) -> Result<Str
         "build": {
             "version": env!("CARGO_PKG_VERSION"),
             "git_sha": crate::BUILD_GIT_SHA,
+            "source_digest": env!("FSNOW_BUILD_SOURCE_DIGEST"),
         },
     });
     // Only failure receipts carry `error`, so a completed statement's canonical
@@ -403,6 +404,190 @@ pub fn record_execution(store: &Store, facts: &ExecutionFacts<'_>) -> Result<Str
     Ok(receipt_id)
 }
 
+/// A dry run the write ladder issued a confirmation token for (reality-check
+/// bead B4). Recorded on the append-only audit log; a `--confirm` must name one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssuedConfirmation {
+    /// Random, unguessable id; the token is `confirm:<kind>:<id>` and a
+    /// confirmed write submits it as the SQL API `requestId`.
+    pub confirm_id: String,
+    pub profile: String,
+    /// Keyed digest of the exact statement ([`keyed_sql_digest`]).
+    pub sql_digest: String,
+    /// Statement-kind token (`insert`, `merge`, ...).
+    pub statement_kind: String,
+    pub issued_at_ms: u64,
+}
+
+const DRY_RUN_EVENT: &str = "write_dry_run";
+const CONSUMED_EVENT: &str = "write_confirm_consumed";
+const CONFIRM_KEY_FILE: &str = "write_confirm.key";
+
+/// A fresh random UUID-shaped id from the OS random source.
+///
+/// # Errors
+/// The OS random source failed.
+pub fn random_id() -> Result<String, String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| format!("random source unavailable: {error}"))?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
+}
+
+/// The per-data-directory key for keyed SQL digests: 32 random bytes in
+/// `<data dir>/write_confirm.key`, created on first use (owner-only on Unix).
+fn confirm_key(store: &Store) -> Result<Vec<u8>, String> {
+    let path = store.dir.join(CONFIRM_KEY_FILE);
+    if let Ok(key) = std::fs::read(&path)
+        && key.len() == 32
+    {
+        return Ok(key);
+    }
+    let mut key = [0_u8; 32];
+    getrandom::fill(&mut key).map_err(|error| format!("random source unavailable: {error}"))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            file.write_all(&key)
+                .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+            Ok(key.to_vec())
+        }
+        // Another process created it first: use theirs.
+        Err(_) => std::fs::read(&path)
+            .ok()
+            .filter(|key| key.len() == 32)
+            .ok_or_else(|| format!("cannot create or read {}", path.display())),
+    }
+}
+
+/// HMAC-SHA256 of `profile` and the exact statement under the store's key, so
+/// the audit log binds a token to one statement without letting anyone who
+/// reads the log test guesses at a secret inside it.
+///
+/// # Errors
+/// The key could not be created or read.
+pub fn keyed_sql_digest(store: &Store, profile: &str, sql: &str) -> Result<String, String> {
+    use hmac::{Hmac, Mac};
+    let key = confirm_key(store)?;
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&key)
+        .map_err(|error| format!("bad confirmation key: {error}"))?;
+    mac.update(profile.as_bytes());
+    mac.update(&[0x1f]);
+    mac.update(sql.as_bytes());
+    Ok(mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+/// Record a dry run's confirmation on the audit log.
+///
+/// # Errors
+/// The audit log could not be appended.
+pub fn record_dry_run(
+    store: &Store,
+    trace_id: &str,
+    issued: &IssuedConfirmation,
+) -> Result<String, CacheError> {
+    append_audit(
+        store,
+        "query.write",
+        trace_id,
+        DRY_RUN_EVENT,
+        &serde_json::json!({
+            "confirm_id": issued.confirm_id,
+            "profile_id": issued.profile,
+            "sql_digest": issued.sql_digest,
+            "statement_kind": issued.statement_kind,
+            "issued_at_ms": issued.issued_at_ms,
+        }),
+        None,
+    )
+}
+
+fn audit_events_of(store: &Store, kind: &str) -> Vec<serde_json::Value> {
+    store
+        .cache
+        .audit_events()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|event| event.event_kind == kind)
+        .filter_map(|event| serde_json::from_str(&event.event_json).ok())
+        .collect()
+}
+
+/// The dry run a confirmation id names, if this store issued it.
+#[must_use]
+pub fn find_dry_run(store: &Store, confirm_id: &str) -> Option<IssuedConfirmation> {
+    audit_events_of(store, DRY_RUN_EVENT)
+        .into_iter()
+        .find(|event| event["confirm_id"] == confirm_id)
+        .map(|event| IssuedConfirmation {
+            confirm_id: confirm_id.to_owned(),
+            profile: event["profile_id"].as_str().unwrap_or_default().to_owned(),
+            sql_digest: event["sql_digest"].as_str().unwrap_or_default().to_owned(),
+            statement_kind: event["statement_kind"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            issued_at_ms: event["issued_at_ms"].as_u64().unwrap_or(0),
+        })
+}
+
+/// The receipt of the completed write that already used this confirmation, if
+/// any (tokens are single-use once a write succeeds).
+#[must_use]
+pub fn confirmation_consumed_by(store: &Store, confirm_id: &str) -> Option<String> {
+    audit_events_of(store, CONSUMED_EVENT)
+        .into_iter()
+        .find(|event| event["confirm_id"] == confirm_id)
+        .map(|event| {
+            event["receipt_hash"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+}
+
+/// Record that a confirmed write completed, so its token cannot run it again.
+///
+/// # Errors
+/// The audit log could not be appended.
+#[cfg(any(feature = "live", test))]
+pub fn record_confirmation_consumed(
+    store: &Store,
+    trace_id: &str,
+    confirm_id: &str,
+    receipt_hash: Option<&str>,
+) -> Result<String, CacheError> {
+    append_audit(
+        store,
+        "query.write",
+        trace_id,
+        CONSUMED_EVENT,
+        &serde_json::json!({ "confirm_id": confirm_id, "receipt_hash": receipt_hash }),
+        receipt_hash,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,6 +655,10 @@ mod tests {
         assert_eq!(body["session"]["warehouse"], "WH");
         assert_eq!(body["session"]["query_tag"], "fsnow:query.run:trace-1");
         assert_eq!(body["build"]["git_sha"], crate::BUILD_GIT_SHA);
+        assert_eq!(
+            body["build"]["source_digest"].as_str().map(str::len),
+            Some(64)
+        );
         assert_eq!(store.cache.partitions_for_receipt(&hash)?.len(), 2);
         let events = store.cache.audit_events()?;
         assert_eq!(events.len(), 1);
@@ -529,6 +718,77 @@ mod tests {
         let completed: serde_json::Value = serde_json::from_str(&completed.receipt.canonical)?;
         assert!(completed.get("error").is_none(), "{completed}");
         assert_eq!(completed["outcome_kind"], "success");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Reality-check bead B4: confirmation records bind a random id to one
+    /// statement under a keyed digest; consumption is recorded.
+    #[test]
+    fn confirmations_are_random_keyed_and_single_use() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!(
+            "fsnow-confirm-test-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let store = Store {
+            cache: FileCache::open(&dir)?,
+            dir: dir.clone(),
+        };
+        let a = random_id()?;
+        let b = random_id()?;
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 36);
+        assert_eq!(&a[14..15], "4");
+
+        let digest = keyed_sql_digest(&store, "p", "insert into t values (1)")?;
+        assert_eq!(digest.len(), 64);
+        // Stable for the same statement under the same key...
+        assert_eq!(
+            digest,
+            keyed_sql_digest(&store, "p", "insert into t values (1)")?
+        );
+        // ...different for another statement or profile...
+        assert_ne!(
+            digest,
+            keyed_sql_digest(&store, "p", "insert into t values (2)")?
+        );
+        assert_ne!(
+            digest,
+            keyed_sql_digest(&store, "q", "insert into t values (1)")?
+        );
+        // ...and keyed: not the plain SHA-256 of the input.
+        use sha2::Digest as _;
+        let plain: String = sha2::Sha256::digest(b"p\x1finsert into t values (1)")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_ne!(digest, plain);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join(CONFIRM_KEY_FILE))?
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the key is owner-only");
+        }
+
+        let issued = IssuedConfirmation {
+            confirm_id: a.clone(),
+            profile: "p".to_owned(),
+            sql_digest: digest,
+            statement_kind: "insert".to_owned(),
+            issued_at_ms: now_unix_ms(),
+        };
+        record_dry_run(&store, "trace-1", &issued)?;
+        assert_eq!(find_dry_run(&store, &a), Some(issued));
+        assert_eq!(find_dry_run(&store, &b), None);
+        assert_eq!(confirmation_consumed_by(&store, &a), None);
+        record_confirmation_consumed(&store, "trace-2", &a, Some("receipt-1"))?;
+        assert_eq!(
+            confirmation_consumed_by(&store, &a).as_deref(),
+            Some("receipt-1")
+        );
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
