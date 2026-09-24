@@ -618,7 +618,10 @@ impl<H: RawHttp> SnowflakeHttpClient<H> {
                         .map(|h| (h.name.clone(), h.value.clone()))
                         .collect(),
                     wire.body.clone(),
-                    budget_timeout_at(attempt_budget, budget_now),
+                    sooner(
+                        budget_timeout_at(attempt_budget, budget_now),
+                        self.config.attempt_timeout,
+                    ),
                 )
                 .await;
 
@@ -752,6 +755,12 @@ impl<H: RawHttp> SnowflakeHttpClient<H> {
     }
 }
 
+/// Default bound on one HTTP exchange (connect, TLS, request, response). The
+/// SQL API holds a synchronous submit for up to about 45 s before answering
+/// `202`, and a result partition is a bounded download, so five minutes only
+/// ever cuts a stalled connection.
+pub const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Immutable transport configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransportConfig {
@@ -767,6 +776,11 @@ pub struct TransportConfig {
     pub retry: RetryPolicy,
     /// Attempt-log behavior.
     pub log: AttemptLogPolicy,
+    /// Longest one exchange may take before it is cancelled with a deadline
+    /// (reality-check bead E3: without it a stalled connection hangs the
+    /// command, since the HTTP client imposes no timeout of its own). The
+    /// ambient budget's deadline still applies when it is sooner.
+    pub attempt_timeout: Option<Duration>,
 }
 
 impl TransportConfig {
@@ -780,7 +794,17 @@ impl TransportConfig {
             limits: BodyLimits::default(),
             retry: RetryPolicy::default(),
             log: AttemptLogPolicy::default(),
+            attempt_timeout: Some(DEFAULT_ATTEMPT_TIMEOUT),
         }
+    }
+}
+
+/// The sooner of two optional bounds.
+fn sooner(left: Option<Duration>, right: Option<Duration>) -> Option<Duration> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, None) => left,
+        (None, right) => right,
     }
 }
 
@@ -3316,10 +3340,15 @@ mod tests {
                 );
             }
             // The resubmit is byte-identical to the original: same URL, same body,
-            // and with an unlimited budget neither attempt carries a timeout.
+            // and with an unlimited budget each attempt carries only the
+            // default exchange bound.
             assert_eq!(requests[0].url, requests[1].url);
             assert_eq!(requests[0].body, requests[1].body);
-            assert!(requests.iter().all(|request| request.timeout.is_none()));
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.timeout == Some(DEFAULT_ATTEMPT_TIMEOUT))
+            );
         });
     }
 
@@ -3431,6 +3460,41 @@ mod tests {
                 requests[1].url
             );
             assert_eq!(requests[1].method, Method::Get);
+        });
+    }
+
+    /// Reality-check bead E3: every exchange is bounded by default (a stalled
+    /// connection cannot hang a command); the sooner bound wins; turning the
+    /// default off leaves the ambient budget alone.
+    #[test]
+    fn every_exchange_carries_a_bound() {
+        assert_eq!(
+            sooner(Some(Duration::from_secs(9)), Some(Duration::from_secs(3))),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            sooner(None, Some(Duration::from_secs(3))),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            sooner(Some(Duration::from_secs(9)), None),
+            Some(Duration::from_secs(9))
+        );
+        assert_eq!(sooner(None, None), None);
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::for_testing();
+            let bounded = scripted_client(1, vec![ok_json(200, "{}")]);
+            let _ = bounded.poll_statement(&cx, poll_request()).await;
+            assert_eq!(
+                bounded.client.requests()[0].timeout,
+                Some(DEFAULT_ATTEMPT_TIMEOUT)
+            );
+            let mut config = fast_retry_config(1);
+            config.attempt_timeout = None;
+            let unbounded =
+                SnowflakeHttpClient::new(config, ScriptedRaw::new(vec![ok_json(200, "{}")]));
+            let _ = unbounded.poll_statement(&cx, poll_request()).await;
+            assert_eq!(unbounded.client.requests()[0].timeout, None);
         });
     }
 
