@@ -542,6 +542,18 @@ impl WorkloadIdentityAuth {
                 format!("https://{acct}.snowflakecomputing.com{SNOWFLAKE_OAUTH_TOKEN_REQUEST_PATH}")
             }
         });
+        // Never send the OIDC assertion over cleartext (reality-check bead C7a:
+        // the token URL used to be accepted verbatim, including http://).
+        if !endpoint_url
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("https://")
+        {
+            return Err(AuthError::OidcTokenExchangeFailed {
+                status_code: 0,
+                reason: "the OIDC token endpoint must use https; refusing to send the assertion over cleartext".to_owned(),
+            });
+        }
         let credential_handle = Some(token_source.credential_handle());
         Ok(Self {
             account,

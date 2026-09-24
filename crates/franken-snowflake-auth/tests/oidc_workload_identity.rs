@@ -525,3 +525,56 @@ fn test_token_exchange_http_error_handling() {
         }
     });
 }
+
+/// Reality-check bead C7a: the token URL came from an env handle verbatim, so
+/// the OIDC assertion could be sent over cleartext to any host.
+#[test]
+fn test_cleartext_token_endpoint_is_refused() {
+    for url in [
+        "http://evil.example/oauth/token-request",
+        "ftp://x/y",
+        "evil.example/token",
+    ] {
+        let result = WorkloadIdentityAuth::new(
+            "myaccount",
+            "myuser",
+            OidcTokenSource::env_var("MY_OIDC_TOKEN"),
+            Some(url.to_string()),
+            None,
+            None,
+            None,
+        );
+        match result {
+            Err(AuthError::OidcTokenExchangeFailed { reason, .. }) => {
+                assert!(reason.contains("https"), "{url}: {reason}");
+            }
+            other => panic!("{url}: expected a refusal, got {:?}", other.map(|_| ())),
+        }
+    }
+    // An http:// account (the default endpoint derives from it) is refused too.
+    assert!(
+        WorkloadIdentityAuth::new(
+            "http://myaccount.snowflakecomputing.com",
+            "myuser",
+            OidcTokenSource::env_var("MY_OIDC_TOKEN"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .is_err()
+    );
+    // The documented https default still constructs.
+    assert!(
+        WorkloadIdentityAuth::new(
+            "myaccount",
+            "myuser",
+            OidcTokenSource::env_var("MY_OIDC_TOKEN"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .is_ok()
+    );
+}
