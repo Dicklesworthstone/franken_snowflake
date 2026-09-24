@@ -519,6 +519,20 @@ impl StatementMachine {
     /// Enter partition assembly (or finish immediately for a single partition).
     fn enter_terminal_result(&mut self, result_set: ResultSet) -> Result<Progress, LifecycleError> {
         let handle = result_set.statement_handle.clone();
+        // A multi-statement parent's rows are only a status message ("Multiple
+        // statements executed successfully."); the results are its children's,
+        // fetched by the handles it lists. Nothing to assemble or reconcile.
+        if result_set.is_multi_statement() {
+            self.phase = Phase::Done;
+            let rows = result_set.data.clone();
+            return Ok(Progress::Complete(CompletedStatement {
+                statement_handle: handle,
+                result_set,
+                rows,
+                fetched_partitions: 1,
+                total_partitions: 1,
+            }));
+        }
         let total = partition_total(&result_set);
         let rows = result_set.data.clone();
         validate_partition_row_count(&result_set, 0, rows.len())?;

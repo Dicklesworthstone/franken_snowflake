@@ -215,8 +215,7 @@ pub async fn run_statement_with_auth<T: StatementTransport, A: AuthProvider>(
         cx,
         client,
         auth,
-        request,
-        params,
+        Start::Submit { request, params },
         poll_plan,
         &mut stats,
         StatementHooks::default(),
@@ -333,10 +332,123 @@ pub async fn run_statement_hooked<T: StatementTransport, A: AuthProvider>(
 ) -> (StatementOutcome, DriverStats) {
     let mut stats = DriverStats::default();
     let outcome = drive(
-        cx, client, auth, request, params, poll_plan, &mut stats, hooks,
+        cx,
+        client,
+        auth,
+        Start::Submit { request, params },
+        poll_plan,
+        &mut stats,
+        hooks,
     )
     .await;
     (outcome, stats)
+}
+
+/// The results of a multi-statement request (reality-check bead L1).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultiStatementResult {
+    /// The parent statement: its handle identifies the request; its only row
+    /// is Snowflake's status message.
+    pub parent: CompletedStatement,
+    /// Each statement's result, in the order the SQL text listed them.
+    pub statements: Vec<CompletedStatement>,
+}
+
+/// Run a request whose `MULTI_STATEMENT_COUNT` is above one (reality-check
+/// bead L1): the parent statement, then each statement fetched by the handle
+/// the parent lists (`GET /api/v2/statements/{handle}`), in statement order.
+/// Each statement assembles like a single one (polls, partitions, the plan's
+/// row cap). A failing statement fails the request with `422` before any
+/// result is fetched. The observer sees every step.
+pub async fn run_multi_statement_hooked<T: StatementTransport, A: AuthProvider>(
+    cx: &Cx,
+    client: &T,
+    auth: &mut A,
+    request: SubmitStatementRequest,
+    params: SubmitQueryParams,
+    poll_plan: PollPlan,
+    mut observer: Option<&mut dyn DriverObserver>,
+) -> (SnowflakeOutcome<MultiStatementResult>, DriverStats) {
+    let mut stats = DriverStats::default();
+    let parent = match drive(
+        cx,
+        client,
+        auth,
+        Start::Submit { request, params },
+        poll_plan,
+        &mut stats,
+        StatementHooks {
+            sink: None,
+            observer: observer
+                .as_mut()
+                .map(|observer| &mut **observer as &mut dyn DriverObserver),
+        },
+    )
+    .await
+    {
+        SnowflakeOutcome::Ok(parent) => parent,
+        SnowflakeOutcome::Err(error) => return (SnowflakeOutcome::err(error), stats),
+        SnowflakeOutcome::Cancelled(reason) => return (SnowflakeOutcome::cancelled(reason), stats),
+        SnowflakeOutcome::Panicked(payload) => return (SnowflakeOutcome::panicked(payload), stats),
+    };
+    let handles = parent
+        .result_set
+        .statement_handles
+        .clone()
+        .unwrap_or_default();
+    if handles.is_empty() {
+        return (
+            SnowflakeOutcome::err(SnowflakeError::new(
+                SnowflakeErrorCode::UpstreamError,
+                "the SQL API answered a multi-statement request without statementHandles",
+            )),
+            stats,
+        );
+    }
+    let mut statements = Vec::with_capacity(handles.len());
+    for handle in handles {
+        match drive(
+            cx,
+            client,
+            auth,
+            Start::Handle(handle),
+            poll_plan,
+            &mut stats,
+            StatementHooks {
+                sink: None,
+                observer: observer
+                    .as_mut()
+                    .map(|observer| &mut **observer as &mut dyn DriverObserver),
+            },
+        )
+        .await
+        {
+            SnowflakeOutcome::Ok(done) => statements.push(done),
+            SnowflakeOutcome::Err(error) => return (SnowflakeOutcome::err(error), stats),
+            SnowflakeOutcome::Cancelled(reason) => {
+                return (SnowflakeOutcome::cancelled(reason), stats);
+            }
+            SnowflakeOutcome::Panicked(payload) => {
+                return (SnowflakeOutcome::panicked(payload), stats);
+            }
+        }
+    }
+    (
+        SnowflakeOutcome::ok(MultiStatementResult { parent, statements }),
+        stats,
+    )
+}
+
+/// Where a driven statement starts.
+enum Start {
+    /// `POST` a new statement.
+    Submit {
+        request: SubmitStatementRequest,
+        params: SubmitQueryParams,
+    },
+    /// Fetch a statement Snowflake already ran, by its handle (a
+    /// multi-statement request's statements).
+    Handle(StatementHandle),
 }
 
 fn notify(observer: &mut Option<&mut dyn DriverObserver>, event: DriverEvent) {
@@ -495,8 +607,7 @@ async fn drive<T: StatementTransport, A: AuthProvider>(
     cx: &Cx,
     client: &T,
     provider: &mut A,
-    request: SubmitStatementRequest,
-    params: SubmitQueryParams,
+    start: Start,
     poll_plan: PollPlan,
     stats: &mut DriverStats,
     hooks: StatementHooks<'_>,
@@ -510,8 +621,7 @@ async fn drive<T: StatementTransport, A: AuthProvider>(
         cx,
         &recorder,
         provider,
-        request,
-        params,
+        start,
         poll_plan,
         stats,
         // Both hooks are reborrowed for the inner run: `StatementHooks` is
@@ -530,22 +640,20 @@ async fn drive<T: StatementTransport, A: AuthProvider>(
     outcome
 }
 
+/// Submit `request` and feed Snowflake's answer to `machine`: the first
+/// [`Progress`], or how the statement ended before it had a handle.
 #[allow(clippy::too_many_arguments)]
-async fn drive_statement<T: StatementTransport, A: AuthProvider>(
+async fn submit<T: StatementTransport, A: AuthProvider>(
     cx: &Cx,
     client: &T,
     provider: &mut A,
-    request: SubmitStatementRequest,
-    params: SubmitQueryParams,
-    poll_plan: PollPlan,
-    stats: &mut DriverStats,
-    hooks: StatementHooks<'_>,
-) -> StatementOutcome {
-    let StatementHooks {
-        mut sink,
-        mut observer,
-    } = hooks;
-    let body = match serde_json::to_vec(&request) {
+    auth: &mut AuthorizationDescriptor,
+    reauth_left: &mut u8,
+    request: &SubmitStatementRequest,
+    params: &SubmitQueryParams,
+    machine: &mut StatementMachine,
+) -> SnowflakeOutcome<Progress> {
+    let body = match serde_json::to_vec(request) {
         Ok(body) => body,
         Err(error) => {
             return SnowflakeOutcome::err(SnowflakeError::new(
@@ -554,17 +662,9 @@ async fn drive_statement<T: StatementTransport, A: AuthProvider>(
             ));
         }
     };
-
-    let mut auth = match provider.descriptor() {
-        Ok(auth) => auth,
-        Err(error) => return SnowflakeOutcome::err(error),
-    };
-    // One 401 retry per step; reset after any accepted response.
-    let mut reauth_left: u8 = 1;
-
     let submit_response = loop {
         let submit = SubmitHttpRequest {
-            route: submit_route(&params),
+            route: submit_route(params),
             auth: auth.clone(),
             body: body.clone(),
             retry_resubmit: params.retry,
@@ -573,8 +673,8 @@ async fn drive_statement<T: StatementTransport, A: AuthProvider>(
             SnowflakeOutcome::Ok(response) if response.status == StatusClass::Unauthorized => {
                 // No handle was issued, so a resubmit with the same requestId
                 // is safe; nothing to cancel server-side.
-                match refresh_after_unauthorized(provider, &mut reauth_left, "submit") {
-                    Ok(fresh) => auth = fresh,
+                match refresh_after_unauthorized(provider, reauth_left, "submit") {
+                    Ok(fresh) => *auth = fresh,
                     Err(error) => return SnowflakeOutcome::err(error),
                 }
             }
@@ -584,26 +684,74 @@ async fn drive_statement<T: StatementTransport, A: AuthProvider>(
             SnowflakeOutcome::Panicked(payload) => return SnowflakeOutcome::panicked(payload),
         }
     };
-    reauth_left = 1;
+    *reauth_left = 1;
+    match machine.on_submit(
+        response_class(submit_response.status),
+        &submit_response.body,
+    ) {
+        Ok(progress) => SnowflakeOutcome::ok(progress),
+        Err(error) => SnowflakeOutcome::err(error.into_snowflake_error()),
+    }
+}
 
+async fn drive_statement<T: StatementTransport, A: AuthProvider>(
+    cx: &Cx,
+    client: &T,
+    provider: &mut A,
+    start: Start,
+    poll_plan: PollPlan,
+    stats: &mut DriverStats,
+    hooks: StatementHooks<'_>,
+) -> StatementOutcome {
+    let StatementHooks {
+        mut sink,
+        mut observer,
+    } = hooks;
+    let mut auth = match provider.descriptor() {
+        Ok(auth) => auth,
+        Err(error) => return SnowflakeOutcome::err(error),
+    };
+    // One 401 retry per step; reset after any accepted response.
+    let mut reauth_left: u8 = 1;
     // Captured before the machine takes ownership; `PollPlan` is `Copy`. The 202
     // poll loop waits this long between GETs (see `wait_poll_interval`).
     let poll_interval = poll_plan.effective_poll_interval();
     let mut machine = StatementMachine::new(poll_plan);
-    let mut progress = match machine.on_submit(
-        response_class(submit_response.status),
-        &submit_response.body,
-    ) {
-        Ok(progress) => progress,
-        Err(error) => return SnowflakeOutcome::err(error.into_snowflake_error()),
+    // A statement resumed by its handle has already run: poll it at once.
+    let mut poll_now = false;
+    let mut progress = match start {
+        Start::Handle(handle) => {
+            poll_now = true;
+            Progress::PollAgain(handle)
+        }
+        Start::Submit { request, params } => {
+            let progress = match submit(
+                cx,
+                client,
+                provider,
+                &mut auth,
+                &mut reauth_left,
+                &request,
+                &params,
+                &mut machine,
+            )
+            .await
+            {
+                SnowflakeOutcome::Ok(progress) => progress,
+                SnowflakeOutcome::Err(error) => return SnowflakeOutcome::err(error),
+                SnowflakeOutcome::Cancelled(reason) => return SnowflakeOutcome::cancelled(reason),
+                SnowflakeOutcome::Panicked(payload) => return SnowflakeOutcome::panicked(payload),
+            };
+            notify(
+                &mut observer,
+                DriverEvent::Submitted {
+                    statement_handle: progress_handle(&progress),
+                    running: matches!(progress, Progress::PollAgain(_)),
+                },
+            );
+            progress
+        }
     };
-    notify(
-        &mut observer,
-        DriverEvent::Submitted {
-            statement_handle: progress_handle(&progress),
-            running: matches!(progress, Progress::PollAgain(_)),
-        },
-    );
 
     loop {
         match progress {
@@ -647,7 +795,9 @@ async fn drive_statement<T: StatementTransport, A: AuthProvider>(
                 // so without this cancel-aware wait the loop would hammer the SQL
                 // API and burn the poll quota in milliseconds. A cancellation
                 // during the wait still fires the remote cancel for the live handle.
-                if let Err(reason) = wait_poll_interval(cx, poll_interval).await {
+                if !std::mem::take(&mut poll_now)
+                    && let Err(reason) = wait_poll_interval(cx, poll_interval).await
+                {
                     return cancel_locally(cx, client, &auth, &handle, reason).await;
                 }
                 stats.polls = stats.polls.saturating_add(1);
@@ -1146,6 +1296,8 @@ mod tests {
         /// Consumed by the first submit only (models a 401 on the initial POST).
         submit_first: RefCell<Option<Scripted>>,
         polls: RefCell<Vec<Scripted>>,
+        /// The handle of every poll, in order.
+        polled: RefCell<Vec<String>>,
         /// Per-partition answer queues (a partition may be scripted more than
         /// once, e.g. `401` then the body).
         partitions: RefCell<BTreeMap<u32, VecDeque<Scripted>>>,
@@ -1170,6 +1322,7 @@ mod tests {
                 submit,
                 submit_first: RefCell::new(None),
                 polls: RefCell::new(Vec::new()),
+                polled: RefCell::new(Vec::new()),
                 partitions: RefCell::new(BTreeMap::new()),
                 cancels_after_local: RefCell::new(Vec::new()),
                 orphan_cancels: RefCell::new(Vec::new()),
@@ -1237,6 +1390,9 @@ mod tests {
             self.auth_seen
                 .borrow_mut()
                 .push(request.auth.redacted_fingerprint().to_owned());
+            self.polled
+                .borrow_mut()
+                .push(request.statement_handle.as_str().to_owned());
             let next = self.polls.borrow_mut().remove(0);
             match next {
                 Scripted::Ok(status, body) => {
@@ -1412,6 +1568,148 @@ mod tests {
             .iter()
             .map(|row| row[0].clone().unwrap_or_default())
             .collect()
+    }
+
+    fn multi_parent(handles: &[&str]) -> Vec<u8> {
+        let body = serde_json::json!({
+            "resultSetMetaData": {
+                "numRows": 1,
+                "format": "jsonv2",
+                "rowType": [{ "name": "multiple statement execution", "type": "text", "nullable": false }],
+                // Snowflake's reference example lists more partitions than the
+                // status row; a parent's partitions are never fetched.
+                "partitionInfo": [{ "rowCount": 1 }, { "rowCount": 5 }]
+            },
+            "data": [["Multiple statements executed successfully."]],
+            "code": "090001",
+            "statementHandle": "01b2c3d4-0000-0000-0000-0000000000a0",
+            "statementHandles": handles,
+        });
+        serde_json::to_vec(&body).unwrap_or_default()
+    }
+
+    fn one_value_result(handle: &str, value: &str) -> Scripted {
+        let body = serde_json::json!({
+            "resultSetMetaData": {
+                "numRows": 1,
+                "format": "jsonv2",
+                "rowType": [{ "name": "V", "type": "TEXT", "nullable": false }]
+            },
+            "data": [[value]],
+            "code": "090001",
+            "statementHandle": handle,
+        });
+        Scripted::Ok(
+            StatusClass::Completed,
+            serde_json::to_vec(&body).unwrap_or_default(),
+        )
+    }
+
+    /// Reality-check bead L1: the parent lists the statement handles; each
+    /// statement is fetched by its handle, in order, and assembled on its own.
+    #[test]
+    fn a_multi_statement_request_fetches_each_statement_by_handle_in_order() {
+        asupersync::test_utils::run_test(|| async {
+            const FIRST: &str = "01b2c3d4-0000-0000-0000-0000000000a1";
+            const SECOND: &str = "01b2c3d4-0000-0000-0000-0000000000a2";
+            let transport = FakeTransport::new(Scripted::Ok(
+                StatusClass::Completed,
+                multi_parent(&[FIRST, SECOND]),
+            ));
+            *transport.polls.borrow_mut() = vec![
+                one_value_result(FIRST, "first"),
+                one_value_result(SECOND, "second"),
+            ];
+            let cx = Cx::for_testing();
+            let (outcome, stats) = run_multi_statement_hooked(
+                &cx,
+                &transport,
+                &mut fake_auth(),
+                SubmitStatementRequest::new("select 'first'; select 'second'"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5),
+                None,
+            )
+            .await;
+            let result = match outcome {
+                SnowflakeOutcome::Ok(result) => result,
+                other => panic!("expected both statements, got {other:?}"),
+            };
+            let values: Vec<Vec<String>> = result.statements.iter().map(column_values).collect();
+            assert_eq!(values, [["first"], ["second"]]);
+            assert_eq!(
+                result.parent.rows,
+                [[Some(
+                    "Multiple statements executed successfully.".to_owned()
+                )]]
+            );
+            assert_eq!(transport.polled.borrow().as_slice(), [FIRST, SECOND]);
+            assert_eq!(stats.polls, 2);
+            // The parent's listed partitions were not fetched.
+            assert!(transport.events().is_empty(), "{:?}", transport.events());
+            assert!(transport.orphan_cancels.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_multi_statement_parent_without_handles_is_an_upstream_error() {
+        asupersync::test_utils::run_test(|| async {
+            let transport = FakeTransport::new(Scripted::Ok(
+                StatusClass::Completed,
+                RESP_200_SINGLE.to_vec(),
+            ));
+            let cx = Cx::for_testing();
+            let (outcome, _) = run_multi_statement_hooked(
+                &cx,
+                &transport,
+                &mut fake_auth(),
+                SubmitStatementRequest::new("select 1; select 2"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5),
+                None,
+            )
+            .await;
+            let error = match outcome {
+                SnowflakeOutcome::Err(error) => error,
+                other => panic!("expected an error, got {other:?}"),
+            };
+            assert_eq!(error.code, SnowflakeErrorCode::UpstreamError);
+            assert!(transport.polled.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_failing_statement_fails_the_multi_statement_request_before_any_fetch() {
+        asupersync::test_utils::run_test(|| async {
+            let failure = serde_json::json!({
+                "code": "100132",
+                "sqlState": "P0000",
+                "message": "JavaScript execution error: Uncaught Execution of multiple statements failed on statement \"select * from missing_table\"",
+                "statementHandle": "01b2c3d4-0000-0000-0000-0000000000a0",
+            });
+            let transport = FakeTransport::new(Scripted::Ok(
+                StatusClass::QueryFailure,
+                serde_json::to_vec(&failure).unwrap_or_default(),
+            ));
+            let cx = Cx::for_testing();
+            let (outcome, _) = run_multi_statement_hooked(
+                &cx,
+                &transport,
+                &mut fake_auth(),
+                SubmitStatementRequest::new("select 1; select * from missing_table"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5),
+                None,
+            )
+            .await;
+            let error = match outcome {
+                SnowflakeOutcome::Err(error) => error,
+                other => panic!("expected the statement failure, got {other:?}"),
+            };
+            assert_eq!(error.code, SnowflakeErrorCode::StatementFailed);
+            assert!(error.message.contains("missing_table"), "{}", error.message);
+            assert!(transport.polled.borrow().is_empty());
+        });
     }
 
     #[test]
