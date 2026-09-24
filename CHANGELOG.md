@@ -194,8 +194,54 @@ implementation first and the test/hardening pass follows in a later wave. The
   `profile doctor` gives lifetime guidance for the configured lane only.
 - **Ctrl-C cancels a running statement.** SIGINT (or SIGTERM) while a live
   statement runs cancels it through the driver, which sends the SQL API
-  remote cancel, and the envelope reads `cancelled`; a second signal exits at
-  once (130/143). Outside a statement the signals keep their default action.
+  remote cancel; the envelope reads `cancelled` and the exit status is 130
+  (SIGINT) or 143 (SIGTERM), the shell convention; a second signal exits at
+  once. Outside a statement the signals keep their default action. The
+  receipt (and envelope) of a failed or cancelled run names the statement
+  handle, whether Snowflake accepted the statement, and whether the remote
+  cancel was acknowledged; `--progress` shows it as a `remote_cancel` event.
+- **Catalog graph verbs.** `catalog relates <profile> <object> [--depth n]`,
+  `catalog lineage <profile> <object> --up|--down` and `catalog cycles
+  <profile>` (MCP `catalog_relates`, `catalog_lineage`, `catalog_cycles`) answer
+  from the newest local snapshot: an object is a node key, a dataset id, or a
+  case-insensitive `DB.SCHEMA.OBJECT[.COLUMN]`; an unknown one is `FSNOW-7002`
+  with suggestions. `lineage` follows dependency edges only (view sources,
+  foreign keys, stage and file-format use, datasets), never containment.
+- **Workspace credential Debug-leak gate.** A test scans every crate's
+  sources (structs, enums, tuple variants) for a `Debug` that would print a
+  credential-shaped field or credential type; before, only the auth crate's
+  own sources were gated. Planted controls cover each shape.
+- **Bounded HTTP exchanges.** Every SQL API exchange (connect, TLS, request,
+  response) is bounded at 300 s (`TransportConfig::attempt_timeout`); the
+  HTTP client imposes no timeout of its own, so a stalled connection used to
+  hang the command. A breach is a deadline cancel: outcome `timeout`, remote
+  cancel sent.
+- **MCP cancellation.** A `notifications/cancelled` for a running tool call
+  (stdio or HTTP), or a stdio client closing its input, cancels the statement
+  the call started, with the SQL API remote cancel; stdin is read by a watcher
+  thread because FastMCP's stdio loop handles one request at a time.
+- **Catalog search.** `catalog search <profile> "<words>"` (MCP
+  `catalog_search`) ranks the newest snapshot's datasets by the words in their
+  names, columns, comments and tags, with where each word matched; offline and
+  deterministic, always over the latest scan.
+- **Dataset manifest overlay.** A non-secret TOML file
+  (`FRANKEN_SNOWFLAKE_MANIFEST` or `<data dir>/datasets.toml`) overrides
+  discovery's inferred field roles, rights class, limits and description per
+  dataset at read time (`dataset inspect`, dataset-mode planning, `dataset
+  profile`); unknown columns are usage errors with suggestions, unknown rights
+  labels fail closed, credential-like keys are refused, and `dataset
+  validate-manifest` (MCP `dataset_validate_manifest`) checks the file.
+- **Catalog relation pass.** `catalog scan` also reads primary keys (`SHOW
+  PRIMARY KEYS`), table-level foreign keys (`TABLE_CONSTRAINTS` +
+  `REFERENTIAL_CONSTRAINTS`), view dependencies (`GET_OBJECT_REFERENCES` per
+  view, `--max-view-refs`), stages, file formats, external-table sources and,
+  with `--tags`, `ACCOUNT_USAGE.TAG_REFERENCES`. The snapshot (schema
+  `dataset_manifest.v2`) carries the relations, keys, stages, formats, tags,
+  and every gap; the graph gains `view_depends_on`, `foreign_key`,
+  `uses_stage`, `uses_file_format` and `tagged` edges; `catalog diff` reports
+  added and removed relations; `dataset inspect` shows an object's key,
+  relations and tags. A refused source is `partial_success` (exit 1) naming
+  it, never a silent empty.
 - **Streaming local exports.** `export run --format csv|jsonl` writes rows to
   the file as each partition window arrives (peak memory is one window, not the
   result) into a temporary file that replaces the target only on success; a
@@ -203,6 +249,9 @@ implementation first and the test/hardening pass follows in a later wave. The
   `<PREFIX>_EXPORT_MAX_ROWS`) refuses a larger result with `FSNOW-3004` and
   cancels the statement; parquet and frame exports stop fetching just past the
   limit. The receipt's content address covers exactly the bytes written.
+  `--progress` on `export run` and `query run` writes NDJSON statement events
+  (`submitted`, `polled`, `partition_fetched` with rows and bytes, `completed`,
+  each with `elapsed_ms`) to stderr; off by default, and stdout is unchanged.
 - **`profile doctor --online` checks the role's grants.** It walks
   `SHOW GRANTS TO ROLE` from `CURRENT_ROLE()` through granted roles (up to 8,
   `partial` beyond) and reports write-capable privileges (INSERT, UPDATE,

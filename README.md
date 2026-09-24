@@ -158,9 +158,15 @@ which reaches the CLI envelope intact (a cancellation reads `cancelled` or
 path and every deadline, budget, shutdown, or user cancellation fires a
 best-effort remote cancel, and the
 server-side `STATEMENT_TIMEOUT_IN_SECONDS` (60 s by default) is sent with every
-request as the backstop. The retry loop is the project's own, built on that
+request as the backstop. Each HTTP exchange is bounded (300 s), so a stalled
+connection ends as a `timeout` with the remote cancel instead of hanging. The retry loop is the project's own, built on that
 client. While a statement runs, Ctrl-C (SIGINT) or SIGTERM cancels it the same
-way (a second signal exits at once); a process killed with SIGKILL still leaves
+way: the envelope reads `cancelled` and the exit status is 130 (SIGINT) or 143
+(SIGTERM), as for any interrupted command; a second signal exits at once. The
+receipt of a run that ended without rows names the statement handle, says
+whether Snowflake ever accepted the statement (`accepted_by_snowflake`), and
+records whether the remote cancel was acknowledged (`remote_cancel`). A
+process killed with SIGKILL still leaves
 it to the server timeout. Not yet wired: a drop guard for the statement handle,
 capability-row narrowing, and a cost budget on the live path. The testkit explores a model of the driver's
 cancel and retry interleavings with DPOR.
@@ -184,8 +190,10 @@ and denies `clippy::unwrap_used`, `expect_used`, `panic`, `todo`, and
 and the policy is verified to actually fail a build or clippy run.
 
 **Safe writes, redaction, guardrails, and budgets.** Secrets never appear in
-config, `Debug`, JSON output, or panic text; a compile-time gate fails the build
-if a credential-shaped field derives `Debug`. Reads run with read-only
+config, `Debug`, JSON output, or panic text: the auth crate's build fails if one
+of its credential-shaped fields derives `Debug`, and a workspace test fails if
+any crate's struct or enum would print one through `Debug` (derived, or a
+manual impl that prints the field or never redacts). Reads run with read-only
 capabilities, while writes are gated behind a per-profile `WRITE_ENABLED` opt-in
 and execute directly once enabled; `--dry-run` previews and binds a confirmation
 token to the exact statement, and `WRITE_REQUIRE_CONFIRM` makes that ceremony
@@ -440,8 +448,8 @@ handle sets per auth lane.
 
 | Command | What it does |
 |---|---|
-| `fsnow catalog scan <profile> --database <db> --schema <schema> [--require-live] --json` | Discover tables, views, and columns through bound `INFORMATION_SCHEMA` statements, build dataset manifests (field roles, row/byte hints), and persist the snapshot to the local store; `--require-live` hard-refuses with `FSNOW-3003` unless served by the live transport |
-| `fsnow catalog graph <profile> --database <db> [--schema <schema>] [--refresh] [--json\|--toon\|--mermaid\|--svg]` | Render the catalog graph (containment: profile > database > schema > object > column, plus dataset-to-object and field-to-column edges; view-dependency and foreign-key lineage are not extracted yet) from the local snapshot, or from a live scan with `--refresh` |
+| `fsnow catalog scan <profile> --database <db> --schema <schema> [--max-view-refs <n>] [--tags] [--require-live] --json` | Discover tables, views, and columns through bound `INFORMATION_SCHEMA` statements, then the relation pass (primary keys, foreign keys, view dependencies, stages, file formats, external-table sources, and with `--tags` tag assignments); build dataset manifests (field roles, row/byte hints, primary keys) and persist the snapshot to the local store; `--require-live` hard-refuses with `FSNOW-3003` unless served by the live transport |
+| `fsnow catalog graph <profile> --database <db> [--schema <schema>] [--refresh] [--json\|--toon\|--mermaid\|--svg]` | Render the catalog graph (containment: profile > database > schema > object > column; dataset-to-object and field-to-column edges; view dependencies, foreign keys, stage and file-format use, and tags from the relation pass) from the local snapshot, or from a live scan with `--refresh` |
 | `fsnow catalog diff <profile> [--database <db>] [--schema <schema>] [--base <snapshot-id>] [--target <snapshot-id>] --json` | Compare two catalog snapshots or audit schema drift across historical scans from the local store; reports added/removed/modified tables and columns with breaking-change classification and envelope warnings |
 
 Both `--database` and `--schema` are required for `catalog scan`. `catalog
@@ -454,6 +462,21 @@ feature plus credentials (the default build returns a typed "live transport
 required" envelope); `catalog graph`, `catalog diff`, `dataset inspect`, and `dataset profile`
 then work offline from the persisted snapshot.
 
+The relation pass reads `SHOW PRIMARY KEYS IN SCHEMA` (quoted identifiers:
+SHOW takes no binds), `INFORMATION_SCHEMA` `TABLE_CONSTRAINTS` +
+`REFERENTIAL_CONSTRAINTS` (foreign keys, table level: Snowflake's documented
+views do not map key columns, and a constraint name that does not identify
+one table is reported, not guessed), `STAGES`, `FILE_FORMATS`,
+`EXTERNAL_TABLES` (only when the schema has one), and
+`GET_OBJECT_REFERENCES` once per view (the view's whole dependency closure;
+`--max-view-refs`, default 25, max 500, 0 skips). `--tags` adds
+`SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES`, which needs the `GOVERNANCE_VIEWER`
+database role and lags up to two hours. A source Snowflake refuses
+(privileges, edition, a view it cannot resolve) makes the scan
+`partial_success` (exit 1) with a warning naming the source; the snapshot is
+still persisted and records the gap, so a missing relation is never a silent
+empty. Transport, auth, and cancel errors still fail the scan.
+
 ```bash
 fsnow catalog scan demo-prod --database ANALYTICS --schema PUBLIC --json
 fsnow catalog diff demo-prod --database ANALYTICS --schema PUBLIC --json
@@ -465,14 +488,38 @@ fsnow catalog graph demo-prod --database ANALYTICS --schema PUBLIC --svg
 
 | Command | What it does |
 |---|---|
-| `fsnow dataset inspect <dataset-id> --json` | Return the dataset manifest (roles, limits, row/byte hints), its column catalog, and the operator catalog from the local store |
+| `fsnow dataset inspect <dataset-id> --json` | Return the dataset manifest (roles, limits, row/byte hints), its column catalog (with column tags), its primary key and relations, and the operator catalog from the local store |
 | `fsnow dataset profile <dataset-id> [--execute] --json` | Build the pushed-down `APPROX_COUNT_DISTINCT` / null-count / min-max profiling statement; `--execute` runs it live and returns the stats |
+| `fsnow dataset validate-manifest --json` | Parse the dataset manifest overlay and check each entry's fields against the datasets in the local store |
 | `fsnow dataset describe-operator <operator> --jsonschema` | Return the catalog entry and JSON Schema 2020-12 for one of the 11 filter operators (`eq neq lt lte gt gte between in is_null is_not_null contains`) |
 
 `dataset describe-operator` is fully offline and deterministic. `dataset
 inspect` and `dataset profile` read the snapshot a `catalog scan` persisted; an
 unknown dataset is a typed `FSNOW-7002` error naming the scan command. Dataset
 ids look like `<db>_<schema>_<object>_b3_<hash>` and are listed by `catalog scan`.
+
+Discovery infers field roles from names and types. A non-secret TOML overlay
+(`FRANKEN_SNOWFLAKE_MANIFEST`, or `<data dir>/datasets.toml`) confirms or
+corrects them per dataset (by `id`, or `database` + `schema` + `object`):
+field roles, `rights_class` (an unknown label fails closed to `restricted`),
+`default_limit`, `max_rows_without_export`, and `description`. It applies at
+read time to `dataset inspect`, `query plan|run --dataset`, and `dataset
+profile`; overlaid fields report `role_confidence: overlay`. A field naming a
+column the dataset lacks is a usage error with suggestions, a key that looks
+like a credential is refused, and `dataset validate-manifest --json` checks the
+file against the local store.
+
+```toml
+[[datasets]]
+database = "ANALYTICS"
+schema = "PUBLIC"
+object = "EVENTS"
+default_limit = 500
+
+[[datasets.fields]]
+column = "ACCOUNT_REF"
+role = "entity_key"
+```
 
 ```bash
 fsnow dataset describe-operator between --jsonschema
@@ -641,10 +688,14 @@ that live transport and credentials are required); it never fakes an execution.
 
 | Command | What it does |
 |---|---|
+| `fsnow catalog relates <profile> <object> [--depth <n>] --json` | What relates to a catalog object (a node key, dataset id, or `DB.SCHEMA.OBJECT[.COLUMN]`, case-insensitive) within `--depth` hops, offline from the local snapshot; an unknown object is `FSNOW-7002` with suggestions |
+| `fsnow catalog search <profile> "<words>" [--limit <n>] --json` | Rank the newest snapshot's datasets by the query's words in their names, columns, comments, and tags (whole words weigh twice a prefix; matching every word adds half), with where each word matched; offline, and nothing matching is an empty success |
+| `fsnow catalog lineage <profile> <object> --up\|--down --json` | Dependency lineage, transitively: `--up` is what the object reads or references (view sources, referenced tables, stages, file formats), `--down` is what reads or references it (views, datasets, referencing tables); each node carries its depth and the edge kind that reached it. Containment is not lineage; a snapshot scanned before the relation pass says so in a warning |
+| `fsnow catalog cycles <profile> --json` | Dependency cycles in the catalog graph |
 | `fsnow receipt show <receipt-hash> --json` | Look up a content-addressed query receipt, its partition evidence, and the audit events that reference it |
 | `fsnow receipt refetch <receipt-hash> [--profile <p>] [--limit <rows>] [--raw-cells] --json` | Re-read a completed statement's rows from Snowflake's result cache (`RESULT_SCAN` on the receipt's query id, kept about 24 hours) without running it again; an older receipt is refused (`FSNOW-7001`), an unknown one is `FSNOW-7002` (live feature) |
 | `fsnow export plan --profile <p> --sql <select>\|--query-id <id> --location @stage/path [--format csv\|jsonl] [--compression gzip] [--header false] [--overwrite] [--single] [--max-file-size <bytes>] --json` | Build a content-addressed `COPY INTO <stage>` plan (Snowflake-side unload) and the exact `query write` command that executes it |
-| `fsnow export run --profile <p> --sql <select>\|--query-id <id> --format csv\|jsonl\|parquet\|frame [--compression none\|snappy\|gzip] --out <path> [--overwrite] [--max-rows <n>] --json` | Run a read live and write a content-addressed local CSV/JSONL/Parquet/frame artifact (live feature; frame requires `--features frankenpandas`). CSV and JSONL stream to the file partition by partition; a result over `--max-rows` (default 1000000) is refused with no file left. An existing file is replaced only with `--overwrite` (atomically, via rename); a symlink or non-file target is refused. The envelope reports `resolved_path` and `overwrote` |
+| `fsnow export run --profile <p> --sql <select>\|--query-id <id> --format csv\|jsonl\|parquet\|frame [--compression none\|snappy\|gzip] --out <path> [--overwrite] [--max-rows <n>] [--progress] --json` | Run a read live and write a content-addressed local CSV/JSONL/Parquet/frame artifact (live feature; frame requires `--features frankenpandas`). CSV and JSONL stream to the file partition by partition; a result over `--max-rows` (default 1000000) is refused with no file left. `--progress` (also on `query run`) writes one JSON object per statement event (`submitted`, `polled`, `partition_fetched` with rows and bytes, `completed`) to stderr; stdout stays the single envelope. An existing file is replaced only with `--overwrite` (atomically, via rename); a symlink or non-file target is refused. The envelope reports `resolved_path` and `overwrote` |
 
 ```bash
 fsnow export plan --profile demo-prod --sql "select * from events" --location @my_stage/exports/run_001 --format jsonl --json
@@ -862,7 +913,9 @@ With the `mcp` feature compiled in, `fsnow mcp serve` exposes the connector's
 read verbs, plus `query_cancel` and `export_run`, as MCP tools backed by the same
 CLI handlers and the same JSON envelope, so the CLI and the MCP server cannot
 diverge into two contracts. The server runs over stdio or HTTP and is
-stdio-first by design; data writes go through the CLI `query write` ladder.
+stdio-first by design; data writes go through the CLI `query write` ladder. A
+`notifications/cancelled` for a running call, or a stdio client closing its
+input, cancels the statement it started, SQL API remote cancel included.
 
 The exposed tools mirror the CLI read and discovery verbs:
 

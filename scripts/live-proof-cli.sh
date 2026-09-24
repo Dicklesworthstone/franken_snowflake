@@ -336,7 +336,23 @@ fi
 if [ -n "$DATABASE" ] && [ -n "$SCHEMA" ]; then
   run_step catalog_scan hard '.ok == true and .data_source == "live" and (.receipt_hash | length) == 64' -- catalog scan "$PROFILE" --database "$DATABASE" --schema "$SCHEMA" --json
   DATASET=$(field catalog_scan '.data.datasets[0].dataset_id // empty')
+  OBJECT=$(field catalog_scan '.data.datasets[0].object // empty')
+  # The relation pass (SHOW PRIMARY KEYS, the constraint views, STAGES,
+  # FILE_FORMATS, EXTERNAL_TABLES, GET_OBJECT_REFERENCES per view): its SQL
+  # shapes are fixture-proven only, so a refused source is a finding naming it.
+  if jq -e '.data.relations.discovered == true and ([.data.relations.gaps[]? | select(.kind == "failed")] | length) == 0' "$RUN_DIR/catalog_scan.json" >/dev/null 2>&1; then
+    event catalog_relation_pass pass 0 0 "every relation source answered"
+  else
+    SOFT_FINDINGS=$((SOFT_FINDINGS + 1))
+    event catalog_relation_pass finding 0 0 "relation sources refused: $(jq -c '[.data.relations.gaps[]? | select(.kind == "failed") | .source]' "$RUN_DIR/catalog_scan.json" 2>/dev/null)"
+  fi
+  # Tags need GOVERNANCE_VIEWER: refused is partial_success (exit 1), never an error.
+  run_step catalog_scan_tags soft '.ok == true and .data.relations.discovered == true' -- catalog scan "$PROFILE" --database "$DATABASE" --schema "$SCHEMA" --tags --json
   run_step catalog_graph_mermaid hard 'true' -- catalog graph "$PROFILE" --database "$DATABASE" --schema "$SCHEMA" --json
+  if [ -n "$OBJECT" ]; then
+    run_step catalog_search hard '.ok == true and .data.count >= 1' -- catalog search "$PROFILE" "$OBJECT" --json
+    run_step catalog_lineage_down hard '.ok == true' -- catalog lineage "$PROFILE" "$DATABASE.$SCHEMA.$OBJECT" --down --json
+  fi
   if [ -n "$DATASET" ]; then
     run_step dataset_inspect hard '.ok == true and .data_source == "cache"' -- dataset inspect "$DATASET" --json
     run_step query_plan_dataset hard '.ok == true and (.data.sql | length) > 0' -- query plan --dataset "$DATASET" --limit 5 --json
