@@ -6,11 +6,13 @@ requiring live Snowflake credentials.
 
 ## Current Release State
 
-- Package version: `0.0.4` (GitHub Release 2026-09-11). Built by `dsr` on all
-  six targets with `--features live,mcp`; `capabilities` on each executed artifact
-  reports `live=true, mcp=true` before upload.
-- Publish state: workspace crates configure `publish = ["crates-io"]` and declare
-  version requirements across internal path dependencies for crates.io publishing.
+- Package version: `0.0.4` (GitHub Release 2026-09-11). Built by `dsr` (run
+  `dd041529`, manifest source `edd80c7`) on all six targets with
+  `--features live,mcp`. `capabilities` reported `live=true, mcp=true` on every
+  artifact that was executed; `aarch64-pc-windows-msvc` has never been executed.
+- Publish state: all 14 crates are published on crates.io at `0.0.4` (first
+  published 2026-09-12); they configure `publish = ["crates-io"]` and declare
+  version requirements across internal path dependencies.
 - License metadata: workspace crates inherit `license-file = "LICENSE"` because
   the repository uses MIT plus the OpenAI/Anthropic rider.
 - Default feature policy: default features are intentionally lean; live, MCP,
@@ -35,6 +37,9 @@ cargo test --locked -p franken-snowflake-cli --features frankenpandas
 cargo test --locked -p franken-snowflake-cli --features frankensearch
 cargo test --locked -p franken-snowflake-cache --features frankensqlite
 cargo test --locked -p franken-snowflake-export --features export
+# Parquet read back by PyArrow and DuckDB (needs `uv`); a missing uv fails here:
+FSNOW_REQUIRE_EXTERNAL_PARQUET=1 cargo test --locked -p franken-snowflake-export --all-features --test parquet_conformance
+FSNOW_PRIVATE_DENYLIST=<path outside the repo> scripts/check-public-safety.sh
 cargo test --locked -p franken-snowflake-frame --features frankenpandas
 cargo test --locked -p franken-snowflake-graph --features graph
 cargo test --locked -p franken-snowflake-http --features compression
@@ -57,8 +62,10 @@ in a scanned lane blocks release.
 
 ## Required Cross-Platform Proof (dsr, never GitHub Actions)
 
-This repository does not use GitHub Actions. There is no `.github/workflows`
-directory and none may be added. Cross-platform builds, tests, and release
+This repository does not use GitHub Actions: Actions are disabled in the
+repository settings, and no workflow may be added. The one leftover file,
+`.github/workflows/ci.yml`, is still tracked; deleting it awaits an explicit
+operator go-ahead. Cross-platform builds, tests, and release
 artifacts run through `dsr` (Doodlestein Self-Releaser) on its Linux, macOS,
 and Windows build hosts. The repository is registered with `dsr` as the tool
 `franken_snowflake` (six targets: x86_64/aarch64 Linux, macOS, and Windows;
@@ -93,10 +100,12 @@ keep the fsqlite `cfg(unix)` prerequisite documented in
 only for that known upstream prerequisite, not for forbidden-dependency
 failures.
 
-History: a GitHub Actions workflow existed until 2026-09-03 and never executed
-a single job (52 runs failed at workflow parse; the 10 after a fix were never
-assigned a runner). It was removed; any "CI proof" wording older than this
-note is unbacked.
+History: through 2026-09-03 the GitHub Actions workflow never executed a job
+(52 runs failed at workflow parse; the 10 after a fix were never assigned a
+runner). Runs on 2026-09-12/13 did execute and failed on real defects (a
+`cli_e2e` TLS connection to `127.0.0.1.snowflakecomputing.com`, fixed in
+`9297728`, and a macOS installer step exiting 127); Actions were then disabled.
+Any "CI proof" wording older than this note is unbacked.
 
 ## Cross-Compile Status (2026-09-03, local, `--features live,mcp --locked`)
 
@@ -268,13 +277,26 @@ rg -n "PRIVATE|SECRET|TOKEN|PASSWORD|BEGIN .*PRIVATE KEY|SNOWFLAKE_ACCOUNT|AKIA|
 False positives are allowed only when the surrounding file is a documented
 redaction or canary fixture and the value is synthetic.
 
+Private names cannot be listed in a public pattern, so they are checked from a
+denylist kept outside the repository (one literal token per line):
+
+```bash
+FSNOW_PRIVATE_DENYLIST=~/private/fsnow-denylist.txt scripts/check-public-safety.sh
+FSNOW_PRIVATE_DENYLIST=~/private/fsnow-denylist.txt scripts/check-public-safety.sh --selftest
+```
+
+It scans the tree and `.beads/issues.jsonl` (not git history), reports only
+`file:count`, exits 1 on any hit, and refuses (exit 2) without a denylist or
+with one inside the repository.
+
 ## Packaging Steps
 
-1. Choose the first public SemVer version and update `workspace.package.version`.
+1. Choose the next SemVer version and update `workspace.package.version` and the
+   internal path dependencies' version requirements to match.
 2. Re-run the local proof commands above and commit the resulting `Cargo.lock`
    change in the same release commit.
-3. If crates.io publish is intended, change `publish = false` deliberately and
-   ensure every internal path dependency has a matching version requirement.
+3. Publish the crates to crates.io in dependency order with
+   `scripts/publish-crates.py` (it waits for each crate to propagate).
 4. Tag the release and build release artifacts from the clean tag.
 5. Publish checksums and install smoke-test the artifact in a clean environment.
 6. Update `CHANGELOG.md` with the tag date, commit range, and proof evidence.

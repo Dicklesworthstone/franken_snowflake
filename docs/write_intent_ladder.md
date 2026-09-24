@@ -8,7 +8,8 @@ designated path that may ever request a capability row wider than read-only.
 This document was the design contract for the ladder. Status as of
 2026-09-03: the executor **has landed** (`query write` / `write`, 2026-06-29).
 With the `live` feature and a profile that sets `WRITE_ENABLED`, a bare
-`query write` executes INSERT/MERGE/UPDATE/DELETE/COPY INTO/PUT directly and
+`query write` executes INSERT/MERGE/UPDATE/DELETE/COPY INTO directly (the SQL
+API does not support `PUT`/`GET`) and
 returns a live execution receipt; `--dry-run` previews and emits a confirmation
 token bound to (profile, SQL); `WRITE_REQUIRE_CONFIRM=true` makes the dry-run
 then `--confirm <token>` ceremony mandatory; DDL needs `WRITE_ALLOW_DDL=true`.
@@ -35,9 +36,10 @@ The type-level capability rows stay ordered as:
 3. `WriteCaps`: reserved for the future write-intent ladder.
 
 Only the ladder may ever request `WriteCaps`. Read commands, read-side MCP
-tools, catalog scans, and result partition fetchers remain under narrower
-capability rows. A future executor must compile through the ladder types before
-it can receive wider authority.
+tools, catalog scans, and result partition fetchers are meant to stay under
+narrower capability rows. These row types exist in `franken-snowflake-core`,
+but the executor that landed does not yet compile through them: read-only is
+enforced at runtime by the SQL guard and the `WRITE_ENABLED` gate.
 
 ## Ladder Rungs
 

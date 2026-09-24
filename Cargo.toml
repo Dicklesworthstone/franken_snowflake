@@ -1,15 +1,12 @@
-# franken_snowflake — workspace root.
+# franken_snowflake — workspace root: the 14 connector crates and the
+# workspace-wide lint policy.
 #
-# Phase 0 scaffold (bead fsnow-repo-governance-scaffold-zra): the minimal-five
-# crate skeletons plus the workspace-wide lint policy. The remaining crates
-# (http, catalog, frame, export, graph, cache, tui, mcp) are added by their
-# boundary-owning beads, not in one blind sweep — see
-# COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md ("Repository Shape").
-#
-# The toolchain pin (rust-toolchain.toml), the [patch.crates-io] Asupersync
-# unification block, and the single-asupersync-version CI gate are owned by
-# bead fsnow-native-snowflake-connector-w0i.3. The broader forbidden-dependency
-# admissibility harness remains in fsnow-native-snowflake-connector-w0i.7.
+# The toolchain is pinned in rust-toolchain.toml. Asupersync is pinned to one
+# exact version below (`=0.3.5`), and scripts/check-asupersync-single-version.sh
+# fails if the lockfile ever carries a second one. FrankenSuite dependencies
+# resolve from crates.io; local sibling checkouts are an opt-in `paths` override
+# in a gitignored .cargo/config.toml. scripts/check-dependency-admissibility.py
+# proves no forbidden crate enters a production feature graph.
 
 [workspace]
 resolver = "3"

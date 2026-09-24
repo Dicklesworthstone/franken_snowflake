@@ -10,12 +10,13 @@ are load-bearing and self-reinforcing: the connector **cannot leak secrets**,
 
 ## Security Defaults
 
-- **Read-only by default**, enforced at the type level via narrowed Asupersync
-  capability rows. The pure planning / validation / SQL-compile path runs under
-  `cx_readonly()` (`Cx<cap::None>` — zero capabilities, no IO); the transport
-  layer runs under a narrowed `Cx` that grants `IO` (and `TIME`/`SPAWN`) but
-  **never** `REMOTE`. Only the write-intent ladder widens authority further. See
-  `docs/asupersync_leverage.md`.
+- **Read-only by default**, enforced at runtime: `query run` accepts one read
+  statement (the shared SQL lexer in `franken-snowflake-core::sql_lexer`; see
+  "SQL Statement Guard" below), and `query write` refuses unless the profile
+  sets `WRITE_ENABLED`. The target design also narrows Asupersync capability
+  rows (planning under `cx_readonly()`, transport without `REMOTE`, only the
+  write ladder wider); those types exist in `franken-snowflake-core` but no call
+  path narrows its `Cx` yet. See `docs/asupersync_leverage.md`.
 - **No secret values** in config files, `Debug`, `Display`, JSON output, error
   messages, panic text, Beads comments, support bundles, logs, or test fixtures.
 - **TLS required** on every live connection.
@@ -70,6 +71,32 @@ when requested; tokens and private keys are **always** redacted.
    and any leak fails the build. Because the production redactor and the test-time
    guard read one constant, a newly observed secret shape is added in exactly one
    place and both sides stay in lock-step.
+3. **Secret values inside SQL.** A statement can carry a secret as a string
+   value, and the local store is append-only, so a leak there is permanent. The
+   same `redact()` also replaces the value of every secret-bearing parameter
+   (`<param> = '...'`, `<param> => '...'`, or `$$...$$`) with `[REDACTED]`,
+   keeping the quotes; a name matches when it contains `PASSWORD`,
+   `PASSPHRASE`, `SECRET`, `TOKEN`, `CREDENTIAL`, or `_KEY`
+   (`redact::SECRET_SQL_PARAMETER_FRAGMENTS`). The families, per the Snowflake
+   SQL reference (consulted 2026-09-24):
+   [CREATE USER](https://docs.snowflake.com/en/sql-reference/sql/create-user)
+   `PASSWORD`;
+   [CREATE STAGE](https://docs.snowflake.com/en/sql-reference/sql/create-stage)
+   and [COPY INTO](https://docs.snowflake.com/en/sql-reference/sql/copy-into-table)
+   `CREDENTIALS = (AWS_KEY_ID, AWS_SECRET_KEY, AWS_TOKEN | AZURE_SAS_TOKEN)` and
+   `ENCRYPTION = (MASTER_KEY, KMS_KEY_ID)`;
+   [CREATE SECRET](https://docs.snowflake.com/en/sql-reference/sql/create-secret)
+   `SECRET_STRING`, `OAUTH_REFRESH_TOKEN`, `PASSWORD`;
+   [API authentication integrations](https://docs.snowflake.com/en/sql-reference/sql/create-security-integration-api-auth)
+   `OAUTH_CLIENT_SECRET`;
+   [CREATE API INTEGRATION](https://docs.snowflake.com/en/sql-reference/sql/create-api-integration)
+   `API_KEY`. The scan is context-free, so it also catches a value inside a
+   shell command or a message, and every envelope string, receipt preview,
+   audit event (redacted again at the sink), and export provenance record passes
+   through it. The SQL submitted to Snowflake is never altered. A suggested
+   command (`confirm_command`, a dry-run hint) never embeds SQL that carried a
+   secret, because a redacted copy would run with `[REDACTED]` as the value; it
+   says `--sql <the same SQL; its secret values are not echoed>` instead.
 
 ## Auth Lanes
 
@@ -82,16 +109,27 @@ Implemented in this order; a later lane never blocks an earlier one:
    (`rust_crypto` + `use_pem`) path; `X-Snowflake-Authorization-Token-Type:
    KEYPAIR_JWT`. Claims: `iss = "<ACCOUNT>.<USER>.SHA256:<fp>"`,
    `sub = "<ACCOUNT>.<USER>"` (no fingerprint), uppercase ACCOUNT/USER, org-form
-   `.`→`-`. Effective `exp` is capped at ≤ 3600s and re-signed mid-`bracket` for
-   long polls (Snowflake caps JWT validity at 1 hour). See "Auth Crypto Path" in
+   `.`→`-`. Effective `exp` is capped at ≤ 3600s and re-signed before a poll or
+   fetch that would outlive it (Snowflake caps JWT validity at 1 hour). See "Auth Crypto Path" in
    the plan.
-3. **OAuth bearer** pass-through (short-lived ~10 min; refreshed during long polls).
-4. **Workload identity federation** — only after the first three are stable.
+3. **OAuth bearer** pass-through (short-lived, commonly ~10 min). The connector
+   cannot refresh it: a token that expires mid-poll becomes a typed
+   `credential_expired` error (with a remote cancel when a statement handle exists).
+4. **Workload identity federation** — quarantined. The implementation exchanges
+   the OIDC token through an RFC 7523 grant, which is not Snowflake's documented
+   SQL API scheme (`Authorization: Bearer WIF.<provider>.<token>` with
+   `X-Snowflake-Authorization-Token-Type: WORKLOAD_IDENTITY_FEDERATION`), so
+   `profile validate` reports the lane as unusable and the live path refuses it.
 
 `profile validate --json` checks shape and env-var presence without contacting
-Snowflake unless `--online` is passed. `profile doctor` surfaces
-credential-lifetime warnings ("your token expires in N days/minutes") where
-derivable without leaking the secret, instead of a surprise 401 mid-poll.
+Snowflake and without reading a secret value. It fails (exit 3, `FSNOW-2002`) a
+profile the live path would refuse: an `_ACCOUNT` that does not form a canonical
+`https://<account>.snowflakecomputing.com` endpoint (checked with the same rule
+the transport applies) or an unknown or quarantined lane. `profile doctor`
+reports lifetime guidance for the configured lane from non-secret configuration
+only (for example, a `_JWT_VALIDITY_SECONDS` above the 3600 s cap); it cannot see
+a PAT or OAuth token's expiry offline. RSA keys under 2048 bits are refused when
+the live path loads the key.
 
 ## Fail-Closed Rights
 
@@ -156,8 +194,9 @@ carry a cost vector (`statements_run`, `partitions_fetched`, `bytes_scanned`,
 
 ## Write-Intent Ladder
 
-Write/update support is deferred until read/query/catalog is strong. When added,
-it is the **only** code path permitted a capability row wider than read-only, and
+Write support has landed as `query write` (see `docs/write_intent_ladder.md` for
+what each rung does today). By design it is the only code path that may request
+a capability row wider than read-only (capability rows are not wired yet), and
 it proceeds in fixed rungs:
 
 1. `write plan --dry-run --json`

@@ -3,7 +3,8 @@
 All notable changes to `franken_snowflake` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at the
-workspace version (`0.0.2`). Crates still inherit `publish = false`.
+workspace version (`0.0.4`). All 14 crates are published on crates.io (first
+published 2026-09-12).
 
 ## Scope and method
 
@@ -107,23 +108,86 @@ implementation first and the test/hardening pass follows in a later wave. The
 
 ## [Unreleased]
 
+### Security
+
+- **SQL statement guard on one shared lexer.** `franken-snowflake-core::sql_lexer`
+  understands `$$` strings, quoted identifiers, comments, and `$`-bearing
+  identifiers; the read guard, the multi-statement check, and write
+  classification all use it, which closes a `$$`-quoting bypass of the
+  one-statement rule. Every live submit pins `MULTI_STATEMENT_COUNT=1`.
+- **`mcp serve --http` requires a bearer token** (`FRANKEN_SNOWFLAKE_MCP_TOKEN`,
+  32+ characters, compared in constant time), refuses foreign `Host` and
+  `Origin` headers before dispatch (CORS headers only for `--allow-origin`
+  origins), binds loopback unless `--allow-remote`, and exposes only read-only
+  tools unless `--allow-tool` names more. Before this, any web page open in the
+  operator's browser could call the tools cross-origin.
+- **`export run --out` confinement.** An existing file is replaced only with
+  `--overwrite` (atomically), symlink and non-file targets are refused, and the
+  MCP `export_run` tool is confined to relative paths under `<data dir>/exports`.
+- **Secret values in SQL are redacted everywhere they could be stored or
+  shown.** The shared redactor now also replaces the string value of
+  secret-bearing parameters (`PASSWORD`, `CREDENTIALS = (AWS_SECRET_KEY ...)`,
+  `MASTER_KEY`, `SECRET_STRING`, `OAUTH_CLIENT_SECRET`, `API_KEY`, ...) in
+  envelopes, receipts, the append-only audit log (redacted again at the sink),
+  and export provenance. A dry-run's `confirm_command` no longer embeds a
+  redacted copy of such SQL, which would have run with `[REDACTED]` as the value.
+- **A supplied `--confirm` token is always checked.** In the default
+  (frictionless) write mode a token for different SQL or another profile was
+  ignored; it is now refused with `FSNOW-3008`.
+- **Workload identity quarantined.** The lane's RFC 7523 exchange is not
+  Snowflake's documented `WIF.<provider>.<token>` scheme for the SQL API, so
+  `profile validate` reports it unusable and the live path refuses it; the token
+  endpoint must be `https://`.
+
 ### Added
 
-- **RFC 7523 Native OIDC Workload Identity Federation (`franken-snowflake-auth`):**
-  - Added clean-room OAuth 2.0 JWT Bearer Assertion token exchange (`urn:ietf:params:oauth:grant-type:jwt-bearer`) for keyless cloud agents (Kubernetes Service Accounts, AWS IRSA, GCP Workload Identity).
-  - Pre-flight client-side assertion validation checks structure and expiration (`exp <= now` triggers `FSNOW-2004`) fail-closed before network transit.
-  - Built on Asupersync HTTP transport with automatic token caching and proactive mid-flight refresh (default 60s pre-expiry window) during statement polling loops.
-  - Strict compile-time secret leak gate verification; planted canary tests prove zero secret leakage in `Debug`, `Display`, error text, and envelopes.
-- **Pure Safe Rust Tokio-Free Parquet v2.0 Export (`franken-snowflake-export`):**
-  - Implemented self-contained Parquet v2.0 file writer with Snappy and Gzip compression without depending on Tokio, `orc-rust`, `arrow`, or `parquet` crates.
-  - Preserves `#![forbid(unsafe_code)]` workspace-wide and passes dependency admissibility across all feature lanes.
-  - Conformance verified via cross-engine round-trips against external PyArrow 25.0.1 and DuckDB 1.5.5.
-  - Exposed through CLI `--format parquet` for `query run` and `export run`, machine-readable capabilities schema, and FastMCP tools (`export_run`, `export_plan`).
-- **Zero-Copy SIMD jsonv2 Streaming Partition Decoder (`franken-snowflake-sqlapi`):**
-  - Added high-throughput streaming SIMD partition row and cell extractor, exceeding 350 MB/s throughput.
-  - Includes comprehensive differential fuzzing suite and bitwise parity tests against standard serde-based parser.
-- **Hermetic 15-Type Canonical Wire Codec Test (`franken-snowflake-frame`):**
-  - Added data-driven test embedding canonical `jsonv2_codec_cells.json` fixture verifying `DATE` epoch days (18262 = 2020-01-01), `TIME`/`TIMESTAMP` fractional epoch seconds, `TIMESTAMP_TZ` offset decoding (`offset - 1440`), `FIXED` exact decimal strings, `BOOLEAN`, `BINARY`, and structured JSON variants.
+- **Workload identity federation library code (`franken-snowflake-auth`,
+  quarantined):** an RFC 7523 JWT-bearer token exchange with pre-flight
+  assertion checks (`exp <= now` gives `FSNOW-2004`). The exchange runs once at
+  connection setup; it is refused on the live path (see Security).
+- **Local Parquet export (`franken-snowflake-export`, `export run --format
+  parquet`):** a Tokio-free writer (no `arrow`, `parquet`, or `orc-rust`) that
+  emits Parquet format version 1 files (DataPage v1, PLAIN, Snappy or Gzip).
+  `NUMBER(p,s)` is an exact DECIMAL, TIME and TIMESTAMP keep their declared
+  unit, and `TIMESTAMP_TZ` becomes a UTC instant plus a
+  `<name>__tz_offset_minutes` column; a value that cannot be written without
+  loss is refused. A cross-engine test reads a live-shaped file with PyArrow and
+  DuckDB through `uv` (it skips without `uv` unless
+  `FSNOW_REQUIRE_EXTERNAL_PARQUET=1`). Not yet run against a live account.
+- **SWAR jsonv2 partition decoder (`franken-snowflake-frame`, behind
+  `frankenpandas`):** a SIMD-within-a-register row and cell scanner with parity
+  tests against the serde path and malformed-input tests. The live path does
+  not call it yet, and its throughput test compares it with the crate's own
+  serde path (release target 350 MB/s; no gate lane runs release mode).
+- **Wire codec test (`franken-snowflake-frame`):** asserts the codec against
+  the document-derived conventions in `jsonv2_codec_cells.json` (`DATE` epoch
+  days, `TIME`/`TIMESTAMP` fractional epoch seconds, `TIMESTAMP_TZ` offset
+  minus 1440, `FIXED` exact decimal strings, `BOOLEAN`, `BINARY`, structured
+  JSON); a live capture has not confirmed them yet.
+- **Per-command flag validation.** Each command accepts exactly the flags its
+  `capabilities` `input_schema` documents; any other flag is `FSNOW-1002`
+  (exit 64) with suggestions from that command's own flags, and MCP tools refuse
+  undeclared arguments. `catalog diff --base/--target` were unreachable before.
+- **Cancellation reaches the envelope.** A cancelled or timed-out live statement
+  is `FSNOW-5004` with `outcome_kind` `cancelled` or `timeout` and the cancel
+  kind in the evidence; exit codes follow the core cancel policy. A statement
+  that ends without rows still writes a receipt whose `receipt_state` says how
+  (`failed`, `cancelled`, `timed_out`).
+- **Build identity.** `capabilities.build` reports the version, git commit,
+  dirty flag, target, profile, rustc, and features; `--with-exe-hash` adds the
+  SHA-256 of the running binary. Receipts and audit events record the commit,
+  and the live-proof scripts refuse a binary built from another commit unless
+  `FSNOW_ALLOW_STALE_BIN=1`.
+- **Stricter `profile validate`.** An `_ACCOUNT` that does not form a canonical
+  `https://<account>.snowflakecomputing.com` endpoint, or an unknown or
+  quarantined auth lane, is exit 3 (`FSNOW-2002`) with a repair command;
+  `profile doctor` gives lifetime guidance for the configured lane only.
+- **Default `QUERY_TAG`.** Every live statement carries
+  `fsnow:<command_id>:<request_id>` (profile-configurable with
+  `<PREFIX>_QUERY_TAG`, `off` to disable), and receipts record the tag, so a
+  statement in Snowflake's query history leads back to its envelope.
+- **Public-safety scan** (`scripts/check-public-safety.sh`) checks the tree and
+  the Beads export against a private denylist kept outside the repository.
 - **Offline Catalog Diff & Schema Drift Detection (`franken-snowflake-cli`, `franken-snowflake-mcp`, `franken-snowflake-cache`):**
   - Added `franken-snowflake catalog diff <profile> [--database <db>] [--schema <schema>] [--base <id>] [--target <id>] --json` CLI command and `catalog_diff` FastMCP read tool.
   - Added `CacheBackend::catalog_snapshots` across `InMemoryCache`, `FrankenSqliteCache`, and `FileCache` to index and retrieve historical snapshots ordered newest-first.
@@ -134,13 +198,16 @@ implementation first and the test/hardening pass follows in a later wave. The
 ### Fixed
 
 - **Frame Benchmark Resiliency under Shared CI Worker Load (`franken-snowflake-frame`):**
-  - Adjusted debug-assertions throughput target in `zero_copy_parity.rs` to prevent intermittent test failures due to CPU scheduling contention on shared remote workers, while preserving the full >350 MB/s release benchmark.
+  - Lowered the debug-assertions throughput target in `zero_copy_parity.rs` from 35 to 20 MB/s to stop intermittent failures on shared remote workers; the release target stays 350 MB/s, but no gate lane runs the test in release mode.
+- **`selftest` reports uncompiled checks as `skipped`.** The frame codec and
+  text-indexing fixtures reported `pass` from hardcoded data in builds without
+  their features.
 - **Feature Lane Clippy Gate Across All Workspace Features (`scripts/check-feature-lanes.sh`):**
   - Cleaned Clippy warnings across all 21 feature combinations under `-D warnings`.
   - Resolved needless lifetimes, complex return types, manual default impls, identity bitwise ops, collapsible if conditions, and simplified iterators in `franken-snowflake-export` and `franken-snowflake-frame`.
   - Added coverage for `franken-snowflake-export|parquet` feature lane in `scripts/check-feature-lanes.sh` with 100% coverage verification.
 - **Harness & Pre-Built Binary Discovery (`scripts/`):**
-  - Hardened `scripts/live-proof-cli.sh` and `scripts/capture-jsonv2-golden.sh` to automatically detect and reuse pre-built binaries in `$CARGO_TARGET_DIR` before falling back to full compilation.
+  - `scripts/live-proof-cli.sh` and `scripts/capture-jsonv2-golden.sh` reuse a pre-built binary in `$CARGO_TARGET_DIR` before falling back to a build, and now check that it was built from HEAD (see Build identity).
 
 ## [v0.0.4] — 2026-09-11
 
@@ -156,9 +223,9 @@ checksums published alongside. Crates configured for crates.io publishing.
   executor re-checks the read-only shape at the execution boundary, and
   `--require-live=<value>` is rejected loudly instead of being silently
   ignored.
-- **jsonv2 golden validation loop.** Data-driven verification test
-  consumes captured wire response fixtures and asserts frame codec data
-  type mappings.
+- **jsonv2 golden validation loop.** A data-driven test asserts the frame
+  codec's type mappings against a captured wire response; no capture has been
+  committed yet (`tests/captured/` is empty), so it skips until one is.
 - **Clippy & lint coverage.** Fixed non-live `dead_code` warning on
   `QueryRunOptions.bindings_json` and cfg-gated `BTreeMap`/`TypedBinding`
   imports in `tui_surface.rs` to keep all 18 feature lanes clean under
@@ -190,8 +257,10 @@ closes those gaps:
   `runner` context in job-level `env`; a rewrite in
   [`2809a3f`](https://github.com/Dicklesworthstone/franken_snowflake/commit/2809a3f)
   created jobs that were never assigned a hosted runner). Per project policy
-  this repository never uses Actions; `.github/workflows` was deleted and
-  `docs/RELEASE.md` now specifies the `dsr` cross-platform proof instead.
+  this repository never uses Actions: Actions are disabled in the repository
+  settings, and `docs/RELEASE.md` specifies the `dsr` cross-platform proof
+  instead. `.github/workflows/ci.yml` is still tracked; deleting it awaits an
+  explicit operator go-ahead.
 - **Local store.** `franken-snowflake-cache` gained an append-only JSONL
   `FileCache` backend (first-write-wins, tamper-detected receipts, malformed
   lines skipped and counted), a platform data-dir resolver
@@ -301,8 +370,10 @@ closes those gaps:
   still fires the remote cleanup cancel on every interleaving.
 - **Cross-compile proof.** `x86_64-pc-windows-msvc` (cargo xwin) and
   `aarch64-unknown-linux-gnu` (cargo zigbuild) build with `--features
-  live,mcp`; `aarch64-pc-windows-msvc` does not (ring/cargo-xwin, see
-  `docs/RELEASE.md`) and leaves the release target set.
+  live,mcp`. `aarch64-pc-windows-msvc` did not cross-compile with cargo-xwin
+  at first (ring); `scripts/cross-build-windows-arm64.sh` fixed that, and the
+  target stays in the release set, built natively on the Windows host through
+  dsr.
 - **Raw-transport seam.** `SnowflakeHttpClient` is generic over a `RawHttp`
   trait (one HTTP exchange; the Asupersync pooled client in production), so
   the transport's retry/backoff/resubmit/cancel loop is now covered by eight
@@ -358,14 +429,14 @@ through HEAD
 External clones no longer need a `/dp` FrankenSuite checkout. Workspace
 dependencies resolve from crates.io; the installer dropped the sibling-tree
 preflight. Typed query options were accepted on the live path
-(`hfdt-snowflake-franken-integration-ejodq.5.9`). Parallel rustc front-end
+(a downstream integration request). Parallel rustc front-end
 threads (`-Z threads=4`) and multi-repo gitignore patterns landed as build
 hygiene.
 
 **Representative commits**
 - [`aa26f37`](https://github.com/Dicklesworthstone/franken_snowflake/commit/aa26f371046f555c7a445d2c65bac9600eda859f) — `deps: resolve FrankenSuite deps from crates.io (standalone buildability)`
 - [`2dc54fc`](https://github.com/Dicklesworthstone/franken_snowflake/commit/2dc54fca945c66a0befbac06883078792a1b493f) — `installer+docs: external builds now work via crates.io; drop preflight`
-- [`8e1d162`](https://github.com/Dicklesworthstone/franken_snowflake/commit/8e1d1626f6b9740d89f71f2ab8463d0862941c26) — `fix(snowflake): accept typed query options (hfdt-snowflake-franken-integration-ejodq.5.9)`
+- [`8e1d162`](https://github.com/Dicklesworthstone/franken_snowflake/commit/8e1d1626f6b9740d89f71f2ab8463d0862941c26) — `fix(snowflake): accept typed query options`, subject abbreviated
 
 ### Janitor docs-reorg (2026-08-19)
 

@@ -23,9 +23,9 @@ CLI/MCP parity test enforces this.
   order, and `schema_version` / `output_contract_id` identify the shape.
 - Non-TTY mode shows no interactive prompt. `NO_COLOR`, `CI`, and a non-TTY
   stdout each independently disable ANSI. TTY detection uses `IsTerminal`.
-- Long-running commands emit typed NDJSON progress events on **stderr** (sourced
-  from Asupersync's native `cli::progress::ProgressEvent`) while the final
-  envelope goes to stdout.
+- Progress events are not emitted yet: a long-running command is silent until
+  its envelope reaches stdout. When they land they will be typed NDJSON on
+  **stderr** (Asupersync's `cli::progress::ProgressEvent`), never on stdout.
 
 ## Command Families
 
@@ -83,7 +83,7 @@ Every JSON envelope includes:
 | `request_id` | Client-generated, UUID-shaped, unique per invocation (the envelope trace id). The SQL API idempotency `requestId` is a separate per-statement id reported as `data.sql_api_request_id`. |
 | `query_id` | Snowflake `query_id`, when applicable. |
 | `statement_handle` | SQL API statement handle, when applicable. |
-| `receipt_hash` | BLAKE3 content address of the query receipt written to the local store by every successful live execution; `null` for offline commands and when the store could not be written (a warning says so). |
+| `receipt_hash` | BLAKE3 content address of the query receipt written to the local store by every live statement: a completed one (`receipt_state = completed`) and one that ended without rows (`failed`, `cancelled`, or `timed_out`, with the error code and cancel kind in the receipt). `null` for offline commands, for refusals before execution (usage, profile, SQL guard), and when the store could not be written (a warning says so). |
 | `started_at` / `finished_at` / `duration_ms` | Timing. |
 | `warnings` | Non-fatal findings. |
 | `safe_next_commands` | Suggested follow-ups. |
@@ -101,6 +101,16 @@ over known command / column / dataset names.
 owned by `franken-snowflake-core`, which derive from Asupersync's four-valued
 `Outcome` (see `docs/asupersync_leverage.md`). A cancelled query is
 `outcome_kind = cancelled`, not an error.
+
+A local cancellation of a live statement carries error code `FSNOW-5004`, with
+the Asupersync cancel kind in `error.evidence` (for example
+`cancel_kind=Deadline`). `outcome_kind` is `timeout` for `Deadline` and
+`Timeout` and `cancelled` for every other kind. The exit code follows the core
+cancel policy: 5 for deadline, timeout, poll-quota, shutdown and drain kinds,
+2 for a cost-budget breach (a safety boundary), and 0 for a user-requested
+cancel. A panic inside a statement task is `FSNOW-9001` with its redacted
+payload summary. A statement that exceeds `STATEMENT_TIMEOUT_IN_SECONDS` on the
+server is `FSNOW-4003` with `outcome_kind = timeout`.
 
 ## Exit Codes
 
@@ -131,17 +141,25 @@ requested and always redact tokens / private keys (see `docs/security_model.md`)
 ## MCP Surface
 
 `franken-snowflake mcp serve` (feature `mcp`, built on `fastmcp-rust`) exposes
-each read verb as an MCP `#[tool]` whose JSON schema is generated from the
-handler signature. Each call is wrapped in an Asupersync `web::request_region`
-so an agent disconnect drains the statement `bracket` plus partition `Scope` as
-one owned region; `ctx.checkpoint()` provides cooperative cancel points inside
-it. Sequencing: `run_stdio()` + read-only tools first, `run_http()` second,
-write tools deferred behind the same write-intent ladder as the CLI.
+each read verb, plus `query_cancel` and `export_run`, as an MCP tool whose input
+schema (`additionalProperties: false`; unknown arguments are refused) maps onto
+the CLI flags, and each call runs the same CLI handler. `ctx.checkpoint()`
+provides cooperative cancel points before and after a call. Not yet wired: an
+Asupersync `web::request_region` per call, so an agent disconnect does not yet
+cancel an in-flight statement (it runs to completion or to the server-side
+statement timeout). `--http` requires a bearer token, refuses foreign `Host`
+and `Origin` headers, and exposes only read-only tools unless `--allow-tool`
+names more; data writes stay on the CLI `query write` ladder.
 
 ## Mutation Posture
 
-Mutating operations are disabled by default. Any future DDL/DML/write path
-requires `--dry-run`, explicit `--confirm`, an idempotency request ID, an exact
-confirmation token, an execution receipt, and an append-only audit record — the
-write-intent ladder in `docs/security_model.md`. It is the only path permitted to
-request a capability row wider than read-only.
+Mutating operations are disabled by default: `query write` refuses unless the
+profile sets `<PREFIX>_WRITE_ENABLED=true`, and DDL additionally needs
+`<PREFIX>_WRITE_ALLOW_DDL=true`. Once enabled, a data write executes directly
+and returns an execution receipt; `--dry-run` previews it and returns a
+confirmation token bound to (profile, SQL), and `<PREFIX>_WRITE_REQUIRE_CONFIRM=true`
+makes that dry-run/confirm ceremony mandatory (see
+`docs/write_intent_ladder.md`). `query run` accepts only single read statements,
+with `MULTI_STATEMENT_COUNT=1` pinned on every submit. Capability rows are not
+wired, so read-only is enforced by the SQL guard and the write gate, not by the
+type system.

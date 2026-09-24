@@ -45,6 +45,7 @@ to end with `--json`, asserting the typed fields with `jq`:
 
 | step | asserts |
 |---|---|
+| `binary_identity` | the binary's self-reported `exe_sha256` equals the file on disk, and its `build.git_sha` equals `git rev-parse HEAD`; a build of another commit (or an unverifiable one) is refused unless `FSNOW_ALLOW_STALE_BIN=1`, which records `stale: true` in `summary.json` |
 | `profile_validate`, `profile_doctor_online` | `ok`, `data_source=live`, a 64-hex `receipt_hash` |
 | `query_run_small` then `receipt_show` | rows returned; the receipt reads back from the local store and names the statement handle |
 | `query_run_partitioned` (+ `partition_early_stop`) | `--limit 10` returns 10 rows and stops fetching partitions early (a single-partition trial result is a finding, not a failure) |
@@ -57,15 +58,15 @@ Every step's envelope is saved as `<step>.json` next to `events.jsonl` and
 `summary.json` in a fresh run directory that also holds the run's own local
 store (`data/`), so receipts and snapshots are inspectable afterwards. The
 script exits non-zero on the first hard failure. `scripts/live-proof-cli.sh
---selftest` proves the harness offline: it runs an offline command, an
-offline refusal, and a planted-canary scan (the scan must report the hit).
+--selftest` proves the harness offline: a planted commit mismatch (the
+identity check must refuse it), an offline command, an offline refusal, and a
+planted-canary scan (the scan must report the hit).
 
 The credentialed run of this battery is the evidence that closes bead
 `fsnow-agent-ergonomic-cli-cli-live-e2e-and-receipts-bvf`; the offline
 scope is complete (receipts wired, `--require-live` gate, the gated
 in-crate `cli_live_proof` test), and only the credentialed evidence run —
-against a fresh Snowflake trial, since the June UA70404 trial is past its
-30-day window — remains.
+against a fresh Snowflake trial account — remains.
 
 ## Required Opt-In
 

@@ -18,6 +18,25 @@ Read these skill references before implementing the connector spine:
 - `asupersync-mega-skill` → `LAB-TRACE-DPOR.md`
 - `asupersync-mega-skill` → `WEB-GRPC-HTTP.md` (request-region pattern, for the MCP/HTTP surface)
 
+## Status (2026-09-24)
+
+This is the target contract; not every line below is wired yet.
+
+- Wired on the live path: the four-valued `Outcome` carried to the CLI edge (a
+  cancellation reads `cancelled` or `timeout` with `FSNOW-5004`, and the exit
+  code follows `cancel_exit_code`); `reason.kind` routing of the best-effort
+  remote cancel (quiet-drain kinds skip it); the deadline and poll-quota budget
+  in the transport; a bounded partition-fetch window; Asupersync's HTTP/TLS
+  client with gzip. Submit retries are the project's own loop on that client.
+- Not wired yet: a `bracket` or drop guard for the statement handle (signal
+  handling is absent, so Ctrl-C or a killed process leaves a submitted statement
+  to the server-side `STATEMENT_TIMEOUT_IN_SECONDS`); capability rows (the types
+  exist in `franken-snowflake-core::capabilities`, but no call path narrows its
+  `Cx`); the cost quota on the live path; `web::request_region` around MCP calls;
+  `cli::progress` events; the declared `PoolConfig`; backup requests.
+- The LabRuntime/DPOR suite explores a model of the driver's cancel and retry
+  interleavings in the testkit, not the production driver itself.
+
 ## Mapping
 
 Each line is `concern → primitive — payoff`, kept compact deliberately:
