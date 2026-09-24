@@ -1,10 +1,11 @@
 //! Schema diff and drift detection between catalog snapshots.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::model::{
-    CatalogSnapshot, ColumnCatalogEntry, DatasetManifest, DtypeClass, RightsClass, same_identifier,
+    CatalogRelation, CatalogSnapshot, ColumnCatalogEntry, DatasetManifest, DtypeClass, RightsClass,
+    same_identifier,
 };
 
 /// Contract version for catalog diff JSON outputs.
@@ -31,6 +32,13 @@ pub struct CatalogDiff {
     /// Datasets modified between base and target.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub datasets_modified: Vec<DatasetDiff>,
+    /// Relations (keys, view dependencies, stage/format use) new in target.
+    /// Compared only when both snapshots ran the relation pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relations_added: Vec<CatalogRelation>,
+    /// Relations in base that target no longer has.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relations_removed: Vec<CatalogRelation>,
 }
 
 /// Summary counts of drift between two snapshots.
@@ -42,6 +50,10 @@ pub struct CatalogDiffSummary {
     pub columns_added: usize,
     pub columns_removed: usize,
     pub columns_modified: usize,
+    #[serde(default)]
+    pub relations_added: usize,
+    #[serde(default)]
+    pub relations_removed: usize,
     /// True if any change is potentially breaking (e.g. dropped dataset, dropped column,
     /// column made non-nullable, or incompatible dtype change).
     pub has_breaking_changes: bool,
@@ -131,12 +143,16 @@ impl CatalogDiff {
                 columns_added: columns_count,
                 columns_removed: 0,
                 columns_modified: 0,
+                relations_added: target.relations.len(),
+                relations_removed: 0,
                 has_breaking_changes: false,
                 is_identical: false,
             },
             datasets_added: target.datasets.clone(),
             datasets_removed: Vec::new(),
             datasets_modified: Vec::new(),
+            relations_added: target.relations.clone(),
+            relations_removed: Vec::new(),
         }
     }
 
@@ -163,8 +179,16 @@ impl CatalogDiff {
         } else {
             ""
         };
+        let relations = if self.summary.relations_added + self.summary.relations_removed > 0 {
+            format!(
+                " | Relations: +{} -{}",
+                self.summary.relations_added, self.summary.relations_removed
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "Datasets: +{} -{} ~{} | Columns: +{} -{} ~{}{}",
+            "Datasets: +{} -{} ~{} | Columns: +{} -{} ~{}{relations}{}",
             self.summary.datasets_added,
             self.summary.datasets_removed,
             self.summary.datasets_modified,
@@ -401,10 +425,33 @@ pub fn diff_snapshots(base: &CatalogSnapshot, target: &CatalogSnapshot) -> Catal
         }
     }
 
+    // A snapshot without the relation pass never looked for relations, so
+    // only two snapshots that both ran it are compared.
+    let (relations_added, relations_removed) =
+        if base.relations_discovered && target.relations_discovered {
+            let base_relations: BTreeSet<&CatalogRelation> = base.relations.iter().collect();
+            let target_relations: BTreeSet<&CatalogRelation> = target.relations.iter().collect();
+            (
+                target_relations
+                    .difference(&base_relations)
+                    .map(|relation| (*relation).clone())
+                    .collect::<Vec<_>>(),
+                base_relations
+                    .difference(&target_relations)
+                    .map(|relation| (*relation).clone())
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
     let has_breaking_changes =
         !datasets_removed.is_empty() || datasets_modified.iter().any(|d| d.is_breaking);
-    let is_identical =
-        datasets_added.is_empty() && datasets_removed.is_empty() && datasets_modified.is_empty();
+    let is_identical = datasets_added.is_empty()
+        && datasets_removed.is_empty()
+        && datasets_modified.is_empty()
+        && relations_added.is_empty()
+        && relations_removed.is_empty();
 
     CatalogDiff {
         schema_version: DIFF_SCHEMA_VERSION.to_owned(),
@@ -417,12 +464,16 @@ pub fn diff_snapshots(base: &CatalogSnapshot, target: &CatalogSnapshot) -> Catal
             columns_added: total_columns_added,
             columns_removed: total_columns_removed,
             columns_modified: total_columns_modified,
+            relations_added: relations_added.len(),
+            relations_removed: relations_removed.len(),
             has_breaking_changes,
             is_identical,
         },
         datasets_added,
         datasets_removed,
         datasets_modified,
+        relations_added,
+        relations_removed,
     }
 }
 
@@ -606,6 +657,38 @@ mod tests {
                 new: Some(1500)
             })
         );
+    }
+
+    #[test]
+    fn relation_changes_are_diffed_only_between_relation_passes() {
+        use crate::model::ObjectRef;
+
+        let view = ObjectRef::new("DB", "PUBLIC", "V");
+        let depends = |source: &str| CatalogRelation::ViewDependsOn {
+            view: view.clone(),
+            source: ObjectRef::new("DB", "PUBLIC", source),
+            source_type: Some("TABLE".to_owned()),
+        };
+        let mut base = CatalogSnapshot::empty(dummy_provenance("snap-a"));
+        base.relations_discovered = true;
+        base.relations = vec![depends("A"), depends("B")];
+        let mut target = CatalogSnapshot::empty(dummy_provenance("snap-b"));
+        target.relations_discovered = true;
+        target.relations = vec![depends("B"), depends("C")];
+
+        let diff = diff_snapshots(&base, &target);
+        assert_eq!(diff.relations_added, vec![depends("C")]);
+        assert_eq!(diff.relations_removed, vec![depends("A")]);
+        assert!(!diff.summary.is_identical);
+        assert!(!diff.summary.has_breaking_changes);
+        assert!(diff.summary_text().contains("Relations: +1 -1"));
+
+        // A base that never ran the pass says nothing about relations.
+        base.relations_discovered = false;
+        base.relations.clear();
+        let diff = diff_snapshots(&base, &target);
+        assert!(diff.relations_added.is_empty());
+        assert!(diff.summary.is_identical);
     }
 
     #[test]

@@ -162,6 +162,18 @@ fn discovery_sql(
     built: BuiltStatement,
     input: &CatalogDiscoveryInput,
 ) -> CatalogDiscoverySql {
+    CatalogDiscoverySql {
+        kind,
+        request: statement_request(input, built),
+    }
+}
+
+/// A discovery submit request: the scan's database/schema as session context,
+/// a 60 s statement timeout, and every filter value bound positionally.
+pub(crate) fn statement_request(
+    input: &CatalogDiscoveryInput,
+    built: BuiltStatement,
+) -> SubmitStatementRequest {
     let mut request = SubmitStatementRequest::new(built.sql);
     request.timeout = Some(60);
     request.database = input
@@ -180,7 +192,7 @@ fn discovery_sql(
         }
         request.bindings = Some(bindings);
     }
-    CatalogDiscoverySql { kind, request }
+    request
 }
 
 /// Build a deterministic snapshot from completed Information Schema statements.
@@ -325,7 +337,7 @@ fn canonical_json<T: Serialize>(value: &T) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "{}".to_owned())
 }
 
-fn rows_from_completed(completed: &CompletedStatement) -> Vec<InformationSchemaRow> {
+pub(crate) fn rows_from_completed(completed: &CompletedStatement) -> Vec<InformationSchemaRow> {
     completed
         .rows
         .iter()
@@ -349,9 +361,9 @@ fn row_from_values(columns: &[ColumnType], values: &[Option<String>]) -> Informa
 
 /// A discovery statement plus its ordered positional binding values. The `?`
 /// placeholders in `sql` are bound 1-based in `binding_values` order.
-struct BuiltStatement {
-    sql: String,
-    binding_values: Vec<String>,
+pub(crate) struct BuiltStatement {
+    pub(crate) sql: String,
+    pub(crate) binding_values: Vec<String>,
 }
 
 fn databases_sql(input: &CatalogDiscoveryInput) -> BuiltStatement {
@@ -400,7 +412,7 @@ fn columns_sql(input: &CatalogDiscoveryInput) -> BuiltStatement {
 /// Build a deterministic `SELECT ... [WHERE col = ? AND ...] ORDER BY ...`
 /// statement using positional `?` placeholders for every present filter value,
 /// never string interpolation. `filters` preserves placeholder order.
-fn build_statement(
+pub(crate) fn build_statement(
     select_from: &str,
     filters: &[(&str, Option<&str>)],
     order_by: &str,

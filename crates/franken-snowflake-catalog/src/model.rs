@@ -3,9 +3,12 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Version string carried by persisted TOML and deterministic JSON outputs.
-pub const SCHEMA_VERSION: &str = "franken_snowflake.dataset_manifest.v1";
+/// v2 added the relation pass (keys, view dependencies, stages, file formats,
+/// tags) and the gaps it could not fill.
+pub const SCHEMA_VERSION: &str = "franken_snowflake.dataset_manifest.v2";
 
-/// A full catalog snapshot envelope payload: datasets, columns, and operators.
+/// A full catalog snapshot envelope payload: datasets, columns, operators, and
+/// the relations discovered between catalog objects.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogSnapshot {
     /// Artifact contract version.
@@ -21,6 +24,29 @@ pub struct CatalogSnapshot {
     /// Independently queryable operator catalog entries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operators: Vec<crate::operator::OperatorCatalogEntry>,
+    /// Whether the relation pass ran. Without it the snapshot says nothing
+    /// about keys, dependencies, stages, file formats or tags: their absence
+    /// means "not looked for", not "none".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub relations_discovered: bool,
+    /// Typed relations between catalog objects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relations: Vec<CatalogRelation>,
+    /// Primary keys, columns in key order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub primary_keys: Vec<PrimaryKey>,
+    /// Named stages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<StageEntry>,
+    /// Named file formats.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_formats: Vec<FileFormatEntry>,
+    /// Tags set directly on objects or their columns.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<TagAssignment>,
+    /// What discovery could not see, and why.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<DiscoveryGap>,
 }
 
 impl CatalogSnapshot {
@@ -33,7 +59,20 @@ impl CatalogSnapshot {
             datasets: Vec::new(),
             columns: Vec::new(),
             operators: Vec::new(),
+            relations_discovered: false,
+            relations: Vec::new(),
+            primary_keys: Vec::new(),
+            stages: Vec::new(),
+            file_formats: Vec::new(),
+            tags: Vec::new(),
+            gaps: Vec::new(),
         }
+    }
+
+    /// The primary key of `object`, if one was discovered.
+    #[must_use]
+    pub fn primary_key(&self, object: &ObjectRef) -> Option<&PrimaryKey> {
+        self.primary_keys.iter().find(|key| &key.object == object)
     }
 
     /// Find a dataset by ID.
@@ -61,6 +100,179 @@ impl CatalogSnapshot {
     pub fn diff_from(&self, base: &Self) -> crate::diff::CatalogDiff {
         crate::diff::diff_snapshots(base, self)
     }
+}
+
+/// Exact three-part identity of a catalog object (table, view, stage, file
+/// format, or tag), identifiers exactly as Snowflake reports them.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ObjectRef {
+    /// Database identifier.
+    pub database: String,
+    /// Schema identifier.
+    pub schema: String,
+    /// Object identifier.
+    pub name: String,
+}
+
+impl ObjectRef {
+    /// Build a reference from its three parts.
+    #[must_use]
+    pub fn new(
+        database: impl Into<String>,
+        schema: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self {
+            database: database.into(),
+            schema: schema.into(),
+            name: name.into(),
+        }
+    }
+
+    /// `DATABASE.SCHEMA.NAME` for display and lookup; quote each part before
+    /// using it in SQL.
+    #[must_use]
+    pub fn qualified(&self) -> String {
+        format!("{}.{}.{}", self.database, self.schema, self.name)
+    }
+}
+
+/// A typed relation between catalog objects, discovered from Snowflake metadata.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CatalogRelation {
+    /// `view` reads `source`, directly or through other views: Snowflake's
+    /// `GET_OBJECT_REFERENCES` reports a view's whole dependency closure.
+    ViewDependsOn {
+        /// The dependent view.
+        view: ObjectRef,
+        /// A table or view it reads.
+        source: ObjectRef,
+        /// `TABLE` or `VIEW`, as Snowflake reports it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_type: Option<String>,
+    },
+    /// A foreign key of `from` referencing the primary or unique key of `to`.
+    /// Table level: Snowflake's documented metadata views do not map key
+    /// columns.
+    ForeignKey {
+        /// The table declaring the foreign key.
+        from: ObjectRef,
+        /// The table owning the referenced key.
+        to: ObjectRef,
+        /// The foreign key constraint name.
+        constraint: String,
+    },
+    /// An external table reads its files from `stage`.
+    UsesStage {
+        /// The external table.
+        object: ObjectRef,
+        /// The stage its location names.
+        stage: ObjectRef,
+    },
+    /// An external table parses its files with the named `file_format`.
+    UsesFileFormat {
+        /// The external table.
+        object: ObjectRef,
+        /// The named file format.
+        file_format: ObjectRef,
+    },
+}
+
+/// A table's primary key.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PrimaryKey {
+    /// The keyed table.
+    pub object: ObjectRef,
+    /// Key columns in key order.
+    pub columns: Vec<String>,
+    /// Constraint name, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint: Option<String>,
+}
+
+/// A named stage.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct StageEntry {
+    /// Stage identity.
+    pub stage: ObjectRef,
+    /// `Internal Named` or `External Named`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_type: Option<String>,
+    /// An external stage's location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// An external stage's cloud region.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// Stage comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+/// A named file format.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct FileFormatEntry {
+    /// File format identity.
+    pub file_format: ObjectRef,
+    /// `CSV`, `JSON`, `PARQUET`, ...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_type: Option<String>,
+    /// File format comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+/// A tag set directly on an object or one of its columns.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TagAssignment {
+    /// Tag identity.
+    pub tag: ObjectRef,
+    /// Tag value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// The tagged object (a column's table for a column tag).
+    pub object: ObjectRef,
+    /// The tagged column, for a column tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+}
+
+impl TagAssignment {
+    /// `DB.SCHEMA.TAG=value` (or `DB.SCHEMA.TAG` without a value), the form
+    /// carried in [`ColumnCatalogEntry::tags`].
+    #[must_use]
+    pub fn label(&self) -> String {
+        match &self.value {
+            Some(value) => format!("{}={value}", self.tag.qualified()),
+            None => self.tag.qualified(),
+        }
+    }
+}
+
+/// What a discovery pass could not see, and why: never a silent empty.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryGap {
+    /// The metadata source (`primary_keys`, `object_references`, ...).
+    pub source: String,
+    /// Why the source is incomplete.
+    pub kind: DiscoveryGapKind,
+    /// The upstream message or the limit that applied.
+    pub detail: String,
+}
+
+/// Why a discovery source is incomplete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryGapKind {
+    /// The source's statement failed (privilege, edition, unsupported object).
+    Failed,
+    /// The source was not attempted (opt-in, or a limit of zero).
+    Skipped,
+    /// Only part of the source was read (a bounded per-object pass).
+    Truncated,
+    /// Rows came back but could not be resolved unambiguously.
+    Unresolved,
 }
 
 /// Secret-free provenance attached to snapshots and artifacts.

@@ -14,8 +14,11 @@ pub mod diff;
 pub mod discovery;
 pub mod model;
 pub mod operator;
+pub mod overlay;
 pub mod planner;
 pub mod predicate;
+pub mod relations;
+pub mod search;
 
 /// Crate version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -32,13 +35,18 @@ pub mod prelude {
         build_snapshot_from_information_schema, persist_snapshot,
     };
     pub use crate::model::{
-        CatalogSnapshot, ColumnCatalogEntry, DataSourceClass, DatasetField, DatasetKind,
-        DatasetManifest, DtypeClass, FieldRole, Provenance, ProvenanceSource, RightsClass,
-        RoleConfidence, SCHEMA_VERSION,
+        CatalogRelation, CatalogSnapshot, ColumnCatalogEntry, DataSourceClass, DatasetField,
+        DatasetKind, DatasetManifest, DiscoveryGap, DiscoveryGapKind, DtypeClass, FieldRole,
+        FileFormatEntry, ObjectRef, PrimaryKey, Provenance, ProvenanceSource, RightsClass,
+        RoleConfidence, SCHEMA_VERSION, StageEntry, TagAssignment,
     };
     pub use crate::operator::{
         OperatorArity, OperatorCatalogEntry, OutputDtypeRule, built_in_operator_catalog,
         describe_operator_json_schema,
+    };
+    pub use crate::overlay::{
+        DatasetOverlay, FieldOverlay, ManifestOverlay, OverlayError, apply_dataset_overlay,
+        overlay_for, parse_overlay,
     };
     pub use crate::planner::{
         DatasetQueryRequest, PlanGuardrails, PlanMode, PlanRefusal, PlanWarning, PlannerLogLine,
@@ -48,5 +56,13 @@ pub mod prelude {
     pub use crate::predicate::{
         LeafPredicate, PredicateAst, PredicateRefusal, PredicateRefusalCode,
         did_you_mean_operators, validate_predicate,
+    };
+    pub use crate::relations::{
+        RelationOptions, RelationOutcome, RelationPlan, RelationSource, RelationStatement,
+        apply_relation_results, plan_relation_discovery,
+    };
+    pub use crate::search::{
+        DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT, SearchField, SearchHit, SearchMatch,
+        search_snapshot, search_words,
     };
 }

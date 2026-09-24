@@ -1652,6 +1652,7 @@ dependencies = [
  "franken-snowflake-testkit",
  "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]

@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use fnx_classes::digraph::DiGraph;
 use franken_snowflake_catalog::model::{
-    CatalogSnapshot, ColumnCatalogEntry, DatasetField, DatasetKind, DatasetManifest, FieldRole,
-    Provenance,
+    CatalogRelation, CatalogSnapshot, ColumnCatalogEntry, DatasetField, DatasetKind,
+    DatasetManifest, FieldRole, ObjectRef, Provenance,
 };
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +44,8 @@ pub enum CatalogNodeKind {
     FileFormat,
     /// Dataset manifest.
     Dataset,
+    /// Snowflake tag.
+    Tag,
 }
 
 impl CatalogNodeKind {
@@ -59,6 +61,7 @@ impl CatalogNodeKind {
             Self::Stage => "stage",
             Self::FileFormat => "file_format",
             Self::Dataset => "dataset",
+            Self::Tag => "tag",
         }
     }
 }
@@ -73,7 +76,7 @@ pub enum CatalogEdgeKind {
     DatasetObject,
     /// Dataset field points at a backing column.
     FieldColumn,
-    /// Referencing column -> referenced column.
+    /// Referencing table -> table owning the referenced key.
     ForeignKey,
     /// View object -> source object.
     ViewDependsOn,
@@ -81,8 +84,10 @@ pub enum CatalogEdgeKind {
     LineageReads,
     /// Object/export plan -> stage.
     UsesStage,
-    /// Stage/export plan -> file format.
+    /// Object/stage/export plan -> file format.
     UsesFileFormat,
+    /// Object or column -> tag set on it (the edge detail is the value).
+    Tagged,
 }
 
 impl CatalogEdgeKind {
@@ -98,8 +103,39 @@ impl CatalogEdgeKind {
             Self::LineageReads => "lineage_reads",
             Self::UsesStage => "uses_stage",
             Self::UsesFileFormat => "uses_file_format",
+            Self::Tagged => "tagged",
         }
     }
+
+    /// Whether the edge is a dependency: its source reads, references, or is
+    /// built on its target. Containment and tags are not lineage.
+    #[must_use]
+    pub const fn is_dependency(self) -> bool {
+        !matches!(self, Self::Contains | Self::Tagged)
+    }
+}
+
+/// Direction of a [`CatalogGraph::lineage`] walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LineageDirection {
+    /// What the node reads or references, transitively (its sources).
+    Upstream,
+    /// What reads or references the node, transitively (its dependents).
+    Downstream,
+}
+
+/// One node reached by a lineage walk.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineageStep {
+    /// The node reached.
+    pub node: NodeKey,
+    /// Dependency hops from the seed.
+    pub depth: usize,
+    /// The kind of the edge that first reached it.
+    pub via: CatalogEdgeKind,
+    /// The node it was reached from.
+    pub from: NodeKey,
 }
 
 /// Secret-free graph node payload.
@@ -241,6 +277,11 @@ impl CatalogGraph {
         for dataset in &snapshot.datasets {
             graph.add_dataset_edges(dataset);
         }
+        let profile = snapshot.datasets.first().map_or_else(
+            || snapshot.provenance.profile_fingerprint.clone(),
+            |dataset| dataset.profile.clone(),
+        );
+        graph.add_relations(&profile, snapshot);
 
         graph
     }
@@ -304,6 +345,56 @@ impl CatalogGraph {
     #[must_use]
     pub fn reachable(&self, from: &str, to: &str) -> bool {
         from == to || self.descendants(from).iter().any(|node| node == to)
+    }
+
+    /// Dependency lineage of `node`: [`LineageDirection::Upstream`] follows
+    /// dependency edges forward (what it reads or references),
+    /// [`LineageDirection::Downstream`] follows them backward (what reads or
+    /// references it). Breadth-first, each node once at its shortest depth;
+    /// containment and tag edges are not followed.
+    #[must_use]
+    pub fn lineage(&self, node: &str, direction: LineageDirection) -> Vec<LineageStep> {
+        if !self.nodes.contains_key(node) {
+            return Vec::new();
+        }
+        let mut steps = Vec::new();
+        let mut seen = BTreeSet::from([node.to_owned()]);
+        let mut queue = VecDeque::from([(node.to_owned(), 0_usize)]);
+        while let Some((current, depth)) = queue.pop_front() {
+            let indexes = match direction {
+                LineageDirection::Upstream => self.outgoing.get(&current),
+                LineageDirection::Downstream => self.incoming.get(&current),
+            };
+            let mut next_edges = indexes
+                .into_iter()
+                .flat_map(|set| set.iter())
+                .filter_map(|index| self.edges.get(*index))
+                .filter(|edge| edge.kind.is_dependency())
+                .collect::<Vec<_>>();
+            next_edges.sort_by(|left, right| {
+                (left.kind, &left.source, &left.target).cmp(&(
+                    right.kind,
+                    &right.source,
+                    &right.target,
+                ))
+            });
+            for edge in next_edges {
+                let next = match direction {
+                    LineageDirection::Upstream => &edge.target,
+                    LineageDirection::Downstream => &edge.source,
+                };
+                if seen.insert(next.clone()) {
+                    steps.push(LineageStep {
+                        node: next.clone(),
+                        depth: depth.saturating_add(1),
+                        via: edge.kind,
+                        from: current.clone(),
+                    });
+                    queue.push_back((next.clone(), depth.saturating_add(1)));
+                }
+            }
+        }
+        steps
     }
 
     /// Bounded bidirectional neighborhood for agent discovery.
@@ -633,6 +724,226 @@ impl CatalogGraph {
         }
     }
 
+    /// Stages, file formats, relations and tags from the snapshot's relation
+    /// pass. Objects a relation names outside the scanned scope (a view's
+    /// source in another schema, say) get their own nodes.
+    fn add_relations(&mut self, profile: &str, snapshot: &CatalogSnapshot) {
+        let provenance = &snapshot.provenance;
+        for stage in &snapshot.stages {
+            self.ensure_named(profile, &stage.stage, CatalogNodeKind::Stage, provenance);
+        }
+        for file_format in &snapshot.file_formats {
+            self.ensure_named(
+                profile,
+                &file_format.file_format,
+                CatalogNodeKind::FileFormat,
+                provenance,
+            );
+        }
+        for relation in &snapshot.relations {
+            let (source, kind, target, detail) = match relation {
+                CatalogRelation::ViewDependsOn {
+                    view,
+                    source,
+                    source_type,
+                } => (
+                    self.ensure_object(profile, view, provenance),
+                    CatalogEdgeKind::ViewDependsOn,
+                    self.ensure_object(profile, source, provenance),
+                    source_type.as_deref().map(str::to_ascii_lowercase),
+                ),
+                CatalogRelation::ForeignKey {
+                    from,
+                    to,
+                    constraint,
+                } => (
+                    self.ensure_object(profile, from, provenance),
+                    CatalogEdgeKind::ForeignKey,
+                    self.ensure_object(profile, to, provenance),
+                    Some(constraint.clone()),
+                ),
+                CatalogRelation::UsesStage { object, stage } => (
+                    self.ensure_object(profile, object, provenance),
+                    CatalogEdgeKind::UsesStage,
+                    self.ensure_named(profile, stage, CatalogNodeKind::Stage, provenance),
+                    None,
+                ),
+                CatalogRelation::UsesFileFormat {
+                    object,
+                    file_format,
+                } => (
+                    self.ensure_object(profile, object, provenance),
+                    CatalogEdgeKind::UsesFileFormat,
+                    self.ensure_named(
+                        profile,
+                        file_format,
+                        CatalogNodeKind::FileFormat,
+                        provenance,
+                    ),
+                    None,
+                ),
+            };
+            self.add_edge(edge(&source, kind, &target, detail, provenance));
+        }
+        for tag in &snapshot.tags {
+            let tag_node = tag_key(profile, &tag.tag);
+            self.ensure_node(node(
+                tag_node.clone(),
+                CatalogNodeKind::Tag,
+                format!("tag:{}", tag.tag.qualified()),
+                Some(tag.tag.qualified()),
+                provenance,
+            ));
+            let object = self.ensure_object(profile, &tag.object, provenance);
+            let tagged = match &tag.column {
+                Some(column) => {
+                    let key = column_key(
+                        profile,
+                        &tag.object.database,
+                        &tag.object.schema,
+                        &tag.object.name,
+                        column,
+                    );
+                    self.ensure_node(node(
+                        key.clone(),
+                        CatalogNodeKind::Column,
+                        format!("column:{column}"),
+                        Some(format!("{}.{column}", tag.object.qualified())),
+                        provenance,
+                    ));
+                    self.add_edge(edge(
+                        &object,
+                        CatalogEdgeKind::Contains,
+                        &key,
+                        None,
+                        provenance,
+                    ));
+                    key
+                }
+                None => object,
+            };
+            self.add_edge(edge(
+                &tagged,
+                CatalogEdgeKind::Tagged,
+                &tag_node,
+                tag.value.clone(),
+                provenance,
+            ));
+        }
+    }
+
+    /// The node for `object`, adding it (and its database/schema chain) when
+    /// the snapshot has no dataset for it.
+    fn ensure_object(
+        &mut self,
+        profile: &str,
+        object: &ObjectRef,
+        provenance: &Provenance,
+    ) -> NodeKey {
+        let key = object_key(profile, &object.database, &object.schema, &object.name);
+        if !self.nodes.contains_key(&key) {
+            let schema = self.ensure_schema(profile, object, provenance);
+            self.add_node(node(
+                key.clone(),
+                CatalogNodeKind::Object,
+                format!("object:{}", object.qualified()),
+                Some(object.qualified()),
+                provenance,
+            ));
+            self.add_edge(edge(
+                &schema,
+                CatalogEdgeKind::Contains,
+                &key,
+                None,
+                provenance,
+            ));
+        }
+        key
+    }
+
+    /// The node for a named stage or file format, contained by its schema.
+    fn ensure_named(
+        &mut self,
+        profile: &str,
+        named: &ObjectRef,
+        kind: CatalogNodeKind,
+        provenance: &Provenance,
+    ) -> NodeKey {
+        let schema = self.ensure_schema(profile, named, provenance);
+        let key = format!("{schema}/{}:{}", kind.as_str(), named.name);
+        if !self.nodes.contains_key(&key) {
+            self.add_node(node(
+                key.clone(),
+                kind,
+                format!("{}:{}", kind.as_str(), named.qualified()),
+                Some(named.qualified()),
+                provenance,
+            ));
+            self.add_edge(edge(
+                &schema,
+                CatalogEdgeKind::Contains,
+                &key,
+                None,
+                provenance,
+            ));
+        }
+        key
+    }
+
+    fn ensure_schema(
+        &mut self,
+        profile: &str,
+        object: &ObjectRef,
+        provenance: &Provenance,
+    ) -> NodeKey {
+        let profile_key = profile_key(profile);
+        let database_key = database_key(profile, &object.database);
+        let schema_key = schema_key(profile, &object.database, &object.schema);
+        self.ensure_node(node(
+            profile_key.clone(),
+            CatalogNodeKind::Profile,
+            format!("profile:{profile}"),
+            None,
+            provenance,
+        ));
+        self.ensure_node(node(
+            database_key.clone(),
+            CatalogNodeKind::Database,
+            format!("database:{}", object.database),
+            Some(object.database.clone()),
+            provenance,
+        ));
+        self.ensure_node(node(
+            schema_key.clone(),
+            CatalogNodeKind::Schema,
+            format!("schema:{}.{}", object.database, object.schema),
+            Some(format!("{}.{}", object.database, object.schema)),
+            provenance,
+        ));
+        self.add_edge(edge(
+            &profile_key,
+            CatalogEdgeKind::Contains,
+            &database_key,
+            None,
+            provenance,
+        ));
+        self.add_edge(edge(
+            &database_key,
+            CatalogEdgeKind::Contains,
+            &schema_key,
+            None,
+            provenance,
+        ));
+        schema_key
+    }
+
+    /// Insert `node` unless its key is already present.
+    fn ensure_node(&mut self, node: CatalogNode) {
+        if !self.nodes.contains_key(&node.key) {
+            self.add_node(node);
+        }
+    }
+
     fn add_dataset_field_column_node(
         &mut self,
         dataset: &DatasetManifest,
@@ -823,6 +1134,12 @@ pub fn dataset_key(dataset_id: &str) -> NodeKey {
     format!("dataset:{dataset_id}")
 }
 
+/// Stable tag node key.
+#[must_use]
+pub fn tag_key(profile: &str, tag: &ObjectRef) -> NodeKey {
+    format!("{}/tag:{}", profile_key(profile), tag.qualified())
+}
+
 fn node(
     key: NodeKey,
     kind: CatalogNodeKind,
@@ -965,6 +1282,7 @@ fn node_fill(kind: CatalogNodeKind) -> &'static str {
         CatalogNodeKind::Stage => "#ffedd5",
         CatalogNodeKind::FileFormat => "#ede9fe",
         CatalogNodeKind::Dataset => "#fee2e2",
+        CatalogNodeKind::Tag => "#ccfbf1",
     }
 }
 
@@ -972,16 +1290,17 @@ fn node_fill(kind: CatalogNodeKind) -> &'static str {
 pub mod prelude {
     pub use crate::{
         CatalogEdge, CatalogEdgeKind, CatalogGraph, CatalogNode, CatalogNodeKind,
-        FnxAlgorithmEvidence, RelatedNode, VERSION, column_key, database_key, dataset_key,
-        graph_from_snapshot, object_key, profile_key, schema_key,
+        FnxAlgorithmEvidence, LineageDirection, LineageStep, RelatedNode, VERSION, column_key,
+        database_key, dataset_key, graph_from_snapshot, object_key, profile_key, schema_key,
+        tag_key,
     };
 }
 
 #[cfg(test)]
 mod tests {
     use franken_snowflake_catalog::model::{
-        DataSourceClass, DatasetField, DtypeClass, ProvenanceSource, RightsClass, RoleConfidence,
-        SCHEMA_VERSION,
+        DataSourceClass, DatasetField, DtypeClass, FileFormatEntry, ProvenanceSource, RightsClass,
+        RoleConfidence, StageEntry, TagAssignment,
     };
 
     use super::*;
@@ -1064,12 +1383,162 @@ mod tests {
             })
             .collect::<Vec<_>>();
         CatalogSnapshot {
-            schema_version: SCHEMA_VERSION.to_owned(),
-            provenance,
             datasets: vec![dataset],
             columns,
-            operators: Vec::new(),
+            ..CatalogSnapshot::empty(provenance)
         }
+    }
+
+    fn analytics(name: &str) -> ObjectRef {
+        ObjectRef::new("ANALYTICS", "PUBLIC", name)
+    }
+
+    /// The fixture plus a relation pass: V_DAILY reads EVENTS_DAILY, whose
+    /// foreign key references ENTITIES (outside the datasets); EXT reads
+    /// stage RAW with format PARQUET_FMT; ENTITY_ID carries a PII tag.
+    fn related_snapshot() -> CatalogSnapshot {
+        let mut snapshot = fixture_snapshot();
+        snapshot.relations_discovered = true;
+        snapshot.relations = vec![
+            CatalogRelation::ViewDependsOn {
+                view: analytics("V_DAILY"),
+                source: analytics("EVENTS_DAILY"),
+                source_type: Some("TABLE".to_owned()),
+            },
+            CatalogRelation::ForeignKey {
+                from: analytics("EVENTS_DAILY"),
+                to: analytics("ENTITIES"),
+                constraint: "FK_EVENTS_ENTITY".to_owned(),
+            },
+            CatalogRelation::UsesStage {
+                object: analytics("EXT"),
+                stage: analytics("RAW"),
+            },
+            CatalogRelation::UsesFileFormat {
+                object: analytics("EXT"),
+                file_format: analytics("PARQUET_FMT"),
+            },
+        ];
+        snapshot.stages = vec![StageEntry {
+            stage: analytics("RAW"),
+            stage_type: Some("External Named".to_owned()),
+            url: Some("s3://bucket/raw/".to_owned()),
+            region: None,
+            comment: None,
+        }];
+        snapshot.file_formats = vec![FileFormatEntry {
+            file_format: analytics("PARQUET_FMT"),
+            format_type: Some("PARQUET".to_owned()),
+            comment: None,
+        }];
+        snapshot.tags = vec![TagAssignment {
+            tag: ObjectRef::new("GOV", "TAGS", "PII"),
+            value: Some("id".to_owned()),
+            object: analytics("EVENTS_DAILY"),
+            column: Some("ENTITY_ID".to_owned()),
+        }];
+        snapshot
+    }
+
+    #[test]
+    fn relations_become_typed_edges_and_lineage_follows_only_dependencies() {
+        let graph = CatalogGraph::from_snapshot(&related_snapshot());
+        let events = object_key("demo", "ANALYTICS", "PUBLIC", "EVENTS_DAILY");
+        let view = object_key("demo", "ANALYTICS", "PUBLIC", "V_DAILY");
+        let entities = object_key("demo", "ANALYTICS", "PUBLIC", "ENTITIES");
+        let ext = object_key("demo", "ANALYTICS", "PUBLIC", "EXT");
+        let schema = schema_key("demo", "ANALYTICS", "PUBLIC");
+        let stage = format!("{schema}/stage:RAW");
+        let format = format!("{schema}/file_format:PARQUET_FMT");
+        let tag = tag_key("demo", &ObjectRef::new("GOV", "TAGS", "PII"));
+        let has = |source: &str, kind, target: &str| {
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.source == source && edge.kind == kind && edge.target == target)
+        };
+        assert!(has(&view, CatalogEdgeKind::ViewDependsOn, &events));
+        assert!(has(&events, CatalogEdgeKind::ForeignKey, &entities));
+        assert!(has(&ext, CatalogEdgeKind::UsesStage, &stage));
+        assert!(has(&ext, CatalogEdgeKind::UsesFileFormat, &format));
+        assert!(has(&schema, CatalogEdgeKind::Contains, &stage));
+        assert!(has(
+            &column_key("demo", "ANALYTICS", "PUBLIC", "EVENTS_DAILY", "ENTITY_ID"),
+            CatalogEdgeKind::Tagged,
+            &tag
+        ));
+        // Objects outside the datasets still get proper nodes.
+        assert_eq!(
+            graph
+                .nodes
+                .get(&entities)
+                .and_then(|node| node.qualified_name.clone()),
+            Some("ANALYTICS.PUBLIC.ENTITIES".to_owned())
+        );
+
+        let upstream = graph.lineage(&view, LineageDirection::Upstream);
+        let reached: Vec<(&str, usize, CatalogEdgeKind)> = upstream
+            .iter()
+            .map(|step| (step.node.as_str(), step.depth, step.via))
+            .collect();
+        assert_eq!(
+            reached,
+            vec![
+                (events.as_str(), 1, CatalogEdgeKind::ViewDependsOn),
+                (entities.as_str(), 2, CatalogEdgeKind::ForeignKey),
+            ],
+            "containment (columns, schema) is not lineage"
+        );
+        let downstream: Vec<String> = graph
+            .lineage(&events, LineageDirection::Downstream)
+            .into_iter()
+            .map(|step| step.node)
+            .collect();
+        assert_eq!(downstream, vec![dataset_key("events_daily"), view.clone()]);
+        // A leaf has no upstream; an unknown node has no lineage at all.
+        assert!(
+            graph
+                .lineage(&entities, LineageDirection::Upstream)
+                .is_empty()
+        );
+        assert!(
+            graph
+                .lineage("nope", LineageDirection::Downstream)
+                .is_empty()
+        );
+        // The tag relates back to the column it is set on.
+        assert!(
+            graph
+                .what_relates_to(&tag, 1)
+                .iter()
+                .any(|related| related.node
+                    == column_key("demo", "ANALYTICS", "PUBLIC", "EVENTS_DAILY", "ENTITY_ID"))
+        );
+        assert_eq!(graph.cycles(), Vec::<Vec<String>>::new());
+        let mermaid = graph.to_mermaid();
+        assert!(mermaid.contains("-->|view_depends_on table|"), "{mermaid}");
+        assert!(
+            mermaid.contains("-->|foreign_key FK_EVENTS_ENTITY|"),
+            "{mermaid}"
+        );
+    }
+
+    #[test]
+    fn a_view_dependency_cycle_is_reported() {
+        let mut snapshot = related_snapshot();
+        snapshot.relations.push(CatalogRelation::ViewDependsOn {
+            view: analytics("EVENTS_DAILY"),
+            source: analytics("V_DAILY"),
+            source_type: Some("VIEW".to_owned()),
+        });
+        let graph = CatalogGraph::from_snapshot(&snapshot);
+        assert_eq!(
+            graph.cycles(),
+            vec![vec![
+                object_key("demo", "ANALYTICS", "PUBLIC", "EVENTS_DAILY"),
+                object_key("demo", "ANALYTICS", "PUBLIC", "V_DAILY"),
+            ]]
+        );
     }
 
     #[test]

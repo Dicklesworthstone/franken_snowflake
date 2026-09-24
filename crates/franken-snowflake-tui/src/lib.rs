@@ -1400,6 +1400,7 @@ mod tests {
                 },
             ],
             operators: Vec::new(),
+            ..CatalogSnapshot::empty(provenance.clone())
         }
     }
 

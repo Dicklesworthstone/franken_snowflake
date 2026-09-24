@@ -14,6 +14,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+toml = { version = "1.1", default-features = false, features = ["std", "serde", "parse"] }
 franken-snowflake-cache = { path = "../franken-snowflake-cache", version = "0.0.4" }
 franken-snowflake-core = { path = "../franken-snowflake-core", version = "0.0.4" }
 franken-snowflake-sqlapi = { path = "../franken-snowflake-sqlapi", version = "0.0.4" }
