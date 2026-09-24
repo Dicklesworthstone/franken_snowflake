@@ -196,6 +196,13 @@ implementation first and the test/hardening pass follows in a later wave. The
   statement runs cancels it through the driver, which sends the SQL API
   remote cancel, and the envelope reads `cancelled`; a second signal exits at
   once (130/143). Outside a statement the signals keep their default action.
+- **Streaming local exports.** `export run --format csv|jsonl` writes rows to
+  the file as each partition window arrives (peak memory is one window, not the
+  result) into a temporary file that replaces the target only on success; a
+  failed or refused export leaves no file. `--max-rows` (default 1000000,
+  `<PREFIX>_EXPORT_MAX_ROWS`) refuses a larger result with `FSNOW-3004` and
+  cancels the statement; parquet and frame exports stop fetching just past the
+  limit. The receipt's content address covers exactly the bytes written.
 - **`profile doctor --online` checks the role's grants.** It walks
   `SHOW GRANTS TO ROLE` from `CURRENT_ROLE()` through granted roles (up to 8,
   `partial` beyond) and reports write-capable privileges (INSERT, UPDATE,
