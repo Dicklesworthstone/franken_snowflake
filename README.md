@@ -17,8 +17,9 @@
 > **A clean-room Snowflake SQL API connector for Rust and coding agents.**
 > It authenticates with a programmatic access token, a key-pair JWT, or an OAuth
 > bearer token and submits SQL over the [SQL API](https://docs.snowflake.com/en/developer-guide/sql-api/index)
-> with no ODBC, no JDBC, and no Tokio. Reads return rows as Snowflake's jsonv2
-> wire strings alongside each column's declared type, plus catalog discovery and
+> with no ODBC, no JDBC, and no Tokio. Reads return typed rows (a DATE as
+> `"2020-01-01"`, an exact decimal string for NUMBER(38,2), parsed JSON for a
+> VARIANT; see [Result cells](#result-cells)), plus catalog discovery and
 > a containment graph (database > schema > object > column); `query write` runs
 > INSERT, MERGE, UPDATE, DELETE, and COPY INTO once a profile opts in. Results
 > come back as deterministic JSON or `toon`. It ships an agent-ergonomic CLI
@@ -485,11 +486,44 @@ fsnow dataset profile events_daily --json
 |---|---|
 | `fsnow query plan --profile <profile> --sql <sql> --json` | Validate and explain a read plan without submitting it |
 | `fsnow query plan --dataset <id> [--entity <v>] [--from <t>] [--to <t>] [--as-of <t>] [--select a,b] [--filter <json>] [--limit <n>] --json` | Dataset mode: compile pushed-down SQL with positional typed bindings, Time Travel `AT(TIMESTAMP => ...)` for `--as-of`, and an enforced limit, offline from the local snapshot |
-| `fsnow query run --profile <profile> --sql <sql> [--limit <rows>] [--role <r>] [--warehouse <w>] [--statement-timeout <s>] [--require-live] --json` | Submit a single read statement (SELECT / WITH / SHOW / DESCRIBE / EXPLAIN); every flag is honored or rejected, never silently ignored. Result partitions are fetched in a concurrent window and the fetch stops once `--limit` rows are assembled (`partitions_fetched` and a warning say so). `--require-live` hard-refuses with `FSNOW-3003` unless the envelope is backed by the live transport |
+| `fsnow query run --profile <profile> --sql <sql> [--limit <rows>] [--role <r>] [--warehouse <w>] [--statement-timeout <s>] [--require-live] [--raw-cells] --json` | Submit a single read statement (SELECT / WITH / SHOW / DESCRIBE / EXPLAIN); every flag is honored or rejected, never silently ignored. Rows are typed (`row_encoding: typed.v1`, see [Result cells](#result-cells)); `--raw-cells` returns the SQL API jsonv2 wire strings instead. Result partitions are fetched in a concurrent window and the fetch stops once `--limit` rows are assembled (`partitions_fetched` and a warning say so). `--require-live` hard-refuses with `FSNOW-3003` unless the envelope is backed by the live transport |
 | `fsnow query run --dataset <id> ... --json` | Dataset mode: plan as above, then execute live with the same bindings |
 | `fsnow query write --profile <profile> --sql <sql> [--dry-run \| --confirm <token>] --json` | Execute a mutation; direct once `WRITE_ENABLED` is set, with `--dry-run` as an optional preview (see [Writes](#writes)) |
 | `fsnow query --sql <sql> --profile <profile> --json` | Shorthand that maps to `query run` |
 | `fsnow query cancel <statement-handle> --profile <profile> --json` | POST to the SQL API cancel endpoint for a statement handle with the profile's credentials (live feature) |
+
+### Result cells
+
+`query run` (raw SQL and dataset mode), the MCP `query_run` tool and the
+`query write` result carry `row_encoding: "typed.v1"`. Each column in
+`data.columns` has its `type`, `precision`, `scale`, `nullable` and a
+`json_repr` that holds for every cell of the column:
+
+| Snowflake type | `json_repr` | Cell |
+|---|---|---|
+| NUMBER/FIXED, scale 0, precision up to 15 | `integer` | JSON number |
+| other NUMBER/FIXED, DECFLOAT | `decimal_string` | exact decimal string (never a float) |
+| FLOAT/REAL | `float` | JSON number; `"NaN"`, `"Infinity"`, `"-Infinity"` |
+| BOOLEAN | `bool` | `true` / `false` |
+| TEXT | `string` | string |
+| BINARY | `hex` | hex string |
+| DATE | `date` | `"2020-01-01"` |
+| TIME | `time` | `"23:01:59.000000000"` |
+| TIMESTAMP_NTZ | `timestamp_ntz` | `"2021-01-28T22:09:37.123456789"` (no offset) |
+| TIMESTAMP_LTZ | `timestamp_utc` | `"2021-01-28T22:09:37.123456789Z"` |
+| TIMESTAMP_TZ | `timestamp_offset` | `"2021-03-19T18:06:59.000000000+01:00"` |
+| VARIANT, OBJECT, ARRAY | `json` | the parsed JSON value |
+| anything else (GEOGRAPHY, ...) | `wire` | the SQL API string |
+
+SQL NULL is `null`. A column with a cell that does not follow its type's wire
+convention (or a VARIANT holding a number a JSON number cannot carry exactly,
+such as an integer beyond 64 bits) keeps the wire strings for all of its cells,
+`json_repr: "wire"`, and a warning names the column. `--raw-cells` returns
+every cell as the SQL API sent it (`row_encoding: "jsonv2.wire"`). The
+conventions follow the SQL API documentation; a live capture has not confirmed
+them yet. Local CSV and JSONL exports write DATE, TIME and TIMESTAMP cells in
+the same text forms; other cells keep their wire text (JSONL writes numbers and
+booleans as JSON literals and VARIANT verbatim).
 
 `query plan` runs offline: it validates the statement, refuses multiple
 statements and mutating statements (UPDATE / DELETE / INSERT / MERGE / DDL), and
@@ -675,6 +709,7 @@ normalized to `_`, then prefixed with `FRANKEN_SNOWFLAKE_`. The profile
 | `<PREFIX>_STATEMENT_TIMEOUT_SECONDS` | Optional SQL API statement timeout in seconds (default 60; `--statement-timeout` overrides per run) |
 | `<PREFIX>_PARTITION_CONCURRENCY` | Optional partition fetch window, 1-16 (default 4): how many result partitions are downloaded at once; assembly stays in order |
 | `<PREFIX>_QUERY_TAG` | Optional. Unset: every live statement carries `QUERY_TAG = fsnow:<command_id>:<request_id>`, so Snowflake's query history ties back to the envelope and its receipt; a value fixes the tag for the profile; `off` sends none. `--query-tag` overrides it per run |
+| `<PREFIX>_CA_BUNDLE` | Optional path to a PEM CA bundle, for a proxy that re-signs TLS traffic: the server certificate must chain to this bundle instead of the OS trust store. An unreadable bundle, or one without a certificate, is `FSNOW-2002`, never a fallback to the OS store. Connections on this path are not pooled |
 | `<PREFIX>_WRITE_ENABLED` | Set to `true` to enable data writes (DML, COPY INTO) for the profile; a bare `query write` then executes directly |
 | `<PREFIX>_WRITE_REQUIRE_CONFIRM` | Set to `true` to require the dry-run to confirm ceremony on every write (cautious opt-in); a bare `query write` refuses until you `--dry-run`, then `--confirm <token>` |
 | `<PREFIX>_WRITE_ALLOW_DDL` | Set to `true` to additionally allow DDL (CREATE/ALTER/DROP/TRUNCATE/GRANT/REVOKE) through `query write` |

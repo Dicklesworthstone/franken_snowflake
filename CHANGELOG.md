@@ -196,6 +196,32 @@ implementation first and the test/hardening pass follows in a later wave. The
   statement runs cancels it through the driver, which sends the SQL API
   remote cancel, and the envelope reads `cancelled`; a second signal exits at
   once (130/143). Outside a statement the signals keep their default action.
+- **Typed query results (`typed.v1`), output contract `fsnow.query.run.v2`.**
+  `query run`, dataset mode, MCP `query_run` and the `query write` result decode
+  each cell by its column's `rowType`: DATE `"YYYY-MM-DD"`, TIME/TIMESTAMP
+  RFC 3339-style strings (TIMESTAMP_TZ with its own offset), exact decimal
+  strings for NUMBER beyond 15 digits or with a scale, JSON numbers for small
+  integers and FLOAT, booleans, and parsed VARIANT/OBJECT/ARRAY JSON.
+  `columns[]` gains `precision`, `scale` and `json_repr`; `data.row_encoding`
+  names the encoding; `--raw-cells` (MCP `raw_cells`) keeps the wire strings.
+  A column that does not decode keeps its wire strings with a warning. The
+  codec is `franken_snowflake_core::typed`. Local CSV/JSONL exports write
+  DATE/TIME/TIMESTAMP cells in the same text forms (a malformed one is a typed
+  error naming the column); other export cells are unchanged.
+- **Socket-level e2e (`tests/socket_e2e.rs`).** The real binary, through the
+  real Asupersync HTTP/1.1 and TLS client, against a loopback mock SQL API over
+  a real TLS listener with a CA minted per run: 202, then poll, then 200 with a
+  gzip and an identity partition; a 429 resubmitted with the same `requestId`;
+  a typed 422; `query cancel`; SIGINT cancelling an in-flight statement
+  server-side; and three refusals that reach no request (a certificate outside
+  the CA bundle, a missing bundle, a loopback endpoint without the opt-in). A
+  canary PAT is scanned across stdout, stderr and the store. The loopback
+  endpoint needs the test-only `testkit-endpoint` feature and
+  `FRANKEN_SNOWFLAKE_TESTKIT_ENDPOINT=1`.
+- **`<PREFIX>_CA_BUNDLE`.** Verify Snowflake against a PEM CA bundle instead of
+  the OS trust store, for proxies that re-sign TLS traffic
+  (`TlsRootPolicy::ExplicitPemBundle` was declared but unused). An unusable
+  bundle is `FSNOW-2002`, never a fallback.
 - **Default `QUERY_TAG`.** Every live statement carries
   `fsnow:<command_id>:<request_id>` (profile-configurable with
   `<PREFIX>_QUERY_TAG`, `off` to disable), and receipts record the tag, so a

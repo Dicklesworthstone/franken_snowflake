@@ -32,6 +32,10 @@ scripts/check-asupersync-single-version.sh
 python3 scripts/check-golden-lf.py
 cargo test --workspace --locked
 cargo test --locked -p franken-snowflake-cli --features live,mcp
+# Socket e2e: the real binary over real TLS to a loopback mock SQL API
+# (tests/socket_e2e.rs). `testkit-endpoint` is test-only: a release artifact
+# must report `capabilities` `feature_flags.testkit=false`.
+cargo test --locked -p franken-snowflake-cli --features live,mcp,testkit-endpoint
 cargo test --locked -p franken-snowflake-cli --features tui
 cargo test --locked -p franken-snowflake-cli --features frankenpandas
 cargo test --locked -p franken-snowflake-cli --features frankensearch

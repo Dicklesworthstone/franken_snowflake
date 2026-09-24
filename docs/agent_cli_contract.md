@@ -159,7 +159,11 @@ profile sets `<PREFIX>_WRITE_ENABLED=true`, and DDL additionally needs
 and returns an execution receipt; `--dry-run` previews it and returns a
 confirmation token bound to (profile, SQL), and `<PREFIX>_WRITE_REQUIRE_CONFIRM=true`
 makes that dry-run/confirm ceremony mandatory (see
-`docs/write_intent_ladder.md`). `query run` accepts only single read statements,
+`docs/write_intent_ladder.md`). Result rows are `typed.v1` by default: every
+column in `data.columns` carries a `json_repr` that holds for all of its cells
+(the mapping is in the README, "Result cells", and in
+`franken_snowflake_core::typed`); `--raw-cells` returns the jsonv2 wire strings
+with `data.row_encoding = "jsonv2.wire"`. `query run` accepts only single read statements,
 with `MULTI_STATEMENT_COUNT=1` pinned on every submit. Capability rows are not
 wired, so read-only is enforced by the SQL guard and the write gate, not by the
 type system.
