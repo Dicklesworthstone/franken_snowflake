@@ -68,6 +68,7 @@ mod fastmcp_surface {
         QueryRun,
         QueryCancel,
         ReceiptShow,
+        ReceiptRefetch,
         ExportPlan,
         ExportRun,
     }
@@ -91,6 +92,7 @@ mod fastmcp_surface {
         ReadVerb::QueryRun,
         ReadVerb::QueryCancel,
         ReadVerb::ReceiptShow,
+        ReadVerb::ReceiptRefetch,
         ReadVerb::ExportPlan,
         ReadVerb::ExportRun,
     ];
@@ -370,6 +372,31 @@ mod fastmcp_surface {
                     )],
                     tags: &["receipt", "offline"],
                 },
+                Self::ReceiptRefetch => ToolSpec {
+                    name: "receipt_refetch",
+                    description: "Re-read a completed statement's rows from Snowflake's result cache (RESULT_SCAN on the receipt's query id, about 24 h) without running it again.",
+                    open_world_hint: "snowflake",
+                    read_only: true,
+                    params: vec![
+                        ParamSpec::string(
+                            "receipt_hash",
+                            "Receipt hash of a completed live statement.",
+                            true,
+                        ),
+                        ParamSpec::string(
+                            "profile",
+                            "Profile whose credentials run RESULT_SCAN (defaults to the receipt's).",
+                            false,
+                        ),
+                        ParamSpec::string("limit", "Rows to emit in the envelope.", false),
+                        ParamSpec::boolean(
+                            "raw_cells",
+                            "Set true for the SQL API jsonv2 wire strings instead of typed.v1 cells.",
+                            false,
+                        ),
+                    ],
+                    tags: &["receipt", "snowflake"],
+                },
                 Self::ExportPlan => ToolSpec {
                     name: "export_plan",
                     description: "Build a content-addressed COPY INTO <stage> plan (Snowflake-side unload) and the exact `query write` command that executes it; nothing runs.",
@@ -527,6 +554,24 @@ mod fastmcp_surface {
                     &["receipt", "show"],
                     vec![required_string(arguments, "receipt_hash")?],
                 )),
+                Self::ReceiptRefetch => {
+                    let mut args = vec![
+                        "receipt".to_string(),
+                        "refetch".to_string(),
+                        required_string(arguments, "receipt_hash")?,
+                    ];
+                    for (key, flag) in [("profile", "--profile"), ("limit", "--limit")] {
+                        if let Some(value) = optional_string(arguments, key)? {
+                            args.push(flag.to_string());
+                            args.push(value);
+                        }
+                    }
+                    if optional_bool(arguments, "raw_cells")?.unwrap_or(false) {
+                        args.push("--raw-cells".to_string());
+                    }
+                    args.push("--json".to_string());
+                    Ok(args)
+                }
                 Self::ExportPlan => export_args("plan", arguments),
                 Self::ExportRun => export_args("run", arguments),
             }

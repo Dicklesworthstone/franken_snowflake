@@ -114,7 +114,7 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(tools.len(), 20, "{names:?}");
+    assert_eq!(tools.len(), 21, "{names:?}");
     for expected in [
         "capabilities",
         "onboard",

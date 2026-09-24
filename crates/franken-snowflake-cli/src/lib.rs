@@ -132,6 +132,12 @@ enum Command {
         profile: Option<String>,
         statement_handle: String,
     },
+    ReceiptRefetch {
+        receipt_hash: String,
+        profile: Option<String>,
+        limit: Option<String>,
+        raw_cells: bool,
+    },
     ReceiptShow {
         receipt_hash: String,
     },
@@ -503,6 +509,16 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         provider_network: false,
         mutates_local_state: false,
         sensitive_output: false,
+    },
+    CommandSpec {
+        id: "receipt.refetch",
+        invocation: "franken-snowflake receipt refetch <receipt-hash> [--profile <profile>] [--limit <rows>] [--raw-cells] --json",
+        output_contract_id: "fsnow.receipt.refetch.v1",
+        description: "Re-read a completed statement's rows from Snowflake's result cache (RESULT_SCAN on the receipt's query id, kept about 24 h) without running it again.",
+        read_only: true,
+        provider_network: true,
+        mutates_local_state: false,
+        sensitive_output: true,
     },
     CommandSpec {
         id: "export.plan",
@@ -1034,6 +1050,24 @@ fn parse_query(args: &[String], output: OutputFormat) -> Result<Command, Outcome
 }
 
 fn parse_receipt(args: &[String], output: OutputFormat) -> Result<Command, Outcome> {
+    if args.get(1).map(String::as_str) == Some("refetch") {
+        return match args.get(2).filter(|value| !value.starts_with('-')) {
+            Some(receipt_hash) => Ok(Command::ReceiptRefetch {
+                receipt_hash: receipt_hash.clone(),
+                profile: value_after(args, "--profile"),
+                limit: value_after(args, "--limit"),
+                raw_cells: has_flag(args, "--raw-cells"),
+            }),
+            None => Err(usage_error(
+                output,
+                "receipt.refetch",
+                "fsnow.receipt.refetch.v1",
+                "Missing receipt hash for `receipt refetch`.",
+                vec!["franken-snowflake receipt refetch <receipt-hash> --json".to_string()],
+                vec![],
+            )),
+        };
+    }
     if args.get(1).map(String::as_str) != Some("show") {
         return Err(usage_error(
             output,
@@ -1042,7 +1076,7 @@ fn parse_receipt(args: &[String], output: OutputFormat) -> Result<Command, Outco
             "Expected `franken-snowflake receipt show <receipt-hash> --json`.",
             vec!["franken-snowflake receipt show <receipt-hash> --json".to_string()],
             match args.get(1) {
-                Some(value) => did_you_mean(value, &["show"]),
+                Some(value) => did_you_mean(value, &["show", "refetch"]),
                 None => vec![],
             },
         ));
@@ -1439,6 +1473,19 @@ fn dispatch(invocation: Invocation) -> Outcome {
         Command::ReceiptShow { receipt_hash } => {
             catalog_surface::receipt_show_outcome(invocation.output, request_id, receipt_hash)
         }
+        Command::ReceiptRefetch {
+            receipt_hash,
+            profile,
+            limit,
+            raw_cells,
+        } => receipt_refetch_dispatch(
+            invocation.output,
+            request_id,
+            receipt_hash,
+            profile,
+            limit,
+            raw_cells,
+        ),
         Command::ExportPlan { spec } => {
             catalog_surface::export_plan_outcome(invocation.output, request_id, spec)
         }
@@ -2522,6 +2569,33 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
                 "string",
                 true,
                 "positional: BLAKE3 receipt hash from an envelope",
+            ),
+            OUTPUT_INPUT,
+        ],
+        "receipt.refetch" => vec![
+            input(
+                "receipt_hash",
+                "string",
+                true,
+                "positional: BLAKE3 receipt hash of a completed live statement",
+            ),
+            input(
+                "profile",
+                "string",
+                false,
+                "Profile whose credentials run RESULT_SCAN (--profile; default: the receipt's)",
+            ),
+            input(
+                "limit",
+                "integer",
+                false,
+                "Rows to emit in the envelope, 1..=100000 (--limit; default 1000)",
+            ),
+            input(
+                "raw_cells",
+                "boolean",
+                false,
+                "Emit the SQL API jsonv2 wire strings instead of typed.v1 cells (--raw-cells)",
             ),
             OUTPUT_INPUT,
         ],
@@ -4600,6 +4674,56 @@ fn query_cancel_dispatch(
     live::run_query_cancel_outcome(format, request_id, profile, statement_handle)
 }
 
+/// Live build: re-read a receipt's rows with RESULT_SCAN (reality-check bead L5).
+#[cfg(feature = "live")]
+fn receipt_refetch_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    receipt_hash: String,
+    profile: Option<String>,
+    limit: Option<String>,
+    raw_cells: bool,
+) -> Outcome {
+    live::run_receipt_refetch_outcome(
+        format,
+        request_id,
+        receipt_hash,
+        profile,
+        limit.as_deref(),
+        raw_cells,
+    )
+}
+
+/// Default (no-account) build: RESULT_SCAN needs the live transport.
+#[cfg(not(feature = "live"))]
+fn receipt_refetch_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    receipt_hash: String,
+    profile: Option<String>,
+    _limit: Option<String>,
+    _raw_cells: bool,
+) -> Outcome {
+    live_transport_required_with_data(
+        format,
+        "receipt.refetch",
+        "fsnow.receipt.refetch.v1",
+        request_id,
+        profile,
+        json_object(vec![
+            ("receipt_hash", json_string(receipt_hash)),
+            (
+                "requires",
+                json_array(vec![
+                    json_string("live SQL API transport (build with --features live)"),
+                    json_string("profile credential handles"),
+                ]),
+            ),
+        ]),
+        vec!["franken-snowflake receipt show <receipt-hash> --json".to_string()],
+    )
+}
+
 /// Default (no-account) build: no transport to reach the cancel endpoint.
 #[cfg(not(feature = "live"))]
 fn query_cancel_dispatch(
@@ -5020,6 +5144,7 @@ fn command_id(command: &Command) -> Option<&'static str> {
         Command::QueryWrite { .. } => "query.write",
         Command::QueryCancel { .. } => "query.cancel",
         Command::ReceiptShow { .. } => "receipt.show",
+        Command::ReceiptRefetch { .. } => "receipt.refetch",
         Command::ExportPlan { .. } => "export.plan",
         Command::ExportRun { .. } => "export.run",
         Command::Tui { .. } => "tui",

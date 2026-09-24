@@ -36,7 +36,7 @@ use franken_snowflake_auth::{
 };
 use franken_snowflake_cache::{
     CacheBackend, CatalogSnapshotRecord, ContentAddress as CacheAddress, ExportKind, ExportRecord,
-    VerifiedPayload,
+    QueryReceiptRecord, VerifiedPayload,
 };
 use franken_snowflake_catalog::discovery::{
     CatalogDiscoveryInput, CatalogDiscoveryTables, DiscoveryStatementKind,
@@ -246,6 +246,180 @@ pub fn run_query_outcome(
             &conn,
             &request_id,
             sql,
+            &error,
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// receipt refetch (reality-check bead L5)
+// ---------------------------------------------------------------------------
+
+/// How long Snowflake keeps a query's result for `RESULT_SCAN` ("persisted
+/// query results" are kept 24 hours; docs.snowflake.com/en/user-guide/querying-persisted-results,
+/// consulted 2026-09-24).
+const RESULT_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Whether `id` has the shape of a Snowflake query id (a UUID, 8-4-4-4-12 hex).
+fn is_query_id(id: &str) -> bool {
+    let parts: Vec<&str> = id.split('-').collect();
+    parts.len() == 5
+        && parts.iter().zip([8, 4, 4, 4, 12]).all(|(part, len)| {
+            part.len() == len && part.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+/// The query id a receipt's rows can be re-read with, or the typed reason not.
+fn refetch_query_id(record: &QueryReceiptRecord, now_ms: u64) -> Result<String, SnowflakeError> {
+    if !record.is_successful_result_scan_candidate() {
+        return Err(SnowflakeError::new(
+            SnowflakeErrorCode::MetadataError,
+            format!(
+                "receipt `{}` ({}, receipt_state {}) has no completed result to refetch",
+                record.receipt_id, record.command_id, record.receipt_state
+            ),
+        ));
+    }
+    let query_id = record.snowflake_query_id.clone().unwrap_or_default();
+    if !is_query_id(&query_id) {
+        return Err(SnowflakeError::new(
+            SnowflakeErrorCode::MetadataError,
+            format!(
+                "receipt `{}` records a query id that is not a Snowflake query id; refusing to build RESULT_SCAN",
+                record.receipt_id
+            ),
+        ));
+    }
+    let age_ms = now_ms.saturating_sub(record.created_at_ms);
+    if age_ms > RESULT_RETENTION_MS {
+        return Err(SnowflakeError::new(
+            SnowflakeErrorCode::CacheError,
+            format!(
+                "receipt `{}` is {} h old; Snowflake keeps a query's result for RESULT_SCAN about 24 h, so it has likely expired; run the statement again",
+                record.receipt_id,
+                age_ms / 3_600_000
+            ),
+        ));
+    }
+    Ok(query_id)
+}
+
+/// Re-read a completed statement's rows from Snowflake's result cache with
+/// `RESULT_SCAN` on the query id its receipt recorded, without running the
+/// statement again. The refetch itself gets a receipt.
+pub fn run_receipt_refetch_outcome(
+    format: OutputFormat,
+    request_id: String,
+    receipt_hash: String,
+    profile_override: Option<String>,
+    limit: Option<&str>,
+    raw_cells: bool,
+) -> crate::Outcome {
+    let fail = |error: &SnowflakeError, profile: String| {
+        failure_outcome(
+            format,
+            "receipt.refetch",
+            "fsnow.receipt.refetch.v1",
+            request_id.clone(),
+            profile,
+            error,
+        )
+    };
+    let receipt_id = receipt_hash
+        .trim()
+        .strip_prefix("blake3:")
+        .unwrap_or(receipt_hash.trim())
+        .to_ascii_lowercase();
+    let fallback_profile = profile_override.clone().unwrap_or_default();
+    let store = match local_store::open_store() {
+        Ok(store) => store,
+        Err(error) => {
+            return fail(
+                &SnowflakeError::new(SnowflakeErrorCode::CacheError, error.message()),
+                fallback_profile,
+            );
+        }
+    };
+    let record = match store.cache.query_receipt(&receipt_id) {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return fail(
+                &SnowflakeError::new(
+                    SnowflakeErrorCode::MetadataError,
+                    format!(
+                        "receipt `{receipt_id}` is not in the local store at {}",
+                        store.dir.display()
+                    ),
+                ),
+                fallback_profile,
+            );
+        }
+        Err(error) => {
+            return fail(
+                &SnowflakeError::new(SnowflakeErrorCode::CacheError, error.to_string()),
+                fallback_profile,
+            );
+        }
+    };
+    let profile = profile_override.unwrap_or_else(|| record.profile_id.clone());
+    let query_id = match refetch_query_id(&record, local_store::now_unix_ms()) {
+        Ok(query_id) => query_id,
+        Err(error) => return fail(&error, profile),
+    };
+    let emit_cap = match parse_limit(limit) {
+        Ok(cap) => cap,
+        Err(error) => return fail(&error, profile),
+    };
+    let conn = match LiveConn::resolve(&profile, &SessionOverrides::default()) {
+        Ok(conn) => conn.tagged("receipt.refetch", &request_id),
+        Err(error) => return fail(&error, profile),
+    };
+    // The id was checked to be UUID-shaped above, so it is inlined as a
+    // literal: RESULT_SCAN takes a string, and a bind variable in that
+    // position is not confirmed for the SQL API.
+    let sql = format!("SELECT * FROM TABLE(RESULT_SCAN('{query_id}'))");
+    let request_options = QueryRequestOptions {
+        row_cap: Some(emit_cap),
+        ..QueryRequestOptions::default()
+    };
+    match execute(&conn, &sql, request_options) {
+        Ok(rows) => {
+            let (receipt_hash, warnings) = record_receipt(
+                "receipt.refetch",
+                &conn,
+                &request_id,
+                &sql,
+                &rows,
+                "statement_executed",
+                serde_json::json!({
+                    "source_receipt_id": record.receipt_id,
+                    "source_query_id": query_id,
+                }),
+            );
+            rows_success(
+                format,
+                request_id,
+                profile,
+                "receipt.refetch",
+                "fsnow.receipt.refetch.v1",
+                vec![
+                    ("source_receipt_id", json_string(record.receipt_id.clone())),
+                    ("source_query_id", json_string(query_id)),
+                ],
+                &rows,
+                emit_cap,
+                RowEncoding::from_raw_cells(raw_cells),
+                receipt_hash.clone(),
+                warnings,
+                vec![receipt_show_command(receipt_hash.as_deref())],
+            )
+        }
+        Err(error) => with_terminal_receipt(
+            fail(&error, profile),
+            "receipt.refetch",
+            &conn,
+            &request_id,
+            &sql,
             &error,
         ),
     }
@@ -1598,6 +1772,27 @@ pub fn profile_doctor_online_outcome(
             );
             let (credential, mut lifetime_warnings) = online_credential_lifetime(&conn);
             warnings.append(&mut lifetime_warnings);
+            let prefix = crate::profile_env_prefix(&profile);
+            let flag = |key: &str| {
+                env_value(&format!("{prefix}_{key}"))
+                    .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+            };
+            let (role_privileges, mut role_warnings, refusal) = role_verdict(
+                &role_write_check(&conn),
+                !flag("WRITE_ENABLED"),
+                flag("READ_ONLY_EXPECTED"),
+            );
+            if let Some(error) = refusal {
+                return failure_outcome(
+                    format,
+                    "profile.doctor",
+                    "fsnow.profile.doctor.v1",
+                    request_id,
+                    profile,
+                    &error,
+                );
+            }
+            warnings.append(&mut role_warnings);
             probe_success(
                 format,
                 request_id,
@@ -1607,6 +1802,7 @@ pub fn profile_doctor_online_outcome(
                 receipt_hash,
                 warnings,
                 credential,
+                role_privileges,
             )
         }
         Err(error) => with_terminal_receipt(
@@ -1667,6 +1863,213 @@ fn online_credential_lifetime(conn: &LiveConn) -> (Json, Vec<Json>) {
         }
     }
     (json_object(fields), warnings)
+}
+
+/// How many roles the grant walk visits before it reports `partial`.
+const ROLE_WALK_LIMIT: usize = 8;
+
+/// What `SHOW GRANTS TO ROLE` says the profile's role (and the roles granted to
+/// it) may do.
+#[derive(Debug, Default)]
+struct RoleCheck {
+    role: Option<String>,
+    /// Write-capable grants, e.g. `INSERT on TABLE DB.S.T (via LOADER)`.
+    write_grants: Vec<String>,
+    roles_checked: Vec<String>,
+    /// The walk stopped at [`ROLE_WALK_LIMIT`] with roles left unvisited.
+    partial: bool,
+    /// Why the check could not run (the role may not see its own grants).
+    error: Option<String>,
+}
+
+/// Privileges that let a role change data or objects.
+fn is_write_capable_privilege(privilege: &str) -> bool {
+    let privilege = privilege.trim().to_ascii_uppercase();
+    matches!(
+        privilege.as_str(),
+        "INSERT"
+            | "UPDATE"
+            | "DELETE"
+            | "TRUNCATE"
+            | "OWNERSHIP"
+            | "ALL"
+            | "ALL PRIVILEGES"
+            | "EXECUTE TASK"
+    ) || privilege.starts_with("CREATE ")
+        || privilege.starts_with("APPLY ")
+}
+
+/// A role name as a quoted identifier (SHOW takes no bind variables).
+fn quoted_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Walk `SHOW GRANTS TO ROLE` from `CURRENT_ROLE()` through the roles granted
+/// to it (reality-check bead oj0.25; the enforceable read-only guard is
+/// Snowflake's RBAC, not the client-side SQL classifier). Columns per
+/// docs.snowflake.com/en/sql-reference/sql/show-grants (consulted 2026-09-24):
+/// privilege, granted_on, name.
+fn role_write_check(conn: &LiveConn) -> RoleCheck {
+    let mut check = RoleCheck::default();
+    let current = match execute(
+        conn,
+        "SELECT CURRENT_ROLE()",
+        QueryRequestOptions::default(),
+    ) {
+        Ok(rows) => rows
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .cloned()
+            .flatten(),
+        Err(error) => {
+            check.error = Some(format!("CURRENT_ROLE() failed ({})", error.stable_code()));
+            return check;
+        }
+    };
+    let Some(current) = current else {
+        check.error = Some("the session has no current role".to_owned());
+        return check;
+    };
+    check.role = Some(current.clone());
+    let mut pending = vec![current];
+    while let Some(role) = pending.pop() {
+        if check.roles_checked.contains(&role) {
+            continue;
+        }
+        if check.roles_checked.len() >= ROLE_WALK_LIMIT {
+            check.partial = true;
+            break;
+        }
+        let sql = format!("SHOW GRANTS TO ROLE {}", quoted_identifier(&role));
+        let rows = match execute(conn, &sql, QueryRequestOptions::default()) {
+            Ok(rows) => rows,
+            Err(error) => {
+                check.error = Some(format!(
+                    "SHOW GRANTS TO ROLE {role} failed ({})",
+                    error.stable_code()
+                ));
+                return check;
+            }
+        };
+        let column = |name: &str| {
+            rows.columns
+                .iter()
+                .position(|column| column.name.eq_ignore_ascii_case(name))
+        };
+        let (Some(privilege_at), Some(granted_on_at), Some(name_at)) =
+            (column("privilege"), column("granted_on"), column("name"))
+        else {
+            check.error = Some("unrecognized SHOW GRANTS columns".to_owned());
+            return check;
+        };
+        let via = if check.roles_checked.is_empty() {
+            String::new()
+        } else {
+            format!(" (via {role})")
+        };
+        for row in &rows.rows {
+            let cell = |at: usize| row.get(at).cloned().flatten().unwrap_or_default();
+            let (privilege, granted_on, name) =
+                (cell(privilege_at), cell(granted_on_at), cell(name_at));
+            if granted_on.eq_ignore_ascii_case("ROLE") && privilege.eq_ignore_ascii_case("USAGE") {
+                pending.push(name);
+            } else if is_write_capable_privilege(&privilege) {
+                check
+                    .write_grants
+                    .push(format!("{privilege} on {granted_on} {name}{via}"));
+            }
+        }
+        check.roles_checked.push(role);
+    }
+    check
+}
+
+/// The doctor's reading of a [`RoleCheck`]: the `role_privileges` field, the
+/// warnings, and a refusal when the profile expects a read-only role
+/// (`<PREFIX>_READ_ONLY_EXPECTED=true`) but the role can write or the check
+/// could not prove otherwise.
+fn role_verdict(
+    check: &RoleCheck,
+    read_profile: bool,
+    read_only_expected: bool,
+) -> (Json, Vec<Json>, Option<SnowflakeError>) {
+    let write_capable = if check.write_grants.is_empty() {
+        if check.error.is_some() || check.partial {
+            Json::Null
+        } else {
+            Json::Bool(false)
+        }
+    } else {
+        Json::Bool(true)
+    };
+    let data = json_object(vec![
+        ("role", option_json(check.role.clone())),
+        ("write_capable", write_capable),
+        (
+            "write_grants",
+            json_array(
+                check
+                    .write_grants
+                    .iter()
+                    .take(10)
+                    .map(|grant| json_string(grant.clone()))
+                    .collect(),
+            ),
+        ),
+        (
+            "roles_checked",
+            json_array(
+                check
+                    .roles_checked
+                    .iter()
+                    .map(|role| json_string(role.clone()))
+                    .collect(),
+            ),
+        ),
+        ("partial", Json::Bool(check.partial)),
+        ("note", option_json(check.error.clone())),
+    ]);
+    let role = check.role.clone().unwrap_or_else(|| "?".to_owned());
+    let mut warnings = Vec::new();
+    let mut problem = None;
+    if !check.write_grants.is_empty() && (read_profile || read_only_expected) {
+        let shown: Vec<&str> = check
+            .write_grants
+            .iter()
+            .take(3)
+            .map(String::as_str)
+            .collect();
+        problem = Some(format!(
+            "this read profile's role `{role}` can mutate data ({}{}); give read profiles a read-only role",
+            shown.join(", "),
+            if check.write_grants.len() > 3 {
+                ", ..."
+            } else {
+                ""
+            }
+        ));
+    } else if read_only_expected && (check.error.is_some() || check.partial) {
+        problem = Some(format!(
+            "READ_ONLY_EXPECTED is set but the grants of role `{role}` could not be fully checked ({})",
+            check
+                .error
+                .clone()
+                .unwrap_or_else(|| format!("more than {ROLE_WALK_LIMIT} roles"))
+        ));
+    }
+    let refusal = match problem {
+        Some(message) if read_only_expected => Some(SnowflakeError::new(
+            SnowflakeErrorCode::ProfileInvalid,
+            message,
+        )),
+        Some(message) => {
+            warnings.push(json_string(message));
+            None
+        }
+        None => None,
+    };
+    (data, warnings, refusal)
 }
 
 /// Remaining lifetime of a resolved credential, with a warning when it is
@@ -1765,6 +2168,7 @@ fn probe_success(
     receipt_hash: Option<String>,
     warnings: Vec<Json>,
     credential_lifetime: Json,
+    role_privileges: Json,
 ) -> crate::Outcome {
     let data = json_object(vec![
         ("profile_id", json_string(profile.clone())),
@@ -1774,6 +2178,7 @@ fn probe_success(
         // The probe authenticates, so the credential was read (never emitted).
         ("secret_values_read", Json::Bool(true)),
         ("credential_lifetime", credential_lifetime),
+        ("role_privileges", role_privileges),
         (
             "snowflake_version",
             match version {
@@ -4495,6 +4900,170 @@ mod tests {
         let warning = crate::render_json(&degraded.warnings[0]);
         assert!(warning.contains("EVENT_DATE"), "{warning}");
         assert!(!warning.contains("not-a-day-count"), "{warning}");
+    }
+
+    /// Reality-check bead L5: only a completed receipt with a UUID-shaped
+    /// query id inside the ~24 h result retention can be refetched.
+    #[test]
+    fn refetch_needs_a_fresh_completed_receipt_with_a_query_id() {
+        let record =
+            |outcome: &str, query_id: Option<&str>, created_at_ms: u64| QueryReceiptRecord {
+                receipt_id: "r1".to_owned(),
+                plan_id: "p".to_owned(),
+                profile_id: "demo".to_owned(),
+                command_id: "query.run".to_owned(),
+                trace_id: "t".to_owned(),
+                outcome_kind: outcome.to_owned(),
+                receipt_state: "completed".to_owned(),
+                statement_handle: query_id.map(str::to_owned),
+                snowflake_query_id: query_id.map(str::to_owned),
+                request_id: None,
+                row_count: Some(1),
+                receipt: VerifiedPayload {
+                    canonical: "{}".to_owned(),
+                    address: CacheAddress::blake3(b"{}"),
+                },
+                created_at_ms,
+            };
+        let id = "01b2c3d4-0000-0000-0000-00000000ab21";
+        let now = 10 * RESULT_RETENTION_MS;
+        assert_eq!(
+            refetch_query_id(&record("ok", Some(id), now - 1_000), now).ok(),
+            Some(id.to_owned())
+        );
+        let failed = refetch_query_id(&record("error", Some(id), now), now)
+            .err()
+            .map(|e| e.code);
+        assert_eq!(failed, Some(SnowflakeErrorCode::MetadataError));
+        let missing = refetch_query_id(&record("ok", None, now), now)
+            .err()
+            .map(|e| e.code);
+        assert_eq!(missing, Some(SnowflakeErrorCode::MetadataError));
+        // Never interpolate anything but a UUID-shaped id into RESULT_SCAN.
+        for bad in [
+            "x'); drop table t; --",
+            "01b2c3d4-0000-0000-0000",
+            "01b2c3d4-0000-0000-0000-00000000ab2g",
+        ] {
+            let refused = refetch_query_id(&record("ok", Some(bad), now), now)
+                .err()
+                .map(|e| e.code);
+            assert_eq!(refused, Some(SnowflakeErrorCode::MetadataError), "{bad}");
+        }
+        let expired = refetch_query_id(&record("ok", Some(id), now - RESULT_RETENTION_MS - 1), now)
+            .err()
+            .map(|e| e.code);
+        assert_eq!(expired, Some(SnowflakeErrorCode::CacheError));
+    }
+
+    /// Reality-check bead oj0.25: the grant walk follows granted roles and
+    /// flags write-capable privileges with the role they come from.
+    #[test]
+    fn role_write_check_walks_granted_roles() {
+        let grants = |handle: &str, rows: &[[&str; 3]]| {
+            completed(
+                handle,
+                &[
+                    ("privilege", "TEXT"),
+                    ("granted_on", "TEXT"),
+                    ("name", "TEXT"),
+                ],
+                &rows
+                    .iter()
+                    .map(|row| row.iter().map(|cell| Some(*cell)).collect())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let script = install(
+            "demo",
+            None,
+            None,
+            vec![
+                Ok(completed(
+                    "01b2c3d4-0000-0000-0000-00000000ab31",
+                    &[("CURRENT_ROLE()", "TEXT")],
+                    &[vec![Some("ANALYST")]],
+                )),
+                Ok(grants(
+                    "01b2c3d4-0000-0000-0000-00000000ab32",
+                    &[
+                        ["USAGE", "WAREHOUSE", "WH"],
+                        ["SELECT", "TABLE", "DB.S.T"],
+                        ["USAGE", "ROLE", "LOADER"],
+                    ],
+                )),
+                Ok(grants(
+                    "01b2c3d4-0000-0000-0000-00000000ab33",
+                    &[
+                        ["INSERT", "TABLE", "DB.S.T"],
+                        ["CREATE TABLE", "SCHEMA", "DB.S"],
+                    ],
+                )),
+            ],
+        );
+        let conn = LiveConn::resolve("demo", &SessionOverrides::default()).unwrap();
+        let check = role_write_check(&conn);
+        assert_eq!(check.role.as_deref(), Some("ANALYST"));
+        assert_eq!(check.roles_checked, ["ANALYST", "LOADER"]);
+        assert_eq!(
+            check.write_grants,
+            [
+                "INSERT on TABLE DB.S.T (via LOADER)",
+                "CREATE TABLE on SCHEMA DB.S (via LOADER)"
+            ]
+        );
+        let statements: Vec<String> = script
+            .submitted()
+            .into_iter()
+            .map(|request| request.statement)
+            .collect();
+        assert_eq!(statements[1], r#"SHOW GRANTS TO ROLE "ANALYST""#);
+        assert_eq!(statements[2], r#"SHOW GRANTS TO ROLE "LOADER""#);
+    }
+
+    #[test]
+    fn role_verdict_warns_refuses_and_passes() {
+        let check = |write_grants: &[&str], error: Option<&str>| RoleCheck {
+            role: Some("R".to_owned()),
+            write_grants: write_grants
+                .iter()
+                .map(|grant| (*grant).to_owned())
+                .collect(),
+            roles_checked: vec!["R".to_owned()],
+            partial: false,
+            error: error.map(str::to_owned),
+        };
+        // Read-only grants: no warning, no refusal, write_capable false.
+        let (data, warnings, refusal) = role_verdict(&check(&[], None), true, true);
+        assert!(warnings.is_empty() && refusal.is_none());
+        assert!(crate::render_json(&data).contains(r#""write_capable":false"#));
+        // A write grant on a read profile warns.
+        let (_, warnings, refusal) =
+            role_verdict(&check(&["INSERT on TABLE T"], None), true, false);
+        assert_eq!(warnings.len(), 1);
+        assert!(refusal.is_none());
+        assert!(crate::render_json(&warnings[0]).contains("can mutate data (INSERT on TABLE T)"));
+        // READ_ONLY_EXPECTED turns it into a profile error (exit 3).
+        let (_, _, refusal) = role_verdict(&check(&["INSERT on TABLE T"], None), true, true);
+        assert_eq!(
+            refusal.map(|error| error.code),
+            Some(SnowflakeErrorCode::ProfileInvalid)
+        );
+        // A write profile is expected to write: no warning.
+        let (_, warnings, refusal) =
+            role_verdict(&check(&["INSERT on TABLE T"], None), false, false);
+        assert!(warnings.is_empty() && refusal.is_none());
+        // An unverifiable check fails closed only when read-only is expected.
+        let (data, warnings, refusal) =
+            role_verdict(&check(&[], Some("SHOW GRANTS failed")), true, false);
+        assert!(warnings.is_empty() && refusal.is_none());
+        assert!(crate::render_json(&data).contains(r#""write_capable":null"#));
+        let (_, _, refusal) = role_verdict(&check(&[], Some("SHOW GRANTS failed")), true, true);
+        assert!(refusal.is_some());
+        assert!(is_write_capable_privilege("apply masking policy"));
+        assert!(!is_write_capable_privilege("SELECT"));
+        assert!(!is_write_capable_privilege("USAGE"));
+        assert_eq!(quoted_identifier(r#"we"ird"#), r#""we""ird""#);
     }
 
     #[test]

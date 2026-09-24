@@ -246,6 +246,41 @@ fn completed_single(handle: &str) -> MockHttpResponse {
     json(200, &body)
 }
 
+/// A completed single-partition result with the given rowType
+/// (`(name, type, precision, scale)`) and rows.
+fn result_set(
+    handle: &str,
+    columns: &[(&str, &str, Option<i64>, Option<i64>)],
+    rows: &[Vec<Option<&str>>],
+) -> MockHttpResponse {
+    let row_type: Vec<serde_json::Value> = columns
+        .iter()
+        .map(|(name, kind, precision, scale)| {
+            serde_json::json!({
+                "name": name, "type": kind, "nullable": true,
+                "precision": precision, "scale": scale
+            })
+        })
+        .collect();
+    json(
+        200,
+        &serde_json::json!({
+            "resultSetMetaData": {
+                "numRows": rows.len(),
+                "format": "jsonv2",
+                "rowType": row_type,
+                "partitionInfo": [{"rowCount": rows.len(), "uncompressedSize": 256}]
+            },
+            "data": rows,
+            "code": "090001",
+            "sqlState": "00000",
+            "statementHandle": handle,
+            "statementStatusUrl": format!("{SUBMIT_PATH}/{handle}"),
+            "message": "Statement executed successfully."
+        }),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // The binary under test
 // ---------------------------------------------------------------------------
@@ -1138,4 +1173,241 @@ fn raw_cells_returns_the_wire_strings() {
     assert_eq!(data["rows"][0][0], "18262", "{}", run.context());
     assert_eq!(data["rows"][0][2], "1.50", "{}", run.context());
     assert_eq!(data["columns"][0]["json_repr"], "wire", "{}", run.context());
+}
+
+/// The discovery-to-query path over the wire: `catalog scan` runs its
+/// INFORMATION_SCHEMA statements (filters bound as parameters, never
+/// interpolated) and persists a snapshot; `dataset inspect` reads it offline;
+/// `query run --dataset` compiles and submits the pushed-down SQL and returns
+/// typed rows.
+#[test]
+fn catalog_scan_then_dataset_inspect_then_dataset_query() {
+    const TABLES: &str = "01b2c3d4-0000-0000-0000-00000000f120";
+    const COLUMNS: &str = "01b2c3d4-0000-0000-0000-00000000f121";
+    const QUERY: &str = "01b2c3d4-0000-0000-0000-00000000f122";
+    let cert = TestCert::mint();
+    let server = MockServer::start(&cert, |request, _| {
+        if !request.is_submit() {
+            return not_found();
+        }
+        let statement = request.body_json()["statement"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        if statement.contains("INFORMATION_SCHEMA.TABLES") {
+            return result_set(
+                TABLES,
+                &[
+                    ("TABLE_CATALOG", "TEXT", None, None),
+                    ("TABLE_SCHEMA", "TEXT", None, None),
+                    ("TABLE_NAME", "TEXT", None, None),
+                    ("TABLE_TYPE", "TEXT", None, None),
+                    ("COMMENT", "TEXT", None, None),
+                    ("ROW_COUNT", "FIXED", Some(38), Some(0)),
+                    ("BYTES", "FIXED", Some(38), Some(0)),
+                ],
+                &[vec![
+                    Some("DB"),
+                    Some("PUBLIC"),
+                    Some("EVENTS"),
+                    Some("BASE TABLE"),
+                    Some("daily events"),
+                    Some("3"),
+                    Some("4096"),
+                ]],
+            );
+        }
+        if statement.contains("INFORMATION_SCHEMA.COLUMNS") {
+            let column = |name, ordinal, kind, precision, scale| {
+                vec![
+                    Some("DB"),
+                    Some("PUBLIC"),
+                    Some("EVENTS"),
+                    Some(name),
+                    Some(ordinal),
+                    Some(kind),
+                    precision,
+                    scale,
+                    None,
+                    Some("YES"),
+                    None,
+                ]
+            };
+            return result_set(
+                COLUMNS,
+                &[
+                    ("TABLE_CATALOG", "TEXT", None, None),
+                    ("TABLE_SCHEMA", "TEXT", None, None),
+                    ("TABLE_NAME", "TEXT", None, None),
+                    ("COLUMN_NAME", "TEXT", None, None),
+                    ("ORDINAL_POSITION", "FIXED", Some(9), Some(0)),
+                    ("DATA_TYPE", "TEXT", None, None),
+                    ("NUMERIC_PRECISION", "FIXED", Some(9), Some(0)),
+                    ("NUMERIC_SCALE", "FIXED", Some(9), Some(0)),
+                    ("CHARACTER_MAXIMUM_LENGTH", "FIXED", Some(9), Some(0)),
+                    ("IS_NULLABLE", "TEXT", None, None),
+                    ("COMMENT", "TEXT", None, None),
+                ],
+                &[
+                    column("EVENT_DATE", "1", "DATE", None, None),
+                    column("ENTITY_ID", "2", "TEXT", None, None),
+                    column("AMOUNT", "3", "NUMBER", Some("38"), Some("2")),
+                ],
+            );
+        }
+        result_set(
+            QUERY,
+            &[
+                ("EVENT_DATE", "DATE", None, None),
+                ("ENTITY_ID", "TEXT", None, None),
+                ("AMOUNT", "FIXED", Some(38), Some(2)),
+            ],
+            &[vec![Some("18262"), Some("ENTITY123"), Some("12.50")]],
+        )
+    });
+    let h = Harness::new("catalog", &cert);
+
+    let scan = h.run(
+        server.port,
+        &[
+            "catalog",
+            "scan",
+            "sock",
+            "--database",
+            "DB",
+            "--schema",
+            "PUBLIC",
+            "--json",
+        ],
+    );
+    assert_eq!(scan.exit, 0, "{}", scan.context());
+    let data = &scan.envelope["data"];
+    assert_eq!(data["store"]["persisted"], true, "{}", scan.context());
+    let dataset = &data["datasets"][0];
+    assert_eq!(dataset["object"], "EVENTS", "{}", scan.context());
+    assert_eq!(dataset["column_count"], 3, "{}", scan.context());
+    // Field roles inferred from the discovered column types.
+    assert_eq!(dataset["roles"]["time_index"][0], "EVENT_DATE");
+    assert_eq!(dataset["roles"]["entity_key"][0], "ENTITY_ID");
+    let dataset_id = dataset["dataset_id"]
+        .as_str()
+        .expect("dataset id")
+        .to_owned();
+    let discovery: Vec<Seen> = server.seen();
+    assert_eq!(discovery.len(), 2, "{discovery:?}");
+    for statement in &discovery {
+        let body = statement.body_json();
+        let sql = body["statement"].as_str().unwrap_or_default();
+        assert!(
+            !sql.contains("'DB'") && !sql.contains("'PUBLIC'"),
+            "filters are bound, never interpolated: {sql}"
+        );
+        assert_eq!(body["bindings"]["1"]["value"], "DB", "{body}");
+        assert_eq!(body["bindings"]["2"]["value"], "PUBLIC", "{body}");
+    }
+
+    let inspect = h.run(server.port, &["dataset", "inspect", &dataset_id, "--json"]);
+    assert_eq!(inspect.exit, 0, "{}", inspect.context());
+    assert_eq!(server.seen().len(), 2, "inspect is offline");
+
+    let query = h.run(
+        server.port,
+        &[
+            "query",
+            "run",
+            "--dataset",
+            &dataset_id,
+            "--limit",
+            "5",
+            "--json",
+        ],
+    );
+    assert_eq!(query.exit, 0, "{}", query.context());
+    let seen = server.seen();
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    let submitted = seen[2].body_json();
+    let sql = submitted["statement"].as_str().unwrap_or_default();
+    assert!(sql.contains("EVENTS"), "{sql}");
+    assert_eq!(
+        query.envelope["data"]["rows"],
+        serde_json::json!([["2020-01-01", "ENTITY123", "12.50"]]),
+        "{}",
+        query.context()
+    );
+}
+
+/// `receipt refetch` re-reads a completed statement's rows with RESULT_SCAN on
+/// the query id its receipt recorded (reality-check bead L5); an unknown
+/// receipt never reaches the server.
+#[test]
+fn receipt_refetch_reads_the_result_cache_by_query_id() {
+    const HANDLE: &str = "01b2c3d4-0000-0000-0000-00000000f130";
+    const REFETCH: &str = "01b2c3d4-0000-0000-0000-00000000f131";
+    let cert = TestCert::mint();
+    let server = MockServer::start(&cert, |request, _| {
+        if !request.is_submit() {
+            return not_found();
+        }
+        let statement = request.body_json()["statement"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        if statement.contains("RESULT_SCAN") {
+            completed_single(REFETCH)
+        } else {
+            completed_single(HANDLE)
+        }
+    });
+    let h = Harness::new("refetch", &cert);
+    let first = h.run(
+        server.port,
+        &[
+            "query",
+            "run",
+            "--profile",
+            "sock",
+            "--sql",
+            "select 1",
+            "--json",
+        ],
+    );
+    assert_eq!(first.exit, 0, "{}", first.context());
+    let receipt = first.envelope["receipt_hash"]
+        .as_str()
+        .expect("receipt hash")
+        .to_owned();
+
+    let refetch = h.run(server.port, &["receipt", "refetch", &receipt, "--json"]);
+    assert_eq!(refetch.exit, 0, "{}", refetch.context());
+    let data = &refetch.envelope["data"];
+    assert_eq!(data["source_query_id"], HANDLE, "{}", refetch.context());
+    assert_eq!(
+        data["rows"],
+        serde_json::json!([
+            ["2020-01-01", "ENTITY123", "1.50"],
+            ["2020-01-02", "ENTITY124", null]
+        ]),
+        "{}",
+        refetch.context()
+    );
+    let seen = server.seen();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert_eq!(
+        seen[1].body_json()["statement"],
+        format!("SELECT * FROM TABLE(RESULT_SCAN('{HANDLE}'))")
+    );
+
+    let unknown = h.run(server.port, &["receipt", "refetch", "00", "--json"]);
+    assert_ne!(unknown.exit, 0, "{}", unknown.context());
+    assert_eq!(
+        unknown.envelope["error"]["code"],
+        "FSNOW-7002",
+        "{}",
+        unknown.context()
+    );
+    assert_eq!(
+        server.seen().len(),
+        2,
+        "an unknown receipt reaches no server"
+    );
 }

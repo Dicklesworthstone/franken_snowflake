@@ -768,7 +768,12 @@ pub fn profile_handle_presence(profile: &str) -> HandlePresence {
     ] {
         push(key, false, false);
     }
-    for key in ["WRITE_ENABLED", "WRITE_ALLOW_DDL", "WRITE_REQUIRE_CONFIRM"] {
+    for key in [
+        "WRITE_ENABLED",
+        "WRITE_ALLOW_DDL",
+        "WRITE_REQUIRE_CONFIRM",
+        "READ_ONLY_EXPECTED",
+    ] {
         push(key, false, false);
     }
     match secret_key {
