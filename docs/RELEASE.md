@@ -45,6 +45,9 @@ cargo test --locked -p franken-snowflake-export --features export
 FSNOW_REQUIRE_EXTERNAL_PARQUET=1 cargo test --locked -p franken-snowflake-export --all-features --test parquet_conformance
 FSNOW_PRIVATE_DENYLIST=<path outside the repo> scripts/check-public-safety.sh
 cargo test --locked -p franken-snowflake-frame --features frankenpandas
+# Perf lane (wall-clock, so never in the default suite): the jsonv2 decoder's
+# 350 MB/s release target, with the host and CPU governor it ran on.
+cargo test --locked --release -p franken-snowflake-frame --features frankenpandas --test zero_copy_parity -- --ignored --nocapture
 cargo test --locked -p franken-snowflake-graph --features graph
 cargo test --locked -p franken-snowflake-http --features compression
 cargo test --locked -p franken-snowflake-tui --features tui
