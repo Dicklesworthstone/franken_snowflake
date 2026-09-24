@@ -89,7 +89,15 @@ impl Harness {
     /// Run the binary with a scrubbed environment: only the store override, a
     /// HOME under the temp dir, and the planted profile handles.
     fn run(&self, args: &[&str]) -> Run {
-        let output = Command::new(BIN)
+        self.run_with(args, &[])
+    }
+
+    /// Like [`Harness::run`], with extra env vars applied last (they override
+    /// the planted defaults). Only for offline commands: overriding the account
+    /// with a canonical Snowflake host must never reach a live command.
+    fn run_with(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Run {
+        let mut command = Command::new(BIN);
+        command
             .args(args)
             .env_clear()
             .env("HOME", &self.data_dir)
@@ -103,9 +111,11 @@ impl Harness {
             .env("FRANKEN_SNOWFLAKE_E2E_PAT", CANARY_PAT)
             .env("FRANKEN_SNOWFLAKE_E2E_OAUTH_BEARER", CANARY_OAUTH)
             .env("FRANKEN_SNOWFLAKE_E2E_PRIVATE_KEY_PEM", CANARY_PEM)
-            .env("FRANKEN_SNOWFLAKE_E2E_WRITE_ENABLED", "true")
-            .output()
-            .expect("spawn franken-snowflake");
+            .env("FRANKEN_SNOWFLAKE_E2E_WRITE_ENABLED", "true");
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let output = command.output().expect("spawn franken-snowflake");
         let run = Run {
             exit: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -207,7 +217,20 @@ fn discovery_commands_run_offline_with_exit_zero() {
     let selftest = h.run(&["selftest", "--json"]).json();
     let fixtures = selftest["data"]["fixtures"].as_array().unwrap();
     assert!(fixtures.len() >= 9);
-    assert!(fixtures.iter().all(|f| f["status"] == "pass"), "{selftest}");
+    // A fixture whose subject is not compiled in says `skipped` (reality-check
+    // bead C4); every other fixture really passes.
+    let expected = |name: &str| {
+        let compiled = match name {
+            "frame_codec_mapping" => cfg!(feature = "frankenpandas"),
+            "text_indexing_provenance" => cfg!(feature = "frankensearch"),
+            _ => true,
+        };
+        if compiled { "pass" } else { "skipped" }
+    };
+    for fixture in fixtures {
+        let name = fixture["name"].as_str().unwrap_or_default();
+        assert_eq!(fixture["status"], expected(name), "{name}: {selftest}");
+    }
     assert!(fixtures.iter().any(|f| f["name"] == "frame_codec_mapping"));
     assert!(
         fixtures
@@ -274,7 +297,10 @@ fn capabilities_registry_documents_every_command_with_input_schemas() {
 #[test]
 fn profile_validate_reports_handle_presence_by_name_only() {
     let h = Harness::new("profile");
-    let complete = h.run(&["profile", "validate", "e2e", "--json"]);
+    // Offline validation only: a canonical account overrides the planted
+    // loopback one for this single command.
+    let canonical = [("FRANKEN_SNOWFLAKE_E2E_ACCOUNT", "xy12345.us-east-1")];
+    let complete = h.run_with(&["profile", "validate", "e2e", "--json"], &canonical);
     assert_eq!(complete.exit, 0, "{}", complete.stdout);
     let value = assert_envelope(&complete, "profile.validate");
     assert_eq!(value["data"]["status"], "validated");
@@ -301,6 +327,46 @@ fn profile_validate_reports_handle_presence_by_name_only() {
     let doctor = h.run(&["profile", "doctor", "e2e", "--json"]);
     assert_eq!(doctor.exit, 1, "offline doctor is a partial result");
     assert_envelope(&doctor, "profile.doctor");
+}
+
+/// Reality-check bead C5: `profile validate` must not bless a profile that
+/// every live command refuses. The planted loopback account (the live path
+/// refuses it with FSNOW-2002 before any socket) and an unknown or quarantined
+/// auth lane are errors, exit 3, with a repair command.
+#[test]
+fn profile_validate_refuses_unusable_profiles() {
+    let h = Harness::new("profile-unusable");
+    let loopback = h.run(&["profile", "validate", "e2e", "--json"]);
+    assert_eq!(loopback.exit, 3, "{}", loopback.stdout);
+    let value = assert_envelope(&loopback, "profile.validate");
+    assert_eq!(value["outcome_kind"], "error");
+    assert_eq!(loopback.code(), "FSNOW-2002");
+    assert_eq!(value["data"]["status"], "invalid");
+    assert!(
+        value["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "account_endpoint" && c["status"] == "fail"),
+        "{}",
+        loopback.stdout
+    );
+    for (account, lane) in [
+        ("https://x.snowflakecomputing.com.evil.com", "pat"),
+        ("xy12345.us-east-1", "bogus_lane"),
+        ("xy12345.us-east-1", "workload_identity"),
+    ] {
+        let run = h.run_with(
+            &["profile", "validate", "e2e", "--json"],
+            &[
+                ("FRANKEN_SNOWFLAKE_E2E_ACCOUNT", account),
+                ("FRANKEN_SNOWFLAKE_E2E_AUTH", lane),
+                ("FRANKEN_SNOWFLAKE_E2E_OIDC_TOKEN", "x"),
+            ],
+        );
+        assert_eq!(run.exit, 3, "{account}/{lane}: {}", run.stdout);
+        assert_eq!(run.code(), "FSNOW-2002", "{account}/{lane}");
+    }
 }
 
 #[test]
@@ -789,4 +855,244 @@ fn fsnow_alias_binary_runs_and_shares_contract() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("parse json");
     assert_eq!(value["command_id"], "capabilities");
     assert_eq!(value["ok"], true);
+}
+
+/// Reality-check bead H1: the binary names the commit it was built from, and
+/// `--with-exe-hash` self-reports the SHA-256 of the file actually executing,
+/// so a proof harness can check it ran the build it meant to.
+#[test]
+fn capabilities_reports_build_identity_and_self_hash() {
+    use sha2::{Digest, Sha256};
+    let h = Harness::new("build-identity");
+    let run = h.run(&["capabilities", "--with-exe-hash", "--json"]);
+    assert_eq!(run.exit, 0, "{}", run.stdout);
+    let value = assert_envelope(&run, "capabilities");
+    let build = &value["data"]["build"];
+    assert_eq!(build["version"], env!("CARGO_PKG_VERSION"));
+    for key in ["git_sha", "target", "profile", "rustc"] {
+        assert!(
+            build[key].as_str().is_some_and(|text| !text.is_empty()),
+            "build.{key} missing: {build}"
+        );
+    }
+    assert!(build["features"].is_array(), "{build}");
+    let expected: String = Sha256::digest(fs::read(BIN).expect("read the test binary"))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(build["exe_sha256"], expected.as_str(), "{build}");
+    // Hashing reads the whole binary, so it is opt-in.
+    let plain = h.run(&["capabilities", "--json"]);
+    let plain = assert_envelope(&plain, "capabilities");
+    assert!(plain["data"]["build"].get("exe_sha256").is_none());
+    assert_eq!(plain["data"]["build"]["git_sha"], build["git_sha"]);
+}
+
+/// Every file under `dir`, recursively (the harness's private data dir).
+fn files_under(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in fs::read_dir(&next).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+/// Reality-check bead B5: the string value of a secret-bearing SQL parameter
+/// never reaches stdout, stderr, or the append-only local store, on the
+/// refusal path, the dry-run path, and the confirm path; and a suggested
+/// command never embeds a redacted copy that would run with `[REDACTED]`.
+#[test]
+fn secret_sql_literals_never_leave_the_process() {
+    let h = Harness::new("sql-secrets");
+    let corpus = [
+        (
+            "alter user u1 set password = 'cnry_pw_7f3a'",
+            "cnry_pw_7f3a",
+        ),
+        (
+            "create stage s1 url = 's3://b/p' credentials = (aws_key_id = 'cnry_akid_51e2' aws_secret_key = 'cnry_sk_9c0d')",
+            "cnry_sk_9c0d",
+        ),
+        (
+            "copy into @s1/x from t1 credentials = (azure_sas_token = 'cnry_sas_8b1f')",
+            "cnry_sas_8b1f",
+        ),
+        (
+            "create secret s2 type = generic_string secret_string = 'cnry_ss_e19b'",
+            "cnry_ss_e19b",
+        ),
+        (
+            "create api integration a2 api_provider = aws_api_gateway api_key = 'cnry_ak_2b9c'",
+            "cnry_ak_2b9c",
+        ),
+    ];
+    let ddl = [("FRANKEN_SNOWFLAKE_E2E_WRITE_ALLOW_DDL", "true")];
+    let mut runs = Vec::new();
+    for (sql, _) in corpus {
+        // Default profile: DDL is refused (COPY INTO proceeds to the live
+        // path, which refuses the loopback account before any socket).
+        runs.push(h.run(&["query", "write", "--profile", "e2e", "--sql", sql, "--json"]));
+        // DDL allowed: the dry-run plan, then the confirm path with its token.
+        let plan = h.run_with(
+            &[
+                "query",
+                "write",
+                "--profile",
+                "e2e",
+                "--sql",
+                sql,
+                "--dry-run",
+                "--json",
+            ],
+            &ddl,
+        );
+        let value = plan.json();
+        assert_eq!(plan.exit, 0, "{}", plan.stdout);
+        let preview = value["data"]["redacted_sql_preview"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(preview.contains("'[REDACTED]'"), "{preview}");
+        let confirm = value["data"]["confirm_command"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            !confirm.contains("[REDACTED]"),
+            "runnable with a redacted value: {confirm}"
+        );
+        let token = value["data"]["required_confirmation_token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        runs.push(plan);
+        runs.push(h.run_with(
+            &[
+                "query",
+                "write",
+                "--profile",
+                "e2e",
+                "--sql",
+                sql,
+                "--confirm",
+                &token,
+                "--json",
+            ],
+            &ddl,
+        ));
+    }
+    let stored: Vec<(PathBuf, String)> = files_under(&h.data_dir)
+        .into_iter()
+        .map(|path| {
+            let text = String::from_utf8_lossy(&fs::read(&path).unwrap_or_default()).into_owned();
+            (path, text)
+        })
+        .collect();
+    assert!(
+        !stored.is_empty(),
+        "the refusals were expected to reach the audit log"
+    );
+    for (_, canary) in corpus {
+        for run in &runs {
+            assert!(
+                !run.stdout.contains(canary) && !run.stderr.contains(canary),
+                "{canary} leaked: {} {}",
+                run.stdout,
+                run.stderr
+            );
+        }
+        for (path, text) in &stored {
+            assert!(
+                !text.contains(canary),
+                "{canary} persisted in {}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Reality-check bead B4 (first rung): a supplied `--confirm` is checked even
+/// in the frictionless default; a token for other SQL is refused, not ignored.
+#[test]
+fn a_mismatched_confirm_token_is_refused_in_the_default_mode() {
+    let h = Harness::new("confirm-mismatch");
+    let plan = h.run(&[
+        "query",
+        "write",
+        "--profile",
+        "e2e",
+        "--sql",
+        "insert into t values (1)",
+        "--dry-run",
+        "--json",
+    ]);
+    let token = plan.json()["data"]["required_confirmation_token"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let other = h.run(&[
+        "query",
+        "write",
+        "--profile",
+        "e2e",
+        "--sql",
+        "insert into t values (2)",
+        "--confirm",
+        &token,
+        "--json",
+    ]);
+    assert_eq!(other.exit, 2, "{}", other.stdout);
+    assert_eq!(other.code(), "FSNOW-3008", "{}", other.stdout);
+    // The matching token passes the ladder (the live path then refuses the
+    // loopback account, FSNOW-2002, before any socket).
+    let same = h.run(&[
+        "query",
+        "write",
+        "--profile",
+        "e2e",
+        "--sql",
+        "insert into t values (1)",
+        "--confirm",
+        &token,
+        "--json",
+    ]);
+    assert_ne!(same.code(), "FSNOW-3008", "{}", same.stdout);
+}
+
+/// Reality-check bead C7a: the workload-identity lane is refused before any
+/// credential is read or any request is built. The quarantine check runs ahead
+/// of the endpoint check, so the refusal names the quarantine, not the planted
+/// loopback account.
+#[test]
+fn workload_identity_lane_is_refused_before_any_request() {
+    let h = Harness::new("wif");
+    let run = h.run_with(
+        &[
+            "query",
+            "run",
+            "--profile",
+            "e2e",
+            "--sql",
+            "select 1",
+            "--json",
+        ],
+        &[
+            ("FRANKEN_SNOWFLAKE_E2E_AUTH", "workload_identity"),
+            ("FRANKEN_SNOWFLAKE_E2E_OIDC_TOKEN", "e2e.oidc.assertion"),
+        ],
+    );
+    assert_ne!(run.exit, 0, "{}", run.stdout);
+    if cfg!(feature = "live") {
+        assert_eq!(run.exit, 3, "{}", run.stdout);
+        assert_eq!(run.code(), "FSNOW-2002", "{}", run.stdout);
+        assert!(run.stdout.contains("quarantined"), "{}", run.stdout);
+        assert!(!run.stdout.contains("not canonical"), "{}", run.stdout);
+    }
 }

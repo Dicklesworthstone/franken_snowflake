@@ -65,7 +65,10 @@ enum GraphOutput {
 enum Command {
     Help,
     Onboard,
-    Capabilities,
+    Capabilities {
+        /// Also report the SHA-256 of the running executable.
+        with_exe_hash: bool,
+    },
     RobotDocsGuide,
     AgentHandbook,
     Doctor,
@@ -138,13 +141,26 @@ enum Command {
     ExportRun {
         spec: catalog_surface::ExportPlanSpec,
         out: Option<String>,
+        /// Confine `--out` under `<data_dir>/exports` (the MCP tool always sets it).
+        sandbox_out: bool,
     },
     Tui {
         profile: Option<String>,
     },
     McpServe {
-        mode: Option<String>,
+        /// `None` = stdio; `Some` = the secured HTTP transport.
+        http: Option<McpHttpArgs>,
     },
+}
+
+/// `mcp serve --http` options, parsed without the `mcp` feature so the default
+/// build can still refuse them with a precise diagnostic.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct McpHttpArgs {
+    pub addr: String,
+    pub allowed_origins: Vec<String>,
+    pub extra_tools: Vec<String>,
+    pub allow_remote: bool,
 }
 
 #[derive(Debug)]
@@ -516,9 +532,9 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "mcp.serve",
-        invocation: "franken-snowflake mcp serve [--stdio | --http <addr>]",
+        invocation: "franken-snowflake mcp serve [--stdio | --http <addr> [--allow-origin <origin>]... [--allow-tool <name>]... [--allow-remote]]",
         output_contract_id: "fsnow.mcp.serve.v1",
-        description: "Feature-gated MCP server using the same handlers and envelope contract.",
+        description: "Feature-gated MCP server using the same handlers and envelope contract. --http requires a bearer token (FRANKEN_SNOWFLAKE_MCP_TOKEN), refuses foreign Origin/Host headers, binds loopback unless --allow-remote, and exposes only read-only tools unless --allow-tool names a side-effecting one.",
         read_only: true,
         provider_network: false,
         mutates_local_state: false,
@@ -570,7 +586,9 @@ fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
 
     let command = match args[0].as_str() {
         "onboard" => Command::Onboard,
-        "capabilities" => Command::Capabilities,
+        "capabilities" => Command::Capabilities {
+            with_exe_hash: has_flag(&args, "--with-exe-hash"),
+        },
         "robot-docs" => parse_robot_docs(&args, output)?,
         "agent-handbook" => Command::AgentHandbook,
         "doctor" => Command::Doctor,
@@ -612,6 +630,7 @@ fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
             ));
         }
     };
+    validate_command_flags(output, &command, &args)?;
 
     Ok(Invocation {
         request_id,
@@ -1142,6 +1161,7 @@ fn parse_export(args: &[String], output: OutputFormat) -> Result<Command, Outcom
         Some("run") => Ok(Command::ExportRun {
             spec: export_plan_spec(args),
             out: value_after(args, "--out"),
+            sandbox_out: has_flag(args, "--sandbox-out"),
         }),
         Some(other) => Err(usage_error(
             output,
@@ -1214,12 +1234,40 @@ fn parse_mcp(args: &[String], output: OutputFormat) -> Result<Command, Outcome> 
         ));
     }
 
-    let mode = if wants_stdio {
-        Some("stdio".to_string())
+    let allowed_origins = values_after(args, "--allow-origin");
+    let extra_tools = values_after(args, "--allow-tool");
+    let allow_remote = has_flag(args, "--allow-remote");
+    if http_addr.is_none()
+        && (!allowed_origins.is_empty() || !extra_tools.is_empty() || allow_remote)
+    {
+        return Err(usage_error(
+            output,
+            "mcp.serve",
+            "fsnow.mcp.serve.v1",
+            "--allow-origin, --allow-tool and --allow-remote apply only to `mcp serve --http <addr>`.",
+            vec!["franken-snowflake mcp serve --http 127.0.0.1:3000".to_string()],
+            vec![],
+        ));
+    }
+    let http = if wants_stdio {
+        None
     } else {
-        http_addr.map(|addr| format!("http:{addr}"))
+        http_addr.map(|addr| McpHttpArgs {
+            addr,
+            allowed_origins,
+            extra_tools,
+            allow_remote,
+        })
     };
-    Ok(Command::McpServe { mode })
+    Ok(Command::McpServe { http })
+}
+
+/// Every value following a repeatable flag (`--allow-tool a --allow-tool b`).
+fn values_after(args: &[String], flag: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|pair| pair[0] == flag)
+        .map(|pair| pair[1].clone())
+        .collect()
 }
 
 fn dispatch(invocation: Invocation) -> Outcome {
@@ -1247,12 +1295,12 @@ fn dispatch(invocation: Invocation) -> Outcome {
                 "franken-snowflake profile validate <profile> --json".to_string(),
             ],
         ),
-        Command::Capabilities => success(
+        Command::Capabilities { with_exe_hash } => success(
             invocation.output,
             "capabilities",
             "fsnow.capabilities.v1",
             request_id,
-            capabilities_data(),
+            capabilities_data(with_exe_hash),
             vec![],
             vec!["franken-snowflake agent-handbook --json".to_string()],
         ),
@@ -1389,14 +1437,16 @@ fn dispatch(invocation: Invocation) -> Outcome {
         Command::ExportPlan { spec } => {
             catalog_surface::export_plan_outcome(invocation.output, request_id, spec)
         }
-        Command::ExportRun { spec, out } => {
-            export_run_dispatch(invocation.output, request_id, spec, out)
-        }
+        Command::ExportRun {
+            spec,
+            out,
+            sandbox_out,
+        } => export_run_dispatch(invocation.output, request_id, spec, out, sandbox_out),
         Command::Tui { profile } => tui_dispatch(invocation.output, request_id, profile),
-        Command::McpServe { mode } => {
+        Command::McpServe { http } => {
             #[cfg(feature = "mcp")]
             {
-                run_mcp_serve_process(mode)
+                run_mcp_serve_process(http)
             }
             #[cfg(not(feature = "mcp"))]
             {
@@ -1405,7 +1455,10 @@ fn dispatch(invocation: Invocation) -> Outcome {
                     "mcp.serve",
                     "fsnow.mcp.serve.v1",
                     request_id,
-                    mode,
+                    Some(match http {
+                        Some(args) => format!("http:{}", args.addr),
+                        None => "stdio".to_owned(),
+                    }),
                     SnowflakeErrorCode::UsageError,
                     "The MCP server is feature-gated and not linked in this CLI slice.",
                     vec!["franken-snowflake capabilities --json".to_string()],
@@ -2033,6 +2086,7 @@ fn onboard_data() -> Json {
         ("tool_name", json_string("franken-snowflake")),
         ("binary_aliases", string_array(vec!["fsnow".to_string()])),
         ("version", json_string(env!("CARGO_PKG_VERSION"))),
+        ("build", build_identity_json(false)),
         ("contract_version", json_string(CLI_CONTRACT_VERSION)),
         ("schema_version", json_string(ENVELOPE_SCHEMA_VERSION)),
         ("default_output", json_string("json")),
@@ -2099,12 +2153,13 @@ fn environment_docs() -> Json {
     ])])
 }
 
-fn capabilities_data() -> Json {
+fn capabilities_data(with_exe_hash: bool) -> Json {
     json_object(vec![
         ("tool_name", json_string("franken-snowflake")),
         ("binary_aliases", string_array(vec!["fsnow".to_string()])),
         ("crate_name", json_string(env!("CARGO_PKG_NAME"))),
         ("version", json_string(env!("CARGO_PKG_VERSION"))),
+        ("build", build_identity_json(with_exe_hash)),
         ("contract_version", json_string(CLI_CONTRACT_VERSION)),
         ("schema_version", json_string(ENVELOPE_SCHEMA_VERSION)),
         ("default_output", json_string("json")),
@@ -2222,8 +2277,18 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
         "Snowflake schema identifier (--schema)",
     );
     match command_id {
-        "onboard" | "capabilities" | "robot-docs.guide" | "agent-handbook" | "doctor"
-        | "selftest" => vec![OUTPUT_INPUT],
+        "capabilities" => vec![
+            input(
+                "with_exe_hash",
+                "boolean",
+                false,
+                "Also report build.exe_sha256, the SHA-256 of the running executable (--with-exe-hash)",
+            ),
+            OUTPUT_INPUT,
+        ],
+        "onboard" | "robot-docs.guide" | "agent-handbook" | "doctor" | "selftest" => {
+            vec![OUTPUT_INPUT]
+        }
         "profile.validate" => vec![
             input(
                 "profile",
@@ -2532,7 +2597,19 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
                 "out",
                 "string",
                 true,
-                "Local file path for the artifact (--out)",
+                "Local file path for the artifact (--out); an existing file is refused unless --overwrite, and a symlink or non-file target is always refused",
+            ),
+            input(
+                "overwrite",
+                "boolean",
+                false,
+                "Atomically replace an existing --out file (--overwrite)",
+            ),
+            input(
+                "sandbox_out",
+                "boolean",
+                false,
+                "Confine --out to a relative path, without `..` or symlinked components, under <data dir>/exports (--sandbox-out; the MCP export_run tool always sets it)",
             ),
             OUTPUT_INPUT,
         ],
@@ -2543,7 +2620,25 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
                 "http",
                 "string",
                 false,
-                "Serve over HTTP at host:port (--http <addr>)",
+                "Serve over HTTP at host:port (--http <addr>); requires a bearer token of 32+ characters in FRANKEN_SNOWFLAKE_MCP_TOKEN, sent by clients as `Authorization: Bearer <token>`",
+            ),
+            input(
+                "allow_origin",
+                "string",
+                false,
+                "Browser origin allowed to call the HTTP server (--allow-origin <origin>, repeatable; cross-origin requests are refused otherwise)",
+            ),
+            input(
+                "allow_tool",
+                "string",
+                false,
+                "Expose a side-effecting tool over HTTP (--allow-tool export_run|query_cancel, repeatable; only read-only tools are exposed by default)",
+            ),
+            input(
+                "allow_remote",
+                "boolean",
+                false,
+                "Permit a non-loopback HTTP bind address (--allow-remote)",
             ),
         ],
         _ => vec![OUTPUT_INPUT],
@@ -2762,6 +2857,34 @@ fn check_json_owned(name: &'static str, status: &'static str, detail: String) ->
     ])
 }
 
+/// How an `_AUTH` lane value is treated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthLaneStatus {
+    Supported,
+    /// Implemented but refused on the live path (see [`WORKLOAD_IDENTITY_QUARANTINE`]).
+    Quarantined,
+    Unknown,
+}
+
+fn classify_auth_lane(lane: &str) -> AuthLaneStatus {
+    match lane {
+        "pat"
+        | "programmatic_access_token"
+        | "oauth"
+        | "oauth_bearer"
+        | "oauth_bearer_token"
+        | "key_pair_jwt"
+        | "jwt" => AuthLaneStatus::Supported,
+        "workload_identity" | "workload_identity_federation" | "oidc" => {
+            AuthLaneStatus::Quarantined
+        }
+        _ => AuthLaneStatus::Unknown,
+    }
+}
+
+/// Why the workload-identity lane is refused (reality-check bead C7a).
+pub(crate) const WORKLOAD_IDENTITY_QUARANTINE: &str = "the workload_identity auth lane is quarantined: its implementation exchanges the OIDC token through an RFC 7523 grant to /oauth/token-request, which is not Snowflake's documented SQL API protocol (`Authorization: Bearer WIF.<provider>.<token>`, docs.snowflake.com/en/developer-guide/sql-api/authenticating), so it cannot authenticate and would send the token to an unvalidated URL; use pat, key_pair_jwt, or oauth_bearer";
+
 fn profile_validate_outcome(format: OutputFormat, request_id: String, profile: String) -> Outcome {
     let syntax_valid = is_valid_profile_id(&profile);
     let presence = health::profile_handle_presence(&profile);
@@ -2782,18 +2905,52 @@ fn profile_validate_outcome(format: OutputFormat, request_id: String, profile: S
             presence.required_missing.join(", ")
         )));
     }
-    let (outcome_kind, exit, status) = if warnings.is_empty() {
+    // A profile the live path would refuse is an error (exit 3), not a finding:
+    // "validated" must mean the live transport accepts the account and lane.
+    let mut unusable = Vec::new();
+    if let Some(reason) = presence.account_error {
+        unusable.push(format!(
+            "{}_ACCOUNT does not form a canonical https://<account>.snowflakecomputing.com endpoint ({reason})",
+            profile_env_prefix(&profile)
+        ));
+    }
+    match presence.auth_lane.as_deref().map(classify_auth_lane) {
+        Some(AuthLaneStatus::Quarantined) => unusable.push(WORKLOAD_IDENTITY_QUARANTINE.to_owned()),
+        Some(AuthLaneStatus::Unknown) => unusable.push(format!(
+            "auth lane `{}` is not supported; use pat, key_pair_jwt, or oauth_bearer",
+            presence.auth_lane.as_deref().unwrap_or("")
+        )),
+        Some(AuthLaneStatus::Supported) | None => {}
+    }
+    let (outcome_kind, exit, status) = if !unusable.is_empty() {
+        ("error", CoreExitCode::CredentialError, "invalid")
+    } else if warnings.is_empty() {
         ("success", CoreExitCode::Success, "validated")
     } else {
         ("partial_success", CoreExitCode::Findings, "findings")
     };
-    let repair_commands: Vec<String> = presence
+    let mut repair_commands: Vec<String> = presence
         .required_missing
         .iter()
         .map(|name| format!("export {name}=<value>"))
         .collect();
+    if presence.account_error.is_some() {
+        repair_commands.push(format!(
+            "export {}_ACCOUNT=<locator such as xy12345.us-east-1, or org-account such as myorg-prod2>",
+            profile_env_prefix(&profile)
+        ));
+    }
+    if matches!(
+        presence.auth_lane.as_deref().map(classify_auth_lane),
+        Some(AuthLaneStatus::Quarantined | AuthLaneStatus::Unknown)
+    ) {
+        repair_commands.push(format!(
+            "export {}_AUTH=pat   # or key_pair_jwt, oauth_bearer",
+            profile_env_prefix(&profile)
+        ));
+    }
     let mut envelope = base_envelope(
-        true,
+        unusable.is_empty(),
         outcome_kind,
         "profile.validate",
         "fsnow.profile.validate.v1",
@@ -2805,6 +2962,13 @@ fn profile_validate_outcome(format: OutputFormat, request_id: String, profile: S
         format!("franken-snowflake profile doctor {profile} --json"),
         format!("franken-snowflake query plan --profile {profile} --sql \"select 1\" --json"),
     ]);
+    if !unusable.is_empty() {
+        envelope.error = Some(error_info(
+            SnowflakeErrorCode::ProfileInvalid,
+            format!("profile `{profile}` is unusable: {}", unusable.join("; ")),
+            vec![json_string("offline profile validation (no socket)")],
+        ));
+    }
     envelope.repair_commands = repair_commands;
     envelope.profile_id = Some(profile);
     Outcome {
@@ -2938,24 +3102,13 @@ fn profile_diagnostics_data(
             format!("missing: {}", presence.required_missing.join(", ")),
         )
     };
-    let auth_check = match presence.auth_lane.as_deref() {
+    let auth_check = match presence.auth_lane.as_deref().map(classify_auth_lane) {
         None => check_json(
             "auth_lane",
             "not_checked",
-            "_AUTH handle is unset; expected pat, key_pair_jwt, oauth_bearer, or workload_identity",
+            "_AUTH handle is unset; expected pat, key_pair_jwt, or oauth_bearer",
         ),
-        Some(
-            "pat"
-            | "programmatic_access_token"
-            | "oauth"
-            | "oauth_bearer"
-            | "oauth_bearer_token"
-            | "key_pair_jwt"
-            | "jwt"
-            | "workload_identity"
-            | "workload_identity_federation"
-            | "oidc",
-        ) => check_json_owned(
+        Some(AuthLaneStatus::Supported) => check_json_owned(
             "auth_lane",
             "pass",
             format!(
@@ -2963,11 +3116,15 @@ fn profile_diagnostics_data(
                 presence.auth_lane.as_deref().unwrap_or("")
             ),
         ),
-        Some(other) => check_json_owned(
+        Some(AuthLaneStatus::Quarantined) => {
+            check_json("auth_lane", "fail", WORKLOAD_IDENTITY_QUARANTINE)
+        }
+        Some(AuthLaneStatus::Unknown) => check_json_owned(
             "auth_lane",
-            "warn",
+            "fail",
             format!(
-                "auth lane `{other}` is not supported; use pat, key_pair_jwt, oauth_bearer, or workload_identity"
+                "auth lane `{}` is not supported; use pat, key_pair_jwt, or oauth_bearer",
+                presence.auth_lane.as_deref().unwrap_or("")
             ),
         ),
     };
@@ -3001,7 +3158,12 @@ fn profile_diagnostics_data(
         ),
         (
             "credential_lifetime_warnings",
-            Json::Array(credential_lifetime_warnings()),
+            Json::Array(credential_lifetime_warnings(
+                presence.auth_lane.as_deref(),
+                std::env::var(format!("{env_prefix}_JWT_VALIDITY_SECONDS"))
+                    .ok()
+                    .as_deref(),
+            )),
         ),
         ("profile_env_prefix", json_string(env_prefix.clone())),
         ("supported_auth_lanes", health::supported_auth_lanes()),
@@ -3022,6 +3184,7 @@ fn profile_diagnostics_data(
                     syntax_detail.to_string(),
                 ),
                 required_check,
+                account_endpoint_check(presence),
                 auth_check,
                 live_probe_check,
             ]),
@@ -3029,53 +3192,112 @@ fn profile_diagnostics_data(
     ])
 }
 
-fn credential_lifetime_warnings() -> Vec<Json> {
-    vec![
+fn account_endpoint_check(presence: &health::HandlePresence) -> Json {
+    let account_set = !presence
+        .required_missing
+        .iter()
+        .any(|name| name.ends_with("_ACCOUNT"));
+    match (account_set, presence.account_error) {
+        (_, Some(reason)) => check_json_owned(
+            "account_endpoint",
+            "fail",
+            format!(
+                "_ACCOUNT does not form a canonical https://<account>.snowflakecomputing.com endpoint ({reason}); every live command would refuse it"
+            ),
+        ),
+        (true, None) => check_json(
+            "account_endpoint",
+            "pass",
+            "_ACCOUNT forms a canonical SQL API endpoint",
+        ),
+        (false, None) => check_json(
+            "account_endpoint",
+            "not_checked",
+            "_ACCOUNT handle is unset",
+        ),
+    }
+}
+
+/// Credential-lifetime guidance for the profile's configured lane, derived
+/// from non-secret configuration only: the lane name and the raw
+/// `_JWT_VALIDITY_SECONDS` value. Token and key values are never read. With no
+/// lane set, the guidance for every supported lane.
+fn credential_lifetime_warnings(
+    auth_lane: Option<&str>,
+    jwt_validity_seconds: Option<&str>,
+) -> Vec<Json> {
+    let entry = |lane: &str, severity: &str, message: String| {
         json_object(vec![
-            ("auth_lane", json_string("programmatic_access_token")),
-            ("severity", json_string("warning")),
-            (
-                "message",
-                json_string(
-                    "PAT profiles should track the administrator expiry window; warn before the default 15-day lifetime ends",
+            ("auth_lane", json_string(lane)),
+            ("severity", json_string(severity)),
+            ("message", json_string(message)),
+            ("secret_values_read", Json::Bool(false)),
+        ])
+    };
+    let pat = || {
+        entry(
+            "pat",
+            "info",
+            "programmatic access tokens expire on the date the administrator set (15 days by default, at most 365); the expiry is not visible offline and a live command after it fails with a credential error, so rotate before then".to_owned(),
+        )
+    };
+    let oauth = || {
+        entry(
+            "oauth_bearer",
+            "info",
+            "OAuth access tokens are short-lived (commonly about 10 minutes) and this connector cannot refresh them; supply a fresh token per session, because a token that expires mid-poll fails the statement with a credential error".to_owned(),
+        )
+    };
+    let jwt = || {
+        let requested = jwt_validity_seconds.map(str::trim);
+        match requested.map(str::parse::<u64>) {
+            None => entry(
+                "key_pair_jwt",
+                "info",
+                "each JWT is signed for 3600 s (Snowflake's cap) and re-signed before expiry during long polls; nothing to rotate except the key pair itself".to_owned(),
+            ),
+            Some(Ok(0)) => entry(
+                "key_pair_jwt",
+                "error",
+                "_JWT_VALIDITY_SECONDS is 0; the signer refuses a zero validity window, so every live command would fail".to_owned(),
+            ),
+            Some(Ok(seconds)) if seconds > 3_600 => entry(
+                "key_pair_jwt",
+                "warning",
+                format!(
+                    "_JWT_VALIDITY_SECONDS is {seconds}, above Snowflake's 3600 s cap; each JWT is signed for 3600 s instead"
                 ),
             ),
-            ("secret_values_read", Json::Bool(false)),
-        ]),
-        json_object(vec![
-            ("auth_lane", json_string("key_pair_jwt")),
-            ("severity", json_string("warning")),
-            (
-                "message",
-                json_string(
-                    "JWT exp values beyond the one-hour cap are refused or capped by the signer before submission",
+            Some(Ok(seconds)) => entry(
+                "key_pair_jwt",
+                "info",
+                format!(
+                    "each JWT is signed for {seconds} s and re-signed before expiry during long polls"
                 ),
             ),
-            ("secret_values_read", Json::Bool(false)),
-        ]),
-        json_object(vec![
-            ("auth_lane", json_string("oauth_bearer_token")),
-            ("severity", json_string("warning")),
-            (
-                "message",
-                json_string(
-                    "OAuth bearer profiles should refresh before short-lived access tokens approach their roughly 10-minute lifetime",
+            Some(Err(_)) => entry(
+                "key_pair_jwt",
+                "warning",
+                format!(
+                    "_JWT_VALIDITY_SECONDS `{}` is not a whole number of seconds; the live path ignores it and signs for 3600 s",
+                    requested.unwrap_or_default()
                 ),
             ),
-            ("secret_values_read", Json::Bool(false)),
-        ]),
-        json_object(vec![
-            ("auth_lane", json_string("workload_identity")),
-            ("severity", json_string("warning")),
-            (
-                "message",
-                json_string(
-                    "Workload identity federation tokens are refreshed automatically or re-read from OIDC_TOKEN_FILE before expiration",
-                ),
-            ),
-            ("secret_values_read", Json::Bool(false)),
-        ]),
-    ]
+        }
+    };
+    match auth_lane {
+        None => vec![pat(), jwt(), oauth()],
+        Some("pat" | "programmatic_access_token") => vec![pat()],
+        Some("key_pair_jwt" | "jwt") => vec![jwt()],
+        Some("oauth" | "oauth_bearer" | "oauth_bearer_token") => vec![oauth()],
+        Some("workload_identity" | "workload_identity_federation" | "oidc") => vec![entry(
+            "workload_identity",
+            "error",
+            WORKLOAD_IDENTITY_QUARANTINE.to_owned(),
+        )],
+        // The auth_lane check already fails an unknown lane.
+        Some(_) => Vec::new(),
+    }
 }
 
 fn profile_env_handle_sets(env_prefix: &str) -> Vec<Json> {
@@ -3122,6 +3344,8 @@ fn profile_env_handle_sets(env_prefix: &str) -> Vec<Json> {
                     vars
                 }),
             ),
+            ("status", json_string("quarantined")),
+            ("detail", json_string(WORKLOAD_IDENTITY_QUARANTINE)),
         ]),
     ]
 }
@@ -3571,7 +3795,12 @@ fn query_write_outcome(
         WriteIntentMode::PrepareExecution
     };
 
-    let policy = write_policy_for_profile(&profile, statement_kind);
+    let mut policy = write_policy_for_profile(&profile, statement_kind);
+    // A supplied token is always checked (reality-check bead B4): in the
+    // frictionless default a wrong or stale `--confirm` must not execute.
+    if confirm.is_some() {
+        policy.require_exact_confirmation = true;
+    }
     let allowlist_id = cli_allowlist_id(statement_kind);
 
     // Deterministic idempotency id bound to (profile, compacted SQL): the dry-run
@@ -3594,7 +3823,7 @@ fn query_write_outcome(
             write_refusal_outcome(format, request_id, profile, &sql_text, &detail)
         }
         WriteIntentDecision::DryRunPlanned { plan } => {
-            write_plan_outcome(format, request_id, profile, &plan)
+            write_plan_outcome(format, request_id, profile, &sql_text, &plan)
         }
         WriteIntentDecision::ExecutionAuthorized { plan } => {
             query_write_execute_dispatch(format, request_id, profile, &sql_text, &plan)
@@ -3666,12 +3895,13 @@ fn write_plan_outcome(
     format: OutputFormat,
     request_id: String,
     profile: String,
+    sql: &str,
     plan: &WriteIntentPlan,
 ) -> Outcome {
     let token = plan.required_confirmation_token.as_str().to_string();
     let confirm_command = format!(
-        "franken-snowflake query write --profile {profile} --sql \"{}\" --confirm {token} --json",
-        compact_sql(&plan.redacted_sql_preview)
+        "franken-snowflake query write --profile {profile} --sql {} --confirm {token} --json",
+        sql_for_command(sql)
     );
     let next_stages = string_array(
         plan.next_required_stages
@@ -3823,9 +4053,20 @@ fn safety_class_token(class: WriteSafetyClass) -> &'static str {
 fn write_hint(profile: Option<&str>, sql: &str) -> String {
     let profile = profile.unwrap_or("<profile>");
     format!(
-        "franken-snowflake query write --profile {profile} --sql \"{}\" --dry-run --json",
-        compact_sql(sql)
+        "franken-snowflake query write --profile {profile} --sql {} --dry-run --json",
+        sql_for_command(sql)
     )
+}
+
+/// The `--sql` argument for a suggested command. SQL carrying a secret value is
+/// never echoed, and a redacted copy must not be offered either: run as-is it
+/// would execute with `[REDACTED]` as the value (reality-check bead B5).
+fn sql_for_command(sql: &str) -> String {
+    if redact(sql) == sql {
+        format!("\"{}\"", compact_sql(sql))
+    } else {
+        "<the same SQL; its secret values are not echoed>".to_string()
+    }
 }
 
 /// `query write --dry-run` form with a neutral example, for preview/ceremony hints.
@@ -4215,6 +4456,7 @@ fn export_run_dispatch(
     request_id: String,
     spec: catalog_surface::ExportPlanSpec,
     out: Option<String>,
+    _sandbox_out: bool,
 ) -> Outcome {
     live_transport_required_with_data(
         format,
@@ -4246,8 +4488,9 @@ fn export_run_dispatch(
     request_id: String,
     spec: catalog_surface::ExportPlanSpec,
     out: Option<String>,
+    sandbox_out: bool,
 ) -> Outcome {
-    live::export_run_outcome(format, request_id, spec, out)
+    live::export_run_outcome(format, request_id, spec, out, sandbox_out)
 }
 
 fn exit_code_json() -> Json {
@@ -4383,6 +4626,7 @@ fn extract_output_format(raw_args: Vec<String>) -> (OutputFormat, bool, Vec<Stri
 }
 
 fn validate_known_flags(output: OutputFormat, args: &[String]) -> Result<(), Outcome> {
+    let known = known_flags();
     let mut skip_next = false;
     for (index, arg) in args.iter().enumerate() {
         if skip_next {
@@ -4397,7 +4641,7 @@ fn validate_known_flags(output: OutputFormat, args: &[String]) -> Result<(), Out
         let flag_name = arg
             .split_once('=')
             .map_or(arg.as_str(), |(name, _value)| name);
-        if known_flags().iter().any(|known| known == &flag_name) {
+        if known.iter().any(|flag| flag == flag_name) {
             if flag_name == "--require-live" && arg.contains('=') {
                 return Err(usage_error(
                     output,
@@ -4437,7 +4681,10 @@ fn validate_known_flags(output: OutputFormat, args: &[String]) -> Result<(), Out
             ),
             vec!["franken-snowflake capabilities --json".to_string()],
             vec!["franken-snowflake --help".to_string()],
-            did_you_mean(flag_name, &known_flags()),
+            did_you_mean(
+                flag_name,
+                &known.iter().map(String::as_str).collect::<Vec<_>>(),
+            ),
         ));
     }
 
@@ -4458,51 +4705,138 @@ fn missing_flag_value_outcome(output: OutputFormat, flag_name: &str) -> Outcome 
     )
 }
 
-fn known_flags() -> Vec<&'static str> {
-    vec![
-        "--as-of",
-        "--bindings-env",
-        "--compression",
-        "--confirm",
-        "--database",
-        "--dataset",
-        "--dry-run",
-        "--entity",
-        "--execute",
-        "--filter",
-        "--format",
-        "--from",
-        "--header",
-        "--help",
-        "--http",
-        "--json",
-        "--jsonschema",
-        "--limit",
-        "--location",
-        "--max-file-size",
-        "--mermaid",
-        "--no-color",
-        "--online",
-        "--out",
-        "--overwrite",
-        "--profile",
-        "--query-id",
-        "--query-tag",
-        "--require-live",
-        "--refresh",
-        "--role",
-        "--schema",
-        "--select",
-        "--single",
-        "--sql",
-        "--statement-timeout",
-        "--stdio",
-        "--svg",
-        "--to",
-        "--toon",
-        "--warehouse",
-        "-h",
-    ]
+/// Every flag some command accepts, plus the global ones. The first,
+/// command-independent pass ([`validate_known_flags`]: typos, missing values)
+/// uses it; [`validate_command_flags`] then narrows to the parsed command's own
+/// flags.
+fn known_flags() -> Vec<String> {
+    let mut flags: std::collections::BTreeSet<String> =
+        ["--help", "-h", "--json", "--toon", "--no-color"]
+            .map(String::from)
+            .into();
+    for spec in COMMAND_SPECS {
+        flags.extend(command_flags(spec.id));
+    }
+    flags.into_iter().collect()
+}
+
+/// The capabilities-registry id of a parsed command (`None` for help).
+fn command_id(command: &Command) -> Option<&'static str> {
+    Some(match command {
+        Command::Help => return None,
+        Command::Onboard => "onboard",
+        Command::Capabilities { .. } => "capabilities",
+        Command::RobotDocsGuide => "robot-docs.guide",
+        Command::AgentHandbook => "agent-handbook",
+        Command::Doctor => "doctor",
+        Command::Selftest => "selftest",
+        Command::ProfileValidate { .. } => "profile.validate",
+        Command::ProfileDoctor { .. } => "profile.doctor",
+        Command::CatalogScan { .. } => "catalog.scan",
+        Command::CatalogGraph { .. } => "catalog.graph",
+        Command::CatalogDiff { .. } => "catalog.diff",
+        Command::DatasetInspect { .. } => "dataset.inspect",
+        Command::DatasetProfile { .. } => "dataset.profile",
+        Command::DatasetDescribeOperator { .. } => "dataset.describe_operator",
+        Command::QueryPlan { .. } => "query.plan",
+        Command::QueryRun { .. } => "query.run",
+        Command::QueryWrite { .. } => "query.write",
+        Command::QueryCancel { .. } => "query.cancel",
+        Command::ReceiptShow { .. } => "receipt.show",
+        Command::ExportPlan { .. } => "export.plan",
+        Command::ExportRun { .. } => "export.run",
+        Command::Tui { .. } => "tui",
+        Command::McpServe { .. } => "mcp.serve",
+    })
+}
+
+/// The flags a command accepts, derived from its documented inputs (the
+/// capabilities `input_schema`), so the parser and the registry cannot drift:
+/// a command accepts a flag exactly when its schema documents it.
+fn command_flags(command_id: &str) -> Vec<String> {
+    let mut flags = Vec::new();
+    for spec in command_inputs(command_id) {
+        // --json/--toon are global; positionals are not flags.
+        if spec.name == "output" || spec.description.starts_with("positional:") {
+            continue;
+        }
+        match (command_id, spec.name) {
+            ("catalog.graph", "format") => flags.extend(["--mermaid", "--svg"].map(String::from)),
+            ("catalog.diff", "base") => {
+                flags.extend(["--base", "--base-snapshot"].map(String::from));
+            }
+            ("catalog.diff", "target") => {
+                flags.extend(["--target", "--target-snapshot"].map(String::from));
+            }
+            (_, name) => flags.push(format!("--{}", name.replace('_', "-"))),
+        }
+    }
+    flags
+}
+
+/// Refuse any flag the parsed command does not document (reality-check bead
+/// C3): an irrelevant flag is a usage error, never silently ignored.
+fn validate_command_flags(
+    output: OutputFormat,
+    command: &Command,
+    args: &[String],
+) -> Result<(), Outcome> {
+    let Some(id) = command_id(command) else {
+        return Ok(());
+    };
+    let accepted = command_flags(id);
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if !arg.starts_with('-') {
+            continue;
+        }
+        let flag_name = arg
+            .split_once('=')
+            .map_or(arg.as_str(), |(name, _value)| name);
+        if accepted.iter().any(|flag| flag == flag_name) {
+            skip_next = flag_requires_value(flag_name) && !arg.contains('=');
+            continue;
+        }
+        let spec = COMMAND_SPECS.iter().find(|spec| spec.id == id);
+        let display = id.replace('.', " ").replace('_', "-");
+        let candidates: Vec<&str> = accepted.iter().map(String::as_str).collect();
+        return Err(error_outcome(
+            output,
+            id,
+            spec.map_or("fsnow.help.v1", |spec| spec.output_contract_id),
+            CoreExitCode::Usage,
+            "error",
+            error_info(
+                SnowflakeErrorCode::UsageError,
+                format!(
+                    "`{flag_name}` is not a flag of `{display}`; it accepts {}.",
+                    if accepted.is_empty() {
+                        "no flags besides --json/--toon".to_string()
+                    } else {
+                        accepted.join(", ")
+                    }
+                ),
+                vec![
+                    json_string(format!("flag={flag_name}")),
+                    json_string(format!("command={id}")),
+                ],
+            ),
+            vec![
+                spec.map_or_else(
+                    || "franken-snowflake --help".to_string(),
+                    |spec| spec.invocation.to_string(),
+                ),
+                "franken-snowflake capabilities --json".to_string(),
+            ],
+            vec!["franken-snowflake --help".to_string()],
+            did_you_mean(flag_name, &candidates),
+        ));
+    }
+    Ok(())
 }
 
 fn flag_requires_value(flag: &str) -> bool {
@@ -4513,7 +4847,9 @@ fn flag_requires_value(flag: &str) -> bool {
     // `--http`" *before* `parse_mcp` could run, shadowing the specific message.
     matches!(
         flag,
-        "--as-of"
+        "--allow-origin"
+            | "--allow-tool"
+            | "--as-of"
             | "--bindings-env"
             | "--compression"
             | "--confirm"
@@ -4951,6 +5287,10 @@ pub use mcp_surface::run_mcp_serve_process;
 #[cfg(feature = "live")]
 mod live;
 
+// Used by `export run` (live); compiled for tests in every build.
+#[cfg(any(feature = "live", test))]
+mod export_path;
+
 mod catalog_surface;
 mod dataset_mode;
 mod health;
@@ -4977,6 +5317,66 @@ fn live_transport_available() -> bool {
 // `tui`/`toon` are real CLI-crate features (reported via `cfg!`); `testkit` is
 // NOT a feature of this binary — that surface lives in a sibling crate — so it
 // is definitionally false for any `franken-snowflake`/`fsnow` build.
+/// The commit and toolchain this binary was built from (reality-check bead
+/// H1; see `build.rs`). `dirty` is null when unknown. With `exe_hash`, also the
+/// SHA-256 of the running executable, computed from inside the process so a
+/// harness cannot compare a build against itself unnoticed.
+fn build_identity_json(exe_hash: bool) -> Json {
+    let features: Vec<String> = [
+        ("live", live_transport_available()),
+        ("mcp", mcp_surface_available()),
+        ("tui", cfg!(feature = "tui")),
+        ("toon", toon_output_available()),
+        ("frankenpandas", cfg!(feature = "frankenpandas")),
+        ("frankensearch", cfg!(feature = "frankensearch")),
+    ]
+    .into_iter()
+    .filter(|(_, enabled)| *enabled)
+    .map(|(name, _)| name.to_string())
+    .collect();
+    let mut fields = vec![
+        ("version", json_string(env!("CARGO_PKG_VERSION"))),
+        ("git_sha", json_string(BUILD_GIT_SHA)),
+        (
+            "dirty",
+            match env!("FSNOW_BUILD_DIRTY") {
+                "true" => Json::Bool(true),
+                "false" => Json::Bool(false),
+                _ => Json::Null,
+            },
+        ),
+        ("target", json_string(env!("FSNOW_BUILD_TARGET"))),
+        ("profile", json_string(env!("FSNOW_BUILD_PROFILE"))),
+        ("rustc", json_string(env!("FSNOW_BUILD_RUSTC"))),
+        ("features", string_array(features)),
+    ];
+    if exe_hash {
+        fields.push((
+            "exe_sha256",
+            match current_exe_sha256() {
+                Ok(digest) => json_string(digest),
+                Err(error) => json_string(format!("unavailable: {error}")),
+            },
+        ));
+    }
+    json_object(fields)
+}
+
+/// The commit this binary was built from, or `unknown`.
+pub(crate) const BUILD_GIT_SHA: &str = env!("FSNOW_BUILD_GIT_SHA");
+
+fn current_exe_sha256() -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(std::env::current_exe()?)?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 fn feature_flags_json() -> Json {
     json_object(vec![
         ("live", Json::Bool(live_transport_available())),
@@ -5076,26 +5476,178 @@ mod tests {
                 }
             }
         }
-        // Every accepted value/boolean flag is described by at least one command.
-        for flag in known_flags() {
-            let name = flag.trim_start_matches('-');
-            if matches!(
-                flag,
-                "-h" | "--help" | "--no-color" | "--json" | "--toon" | "--mermaid" | "--svg"
-            ) {
-                continue;
+        // Every flag the parser reads is accepted by some command. A flag the
+        // parser reads but no schema documents is unreachable: the validator
+        // refuses it first (catalog diff `--base` was, before 2026-09-24).
+        let known = known_flags();
+        let source = include_str!("lib.rs");
+        for reader in [
+            "value_after(args, \"",
+            "value_after(&args, \"",
+            "has_flag(args, \"",
+            "has_flag(&args, \"",
+            "flag_present(args, \"",
+            "values_after(args, \"",
+        ] {
+            for (index, _) in source.match_indices(reader) {
+                let rest = &source[index + reader.len()..];
+                let flag = rest.split('"').next().unwrap_or_default();
+                assert!(
+                    known.iter().any(|known| known == flag),
+                    "the parser reads `{flag}` but no command documents it"
+                );
             }
-            let documented_here = documented.contains(name)
-                || (matches!(
-                    flag,
-                    "--dataset" | "--entity" | "--from" | "--to" | "--as-of" | "--select"
-                ));
-            assert!(
-                documented_here,
-                "flag {flag} is accepted but undocumented in capabilities"
-            );
         }
         Ok(())
+    }
+
+    /// Reality-check bead C3: every flag a command documents is accepted by
+    /// that command's parser (no documented flag is unreachable).
+    #[test]
+    fn every_documented_flag_is_accepted_by_its_command() {
+        for spec in COMMAND_SPECS {
+            let mut words: Vec<String> = spec
+                .id
+                .split('.')
+                .map(|word| word.replace('_', "-"))
+                .collect();
+            for input in command_inputs(spec.id) {
+                if input.description.starts_with("positional:") {
+                    words.push("demo".to_string());
+                }
+            }
+            for flag in command_flags(spec.id) {
+                let mut args = words.clone();
+                args.push(flag.clone());
+                if flag_requires_value(&flag) {
+                    args.push("1".to_string());
+                }
+                if let Err(outcome) = parse_invocation(args.clone()) {
+                    let rendered = match outcome.body {
+                        Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+                        Body::Raw { data } => data,
+                    };
+                    assert!(
+                        !rendered.contains("is not a flag of")
+                            && !rendered.contains("Unknown flag"),
+                        "{args:?} was refused as an unknown flag: {rendered}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Reality-check bead C3: a flag another command owns is refused with exit
+    /// 64 / FSNOW-1002 and suggestions from this command's own flags; it is
+    /// never accepted and ignored.
+    #[test]
+    fn irrelevant_flags_are_refused_per_command() {
+        let refused = |args: &[&str]| {
+            let outcome = execute(args.iter().map(|arg| (*arg).to_string()).collect());
+            let rendered = match &outcome.body {
+                Body::Envelope { envelope, .. } => render_json(&envelope_json(envelope)),
+                Body::Raw { data } => data.clone(),
+            };
+            (outcome.status.code(), rendered)
+        };
+        // The reality-check evidence invocation: ok:true with zero warnings before.
+        let (code, rendered) = refused(&[
+            "query",
+            "plan",
+            "--profile",
+            "demo",
+            "--sql",
+            "select 1",
+            "--out",
+            "/tmp/x",
+            "--format",
+            "parquet",
+            "--role",
+            "X",
+            "--execute",
+            "--online",
+            "--dry-run",
+            "--json",
+        ]);
+        assert_eq!(code, 64, "{rendered}");
+        assert!(rendered.contains("\"code\":\"FSNOW-1002\""), "{rendered}");
+        assert!(
+            rendered.contains("`--out` is not a flag of `query plan`"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\"ok\":false"), "{rendered}");
+        // Suggestions come from the command's own flags.
+        let (code, rendered) = refused(&["query", "run", "--sql", "select 1", "--svg"]);
+        assert_eq!(code, 64, "{rendered}");
+        assert!(
+            rendered.contains("\"did_you_mean\":[\"--sql\"]"),
+            "{rendered}"
+        );
+        let (code, rendered) = refused(&["catalog", "graph", "demo", "--sql", "x"]);
+        assert_eq!(code, 64, "{rendered}");
+        assert!(
+            rendered.contains("\"did_you_mean\":[\"--svg\"]"),
+            "{rendered}"
+        );
+        for args in [
+            &["capabilities", "--profile", "demo"][..],
+            &["profile", "validate", "demo", "--online"],
+            &[
+                "catalog",
+                "scan",
+                "demo",
+                "--database",
+                "D",
+                "--schema",
+                "S",
+                "--profile",
+                "x",
+            ],
+            &["dataset", "inspect", "d1", "--execute"],
+            &[
+                "query",
+                "write",
+                "--profile",
+                "p",
+                "--sql",
+                "delete from t",
+                "--role",
+                "R",
+            ],
+            &[
+                "write",
+                "--profile",
+                "p",
+                "--sql",
+                "delete from t",
+                "--limit",
+                "5",
+            ],
+            &[
+                "export",
+                "run",
+                "--profile",
+                "p",
+                "--sql",
+                "select 1",
+                "--out",
+                "x.csv",
+                "--location",
+                "@s",
+            ],
+            &["mcp", "serve", "--stdio", "--profile", "p"],
+        ] {
+            let (code, rendered) = refused(args);
+            assert_eq!(code, 64, "{args:?}: {rendered}");
+            assert!(
+                rendered.contains("is not a flag of"),
+                "{args:?}: {rendered}"
+            );
+        }
+        // catalog diff's documented --base/--target were unreachable before.
+        let (_, rendered) = refused(&["catalog", "diff", "demo", "--base", "a", "--target", "b"]);
+        assert!(!rendered.contains("Unknown flag"), "{rendered}");
+        assert!(!rendered.contains("is not a flag of"), "{rendered}");
     }
 
     /// Persist a small fixture snapshot (one dataset, three columns) into the
@@ -5994,9 +6546,9 @@ mod tests {
             "--sql".to_owned(),
             "select ?".to_owned(),
             "--bindings-env".to_owned(),
-            "HFDT_TYPED_BINDINGS_JSON".to_owned(),
+            "ACME_TYPED_BINDINGS_JSON".to_owned(),
             "--query-tag".to_owned(),
-            "hfdt.trace.123".to_owned(),
+            "acme.trace.123".to_owned(),
         ])
         .map_err(|e| format!("{e:?}"))?;
 
@@ -6004,9 +6556,9 @@ mod tests {
             Command::QueryRun { options, .. } => {
                 assert_eq!(
                     options.bindings_env.as_deref(),
-                    Some("HFDT_TYPED_BINDINGS_JSON")
+                    Some("ACME_TYPED_BINDINGS_JSON")
                 );
-                assert_eq!(options.query_tag.as_deref(), Some("hfdt.trace.123"));
+                assert_eq!(options.query_tag.as_deref(), Some("acme.trace.123"));
             }
             other => {
                 assert!(
@@ -6433,27 +6985,89 @@ mod tests {
     fn profile_doctor_reports_lifetime_warnings_without_secret_values() {
         let rendered = render_json(&envelope_for(&["profile", "doctor", "demo-prod"]));
         assert!(rendered.contains("\"credential_lifetime_warnings\""));
-        assert!(rendered.contains("programmatic_access_token"));
-        assert!(rendered.contains("15-day lifetime"));
-        assert!(rendered.contains("key_pair_jwt"));
-        assert!(rendered.contains("one-hour cap"));
-        assert!(rendered.contains("oauth_bearer_token"));
-        assert!(rendered.contains("roughly 10-minute lifetime"));
-        assert!(rendered.contains("workload_identity"));
         assert!(rendered.contains("\"secret_values_read\":false"));
         assert!(!rendered.contains("snowflake_pat_"));
         assert!(!rendered.contains("BEGIN PRIVATE KEY"));
         assert!(!rendered.contains("eyJ"));
     }
 
+    /// Reality-check bead C5 addendum: lifetime guidance follows the configured
+    /// lane instead of one canned list for every profile.
     #[test]
-    fn profile_validate_includes_workload_identity_in_supported_lanes_and_handle_sets() {
+    fn credential_lifetime_guidance_follows_the_configured_lane() {
+        let render = |lane: Option<&str>, validity: Option<&str>| {
+            render_json(&Json::Array(credential_lifetime_warnings(lane, validity)))
+        };
+        let all = render(None, None);
+        for lane in ["\"pat\"", "\"key_pair_jwt\"", "\"oauth_bearer\""] {
+            assert!(all.contains(lane), "{all}");
+        }
+        let pat = render(Some("pat"), None);
+        assert!(pat.contains("15 days by default"), "{pat}");
+        assert!(
+            !pat.contains("key_pair_jwt") && !pat.contains("oauth_bearer"),
+            "{pat}"
+        );
+        let oauth = render(Some("oauth_bearer"), None);
+        assert!(oauth.contains("cannot refresh"), "{oauth}");
+        assert!(!oauth.contains("\"pat\""), "{oauth}");
+        assert!(render(Some("jwt"), None).contains("3600 s (Snowflake's cap)"));
+        let over = render(Some("key_pair_jwt"), Some("7200"));
+        assert!(over.contains("\"severity\":\"warning\""), "{over}");
+        assert!(
+            over.contains("7200, above Snowflake's 3600 s cap"),
+            "{over}"
+        );
+        let under = render(Some("key_pair_jwt"), Some(" 900 "));
+        assert!(under.contains("signed for 900 s"), "{under}");
+        assert!(!under.contains("warning"), "{under}");
+        assert!(render(Some("key_pair_jwt"), Some("0")).contains("\"severity\":\"error\""));
+        assert!(render(Some("key_pair_jwt"), Some("1h")).contains("not a whole number"));
+        assert!(render(Some("workload_identity"), None).contains("quarantined"));
+        assert_eq!(render(Some("bogus_lane"), None), "[]");
+    }
+
+    /// Reality-check bead C7a: the workload-identity lane is quarantined (its
+    /// token exchange is not Snowflake's documented SQL API protocol). It is no
+    /// longer advertised as supported, its handle set is marked quarantined, and
+    /// a profile that selects it gets a failing lane check.
+    #[test]
+    fn workload_identity_lane_is_quarantined_not_advertised() {
         let rendered = render_json(&envelope_for(&["profile", "validate", "demo-prod"]));
         assert!(rendered.contains("\"command_id\":\"profile.validate\""));
-        assert!(rendered.contains("\"workload_identity\""));
-        assert!(rendered.contains("FRANKEN_SNOWFLAKE_DEMO_PROD_OIDC_TOKEN"));
-        assert!(rendered.contains("FRANKEN_SNOWFLAKE_DEMO_PROD_OIDC_TOKEN_FILE"));
-        assert!(rendered.contains("FRANKEN_SNOWFLAKE_DEMO_PROD_OIDC_TOKEN_URL"));
+        assert!(
+            rendered
+                .contains("\"supported_auth_lanes\":[\"pat\",\"key_pair_jwt\",\"oauth_bearer\"]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("\"status\":\"quarantined\""),
+            "{rendered}"
+        );
+        assert_eq!(
+            classify_auth_lane("workload_identity"),
+            AuthLaneStatus::Quarantined
+        );
+        assert_eq!(classify_auth_lane("oidc"), AuthLaneStatus::Quarantined);
+        assert_eq!(classify_auth_lane("pat"), AuthLaneStatus::Supported);
+        assert_eq!(classify_auth_lane("bogus_lane"), AuthLaneStatus::Unknown);
+        let presence = health::HandlePresence {
+            auth_lane: Some("workload_identity".to_owned()),
+            required_missing: vec![],
+            handles: vec![],
+            account_error: None,
+        };
+        let data = render_json(&profile_diagnostics_data(
+            "demo-prod",
+            false,
+            "findings",
+            &presence,
+        ));
+        assert!(
+            data.contains("\"name\":\"auth_lane\",\"status\":\"fail\""),
+            "{data}"
+        );
+        assert!(data.contains("not Snowflake's documented"), "{data}");
     }
 
     #[test]
@@ -6481,6 +7095,35 @@ mod tests {
             !rendered.contains("not_checked"),
             "selftest must execute every fixture"
         );
+    }
+
+    /// Reality-check bead C4: a check whose subject is not compiled into the
+    /// binary must say so (`skipped`), never `pass`. Before 2026-09-24 both of
+    /// these reported pass from hardcoded data in builds without the feature.
+    #[test]
+    fn selftest_reports_uncompiled_checks_as_skipped_not_pass() {
+        let rendered = render_json(&envelope_for(&["selftest", "--json"]));
+        let status_of = |name: &str| {
+            let marker = format!("\"name\":\"{name}\",\"status\":\"");
+            rendered
+                .split(&marker)
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .map(str::to_owned)
+        };
+        let expect = |compiled: bool| if compiled { "pass" } else { "skipped" };
+        assert_eq!(
+            status_of("frame_codec_mapping").as_deref(),
+            Some(expect(cfg!(feature = "frankenpandas"))),
+            "{rendered}"
+        );
+        assert_eq!(
+            status_of("text_indexing_provenance").as_deref(),
+            Some(expect(cfg!(feature = "frankensearch"))),
+            "{rendered}"
+        );
+        // Every compiled check really passes.
+        assert_eq!(status_of("read_only_guard").as_deref(), Some("pass"));
     }
 
     #[test]
@@ -6963,10 +7606,16 @@ mod tests {
             OutputFormat::Json,
             "req-test".to_string(),
             "demo".to_string(),
+            "insert into staging.events values (1)",
             &plan,
         );
         assert_eq!(outcome.status.code(), 0);
         let rendered = render_outcome(outcome);
+        // Secret-free SQL is echoed runnable in the confirm command.
+        assert!(
+            rendered.contains("--sql \\\"insert into staging.events values (1)\\\""),
+            "{rendered}"
+        );
         assert!(rendered.contains("\"command_id\":\"query.write\""));
         assert!(rendered.contains("\"ok\":true"));
         assert!(rendered.contains("\"execution_enabled\":false"));

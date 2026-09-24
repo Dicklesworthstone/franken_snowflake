@@ -67,8 +67,25 @@ elif [ -x "target/debug/franken-snowflake" ]; then
   BIN="target/debug/franken-snowflake"
 else
   echo "building the live binary (set FSNOW_BIN to skip this build)..."
-  cargo build --release -p franken-snowflake-cli --features live --bin franken-snowflake || exit 1
+  FSNOW_BUILD_SHA="$(git rev-parse HEAD 2>/dev/null)" \
+    cargo build --release -p franken-snowflake-cli --features live --bin franken-snowflake || exit 1
   BIN="target/release/franken-snowflake"
+fi
+
+# --- binary identity (reality-check bead H1) --------------------------------
+# A reused binary must be a build of HEAD (its self-reported build.git_sha);
+# FSNOW_ALLOW_STALE_BIN=1 captures with a mismatched one and records that.
+HEAD_SHA=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+"$BIN" capabilities --with-exe-hash --json >"$ARTIFACTS/binary-identity.json" 2>/dev/null
+BIN_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["data"]["build"]["git_sha"])' \
+  "$ARTIFACTS/binary-identity.json" 2>/dev/null || echo unknown)
+if [ "$BIN_SHA" != "$HEAD_SHA" ] || [ "$HEAD_SHA" = unknown ]; then
+  if [ "${FSNOW_ALLOW_STALE_BIN:-0}" != 1 ]; then
+    emit refused ",\"reason\":\"binary built from $BIN_SHA, HEAD is $HEAD_SHA\""
+    echo "refusing: $BIN was built from $BIN_SHA, not HEAD $HEAD_SHA (rebuild it, or set FSNOW_ALLOW_STALE_BIN=1)"
+    exit 1
+  fi
+  emit stale_binary ",\"bin_sha\":\"$BIN_SHA\",\"head_sha\":\"$HEAD_SHA\""
 fi
 
 export FRANKEN_SNOWFLAKE_DATA_DIR="${FRANKEN_SNOWFLAKE_DATA_DIR:-$ARTIFACTS/data}"
