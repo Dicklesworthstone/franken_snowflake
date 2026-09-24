@@ -120,6 +120,24 @@ impl<'a> SqlLex<'a> {
         count
     }
 
+    /// True when a `;` closes a statement with nothing in it (`;;`, a leading
+    /// `;`); one trailing `;` after the last statement is not an empty one.
+    #[must_use]
+    pub fn has_empty_statement(&self) -> bool {
+        let mut segment_has_content = false;
+        for token in self.significant() {
+            if token.kind == SqlTokenKind::Semicolon {
+                if !segment_has_content {
+                    return true;
+                }
+                segment_has_content = false;
+            } else {
+                segment_has_content = true;
+            }
+        }
+        false
+    }
+
     /// Lower-cased executable words (keywords and unquoted identifiers) outside
     /// strings, quoted identifiers and comments, in order.
     #[must_use]
@@ -132,6 +150,35 @@ impl<'a> SqlLex<'a> {
     pub fn first_word(&self) -> Option<String> {
         self.significant().find_map(SqlToken::word)
     }
+}
+
+/// The text of each statement in `sql`, in order: every top-level
+/// `;`-separated segment with a significant token, from its first to its last
+/// significant token (surrounding comments and whitespace left out). The
+/// count is [`SqlLex::statement_count`].
+#[must_use]
+pub fn split_statements(sql: &str) -> Vec<&str> {
+    let lexed = lex(sql);
+    let mut statements = Vec::new();
+    let mut span: Option<(usize, usize)> = None;
+    for token in lexed.significant() {
+        if token.kind == SqlTokenKind::Semicolon {
+            if let Some((start, end)) = span.take()
+                && let Some(text) = sql.get(start..end)
+            {
+                statements.push(text);
+            }
+        } else {
+            let end = token.start + token.text.len();
+            span = Some(span.map_or((token.start, end), |(start, _)| (start, end)));
+        }
+    }
+    if let Some((start, end)) = span
+        && let Some(text) = sql.get(start..end)
+    {
+        statements.push(text);
+    }
+    statements
 }
 
 /// Lex `sql` into tokens. Never panics; every byte belongs to exactly one token,
@@ -398,6 +445,24 @@ pub fn read_side_effect(lexed: &SqlLex<'_>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reality-check bead L1: a batch splits at top-level `;` only, and empty
+    /// statements are detectable.
+    #[test]
+    fn statements_split_at_top_level_separators_only() {
+        let sql = "select 1; /* a;b */ select 'x;y' ; select $$c;d$$ as \"e;f\" -- g;h\n;";
+        assert_eq!(
+            split_statements(sql),
+            ["select 1", "select 'x;y'", "select $$c;d$$ as \"e;f\""]
+        );
+        assert_eq!(split_statements(sql).len(), lex(sql).statement_count());
+        assert!(split_statements("  -- only a comment\n").is_empty());
+        assert!(!lex("select 1; select 2;").has_empty_statement());
+        assert!(!lex("select 1").has_empty_statement());
+        assert!(lex("select 1;; select 2").has_empty_statement());
+        assert!(lex("; select 1").has_empty_statement());
+        assert!(lex("select 1; ;").has_empty_statement());
+    }
 
     fn count(sql: &str) -> usize {
         lex(sql).statement_count()

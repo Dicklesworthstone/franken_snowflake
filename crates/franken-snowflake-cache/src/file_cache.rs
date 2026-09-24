@@ -324,6 +324,10 @@ impl CacheBackend for FileCache {
         self.inner.exports_for_receipt(receipt_id)
     }
 
+    fn export(&self, export_id: &str) -> CacheResult<Option<ExportRecord>> {
+        self.inner.export(export_id)
+    }
+
     fn append_cost_history(&self, record: CostHistoryRecord) -> CacheResult<()> {
         self.inner.append_cost_history(record.clone())?;
         self.append_line(Table::CostHistory, &record)

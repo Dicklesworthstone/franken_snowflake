@@ -17,6 +17,10 @@ adapter-fixtures = []
 [lints]
 workspace = true
 
+[[example]]
+name = "adapter_conformance"
+required-features = ["adapter-fixtures"]
+
 [dependencies]
 asupersync = { workspace = true }
 serde = { version = "1", features = ["derive"] }
