@@ -196,6 +196,17 @@ implementation first and the test/hardening pass follows in a later wave. The
   statement runs cancels it through the driver, which sends the SQL API
   remote cancel, and the envelope reads `cancelled`; a second signal exits at
   once (130/143). Outside a statement the signals keep their default action.
+- **`profile doctor --online` checks the role's grants.** It walks
+  `SHOW GRANTS TO ROLE` from `CURRENT_ROLE()` through granted roles (up to 8,
+  `partial` beyond) and reports write-capable privileges (INSERT, UPDATE,
+  DELETE, TRUNCATE, OWNERSHIP, ALL, EXECUTE TASK, CREATE *, APPLY *); on a read
+  profile they are a warning, and `<PREFIX>_READ_ONLY_EXPECTED=true` makes them,
+  or an incomplete check, a profile error.
+- **`receipt refetch <hash>`** (and MCP `receipt_refetch`) re-reads a completed
+  statement's rows with `RESULT_SCAN` on the query id its receipt recorded,
+  without running the statement again; the id is validated as a query id before
+  it reaches SQL, a receipt older than the ~24 h result retention is refused
+  (`FSNOW-7001`), and the refetch writes its own receipt.
 - **Typed query results (`typed.v1`), output contract `fsnow.query.run.v2`.**
   `query run`, dataset mode, MCP `query_run` and the `query write` result decode
   each cell by its column's `rowType`: DATE `"YYYY-MM-DD"`, TIME/TIMESTAMP
