@@ -403,7 +403,7 @@ becomes optional, while an explicit value still wins. See
 | Command | What it does |
 |---|---|
 | `fsnow onboard --json` | Mega-command: capabilities, exit codes, first commands, and health in one call |
-| `fsnow capabilities [--with-exe-hash] --json` | The complete machine-readable command registry, including compiled `feature_flags`, each command's `input_schema` (the exact flags it accepts), and `build` (version, `git_sha`, `dirty`, target, profile, rustc, features; `--with-exe-hash` adds the SHA-256 of the running binary) |
+| `fsnow capabilities [--with-exe-hash] --json` | The complete machine-readable command registry, including compiled `feature_flags`, each command's `input_schema` (the exact flags it accepts), and `build` (version, `git_sha`, `dirty`, `source_digest` over the crate sources and Cargo.lock, target, profile, rustc, features; `--with-exe-hash` adds the SHA-256 of the running binary) |
 | `fsnow robot-docs guide` | An embedded agent guide for first-contact usage |
 | `fsnow agent-handbook --json` | Envelope keys, exit codes, recovery commands, and non-goals |
 | `fsnow doctor --json` | Executed local readiness checks: binary/features, contract render+parse, data dir writable, local store opens, default-profile handle presence (names only) |
@@ -539,9 +539,14 @@ execution receipt. `write` is a top-level alias for `query write`.
 
 3. **Preview first (optional).** `--dry-run` plans the statement and executes
    nothing (exit 0). The envelope reports `statement_kind`, `safety_class`, and a
-   `required_confirmation_token` such as `confirm:insert:<idempotency-id>`. The
-   token is bound to (profile, SQL), so re-running with `--confirm <token>`
-   executes only the same statement on the same profile.
+   `required_confirmation_token` such as `confirm:insert:<id>`. The id is random
+   (it reveals nothing about the SQL) and the dry run is recorded in the local
+   store, so `--confirm <token>` executes only that statement on that profile,
+   within 15 minutes (`<PREFIX>_WRITE_TOKEN_TTL_SECONDS`), and only once: after
+   the write completes the token is spent. A confirmed write submits the id as
+   the SQL API `requestId` with `retry=true`, so replaying the same `--confirm`
+   after a lost response returns the first result instead of writing twice. A
+   supplied token is always checked, also in the default mode.
 
    ```bash
    fsnow query write --profile demo-prod \
@@ -569,13 +574,27 @@ top of `WRITE_ENABLED`; once set, DDL also executes directly (subject to
 export FRANKEN_SNOWFLAKE_DEMO_PROD_WRITE_ALLOW_DDL=true
 ```
 
+`CALL`, `EXECUTE IMMEDIATE` and `EXECUTE TASK` can run DDL and `GRANT` inside
+the procedure, so they need `WRITE_ALLOW_PROCEDURES=true`; `COPY INTO` an
+external URL (`'s3://...'`, `'gcs://...'`, `'azure://...'`) moves data outside
+Snowflake and needs `WRITE_ALLOW_EXTERNAL=true` (unloads to `@stage` stay
+ordinary writes). `WRITE_ALLOWED_KINDS=insert,merge,...` restricts a profile to
+the listed statement kinds. Statements the SQL API cannot run as a single
+statement (`PUT`, `GET`, `USE`, `ALTER SESSION`, `BEGIN`/`COMMIT`/`ROLLBACK`,
+`SET`) are refused. Every write attempt is recorded on the append-only local
+audit log (dry run, refusal, submission, result), and a write does not proceed
+when the store cannot take the record.
+
 Typed refusals keep the write path honest:
 
 | Code | Meaning |
 |---|---|
 | `FSNOW-3007` | Writes are not enabled for the profile; set `<PREFIX>_WRITE_ENABLED=true` |
-| `FSNOW-3008` | This profile sets `WRITE_REQUIRE_CONFIRM=true` and no matching confirmation token was supplied; run `--dry-run`, then `--confirm <token>` |
+| `FSNOW-3008` | A confirmation token is missing (with `WRITE_REQUIRE_CONFIRM=true`) or does not match: no recorded dry run, another statement or profile, expired, or already used; run `--dry-run` again |
 | `FSNOW-3009` | The statement is DDL and DDL is not opted in; set `<PREFIX>_WRITE_ALLOW_DDL=true` |
+| `FSNOW-3010` | The SQL API cannot run this statement as a single statement (`PUT`/`GET`, `USE`, `ALTER SESSION`, transactions, `SET`) |
+| `FSNOW-3011` | A procedure or external unload without its opt-in; set `<PREFIX>_WRITE_ALLOW_PROCEDURES` or `<PREFIX>_WRITE_ALLOW_EXTERNAL` |
+| `FSNOW-3001` | The statement kind is not in the profile's `WRITE_ALLOWED_KINDS`, or the local audit log cannot be written |
 | `FSNOW-2003` | A required credential handle is missing |
 
 Without the `live` feature or without credentials, `query write` refuses cleanly
@@ -657,6 +676,10 @@ normalized to `_`, then prefixed with `FRANKEN_SNOWFLAKE_`. The profile
 | `<PREFIX>_WRITE_ENABLED` | Set to `true` to enable data writes (DML, COPY INTO) for the profile; a bare `query write` then executes directly |
 | `<PREFIX>_WRITE_REQUIRE_CONFIRM` | Set to `true` to require the dry-run to confirm ceremony on every write (cautious opt-in); a bare `query write` refuses until you `--dry-run`, then `--confirm <token>` |
 | `<PREFIX>_WRITE_ALLOW_DDL` | Set to `true` to additionally allow DDL (CREATE/ALTER/DROP/TRUNCATE/GRANT/REVOKE) through `query write` |
+| `<PREFIX>_WRITE_ALLOW_PROCEDURES` | Set to `true` to allow `CALL`, `EXECUTE IMMEDIATE`, `EXECUTE TASK` (they can run DDL/GRANT inside) |
+| `<PREFIX>_WRITE_ALLOW_EXTERNAL` | Set to `true` to allow `COPY INTO '<scheme>://...'` unloads outside Snowflake |
+| `<PREFIX>_WRITE_ALLOWED_KINDS` | Optional comma-separated statement kinds this profile may write (`insert,merge,update,delete,copy_into_table,...`); an unknown kind is a profile error |
+| `<PREFIX>_WRITE_TOKEN_TTL_SECONDS` | Lifetime of a dry-run confirmation token (default 900) |
 
 ### Global environment variables
 

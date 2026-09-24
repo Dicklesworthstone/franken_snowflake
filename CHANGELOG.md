@@ -131,9 +131,17 @@ implementation first and the test/hardening pass follows in a later wave. The
   envelopes, receipts, the append-only audit log (redacted again at the sink),
   and export provenance. A dry-run's `confirm_command` no longer embeds a
   redacted copy of such SQL, which would have run with `[REDACTED]` as the value.
-- **A supplied `--confirm` token is always checked.** In the default
-  (frictionless) write mode a token for different SQL or another profile was
-  ignored; it is now refused with `FSNOW-3008`.
+- **The write ladder's rungs are real.** A supplied `--confirm` is always
+  checked (in the default frictionless mode a token for other SQL was
+  ignored). Tokens are random per dry run, recorded in the local store with a
+  keyed digest of the statement, expire after 15 minutes, and are spent once
+  the write completes; the old token was a public hash of the SQL. A confirmed
+  write submits its id as the SQL API `requestId` with `retry=true`, so a
+  replay cannot write twice. Every attempt is audited and a write needs a
+  writable audit log. `CALL`/`EXECUTE` need `WRITE_ALLOW_PROCEDURES`,
+  `COPY INTO '<url>'` needs `WRITE_ALLOW_EXTERNAL`, `WRITE_ALLOWED_KINDS`
+  restricts kinds, and `PUT`/`GET`/`USE`/`ALTER SESSION`/transactions/`SET`
+  are refused (`FSNOW-3010`; the SQL API cannot run them alone).
 - **Workload identity quarantined.** The lane's RFC 7523 exchange is not
   Snowflake's documented `WIF.<provider>.<token>` scheme for the SQL API, so
   `profile validate` reports it unusable and the live path refuses it; the token
@@ -174,10 +182,12 @@ implementation first and the test/hardening pass follows in a later wave. The
   that ends without rows still writes a receipt whose `receipt_state` says how
   (`failed`, `cancelled`, `timed_out`).
 - **Build identity.** `capabilities.build` reports the version, git commit,
-  dirty flag, target, profile, rustc, and features; `--with-exe-hash` adds the
+  dirty flag, a git-independent `source_digest` of the crate sources and
+  Cargo.lock, target, profile, rustc, and features; `--with-exe-hash` adds the
   SHA-256 of the running binary. Receipts and audit events record the commit,
-  and the live-proof scripts refuse a binary built from another commit unless
-  `FSNOW_ALLOW_STALE_BIN=1`.
+  and the live-proof scripts refuse a binary not built from the working tree's
+  sources (source digest) unless `FSNOW_ALLOW_STALE_BIN=1`; a remote build
+  worker's stale `.git` cannot fool the check.
 - **Stricter `profile validate`.** An `_ACCOUNT` that does not form a canonical
   `https://<account>.snowflakecomputing.com` endpoint, or an unknown or
   quarantined auth lane, is exit 3 (`FSNOW-2002`) with a repair command;

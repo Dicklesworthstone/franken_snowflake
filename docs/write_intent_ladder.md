@@ -11,9 +11,18 @@ With the `live` feature and a profile that sets `WRITE_ENABLED`, a bare
 `query write` executes INSERT/MERGE/UPDATE/DELETE/COPY INTO directly (the SQL
 API does not support `PUT`/`GET`) and
 returns a live execution receipt; `--dry-run` previews and emits a confirmation
-token bound to (profile, SQL); `WRITE_REQUIRE_CONFIRM=true` makes the dry-run
-then `--confirm <token>` ceremony mandatory; DDL needs `WRITE_ALLOW_DDL=true`.
-Every executed or refused write is appended to the local audit ledger. The
+token (`confirm:<kind>:<id>`, a random id recorded in the local store with a
+keyed digest of the statement, valid 15 minutes, spent once the write
+completes; a confirmed write submits the id as the SQL API `requestId` with
+`retry=true`); a supplied token is always checked; `WRITE_REQUIRE_CONFIRM=true`
+makes the dry-run then `--confirm <token>` ceremony mandatory; DDL needs
+`WRITE_ALLOW_DDL=true`, procedures `WRITE_ALLOW_PROCEDURES=true`, external
+unloads `WRITE_ALLOW_EXTERNAL=true`, and `WRITE_ALLOWED_KINDS` restricts kinds;
+`PUT`/`GET`/`USE`/`ALTER SESSION`/transactions/`SET` are refused (FSNOW-3010).
+Every attempt (dry run, refusal, submission, result) is appended to the local
+audit ledger, and a write does not proceed when the ledger cannot be written.
+The allowlist rung is derived from the classified kind unless
+`WRITE_ALLOWED_KINDS` is set. The
 "Non-Goals" and "future" language below describes the original deferral and is
 kept for the rationale; where it conflicts with the README, the README and the
 code govern.

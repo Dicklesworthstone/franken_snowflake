@@ -45,7 +45,7 @@ to end with `--json`, asserting the typed fields with `jq`:
 
 | step | asserts |
 |---|---|
-| `binary_identity` | the binary's self-reported `exe_sha256` equals the file on disk, and its `build.git_sha` equals `git rev-parse HEAD`; a build of another commit (or an unverifiable one) is refused unless `FSNOW_ALLOW_STALE_BIN=1`, which records `stale: true` in `summary.json` |
+| `binary_identity` | the binary's self-reported `exe_sha256` equals the file on disk, and its `build.source_digest` equals the digest of the working tree's crate sources and Cargo.lock (the git sha is recorded too); a build of other sources (or an unverifiable one) is refused unless `FSNOW_ALLOW_STALE_BIN=1`, which records `stale: true` in `summary.json` |
 | `profile_validate`, `profile_doctor_online` | `ok`, `data_source=live`, a 64-hex `receipt_hash` |
 | `query_run_small` then `receipt_show` | rows returned; the receipt reads back from the local store and names the statement handle |
 | `query_run_partitioned` (+ `partition_early_stop`) | `--limit 10` returns 10 rows and stops fetching partitions early (a single-partition trial result is a finding, not a failure) |
