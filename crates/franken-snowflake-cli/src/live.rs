@@ -70,7 +70,7 @@ use franken_snowflake_http::{
 };
 use franken_snowflake_sqlapi::driver::{
     AuthProvider, DriverEvent, DriverObserver, DriverStats, RowSink, StatementHooks,
-    run_statement_hooked,
+    run_multi_statement_hooked, run_statement_hooked,
 };
 use franken_snowflake_sqlapi::lifecycle::{
     CompletedStatement, DEFAULT_PARTITION_CONCURRENCY, MAX_PARTITION_CONCURRENCY, PollPlan,
@@ -259,6 +259,265 @@ pub fn run_query_outcome(
             sql,
             &error,
         ),
+    }
+}
+
+/// `query run --allow-multiple-statements` (reality-check bead L1): run a
+/// batch of reads as one multi-statement request (`MULTI_STATEMENT_COUNT` =
+/// the batch size) and answer each statement's rows, in order, under
+/// `data.statements[]`. The caller already refused bindings, empty
+/// statements, and anything but reads.
+pub fn run_batch_query_outcome(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    sql: &str,
+    statements: &[&str],
+    options: &QueryRunOptions,
+) -> crate::Outcome {
+    let fail = |error: &SnowflakeError, profile: String| {
+        failure_outcome(
+            format,
+            "query.run",
+            "fsnow.query.run.v2",
+            request_id.clone(),
+            profile,
+            error,
+        )
+    };
+    let mut request_options = match query_request_options(None, None, options.query_tag.as_deref())
+    {
+        Ok(request_options) => request_options,
+        Err(error) => return fail(&error, profile),
+    };
+    let emit_cap = match parse_limit(options.limit.as_deref()) {
+        Ok(cap) => cap,
+        Err(error) => return fail(&error, profile),
+    };
+    // Per statement: do not download partitions the envelope will never show.
+    request_options.row_cap = Some(emit_cap);
+    let overrides = match session_overrides(options, None, None) {
+        Ok(overrides) => overrides,
+        Err(error) => return fail(&error, profile),
+    };
+    let conn = match LiveConn::resolve(&profile, &overrides) {
+        Ok(conn) => conn
+            .tagged("query.run", &request_id)
+            .with_statement_tag(request_options.query_tag.as_deref())
+            .with_progress(options.progress),
+        Err(error) => return fail(&error, profile),
+    };
+    match execute_batch(&conn, sql, statements.len(), request_options) {
+        Ok((parent, results)) => {
+            if let Err(error) = enforce_require_live(options.require_live, DataSource::Live) {
+                return fail(&error, profile);
+            }
+            let per_statement: Vec<serde_json::Value> = results
+                .iter()
+                .map(|rows| {
+                    serde_json::json!({
+                        "statement_handle": rows.statement_handle,
+                        "row_count": rows.total_rows,
+                        "columns": rows
+                            .column_pairs()
+                            .into_iter()
+                            .map(|(name, snowflake_type)| {
+                                serde_json::json!({ "name": name, "type": snowflake_type })
+                            })
+                            .collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            let (receipt_hash, warnings) = record_receipt(
+                "query.run",
+                &conn,
+                &request_id,
+                sql,
+                &parent,
+                "statement_executed",
+                serde_json::json!({ "statements": per_statement }),
+            );
+            batch_success(
+                format,
+                request_id,
+                profile,
+                &parent,
+                &results,
+                statements,
+                emit_cap,
+                RowEncoding::from_raw_cells(options.raw_cells),
+                receipt_hash.clone(),
+                warnings,
+                vec![receipt_show_command(receipt_hash.as_deref())],
+            )
+        }
+        Err(error) => with_terminal_receipt(
+            fail(&error, profile),
+            "query.run",
+            &conn,
+            &request_id,
+            sql,
+            &error,
+        ),
+    }
+}
+
+/// Run `sql`, a batch of `count` statements, as one multi-statement request
+/// and assemble each statement's rows (reality-check bead L1). Returns the
+/// parent (its `total_rows` is the batch's total; its own row is Snowflake's
+/// status message) and each statement in order.
+fn execute_batch(
+    conn: &LiveConn,
+    sql: &str,
+    count: usize,
+    options: QueryRequestOptions,
+) -> Result<(LiveRows, Vec<LiveRows>), SnowflakeError> {
+    let row_cap = options.row_cap;
+    let mut request = build_request(conn, sql, options);
+    // The one place the pinned single-statement count is lifted: the guard
+    // counted the batch with the shared lexer, and Snowflake refuses the
+    // request (422) when its own count differs.
+    request
+        .parameters
+        .get_or_insert_with(BTreeMap::new)
+        .insert("MULTI_STATEMENT_COUNT".to_owned(), count.to_string());
+    let query_tag = request
+        .parameters
+        .as_ref()
+        .and_then(|parameters| parameters.get("QUERY_TAG"))
+        .cloned();
+    let sql_api_request_id = unique_request_id();
+    LAST_RUN.with(RefCell::take);
+    #[cfg(test)]
+    if conn.script.is_some() {
+        return Err(SnowflakeError::new(
+            SnowflakeErrorCode::Internal,
+            "the scripted test transport does not model multi-statement requests",
+        ));
+    }
+    let params = SubmitQueryParams {
+        request_id: Some(sql_api_request_id.clone()),
+        retry: true,
+        asynchronous: false,
+        nullable: None,
+    };
+    let poll_plan = PollPlan::with_max_polls(conn.max_polls)
+        .with_partition_concurrency(conn.partition_concurrency)
+        .with_row_cap(row_cap);
+    let progress = conn.progress;
+    let (outcome, stats, facts) = with_runtime(conn, move |cx, client, auth| {
+        Box::pin(async move {
+            let mut observer = RunObserver::new(progress);
+            let (outcome, stats) = run_multi_statement_hooked(
+                cx,
+                client,
+                auth,
+                request,
+                params,
+                poll_plan,
+                Some(&mut observer),
+            )
+            .await;
+            Ok((outcome, stats, observer.facts))
+        })
+    })?;
+    LAST_RUN.with(|slot| *slot.borrow_mut() = facts);
+    let result = outcome_into_result(outcome, "the statements", true)?;
+    let statements: Vec<LiveRows> = result
+        .statements
+        .into_iter()
+        .map(|done| {
+            let mut rows = into_rows(done, DriverStats::default(), sql_api_request_id.clone());
+            rows.query_tag.clone_from(&query_tag);
+            rows
+        })
+        .collect();
+    let mut parent = into_rows(result.parent, stats, sql_api_request_id);
+    parent.query_tag = query_tag;
+    parent.total_rows = statements.iter().map(|rows| rows.total_rows).sum();
+    Ok((parent, statements))
+}
+
+/// A batch's envelope: each statement's columns and rows, projected like a
+/// single statement's and capped at `emit_cap` each, under
+/// `data.statements[]` in order.
+#[allow(clippy::too_many_arguments)]
+fn batch_success(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    parent: &LiveRows,
+    results: &[LiveRows],
+    statements: &[&str],
+    emit_cap: usize,
+    encoding: RowEncoding,
+    receipt_hash: Option<String>,
+    mut warnings: Vec<Json>,
+    safe_next_commands: Vec<String>,
+) -> crate::Outcome {
+    let mut entries = Vec::with_capacity(results.len());
+    for (index, rows) in results.iter().enumerate() {
+        let position = index + 1;
+        let returned = rows.rows.len().min(emit_cap);
+        let truncated = rows.rows.len() > emit_cap;
+        let projected = project_rows(rows, returned, encoding);
+        warnings.extend(projected.warnings.into_iter().map(|warning| match warning {
+            Json::String(text) => json_string(format!("statement {position}: {text}")),
+            other => other,
+        }));
+        if truncated {
+            warnings.push(json_string(format!(
+                "statement {position}: result truncated to {emit_cap} rows in this envelope; {} total rows were returned (raise --limit up to {MAX_ROW_EMIT_CAP})",
+                rows.total_rows
+            )));
+        }
+        let statement = statements.get(index).copied().unwrap_or_default();
+        entries.push(json_object(vec![
+            ("index", Json::Number(index as i64)),
+            (
+                "statement_handle",
+                json_string(rows.statement_handle.clone()),
+            ),
+            (
+                "sql_preview_redacted",
+                json_string(crate::compact_sql(&redact(statement))),
+            ),
+            ("columns", projected.columns),
+            ("rows", projected.rows),
+            ("row_count", Json::Number(rows.total_rows)),
+            ("returned_rows", Json::Number(returned as i64)),
+            ("partition_count", Json::Number(rows.partition_count as i64)),
+            (
+                "partitions_fetched",
+                Json::Number(i64::from(rows.fetched_partitions)),
+            ),
+            ("truncated", Json::Bool(truncated)),
+        ]));
+    }
+    let data = json_object(vec![
+        ("row_encoding", json_string(encoding.token())),
+        ("statement_count", Json::Number(results.len() as i64)),
+        ("statements", json_array(entries)),
+        ("row_emit_cap", Json::Number(emit_cap as i64)),
+        (
+            "sql_api_request_id",
+            json_string(parent.sql_api_request_id.clone()),
+        ),
+    ]);
+    let mut envelope = base_envelope(
+        true,
+        "success",
+        "query.run",
+        "fsnow.query.run.v2",
+        request_id,
+        data,
+    );
+    stamp_live(&mut envelope, &profile, parent, receipt_hash);
+    envelope.safe_next_commands = safe_next_commands;
+    envelope.warnings = warnings;
+    crate::Outcome {
+        status: CoreExitCode::Success,
+        body: Body::Envelope { envelope, format },
     }
 }
 
@@ -3057,12 +3316,36 @@ impl Drop for InFlight {
 pub(crate) type CancelProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 
 thread_local! {
-    /// The cancel probe of the MCP request this thread is serving, if any.
+    /// The cancel probe of the MCP request or TUI query this thread is
+    /// serving, if any.
     static EXTERNAL_CANCEL: RefCell<Option<CancelProbe>> = const { RefCell::new(None) };
 }
 
+/// Receives every driver event of the statements this thread runs (the TUI's
+/// progress pane).
+pub(crate) type ProgressSink = Arc<dyn Fn(&DriverEvent) + Send + Sync>;
+
+thread_local! {
+    /// The progress sink of the TUI query this thread is running, if any.
+    static PROGRESS_SINK: RefCell<Option<ProgressSink>> = const { RefCell::new(None) };
+}
+
+/// Run `work` with `sink` receiving this thread's driver events.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
+pub(crate) fn with_progress_sink<T>(sink: ProgressSink, work: impl FnOnce() -> T) -> T {
+    struct Reset(Option<ProgressSink>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            PROGRESS_SINK.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+    let _reset = Reset(PROGRESS_SINK.with(|slot| slot.borrow_mut().replace(sink)));
+    work()
+}
+
 /// Run `work` with `cancel` as this thread's external cancel probe.
-#[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "mcp", feature = "tui")), allow(dead_code))]
 pub(crate) fn with_external_cancel<T>(cancel: CancelProbe, work: impl FnOnce() -> T) -> T {
     struct Reset(Option<CancelProbe>);
     impl Drop for Reset {
@@ -3124,7 +3407,10 @@ async fn cancel_on_flags<T>(
                 cx.cancel_with(CancelKind::Shutdown, Some("terminated (SIGTERM)"));
                 raised = true;
             } else if external.as_ref().is_some_and(|cancelled| cancelled()) {
-                cx.cancel_with(CancelKind::User, Some("the MCP request was cancelled"));
+                cx.cancel_with(
+                    CancelKind::User,
+                    Some("the request was cancelled (MCP cancellation or TUI Esc)"),
+                );
                 raised = true;
             }
         }
@@ -3154,6 +3440,7 @@ struct RunObserver {
     started: Instant,
     progress: bool,
     facts: RunFacts,
+    sink: Option<ProgressSink>,
 }
 
 impl RunObserver {
@@ -3162,6 +3449,7 @@ impl RunObserver {
             started: Instant::now(),
             progress,
             facts: RunFacts::default(),
+            sink: PROGRESS_SINK.with(|slot| slot.borrow().clone()),
         }
     }
 }
@@ -3184,6 +3472,9 @@ impl DriverObserver for RunObserver {
                 self.facts.remote_cancel = Some((*acknowledged, detail.clone()));
             }
             _ => {}
+        }
+        if let Some(sink) = &self.sink {
+            sink(&event);
         }
         if self.progress {
             use std::io::Write as _;
@@ -5254,6 +5545,138 @@ mod tests {
         let _ = std::fs::remove_file(&overlay_path);
     }
 
+    /// Reality-check bead oj0.39: the local-store adapter passes the same
+    /// conformance suite as the fixture adapter over artifacts a scripted scan,
+    /// query and export persisted; unknown ids are typed errors.
+    #[test]
+    fn the_local_store_adapter_passes_the_conformance_suite() {
+        use franken_snowflake_core::adapter::SnowflakeDataLakeAdapter;
+        use franken_snowflake_core::adapter::conformance::{
+            ConformanceProbe, check_adapter_conformance,
+        };
+        use franken_snowflake_core::ids::{DatasetId, ProfileName, ReceiptHash};
+        use franken_snowflake_core::outcome::DataSource;
+
+        install(
+            "adapter_profile",
+            None,
+            None,
+            information_schema_script_with_scope("ADP_DB", "PUBLIC"),
+        );
+        let scan = envelope(run_catalog_scan_outcome(
+            OutputFormat::Json,
+            "req-adapter-scan".to_owned(),
+            "adapter_profile".to_owned(),
+            "ADP_DB".to_owned(),
+            "PUBLIC".to_owned(),
+            false,
+            RelationOptions::default(),
+        ));
+        let dataset = scan["data"]["datasets"][0]["dataset_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        install(
+            "adapter_profile",
+            None,
+            None,
+            vec![Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000ad01",
+                &[("ID", "FIXED"), ("NAME", "TEXT")],
+                &[vec![Some("1"), Some("alpha")]],
+            ))],
+        );
+        let query = envelope(run_query_outcome(
+            OutputFormat::Json,
+            "req-adapter-query".to_owned(),
+            "adapter_profile".to_owned(),
+            "select id, name from events",
+            &crate::QueryRunOptions::default(),
+        ));
+        let receipt = query["receipt_hash"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        install(
+            "adapter_profile",
+            None,
+            None,
+            vec![Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000ad02",
+                &[("ID", "FIXED"), ("NAME", "TEXT")],
+                &[vec![Some("1"), Some("alpha")]],
+            ))],
+        );
+        let out = std::env::temp_dir().join(format!(
+            "fsnow-adapter-export-{}-{}.csv",
+            std::process::id(),
+            local_store::now_unix_ms()
+        ));
+        let export = envelope(export_run_outcome(
+            OutputFormat::Json,
+            "req-adapter-export".to_owned(),
+            ExportPlanSpec {
+                profile: Some("adapter_profile".to_owned()),
+                sql: Some("select id, name from events".to_owned()),
+                format: Some("csv".to_owned()),
+                ..Default::default()
+            },
+            Some(out.display().to_string()),
+            false,
+        ));
+        let _ = std::fs::remove_file(&out);
+        let export_id = export["data"]["export_receipt"]["export_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            !dataset.is_empty() && !receipt.is_empty() && !export_id.is_empty(),
+            "{scan}\n{query}\n{export}"
+        );
+
+        let adapter = crate::adapter::LocalStoreAdapter::open_with_env(Box::new(|name| {
+            let value = match name.strip_prefix("FRANKEN_SNOWFLAKE_ADAPTER_PROFILE_")? {
+                "ACCOUNT" => "xy12345.us-east-1",
+                "USER" => "SVC_ADAPTER",
+                "AUTH" => "pat",
+                "WAREHOUSE" => "WH_ADAPTER",
+                "PAT" => "set-but-never-read-by-diagnostics",
+                _ => return None,
+            };
+            Some(value.to_owned())
+        }))
+        .expect("open the local store");
+        let probe = ConformanceProbe {
+            profile: ProfileName::new("adapter_profile"),
+            dataset: DatasetId::new(dataset.clone()),
+            receipt: ReceiptHash::new(receipt),
+            export_id: Some(export_id),
+            frame_id: None,
+            expected_data_source: DataSource::Live,
+        };
+        assert_eq!(
+            check_adapter_conformance(&adapter, &probe),
+            Vec::<String>::new()
+        );
+        // The dataset contract carries the discovered fields and the
+        // snapshot's live provenance.
+        let manifest = adapter
+            .dataset_manifest(&DatasetId::new(dataset))
+            .expect("the scanned dataset");
+        assert_eq!(manifest.data.fields.len(), 3);
+        assert_eq!(manifest.data.provenance.data_source, DataSource::Live);
+        // A profile without handles is not found; one without a lane is invalid.
+        let missing = crate::adapter::LocalStoreAdapter::open_with_env(Box::new(|_| None))
+            .expect("open the local store");
+        assert_eq!(
+            missing
+                .profile_diagnostics(&ProfileName::new("adapter_profile"))
+                .map(|_| ())
+                .map_err(|error| error.code),
+            Err(SnowflakeErrorCode::ProfileNotFound)
+        );
+    }
+
     #[test]
     fn a_transport_error_in_the_relation_pass_fails_the_scan() {
         let mut script = information_schema_script_with_scope("NET_DB", "NET_SCHEMA");
@@ -5824,6 +6247,113 @@ mod tests {
         assert!(!warning.contains("not-a-day-count"), "{warning}");
     }
 
+    /// Reality-check bead C1: typed rows match the published JSON Schema
+    /// (docs/protocol/typed_rows.v1.schema.json) cell by cell, every
+    /// representation is exercised, the published example is exactly what the
+    /// codec fixture projects to, and the shapes a naive decoder produces fail.
+    #[test]
+    fn typed_rows_match_the_published_schema_and_example() {
+        use franken_snowflake_sqlapi::lifecycle::{Progress, StatementMachine};
+        use franken_snowflake_sqlapi::status::ResponseClass;
+        use std::collections::BTreeSet;
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/protocol/typed_rows.v1.schema.json"
+        ))
+        .expect("the schema is JSON");
+        let example: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/protocol/typed_rows.v1.example.json"
+        ))
+        .expect("the example is JSON");
+        let project = |body: &[u8]| -> serde_json::Value {
+            let mut machine = StatementMachine::new(PollPlan::default());
+            let Ok(Progress::Complete(done)) = machine.on_submit(ResponseClass::Completed, body)
+            else {
+                panic!("a completed statement");
+            };
+            let rows = into_rows(done, DriverStats::default(), "req".to_owned());
+            let projected = project_rows(&rows, rows.rows.len(), RowEncoding::Typed);
+            let parse = |json: &Json| -> serde_json::Value {
+                serde_json::from_str(&crate::render_json(json)).unwrap_or_default()
+            };
+            serde_json::json!({
+                "row_encoding": RowEncoding::Typed.token(),
+                "columns": parse(&projected.columns),
+                "rows": parse(&projected.rows),
+            })
+        };
+        let fixture = project(include_bytes!(
+            "../../franken-snowflake-testkit/fixtures/sqlapi/jsonv2_codec_cells.json"
+        ));
+        assert_eq!(fixture, example, "docs/protocol/typed_rows.v1.example.json");
+        // The two representations the fixture lacks: a small exact integer
+        // and a type without a typed form.
+        let extra = project(
+            br#"{"code":"090001","statementHandle":"01b2c3d4-0000-0000-0000-00000000c1c1","resultSetMetaData":{"numRows":2,"format":"jsonv2","rowType":[{"name":"ID","type":"FIXED","precision":9,"scale":0,"nullable":false},{"name":"PLACE","type":"GEOGRAPHY","nullable":true}],"partitionInfo":[{"rowCount":2,"uncompressedSize":64}]},"data":[["-42","POINT(1 2)"],["7",null]]}"#,
+        );
+        let compile = |schema: &serde_json::Value| {
+            jsonschema::validator_for(schema).expect("the schema compiles")
+        };
+        let whole = compile(&schema);
+        let violations = |data: &serde_json::Value| -> Vec<String> {
+            let mut found: Vec<String> = whole
+                .iter_errors(data)
+                .map(|error| error.to_string())
+                .collect();
+            let columns = data["columns"].as_array().cloned().unwrap_or_default();
+            for (index, column) in columns.iter().enumerate() {
+                let repr = column["json_repr"].as_str().unwrap_or_default();
+                let cell = compile(&serde_json::json!({
+                    "$schema": schema["$schema"],
+                    "$defs": schema["$defs"],
+                    "$ref": format!("#/$defs/cell_{repr}"),
+                }));
+                for row in data["rows"].as_array().into_iter().flatten() {
+                    if !cell.is_valid(&row[index]) {
+                        found.push(format!("{}: {} is not {repr}", column["name"], row[index]));
+                    }
+                }
+            }
+            found
+        };
+        assert_eq!(violations(&fixture), Vec::<String>::new());
+        assert_eq!(violations(&extra), Vec::<String>::new());
+        let exercised: BTreeSet<String> = [&fixture, &extra]
+            .iter()
+            .flat_map(|data| data["columns"].as_array().cloned().unwrap_or_default())
+            .filter_map(|column| column["json_repr"].as_str().map(str::to_owned))
+            .collect();
+        let published: BTreeSet<String> =
+            schema["$defs"]["column"]["properties"]["json_repr"]["enum"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|repr| repr.as_str().map(str::to_owned))
+                .collect();
+        assert_eq!(exercised, published, "every representation is exercised");
+        // Shapes a naive decoder produces fail.
+        for (column, naive) in [
+            // FIXED(38,2) through a float.
+            (0, serde_json::json!(12_345_678_901_234_567.89)),
+            // BOOLEAN left as text.
+            (4, serde_json::json!("true")),
+            // DATE as the wire day count.
+            (5, serde_json::json!(18_262)),
+            // TIME without its nine fractional digits.
+            (6, serde_json::json!("23:01:59")),
+            // TIMESTAMP_TZ without its offset.
+            (9, serde_json::json!("2021-03-19T18:06:59.000000000")),
+            // Odd-length hex.
+            (10, serde_json::json!("DEADBEE")),
+        ] {
+            let mut broken = fixture.clone();
+            broken["rows"][0][column] = naive.clone();
+            assert!(
+                !violations(&broken).is_empty(),
+                "{naive} passed as column {column}"
+            );
+        }
+    }
+
     /// Reality-check bead L5: only a completed receipt with a UUID-shaped
     /// query id inside the ~24 h result retention can be refetched.
     #[test]
@@ -6043,6 +6573,38 @@ mod tests {
             3,
         );
         assert!(line.contains(r#""event":"remote_cancel""#), "{line}");
+    }
+
+    /// Bead w0i.11: a run on a thread with a progress sink hands every driver
+    /// event to it; the sink is gone once the scope ends.
+    #[test]
+    fn the_run_observer_feeds_the_threads_progress_sink() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        with_progress_sink(
+            Arc::new(move |event: &DriverEvent| {
+                if let Ok(mut events) = recorded.lock() {
+                    events.push(progress_line(event, 0));
+                }
+            }),
+            || {
+                let mut observer = RunObserver::new(false);
+                observer.event(DriverEvent::Submitted {
+                    statement_handle: Some("01b2-handle".to_owned()),
+                    running: false,
+                });
+                observer.event(DriverEvent::Completed {
+                    rows: 3,
+                    partitions: 1,
+                });
+            },
+        );
+        let lines = seen.lock().map(|events| events.clone()).unwrap_or_default();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("01b2-handle"), "{lines:?}");
+        let mut after = RunObserver::new(false);
+        after.event(DriverEvent::Polled { polls: 1 });
+        assert_eq!(seen.lock().map(|events| events.len()).unwrap_or(0), 2);
     }
 
     #[test]

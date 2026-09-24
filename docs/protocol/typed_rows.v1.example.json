@@ -1,0 +1,39 @@
+{
+  "row_encoding": "typed.v1",
+  "columns": [
+    { "name": "N_SCALE", "type": "FIXED", "nullable": false, "precision": 38, "scale": 2, "json_repr": "decimal_string" },
+    { "name": "N_BIG", "type": "NUMBER", "nullable": false, "precision": 38, "scale": 0, "json_repr": "decimal_string" },
+    { "name": "REAL_VALUE", "type": "REAL", "nullable": false, "precision": null, "scale": null, "json_repr": "float" },
+    { "name": "DECFLOAT_VALUE", "type": "DECFLOAT", "nullable": false, "precision": null, "scale": null, "json_repr": "decimal_string" },
+    { "name": "BOOL_TRUE", "type": "BOOLEAN", "nullable": false, "precision": null, "scale": null, "json_repr": "bool" },
+    { "name": "EVENT_DATE", "type": "DATE", "nullable": false, "precision": null, "scale": null, "json_repr": "date" },
+    { "name": "EVENT_TIME", "type": "TIME", "nullable": false, "precision": null, "scale": 9, "json_repr": "time" },
+    { "name": "TS_NTZ", "type": "TIMESTAMP_NTZ", "nullable": false, "precision": null, "scale": 9, "json_repr": "timestamp_ntz" },
+    { "name": "TS_LTZ", "type": "TIMESTAMP_LTZ", "nullable": false, "precision": null, "scale": 9, "json_repr": "timestamp_utc" },
+    { "name": "TS_TZ", "type": "TIMESTAMP_TZ", "nullable": false, "precision": null, "scale": 9, "json_repr": "timestamp_offset" },
+    { "name": "BIN_VALUE", "type": "BINARY", "nullable": false, "precision": null, "scale": null, "json_repr": "hex" },
+    { "name": "VARIANT_VALUE", "type": "VARIANT", "nullable": false, "precision": null, "scale": null, "json_repr": "json" },
+    { "name": "OBJECT_VALUE", "type": "OBJECT", "nullable": false, "precision": null, "scale": null, "json_repr": "json" },
+    { "name": "ARRAY_VALUE", "type": "ARRAY", "nullable": false, "precision": null, "scale": null, "json_repr": "json" },
+    { "name": "NULL_TEXT", "type": "TEXT", "nullable": true, "precision": null, "scale": null, "json_repr": "string" }
+  ],
+  "rows": [
+    [
+      "12345678901234567.89",
+      "99999999999999999999",
+      1.25,
+      "1.2345678901234567890123456789012345678E+39",
+      true,
+      "2020-01-01",
+      "23:01:59.000000000",
+      "2021-01-28T22:09:37.123456789",
+      "2021-01-28T22:09:37.123456789Z",
+      "2021-03-19T18:06:59.000000000+01:00",
+      "DEADBEEF",
+      { "k": [1, 2] },
+      { "nested": { "ok": true } },
+      [1, "two", null],
+      null
+    ]
+  ]
+}

@@ -216,11 +216,16 @@ pub fn launch_outcome(
 
 /// Build the host-side executor the TUI calls when the operator submits a
 /// planned query: it drives the exact same live outcome path as `query run`
-/// and renders compact result lines for the log pane.
+/// (on the TUI's background task), forwards the driver's events to the
+/// progress pane, cancels the statement (remote cancel included) when the
+/// operator raises the cancel flag, and renders compact result lines for the
+/// log pane.
 #[cfg(feature = "live")]
 fn build_query_executor(profile: String) -> franken_snowflake_tui::QueryExecutor {
-    Box::new(
-        move |sql: &str, bindings: &BTreeMap<String, TypedBinding>| {
+    std::sync::Arc::new(
+        move |sql: &str,
+              bindings: &BTreeMap<String, TypedBinding>,
+              hooks: franken_snowflake_tui::ExecutionHooks| {
             // The planner refuses mutations before a plan exists, and this
             // closure re-checks the read-only shape so the executor itself stays
             // defense-in-depth: only a single read statement can run from here.
@@ -235,16 +240,64 @@ fn build_query_executor(profile: String) -> franken_snowflake_tui::QueryExecutor
                 bindings_json: serde_json::to_string(bindings).ok(),
                 ..crate::QueryRunOptions::default()
             };
-            let mut outcome = crate::live::run_query_outcome(
-                OutputFormat::Json,
-                local_store::invocation_id("tui-query-run"),
-                profile.clone(),
-                sql,
-                &options,
+            let cancel = hooks.cancel;
+            let progress = std::sync::Mutex::new(hooks.progress);
+            let mut outcome = crate::live::with_external_cancel(
+                std::sync::Arc::new(move || cancel.load(std::sync::atomic::Ordering::SeqCst)),
+                || {
+                    crate::live::with_progress_sink(
+                        std::sync::Arc::new(move |event| {
+                            if let (Some(tick), Ok(progress)) =
+                                (progress_tick(event), progress.lock())
+                            {
+                                let _ = progress.send(tick);
+                            }
+                        }),
+                        || {
+                            crate::live::run_query_outcome(
+                                OutputFormat::Json,
+                                local_store::invocation_id("tui-query-run"),
+                                profile.clone(),
+                                sql,
+                                &options,
+                            )
+                        },
+                    )
+                },
             );
             render_outcome_lines(&mut outcome)
         },
     )
+}
+
+/// A driver event as a progress-pane tick: the handle once submitted, a
+/// partition and its rows as each is fetched, the partition total at the end.
+#[cfg(feature = "live")]
+fn progress_tick(
+    event: &franken_snowflake_sqlapi::driver::DriverEvent,
+) -> Option<franken_snowflake_tui::ProgressTick> {
+    use franken_snowflake_sqlapi::driver::DriverEvent;
+    let tick = |statement_handle, partitions_total, partitions_fetched_delta, rows_delta| {
+        franken_snowflake_tui::ProgressTick {
+            statement_handle,
+            partitions_total,
+            partitions_fetched_delta,
+            rows_delta,
+            // The live root budget is not configurable yet (reality-check
+            // bead E3): the pane shows the ambient budget as it is.
+            budget: franken_snowflake_tui::ProgressBudget::from_budget(
+                &franken_snowflake_core::budget::Budget::new(),
+            ),
+        }
+    };
+    match event {
+        DriverEvent::Submitted {
+            statement_handle, ..
+        } => Some(tick(statement_handle.clone(), None, 0, 0)),
+        DriverEvent::PartitionFetched { rows, .. } => Some(tick(None, None, 1, *rows)),
+        DriverEvent::Completed { partitions, .. } => Some(tick(None, Some(*partitions), 0, 0)),
+        DriverEvent::Polled { .. } | DriverEvent::RemoteCancel { .. } => None,
+    }
 }
 
 /// Render a `query run` outcome into TUI log lines: a summary line, the typed
@@ -350,6 +403,36 @@ fn render_outcome_lines(outcome: &mut Outcome) -> Vec<ExecutorLine> {
 mod tests {
     use super::*;
     use franken_snowflake_cache::{CatalogSnapshotRecord, ContentAddress, VerifiedPayload};
+
+    /// Bead w0i.11: driver events become progress-pane ticks.
+    #[cfg(feature = "live")]
+    #[test]
+    fn driver_events_become_progress_ticks() {
+        use franken_snowflake_sqlapi::driver::DriverEvent;
+        let submitted = progress_tick(&DriverEvent::Submitted {
+            statement_handle: Some("01b2-handle".to_owned()),
+            running: true,
+        });
+        assert_eq!(
+            submitted.and_then(|tick| tick.statement_handle).as_deref(),
+            Some("01b2-handle")
+        );
+        let fetched = progress_tick(&DriverEvent::PartitionFetched {
+            index: 2,
+            rows: 40,
+            bytes: 900,
+        });
+        assert_eq!(
+            fetched.map(|tick| (tick.partitions_fetched_delta, tick.rows_delta)),
+            Some((1, 40))
+        );
+        let done = progress_tick(&DriverEvent::Completed {
+            rows: 41,
+            partitions: 3,
+        });
+        assert_eq!(done.and_then(|tick| tick.partitions_total), Some(3));
+        assert_eq!(progress_tick(&DriverEvent::Polled { polls: 4 }), None);
+    }
     use franken_snowflake_catalog::model::{DataSourceClass, Provenance, ProvenanceSource};
 
     fn envelope(outcome: Outcome) -> serde_json::Value {

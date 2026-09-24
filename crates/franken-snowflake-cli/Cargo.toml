@@ -115,3 +115,6 @@ franken-snowflake-testkit = { path = "../franken-snowflake-testkit" }
 # the graph through franken-snowflake-auth).
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
 rand = "0.8"
+# Validates typed rows against docs/protocol/typed_rows.v1.schema.json. No
+# default features: no HTTP/file schema resolution, so no reqwest or Tokio.
+jsonschema = { version = "0.56", default-features = false }

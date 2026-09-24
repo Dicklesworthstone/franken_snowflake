@@ -216,6 +216,9 @@ struct QueryRunOptions {
     /// (`--raw-cells`, reality-check bead C1). Read by the live transport only.
     #[cfg_attr(not(feature = "live"), allow(dead_code))]
     raw_cells: bool,
+    /// Run a batch of read statements in one request
+    /// (`--allow-multiple-statements`, reality-check bead L1).
+    allow_multiple_statements: bool,
     /// NDJSON progress events on stderr (`--progress`, reality-check bead E5).
     #[cfg_attr(not(feature = "live"), allow(dead_code))]
     progress: bool,
@@ -503,7 +506,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "query.run",
-        invocation: "franken-snowflake query [run] --profile <profile> (--sql <sql> | --dataset <id> [--entity <v>] [--from <t>] [--to <t>] [--as-of <t>] [--select a,b] [--filter <json>]) [--limit <rows>] [--role <role>] [--warehouse <wh>] [--statement-timeout <secs>] [--bindings-env <env-var>] [--query-tag <tag>] [--raw-cells] --json",
+        invocation: "franken-snowflake query [run] --profile <profile> (--sql <sql> | --dataset <id> [--entity <v>] [--from <t>] [--to <t>] [--as-of <t>] [--select a,b] [--filter <json>]) [--limit <rows>] [--role <role>] [--warehouse <wh>] [--statement-timeout <secs>] [--bindings-env <env-var>] [--query-tag <tag>] [--raw-cells] [--allow-multiple-statements] --json",
         output_contract_id: "fsnow.query.run.v2",
         description: "Submit a SQL API statement; `query --sql` shorthand maps to this surface.",
         read_only: true,
@@ -1382,6 +1385,7 @@ fn query_run_options(args: &[String]) -> QueryRunOptions {
         statement_timeout: value_after(args, "--statement-timeout"),
         require_live: has_flag(args, "--require-live"),
         raw_cells: has_flag(args, "--raw-cells"),
+        allow_multiple_statements: has_flag(args, "--allow-multiple-statements"),
         progress: has_flag(args, "--progress"),
         bindings_json: None,
     }
@@ -2817,6 +2821,12 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
                     "Emit the SQL API jsonv2 wire strings instead of typed.v1 cells (--raw-cells)",
                 ),
                 input(
+                    "allow_multiple_statements",
+                    "boolean",
+                    false,
+                    "Run a batch of read statements in one request; data.statements[] holds each result in order (--allow-multiple-statements)",
+                ),
+                input(
                     "progress",
                     "boolean",
                     false,
@@ -4035,15 +4045,38 @@ fn query_run_outcome(
         );
     }
     if has_multiple_statements(&sql_text) {
-        return refusal(
+        if !options.allow_multiple_statements {
+            return refusal(
+                format,
+                "query.run",
+                "fsnow.query.run.v2",
+                request_id,
+                profile.clone(),
+                SnowflakeErrorCode::MultiStatementRefused,
+                "Multiple SQL statements are refused by default; submit exactly one read-only statement, or pass --allow-multiple-statements to run a batch of reads in one request.",
+                vec![plan_hint(profile.as_deref(), &sql_text)],
+            );
+        }
+        let statements = sql_lexer::split_statements(&sql_text);
+        if let Some((code, message)) = batch_refusal(&sql_text, &statements, &options) {
+            return refusal(
+                format,
+                "query.run",
+                "fsnow.query.run.v2",
+                request_id,
+                profile.clone(),
+                code,
+                &message,
+                vec![plan_hint(profile.as_deref(), &sql_text)],
+            );
+        }
+        return query_run_batch_dispatch(
             format,
-            "query.run",
-            "fsnow.query.run.v2",
             request_id,
-            profile.clone(),
-            SnowflakeErrorCode::MultiStatementRefused,
-            "Multiple SQL statements are refused by default; submit exactly one read-only statement.",
-            vec![plan_hint(profile.as_deref(), &sql_text)],
+            profile,
+            &sql_text,
+            &statements,
+            options,
         );
     }
     if let Some(function) = read_side_effect(&sql_text) {
@@ -4079,6 +4112,85 @@ fn query_run_outcome(
     // tail stays a single unambiguous expression (no cfg-block-as-tail, no
     // needless_return under the `-D warnings` clippy gate).
     query_run_dispatch(format, request_id, profile, &sql_text, options)
+}
+
+/// Why a `--allow-multiple-statements` batch is refused, if it is
+/// (reality-check bead L1): Snowflake does not support bindings in a
+/// multi-statement request, an empty statement is ambiguous, and every
+/// statement must be a read.
+fn batch_refusal(
+    sql: &str,
+    statements: &[&str],
+    options: &QueryRunOptions,
+) -> Option<(SnowflakeErrorCode, String)> {
+    if options.bindings_env.is_some() || options.bindings_json.is_some() {
+        return Some((
+            SnowflakeErrorCode::UsageError,
+            "Snowflake does not support bindings in a multi-statement request; run each statement on its own with --bindings-env.".to_owned(),
+        ));
+    }
+    if statements.len() < 2 || sql_lexer::lex(sql).has_empty_statement() {
+        return Some((
+            SnowflakeErrorCode::MultiStatementRefused,
+            "A batch needs two or more statements, each ended by a single `;`; an empty statement (`;;`) is refused.".to_owned(),
+        ));
+    }
+    let total = statements.len();
+    for (index, statement) in statements.iter().enumerate() {
+        let position = index + 1;
+        if let Some(function) = read_side_effect(statement) {
+            return Some((
+                SnowflakeErrorCode::MutationRefused,
+                format!(
+                    "statement {position} of {total}: {}",
+                    side_effect_refusal_message(&function)
+                ),
+            ));
+        }
+        if !is_select_like(statement) {
+            return Some((
+                SnowflakeErrorCode::MutationRefused,
+                format!(
+                    "statement {position} of {total} is not a read (SELECT/WITH/SHOW/DESCRIBE/EXPLAIN); a batch runs reads only, and `query write` runs one mutation at a time."
+                ),
+            ));
+        }
+    }
+    None
+}
+
+/// Live build: run the batch as one multi-statement request.
+#[cfg(feature = "live")]
+fn query_run_batch_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    profile: Option<String>,
+    sql_text: &str,
+    statements: &[&str],
+    options: QueryRunOptions,
+) -> Outcome {
+    live::run_batch_query_outcome(
+        format,
+        request_id,
+        profile.unwrap_or_default(),
+        sql_text,
+        statements,
+        &options,
+    )
+}
+
+/// Default build: the batch passed the local guard; the transport is not
+/// linked, so refuse like a single statement.
+#[cfg(not(feature = "live"))]
+fn query_run_batch_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    profile: Option<String>,
+    sql_text: &str,
+    _statements: &[&str],
+    options: QueryRunOptions,
+) -> Outcome {
+    query_run_dispatch(format, request_id, profile, sql_text, options)
 }
 
 /// Live build: drive the real SQL API transport. The profile presence was checked
@@ -4128,6 +4240,10 @@ fn query_run_dispatch(
                     ("bindings_env", option_json(options.bindings_env)),
                     ("query_tag", option_json(options.query_tag)),
                     ("require_live", Json::Bool(options.require_live)),
+                    (
+                        "allow_multiple_statements",
+                        Json::Bool(options.allow_multiple_statements),
+                    ),
                 ]),
             ),
             (
@@ -5930,9 +6046,37 @@ fn render_envelope(envelope: &Envelope, format: OutputFormat) -> String {
     }
 }
 
+/// TOON escapes only `\\`, `"`, and the line breaks and tab; any other
+/// control character in the payload (catalog and result data can hold ESC)
+/// would reach the terminal raw, so such a payload is printed as JSON, which
+/// escapes them all, with a note on stderr (reality-check bead oj0.42).
 #[cfg(feature = "toon")]
 fn render_toon_payload(value: &Json) -> String {
+    if has_control_toon_cannot_escape(value) {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "--toon: the output holds control characters TOON cannot escape; printed as JSON"
+        );
+        return render_json(value);
+    }
     render_toon(value)
+}
+
+#[cfg(feature = "toon")]
+fn has_control_toon_cannot_escape(value: &Json) -> bool {
+    let unescapable = |text: &str| {
+        text.chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    };
+    match value {
+        Json::String(text) => unescapable(text),
+        Json::Array(items) => items.iter().any(has_control_toon_cannot_escape),
+        Json::Object(entries) => entries
+            .iter()
+            .any(|(key, item)| unescapable(key) || has_control_toon_cannot_escape(item)),
+        Json::Null | Json::Bool(_) | Json::Number(_) | Json::Float(_) => false,
+    }
 }
 
 #[cfg(not(feature = "toon"))]
@@ -6075,6 +6219,7 @@ mod live;
 #[cfg(any(feature = "live", test))]
 mod export_path;
 
+pub mod adapter;
 mod catalog_surface;
 mod dataset_mode;
 mod health;
@@ -6779,6 +6924,51 @@ mod tests {
         ]));
         assert!(multi.contains("Multiple SQL statements are refused"));
         assert!(!multi.contains("is the read path"));
+    }
+
+    /// Reality-check bead L1: `--allow-multiple-statements` admits a batch
+    /// of reads only; a mutation anywhere, bindings, or an empty statement is
+    /// refused before any transport.
+    #[test]
+    fn a_batch_admits_reads_only() {
+        let run = |sql: &str, extra: &[&str]| {
+            let mut args = vec![
+                "query",
+                "run",
+                "--profile",
+                "demo",
+                "--sql",
+                sql,
+                "--allow-multiple-statements",
+            ];
+            args.extend_from_slice(extra);
+            (error_code_for(&args), render_json(&envelope_for(&args)))
+        };
+        let (code, rendered) = run("select 1; select 2;", &[]);
+        assert!(
+            !matches!(code, Some("FSNOW-3001" | "FSNOW-3002" | "FSNOW-1002")),
+            "{rendered}"
+        );
+        let (code, rendered) = run("select 1; delete from t", &[]);
+        assert_eq!(code, Some("FSNOW-3001"), "{rendered}");
+        assert!(rendered.contains("statement 2 of 2"), "{rendered}");
+        let (code, rendered) = run("select 1; select system$cancel_all_queries(1)", &[]);
+        assert_eq!(code, Some("FSNOW-3001"), "{rendered}");
+        assert!(rendered.contains("statement 2 of 2"), "{rendered}");
+        let (code, _) = run("select 1;; select 2", &[]);
+        assert_eq!(code, Some("FSNOW-3002"));
+        let (code, rendered) = run(
+            "select ?; select 2",
+            &["--bindings-env", "FSNOW_TEST_BINDINGS"],
+        );
+        assert_eq!(code, Some("FSNOW-1002"), "{rendered}");
+        assert!(rendered.contains("bindings"), "{rendered}");
+        // One statement with the flag is a single statement.
+        let (code, rendered) = run("select 1", &[]);
+        assert!(
+            !matches!(code, Some("FSNOW-3001" | "FSNOW-3002" | "FSNOW-1002")),
+            "{rendered}"
+        );
     }
 
     // mfw: the refusal's next/repair command names the agent's real profile, not

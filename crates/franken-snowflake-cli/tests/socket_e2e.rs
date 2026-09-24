@@ -782,15 +782,38 @@ fn an_mcp_cancel_notification_cancels_the_running_statement() {
             answer = Some(value);
         }
     }
-    let seen = server.seen();
+    let is_cancel =
+        |s: &Seen| s.method == "POST" && s.path() == format!("{SUBMIT_PATH}/{HANDLE}/cancel");
+    assert_eq!(
+        server.seen().iter().filter(|s| is_cancel(s)).count(),
+        1,
+        "the notification cancelled its statement: {:?}",
+        server.seen()
+    );
+    // A client that closes its input mid-call cancels the call too.
+    send(
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"query_run","arguments":{"profile":"sock","sql":"select system$wait(600)"}}}"#,
+    );
+    server.wait_for("the second call's first poll", |seen| {
+        seen.iter().filter(|s| s.is_submit()).count() == 2
+            && seen
+                .iter()
+                .rev()
+                .take_while(|s| !s.is_submit())
+                .any(|s| s.is_poll_of(HANDLE))
+    });
+    assert_eq!(
+        server.seen().iter().filter(|s| is_cancel(s)).count(),
+        1,
+        "nothing cancels the second call before stdin closes"
+    );
     drop(send);
+    drop(stdin);
+    server.wait_for("the cancel after stdin closed", |seen| {
+        seen.iter().filter(|s| is_cancel(s)).count() == 2
+    });
     let _ = child.kill();
     let _ = child.wait();
-    assert!(
-        seen.iter()
-            .any(|s| s.method == "POST" && s.path() == format!("{SUBMIT_PATH}/{HANDLE}/cancel")),
-        "the running statement was cancelled server-side: {seen:?}"
-    );
     let answer = answer.expect("the cancelled call answers");
     let text = answer.to_string();
     assert!(text.contains("cancelled"), "{text}");
@@ -854,6 +877,42 @@ fn stable_envelope(mut envelope: serde_json::Value) -> serde_json::Value {
     envelope
 }
 
+/// A receipt with what differs between two runs of one statement removed:
+/// ids of the invocation and the SQL API request, timestamps, the content
+/// address (it hashes those), the generated query tag (it names the
+/// invocation), and the audit trail (its own ids and times).
+#[cfg(feature = "mcp")]
+fn without_invocation_identity(mut value: serde_json::Value) -> serde_json::Value {
+    const VOLATILE: &[&str] = &[
+        "receipt_id",
+        "trace_id",
+        "sql_api_request_id",
+        "request_id",
+        "created_at_ms",
+        "created_at",
+        "content_address",
+        "query_tag",
+        "audit_events",
+    ];
+    match &mut value {
+        serde_json::Value::Object(map) => {
+            for key in VOLATILE {
+                map.remove(*key);
+            }
+            for child in map.values_mut() {
+                *child = without_invocation_identity(child.take());
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                *item = without_invocation_identity(item.take());
+            }
+        }
+        _ => {}
+    }
+    value
+}
+
 /// Reality-check beads oj0.32 and E2 over `mcp serve --http` with the real
 /// TLS transport: an authorized `query_run` answers the same envelope as the
 /// CLI for the same statement (volatile fields aside), and a
@@ -865,6 +924,7 @@ fn mcp_over_http_matches_the_cli_and_a_cancel_notification_cancels_the_call() {
     use std::io::BufRead as _;
     const DONE: &str = "01b2c3d4-0000-0000-0000-00000000f170";
     const HELD: &str = "01b2c3d4-0000-0000-0000-00000000f171";
+    const HUNG_UP: &str = "01b2c3d4-0000-0000-0000-00000000f172";
     const TOKEN: &str = "fsnow-socket-token-0123456789abcdef0123456789";
     let cert = TestCert::mint();
     let server = MockServer::start(&cert, |request, _| {
@@ -873,17 +933,23 @@ fn mcp_over_http_matches_the_cli_and_a_cancel_notification_cancels_the_call() {
                 .as_str()
                 .unwrap_or_default()
                 .to_owned();
-            return if statement.contains("system$wait") {
+            return if statement.contains("system$wait(601)") {
+                running(HUNG_UP)
+            } else if statement.contains("system$wait") {
                 running(HELD)
             } else {
                 completed_single(DONE)
             };
         }
-        if request.is_poll_of(HELD) {
-            return running(HELD);
-        }
-        if request.method == "POST" && request.path() == format!("{SUBMIT_PATH}/{HELD}/cancel") {
-            return scenarios::cancel();
+        for handle in [HELD, HUNG_UP] {
+            if request.is_poll_of(handle) {
+                return running(handle);
+            }
+            if request.method == "POST"
+                && request.path() == format!("{SUBMIT_PATH}/{handle}/cancel")
+            {
+                return scenarios::cancel();
+            }
         }
         not_found()
     });
@@ -953,6 +1019,33 @@ fn mcp_over_http_matches_the_cli_and_a_cancel_notification_cancels_the_call() {
         stable_envelope(cli.envelope.clone()),
         "MCP and CLI envelopes differ"
     );
+    // Receipts too (bead oj0.32): the MCP call recorded the same receipt as
+    // the CLI run, invocation identity and timing aside.
+    let answered: serde_json::Value = serde_json::from_str(&answer).expect("JSON-RPC answer");
+    let mcp_envelope: serde_json::Value = serde_json::from_str(
+        answered["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default(),
+    )
+    .expect("envelope JSON");
+    let receipt_of = |envelope: &serde_json::Value| {
+        envelope["receipt_hash"]
+            .as_str()
+            .expect("a receipt hash")
+            .to_owned()
+    };
+    let (cli_receipt, mcp_receipt) = (receipt_of(&cli.envelope), receipt_of(&mcp_envelope));
+    assert_ne!(cli_receipt, mcp_receipt, "two runs, two receipts");
+    let shown = |hash: &str| {
+        let run = h.run(server.port, &["receipt", "show", hash, "--json"]);
+        assert_eq!(run.exit, 0, "{}", run.context());
+        without_invocation_identity(run.envelope["data"].clone())
+    };
+    assert_eq!(
+        shown(&cli_receipt),
+        shown(&mcp_receipt),
+        "the MCP call's receipt differs from the CLI's"
+    );
 
     // Cancellation: call on one connection, cancel on another.
     let call = std::thread::spawn(move || {
@@ -972,6 +1065,32 @@ fn mcp_over_http_matches_the_cli_and_a_cancel_notification_cancels_the_call() {
     );
     assert!(status == 200 || status == 202 || status == 204, "{status}");
     let (status, answer) = call.join().expect("the cancelled call returns");
+
+    // Hang-up: a client that closes its connection mid-call, sending nothing
+    // else, cancels its statement too.
+    let is_hang_up_cancel =
+        |s: &Seen| s.method == "POST" && s.path() == format!("{SUBMIT_PATH}/{HUNG_UP}/cancel");
+    {
+        use std::io::Write as _;
+        let body = r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"query_run","arguments":{"profile":"sock","sql":"select system$wait(601)"}}}"#;
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        write!(
+            stream,
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("write");
+        server.wait_for("the hung-up call's first poll", |seen| {
+            seen.iter().any(|s| s.is_poll_of(HUNG_UP))
+        });
+        assert!(
+            !server.seen().iter().any(is_hang_up_cancel),
+            "nothing cancels the call while its client is connected"
+        );
+    }
+    server.wait_for("the cancel after the hang-up", |seen| {
+        seen.iter().any(is_hang_up_cancel)
+    });
     let seen = server.seen();
     let _ = child.kill();
     let _ = child.wait();
@@ -1921,6 +2040,552 @@ fn catalog_scan_then_dataset_inspect_then_dataset_query() {
         "{}",
         tagged.context()
     );
+}
+
+/// Reality-check bead oj0.42: text Snowflake controls (a table name, a comment,
+/// a cell) carrying terminal escapes never reaches stdout or stderr raw, in any
+/// output mode, with `NO_COLOR` and `CI` set and stdout piped; JSON keeps the
+/// bytes as `\u001b` escapes, and `--toon` falls back to JSON for them.
+#[test]
+fn planted_terminal_escapes_never_reach_the_terminal() {
+    const TABLES: &str = "01b2c3d4-0000-0000-0000-00000000f190";
+    const COLUMNS: &str = "01b2c3d4-0000-0000-0000-00000000f191";
+    const RELATION: &str = "01b2c3d4-0000-0000-0000-00000000f192";
+    const QUERY: &str = "01b2c3d4-0000-0000-0000-00000000f193";
+    // An OSC 52 clipboard write, a bell, a screen clear, and a C1 CSI.
+    const HOSTILE: &str = "\u{1b}]52;c;cHduZWQ=\u{7}\u{1b}[2J\u{9b}";
+    let cert = TestCert::mint();
+    let server = MockServer::start(&cert, |request, _| {
+        if !request.is_submit() {
+            return not_found();
+        }
+        let statement = request.body_json()["statement"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let table = format!("EV{HOSTILE}IL");
+        let comment = format!("note {HOSTILE}");
+        if statement.contains("INFORMATION_SCHEMA.TABLES") {
+            return result_set(
+                TABLES,
+                &[
+                    ("TABLE_CATALOG", "TEXT", None, None),
+                    ("TABLE_SCHEMA", "TEXT", None, None),
+                    ("TABLE_NAME", "TEXT", None, None),
+                    ("TABLE_TYPE", "TEXT", None, None),
+                    ("COMMENT", "TEXT", None, None),
+                    ("ROW_COUNT", "FIXED", Some(38), Some(0)),
+                    ("BYTES", "FIXED", Some(38), Some(0)),
+                ],
+                &[vec![
+                    Some("DB"),
+                    Some("PUBLIC"),
+                    Some(table.as_str()),
+                    Some("BASE TABLE"),
+                    Some(comment.as_str()),
+                    Some("1"),
+                    Some("64"),
+                ]],
+            );
+        }
+        if statement.contains("INFORMATION_SCHEMA.COLUMNS") {
+            return result_set(
+                COLUMNS,
+                &[
+                    ("TABLE_CATALOG", "TEXT", None, None),
+                    ("TABLE_SCHEMA", "TEXT", None, None),
+                    ("TABLE_NAME", "TEXT", None, None),
+                    ("COLUMN_NAME", "TEXT", None, None),
+                    ("ORDINAL_POSITION", "FIXED", Some(9), Some(0)),
+                    ("DATA_TYPE", "TEXT", None, None),
+                    ("NUMERIC_PRECISION", "FIXED", Some(9), Some(0)),
+                    ("NUMERIC_SCALE", "FIXED", Some(9), Some(0)),
+                    ("CHARACTER_MAXIMUM_LENGTH", "FIXED", Some(9), Some(0)),
+                    ("IS_NULLABLE", "TEXT", None, None),
+                    ("COMMENT", "TEXT", None, None),
+                ],
+                &[vec![
+                    Some("DB"),
+                    Some("PUBLIC"),
+                    Some(table.as_str()),
+                    Some("NOTE"),
+                    Some("1"),
+                    Some("TEXT"),
+                    None,
+                    None,
+                    None,
+                    Some("YES"),
+                    Some(comment.as_str()),
+                ]],
+            );
+        }
+        if statement.starts_with("SHOW") || statement.contains("INFORMATION_SCHEMA.") {
+            return result_set(RELATION, &[("NAME", "TEXT", None, None)], &[]);
+        }
+        result_set(
+            QUERY,
+            &[("NOTE", "TEXT", None, None)],
+            &[vec![Some(comment.as_str())]],
+        )
+    });
+    let h = Harness::new("ansi", &cert);
+    let run = |args: &[&str]| {
+        let output = h
+            .command(server.port, args)
+            .env("NO_COLOR", "1")
+            .env("CI", "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("spawn");
+        for (stream, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+            assert!(
+                !bytes.iter().any(|byte| *byte == 0x1b || *byte == 0x07),
+                "{args:?} wrote a raw escape to {stream}: {}",
+                String::from_utf8_lossy(bytes)
+            );
+            let text = String::from_utf8_lossy(bytes);
+            assert!(
+                !text.contains('\u{9b}'),
+                "{args:?} wrote a raw C1 control to {stream}: {text}"
+            );
+        }
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        )
+    };
+
+    let scan = [
+        "catalog",
+        "scan",
+        "sock",
+        "--database",
+        "DB",
+        "--schema",
+        "PUBLIC",
+    ];
+    let (exit, json) = run(&[&scan[..], &["--json"][..]].concat());
+    assert_eq!(exit, 0, "{json}");
+    assert!(
+        json.contains("\\u001b"),
+        "JSON keeps the byte as an escape: {json}"
+    );
+    let envelope: serde_json::Value = serde_json::from_str(&json).expect("scan JSON");
+    let dataset_id = envelope["data"]["datasets"][0]["dataset_id"]
+        .as_str()
+        .expect("dataset id")
+        .to_owned();
+    let (exit, toon) = run(&[&scan[..], &["--toon"][..]].concat());
+    assert_eq!(exit, 0, "{toon}");
+    for format in ["--mermaid", "--svg", "--toon"] {
+        let (exit, out) = run(&[
+            "catalog",
+            "graph",
+            "sock",
+            "--database",
+            "DB",
+            "--schema",
+            "PUBLIC",
+            format,
+        ]);
+        assert_eq!(exit, 0, "{format}: {out}");
+        assert!(out.contains("EV"), "{format}: {out}");
+    }
+    let (exit, out) = run(&["dataset", "inspect", &dataset_id, "--toon"]);
+    assert_eq!(exit, 0, "{out}");
+    let (exit, out) = run(&[
+        "query",
+        "run",
+        "--profile",
+        "sock",
+        "--sql",
+        "select note from notes",
+        "--toon",
+    ]);
+    assert_eq!(exit, 0, "{out}");
+    let (exit, out) = run(&[
+        "query",
+        "run",
+        "--profile",
+        "sock",
+        "--sql",
+        "select note from notes",
+        "--json",
+    ]);
+    assert_eq!(exit, 0, "{out}");
+    assert!(out.contains("\\u001b]52"), "{out}");
+}
+
+/// Reality-check bead L1: `--allow-multiple-statements` sends ONE request with
+/// `MULTI_STATEMENT_COUNT` = the batch size, then fetches each statement by the
+/// handle the parent lists, in order; a count Snowflake disputes is a typed
+/// failure; a batch holding a mutation, or bindings, never reaches the server.
+#[test]
+fn a_batch_of_reads_runs_as_one_multi_statement_request() {
+    const PARENT: &str = "01b2c3d4-0000-0000-0000-00000000f180";
+    const FIRST: &str = "01b2c3d4-0000-0000-0000-00000000f181";
+    const SECOND: &str = "01b2c3d4-0000-0000-0000-00000000f182";
+    let cert = TestCert::mint();
+    let server = MockServer::start(&cert, |request, _| {
+        if request.is_submit() {
+            let statement = request.body_json()["statement"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            if statement.contains("disputed") {
+                // The documented message; the docs give no error code, so the
+                // code here is a placeholder.
+                return json(
+                    422,
+                    &serde_json::json!({
+                        "code": "000000",
+                        "sqlState": "0A000",
+                        "message": "Actual statement count 3 did not match the desired statement count 2.",
+                        "statementHandle": PARENT,
+                    }),
+                );
+            }
+            return json(
+                200,
+                &serde_json::json!({
+                    "resultSetMetaData": {
+                        "numRows": 1,
+                        "format": "jsonv2",
+                        "rowType": [{ "name": "multiple statement execution", "type": "text", "nullable": false }]
+                    },
+                    "data": [["Multiple statements executed successfully."]],
+                    "code": "090001",
+                    "sqlState": "00000",
+                    "message": "Statement executed successfully.",
+                    "statementHandle": PARENT,
+                    "statementStatusUrl": format!("{SUBMIT_PATH}/{PARENT}"),
+                    "statementHandles": [FIRST, SECOND],
+                }),
+            );
+        }
+        if request.is_poll_of(FIRST) {
+            return result_set(
+                FIRST,
+                &[("N", "FIXED", Some(9), Some(0))],
+                &[vec![Some("1")]],
+            );
+        }
+        if request.is_poll_of(SECOND) {
+            return result_set(
+                SECOND,
+                &[("WORD", "TEXT", None, None)],
+                &[vec![Some("two")], vec![Some("deux")]],
+            );
+        }
+        not_found()
+    });
+    let h = Harness::new("batch", &cert);
+    let batch = |sql: &str, extra: &[&str]| {
+        let mut args = vec![
+            "query",
+            "run",
+            "--profile",
+            "sock",
+            "--sql",
+            sql,
+            "--allow-multiple-statements",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        h.run(server.port, &args)
+    };
+
+    let run = batch("select 1 as n; select word from words;", &[]);
+    assert_eq!(run.exit, 0, "{}", run.context());
+    let data = &run.envelope["data"];
+    assert_eq!(data["statement_count"], 2, "{}", run.context());
+    assert_eq!(data["statements"][0]["rows"], serde_json::json!([[1]]));
+    assert_eq!(
+        data["statements"][1]["rows"],
+        serde_json::json!([["two"], ["deux"]])
+    );
+    assert_eq!(data["statements"][1]["statement_handle"], SECOND);
+    assert_eq!(
+        data["statements"][1]["sql_preview_redacted"],
+        "select word from words"
+    );
+    assert_eq!(
+        run.envelope["statement_handle"],
+        PARENT,
+        "{}",
+        run.context()
+    );
+    let seen = server.seen();
+    assert_eq!(
+        seen.len(),
+        3,
+        "one submit, then one GET per statement: {seen:?}"
+    );
+    let submitted = seen[0].body_json();
+    assert_eq!(
+        submitted["parameters"]["MULTI_STATEMENT_COUNT"], "2",
+        "{submitted}"
+    );
+    assert!(
+        seen[1].is_poll_of(FIRST) && seen[2].is_poll_of(SECOND),
+        "{seen:?}"
+    );
+
+    // Snowflake counts differently: a typed failure naming the counts.
+    let disputed = batch("select 'disputed'; select 2", &[]);
+    assert_ne!(disputed.exit, 0, "{}", disputed.context());
+    assert!(
+        disputed.envelope["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did not match the desired statement count"),
+        "{}",
+        disputed.context()
+    );
+    let before = server.seen().len();
+
+    // Refused before any request: a mutation anywhere in the batch, bindings.
+    let mutation = batch("select 1; delete from events", &[]);
+    assert_eq!(
+        mutation.envelope["error"]["code"],
+        "FSNOW-3001",
+        "{}",
+        mutation.context()
+    );
+    let bound = batch(
+        "select ?; select 2",
+        &["--bindings-env", "FSNOW_SOCKET_BINDINGS"],
+    );
+    assert_eq!(
+        bound.envelope["error"]["code"],
+        "FSNOW-1002",
+        "{}",
+        bound.context()
+    );
+    assert_eq!(
+        server.seen().len(),
+        before,
+        "refused batches never reach the server"
+    );
+}
+
+/// Reality-check bead oj0.39: the local-store adapter conforms over the store
+/// the real binary filled through TLS (a catalog scan, a dataset query, a CSV
+/// export and, with `frankenpandas`, a frame), answering every operation
+/// offline and naming the PAT only by its env handle.
+#[test]
+fn the_local_store_adapter_conforms_over_what_the_binary_persisted() {
+    use franken_snowflake_cli::adapter::LocalStoreAdapter;
+    use franken_snowflake_core::adapter::SnowflakeDataLakeAdapter;
+    use franken_snowflake_core::adapter::conformance::{
+        ConformanceProbe, check_adapter_conformance,
+    };
+    use franken_snowflake_core::ids::{DatasetId, ProfileName, ReceiptHash};
+    use franken_snowflake_core::outcome::DataSource;
+
+    const TABLES: &str = "01b2c3d4-0000-0000-0000-00000000f150";
+    const COLUMNS: &str = "01b2c3d4-0000-0000-0000-00000000f151";
+    const RELATION: &str = "01b2c3d4-0000-0000-0000-00000000f152";
+    const QUERY: &str = "01b2c3d4-0000-0000-0000-00000000f153";
+    let cert = TestCert::mint();
+    let server = MockServer::start(&cert, |request, _| {
+        if !request.is_submit() {
+            return not_found();
+        }
+        let statement = request.body_json()["statement"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        if statement.contains("INFORMATION_SCHEMA.TABLES") {
+            return result_set(
+                TABLES,
+                &[
+                    ("TABLE_CATALOG", "TEXT", None, None),
+                    ("TABLE_SCHEMA", "TEXT", None, None),
+                    ("TABLE_NAME", "TEXT", None, None),
+                    ("TABLE_TYPE", "TEXT", None, None),
+                    ("COMMENT", "TEXT", None, None),
+                    ("ROW_COUNT", "FIXED", Some(38), Some(0)),
+                    ("BYTES", "FIXED", Some(38), Some(0)),
+                ],
+                &[vec![
+                    Some("DB"),
+                    Some("PUBLIC"),
+                    Some("EVENTS"),
+                    Some("BASE TABLE"),
+                    None,
+                    Some("1"),
+                    Some("64"),
+                ]],
+            );
+        }
+        if statement.contains("INFORMATION_SCHEMA.COLUMNS") {
+            let column = |name, ordinal, kind| {
+                vec![
+                    Some("DB"),
+                    Some("PUBLIC"),
+                    Some("EVENTS"),
+                    Some(name),
+                    Some(ordinal),
+                    Some(kind),
+                    None,
+                    None,
+                    None,
+                    Some("YES"),
+                    None,
+                ]
+            };
+            return result_set(
+                COLUMNS,
+                &[
+                    ("TABLE_CATALOG", "TEXT", None, None),
+                    ("TABLE_SCHEMA", "TEXT", None, None),
+                    ("TABLE_NAME", "TEXT", None, None),
+                    ("COLUMN_NAME", "TEXT", None, None),
+                    ("ORDINAL_POSITION", "FIXED", Some(9), Some(0)),
+                    ("DATA_TYPE", "TEXT", None, None),
+                    ("NUMERIC_PRECISION", "FIXED", Some(9), Some(0)),
+                    ("NUMERIC_SCALE", "FIXED", Some(9), Some(0)),
+                    ("CHARACTER_MAXIMUM_LENGTH", "FIXED", Some(9), Some(0)),
+                    ("IS_NULLABLE", "TEXT", None, None),
+                    ("COMMENT", "TEXT", None, None),
+                ],
+                &[
+                    column("EVENT_DATE", "1", "DATE"),
+                    column("ENTITY_ID", "2", "TEXT"),
+                ],
+            );
+        }
+        if statement.starts_with("SHOW") || statement.contains("INFORMATION_SCHEMA.") {
+            // The relation pass: no keys, constraints, stages or formats.
+            return result_set(RELATION, &[("NAME", "TEXT", None, None)], &[]);
+        }
+        result_set(
+            QUERY,
+            &[
+                ("EVENT_DATE", "DATE", None, None),
+                ("ENTITY_ID", "TEXT", None, None),
+            ],
+            &[vec![Some("18262"), Some("ENTITY123")]],
+        )
+    });
+    let h = Harness::new("adapter", &cert);
+    let scan = h.run(
+        server.port,
+        &[
+            "catalog",
+            "scan",
+            "sock",
+            "--database",
+            "DB",
+            "--schema",
+            "PUBLIC",
+            "--json",
+        ],
+    );
+    assert_eq!(scan.exit, 0, "{}", scan.context());
+    let dataset_id = scan.envelope["data"]["datasets"][0]["dataset_id"]
+        .as_str()
+        .expect("dataset id")
+        .to_owned();
+    let query = h.run(
+        server.port,
+        &["query", "run", "--dataset", &dataset_id, "--json"],
+    );
+    assert_eq!(query.exit, 0, "{}", query.context());
+    let receipt = query.envelope["receipt_hash"]
+        .as_str()
+        .expect("receipt hash")
+        .to_owned();
+    let export = |format: &str, file: &str| {
+        let out = h.dir.join(file).to_string_lossy().into_owned();
+        let run = h.run(
+            server.port,
+            &[
+                "export",
+                "run",
+                "--profile",
+                "sock",
+                "--sql",
+                "select event_date, entity_id from events",
+                "--format",
+                format,
+                "--out",
+                &out,
+                "--json",
+            ],
+        );
+        assert_eq!(run.exit, 0, "{}", run.context());
+        run.envelope["data"]["export_receipt"]["export_id"]
+            .as_str()
+            .expect("export id")
+            .to_owned()
+    };
+    let export_id = export("csv", "adapter.csv");
+    let frame_id = cfg!(feature = "frankenpandas").then(|| export("frame", "adapter.frame.json"));
+    let requests = server.seen().len();
+
+    let adapter = LocalStoreAdapter::open_at(
+        &h.dir.join("store"),
+        Box::new(|name| {
+            let value = match name.strip_prefix("FRANKEN_SNOWFLAKE_SOCK_")? {
+                "ACCOUNT" => "https://127.0.0.1:1",
+                "USER" => "SOCK_USER",
+                "AUTH" => "pat",
+                "WAREHOUSE" => "SOCK_WH",
+                "PAT" => CANARY_PAT,
+                _ => return None,
+            };
+            Some(value.to_owned())
+        }),
+    )
+    .expect("open the store the binary wrote");
+    let probe = ConformanceProbe {
+        profile: ProfileName::new("sock"),
+        dataset: DatasetId::new(dataset_id.clone()),
+        receipt: ReceiptHash::new(receipt.clone()),
+        export_id: Some(export_id),
+        frame_id: frame_id.clone(),
+        expected_data_source: DataSource::Live,
+    };
+    assert_eq!(
+        check_adapter_conformance(&adapter, &probe),
+        Vec::<String>::new()
+    );
+    let manifest = adapter
+        .dataset_manifest(&DatasetId::new(dataset_id))
+        .expect("the scanned dataset");
+    assert_eq!(manifest.data.fields.len(), 2);
+    assert_eq!(
+        adapter
+            .query_receipt(&ReceiptHash::new(receipt))
+            .expect("the query receipt")
+            .data
+            .row_count,
+        Some(1)
+    );
+    if let Some(frame_id) = frame_id {
+        let frame = adapter.frame_ingest(&frame_id).expect("the frame");
+        let names: Vec<&str> = frame
+            .data
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect();
+        assert_eq!(names, ["EVENT_DATE", "ENTITY_ID"]);
+    }
+    let diagnostics = serde_json::to_string(
+        &adapter
+            .profile_diagnostics(&ProfileName::new("sock"))
+            .expect("diagnostics"),
+    )
+    .expect("serialize");
+    assert!(!diagnostics.contains(CANARY_PAT), "{diagnostics}");
+    assert!(
+        diagnostics.contains("FRANKEN_SNOWFLAKE_SOCK_PAT"),
+        "{diagnostics}"
+    );
+    assert_eq!(server.seen().len(), requests, "the adapter is offline");
 }
 
 /// `receipt refetch` re-reads a completed statement's rows with RESULT_SCAN on
