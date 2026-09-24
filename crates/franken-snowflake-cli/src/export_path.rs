@@ -159,9 +159,147 @@ pub fn write_artifact(target: &ExportTarget, bytes: &[u8]) -> Result<(), String>
     })
 }
 
+/// A streaming export file (reality-check bead E5) with the same rules as
+/// [`write_artifact`]: without `--overwrite` the target is reserved with
+/// create-new before anything runs; rows go to a temporary file beside it,
+/// which replaces the target only on [`ArtifactFile::commit`]. An export that
+/// fails or is dropped removes its temporary file (and the empty reservation),
+/// so a failed run never leaves a partial target.
+pub struct ArtifactFile {
+    temp: PathBuf,
+    target: PathBuf,
+    reserved: bool,
+    file: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+/// Open a streaming export for `target`.
+///
+/// # Errors
+/// The target exists without `--overwrite`, or a file cannot be created.
+pub fn open_artifact(target: &ExportTarget) -> Result<ArtifactFile, String> {
+    let reserved = if target.overwrite {
+        false
+    } else {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target.path)
+            .map_err(|error| error.to_string())?;
+        true
+    };
+    let file_name = target
+        .path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temp = target
+        .path
+        .with_file_name(format!(".{file_name}.fsnow-tmp-{}", std::process::id()));
+    let mut artifact = ArtifactFile {
+        temp,
+        target: target.path.clone(),
+        reserved,
+        file: None,
+    };
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&artifact.temp)
+        .map_err(|error| error.to_string())?;
+    artifact.file = Some(std::io::BufWriter::new(file));
+    Ok(artifact)
+}
+
+impl ArtifactFile {
+    /// Flush, sync and move the temporary file onto the target.
+    ///
+    /// # Errors
+    /// A flush, sync or rename failure (the temporary file is then removed).
+    pub fn commit(mut self) -> Result<(), String> {
+        let Some(writer) = self.file.take() else {
+            return Err("the export file was already closed".to_owned());
+        };
+        let file = writer
+            .into_inner()
+            .map_err(|error| error.error().to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        drop(file);
+        std::fs::rename(&self.temp, &self.target).map_err(|error| error.to_string())?;
+        self.reserved = false;
+        Ok(())
+    }
+}
+
+impl Drop for ArtifactFile {
+    /// An uncommitted export leaves nothing behind: its own temporary file and
+    /// the empty reservation it created are removed; nothing else is touched.
+    fn drop(&mut self) {
+        if self.file.take().is_some() || self.temp.exists() {
+            let _ = std::fs::remove_file(&self.temp);
+        }
+        if self.reserved {
+            let _ = std::fs::remove_file(&self.target);
+        }
+    }
+}
+
+impl franken_snowflake_export::ExportByteSink for ArtifactFile {
+    fn write_chunk(&mut self, chunk: &[u8]) -> franken_snowflake_export::ExportResult<()> {
+        let Some(writer) = self.file.as_mut() else {
+            return Err(franken_snowflake_export::ExportError::Sink {
+                message: "the export file is closed".to_owned(),
+            });
+        };
+        writer
+            .write_all(chunk)
+            .map_err(|error| franken_snowflake_export::ExportError::Sink {
+                message: error.to_string(),
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reality-check bead E5: a committed streaming export becomes the target;
+    /// an uncommitted one leaves neither the target nor a temporary file, and
+    /// an existing target still needs --overwrite.
+    #[test]
+    fn streaming_artifacts_commit_or_leave_nothing() -> Result<(), String> {
+        use franken_snowflake_export::ExportByteSink as _;
+        let dir = scratch("stream");
+        let path = dir.join("s.csv");
+        let target = resolve_out(&path.to_string_lossy(), None, false)?;
+        let mut file = open_artifact(&target)?;
+        file.write_chunk(b"a\n").map_err(|e| e.to_string())?;
+        file.commit()?;
+        assert_eq!(std::fs::read(&path).map_err(|e| e.to_string())?, b"a\n");
+        // Without --overwrite the existing target is refused up front.
+        assert!(open_artifact(&target).is_err());
+
+        let other = dir.join("t.csv");
+        let target = resolve_out(&other.to_string_lossy(), None, false)?;
+        let mut file = open_artifact(&target)?;
+        file.write_chunk(b"partial\n").map_err(|e| e.to_string())?;
+        drop(file);
+        assert!(!other.exists(), "an uncommitted export leaves no target");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains("fsnow-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temporary file is left behind");
+
+        // With --overwrite a failed export keeps the old contents.
+        let target = resolve_out(&path.to_string_lossy(), None, true)?;
+        let mut file = open_artifact(&target)?;
+        file.write_chunk(b"new\n").map_err(|e| e.to_string())?;
+        drop(file);
+        assert_eq!(std::fs::read(&path).map_err(|e| e.to_string())?, b"a\n");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
 
     fn scratch(label: &str) -> PathBuf {
         let dir =

@@ -1189,6 +1189,7 @@ fn export_plan_spec(args: &[String]) -> catalog_surface::ExportPlanSpec {
         overwrite: has_flag(args, "--overwrite"),
         single: has_flag(args, "--single"),
         max_file_size: value_after(args, "--max-file-size"),
+        max_rows: value_after(args, "--max-rows"),
     }
 }
 
@@ -2695,6 +2696,12 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
                 "boolean",
                 false,
                 "Confine --out to a relative path, without `..` or symlinked components, under <data dir>/exports (--sandbox-out; the MCP export_run tool always sets it)",
+            ),
+            input(
+                "max_rows",
+                "integer",
+                false,
+                "Refuse (FSNOW-3004) a result with more rows than this (--max-rows; default <PREFIX>_EXPORT_MAX_ROWS or 1000000)",
             ),
             OUTPUT_INPUT,
         ],

@@ -801,6 +801,11 @@ mod fastmcp_surface {
                     false,
                     &["snappy", "gzip", "none"],
                 ),
+                ParamSpec::string(
+                    "max_rows",
+                    "Refuse a result with more rows than this (default 1000000).",
+                    false,
+                ),
             ]);
         }
         params
@@ -865,6 +870,10 @@ mod fastmcp_surface {
             if let Some(compression) = optional_string(arguments, "compression")? {
                 args.push("--compression".to_string());
                 args.push(compression);
+            }
+            if let Some(max_rows) = optional_string(arguments, "max_rows")? {
+                args.push("--max-rows".to_string());
+                args.push(max_rows);
             }
             args.push("--out".to_string());
             args.push(required_string(arguments, "out")?);

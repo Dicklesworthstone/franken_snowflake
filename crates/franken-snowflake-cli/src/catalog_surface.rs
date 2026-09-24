@@ -1299,6 +1299,10 @@ pub struct ExportPlanSpec {
     pub overwrite: bool,
     pub single: bool,
     pub max_file_size: Option<String>,
+    /// `export run --max-rows` (reality-check bead E5). Read by the live
+    /// transport only.
+    #[cfg_attr(not(feature = "live"), allow(dead_code))]
+    pub max_rows: Option<String>,
 }
 
 const EXPORT_PLAN_EXAMPLE: &str = "franken-snowflake export plan --profile <profile> --sql \"select * from events\" --location @my_stage/exports/run_001 --format csv --json";

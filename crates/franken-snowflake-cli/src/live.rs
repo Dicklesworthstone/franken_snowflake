@@ -56,17 +56,21 @@ use franken_snowflake_core::outcome::{DataSource, OutcomeKind};
 use franken_snowflake_core::redact::redact;
 use franken_snowflake_core::typed::{ColumnCodec, JsonRepr, TYPED_ROW_ENCODING, WIRE_ROW_ENCODING};
 use franken_snowflake_export::{
-    CopySource, ExportColumn, LocalExportInput, ResultPartition, export_csv, export_jsonl,
+    CopySource, ExportColumn, ExportReceipt, LocalExportInput, ResultPartition,
+    StreamingTextExport, TextFormat,
 };
 use franken_snowflake_http::{
     AuthorizationDescriptor, CancelHttpRequest, SnowflakeAuthTokenType, SnowflakeEndpoint,
     SnowflakeHttpClient, StatusClass, TlsRootPolicy, TransportConfig, TransportError,
 };
-use franken_snowflake_sqlapi::driver::{AuthProvider, DriverStats, run_statement_with_auth};
+use franken_snowflake_sqlapi::driver::{
+    AuthProvider, DriverStats, RowSink, run_statement_streaming, run_statement_with_auth,
+};
 use franken_snowflake_sqlapi::lifecycle::{
     CompletedStatement, DEFAULT_PARTITION_CONCURRENCY, MAX_PARTITION_CONCURRENCY, PollPlan,
 };
 use franken_snowflake_sqlapi::request::{Binding, SubmitQueryParams, SubmitStatementRequest};
+use franken_snowflake_sqlapi::response::ResultSet;
 
 use crate::catalog_surface::{self, DATA_SOURCE_CACHE, ExportPlanSpec};
 use crate::local_store::{self, ExecutionFacts, Store};
@@ -1523,134 +1527,191 @@ pub fn export_run_outcome(
         Ok(conn) => conn.tagged("export.run", &request_id),
         Err(error) => return fail(&error),
     };
-    let rows = match execute(&conn, &sql, QueryRequestOptions::default()) {
-        Ok(rows) => rows,
-        Err(error) => {
-            return with_terminal_receipt(
-                fail(&error),
-                "export.run",
-                &conn,
-                &request_id,
-                &sql,
-                &error,
-            );
-        }
+    let max_rows = match export_max_rows(spec.max_rows.as_deref(), &profile) {
+        Ok(max_rows) => max_rows,
+        Err(error) => return fail(&error),
     };
-    let input = LocalExportInput::new(
-        rows.columns
-            .iter()
-            .map(|column| {
-                ExportColumn::new(column.name.clone(), column.type_name.clone())
-                    .nullable(column.nullable)
-                    .precision_scale(column.precision, column.scale)
-            })
-            .collect(),
-        vec![ResultPartition::new(0, rows.rows.clone())],
-    );
     let created_at_ms = local_store::now_unix_ms();
     let target_label = redact(&out_path).into_owned();
-    let parquet_compression = match spec
-        .compression
-        .as_deref()
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        None | Some("snappy") => franken_snowflake_export::ParquetCompression::Snappy,
-        Some("gzip") => franken_snowflake_export::ParquetCompression::Gzip,
-        Some("none") | Some("uncompressed") => {
-            franken_snowflake_export::ParquetCompression::Uncompressed
-        }
-        Some(other) => {
-            return fail(&usage(&format!(
-                "Unknown --compression `{other}`; for parquet use snappy (default), gzip, or none."
-            )));
-        }
+    let text_format = match export_format {
+        "csv" => Some(TextFormat::Csv),
+        "jsonl" => Some(TextFormat::Jsonl),
+        _ => None,
     };
-    let parquet_opts = franken_snowflake_export::ParquetWriterOptions {
-        compression: parquet_compression,
-        ..Default::default()
-    };
-    let artifact = match export_format {
-        "csv" => export_csv(&input, target_label.clone(), created_at_ms),
-        "parquet" => franken_snowflake_export::export_parquet(
-            &input,
-            target_label.clone(),
+    let (rows, receipt, log_line) = if let Some(text_format) = text_format {
+        // CSV/JSONL stream to the file as each fetch window completes
+        // (reality-check bead E5): peak memory is one window, not the result.
+        let file = match crate::export_path::open_artifact(&target) {
+            Ok(file) => file,
+            Err(message) => {
+                return fail(&SnowflakeError::new(
+                    SnowflakeErrorCode::Internal,
+                    format!("could not open {target_label}: {message}"),
+                ));
+            }
+        };
+        match stream_text_export(
+            &conn,
+            &sql,
+            file,
+            text_format,
+            max_rows,
+            &target_label,
             created_at_ms,
-            Some(parquet_opts),
-        ),
-        "frame" => {
-            #[cfg(feature = "frankenpandas")]
-            {
-                let frame_cols: Vec<franken_snowflake_frame::SnowflakeColumn> = rows
-                    .columns
-                    .iter()
-                    .map(|column| {
-                        franken_snowflake_frame::SnowflakeColumn::new(
-                            column.name.clone(),
-                            column.type_name.clone(),
-                        )
+        ) {
+            Ok(done) => done,
+            Err(error) => {
+                return with_terminal_receipt(
+                    fail(&error),
+                    "export.run",
+                    &conn,
+                    &request_id,
+                    &sql,
+                    &error,
+                );
+            }
+        }
+    } else {
+        // Parquet and frame need the whole result; the row cap stops the fetch
+        // just past --max-rows so an oversized result is refused, not buffered.
+        let request_options = QueryRequestOptions {
+            row_cap: Some(max_rows.saturating_add(1)),
+            ..QueryRequestOptions::default()
+        };
+        let rows = match execute(&conn, &sql, request_options) {
+            Ok(rows) => rows,
+            Err(error) => {
+                return with_terminal_receipt(
+                    fail(&error),
+                    "export.run",
+                    &conn,
+                    &request_id,
+                    &sql,
+                    &error,
+                );
+            }
+        };
+        if rows.rows.len() > max_rows {
+            return fail(&max_rows_error(max_rows));
+        }
+        let input = LocalExportInput::new(
+            rows.columns
+                .iter()
+                .map(|column| {
+                    ExportColumn::new(column.name.clone(), column.type_name.clone())
                         .nullable(column.nullable)
-                    })
-                    .collect();
-                let frame_partitions = vec![franken_snowflake_frame::ResultPartition::new(
-                    0,
-                    rows.rows.clone(),
-                )];
-                match franken_snowflake_frame::materialize_partitions(&frame_cols, frame_partitions)
+                        .precision_scale(column.precision, column.scale)
+                })
+                .collect(),
+            vec![ResultPartition::new(0, rows.rows.clone())],
+        );
+        let parquet_compression = match spec
+            .compression
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("snappy") => franken_snowflake_export::ParquetCompression::Snappy,
+            Some("gzip") => franken_snowflake_export::ParquetCompression::Gzip,
+            Some("none") | Some("uncompressed") => {
+                franken_snowflake_export::ParquetCompression::Uncompressed
+            }
+            Some(other) => {
+                return fail(&usage(&format!(
+                    "Unknown --compression `{other}`; for parquet use snappy (default), gzip, or none."
+                )));
+            }
+        };
+        let parquet_opts = franken_snowflake_export::ParquetWriterOptions {
+            compression: parquet_compression,
+            ..Default::default()
+        };
+        let artifact = match export_format {
+            "parquet" => franken_snowflake_export::export_parquet(
+                &input,
+                target_label.clone(),
+                created_at_ms,
+                Some(parquet_opts),
+            ),
+            "frame" => {
+                #[cfg(feature = "frankenpandas")]
                 {
-                    Ok(frame) => match serde_json::to_vec_pretty(&frame) {
-                        Ok(bytes) => {
-                            let content_address =
-                                franken_snowflake_export::ContentAddress::blake3(&bytes);
-                            let receipt = franken_snowflake_export::ExportReceipt::new(
-                                franken_snowflake_export::ExportReceiptKind::LocalJsonl,
-                                Some(franken_snowflake_export::ExportFormat::Jsonl),
-                                target_label.clone(),
-                                content_address,
-                                Some(frame.row_count as u64),
-                                None,
-                                None,
-                                created_at_ms,
-                                vec!["format:frame".to_string()],
-                            );
-                            let log_line = serde_json::to_string(&receipt).unwrap_or_default();
-                            Ok(franken_snowflake_export::LocalExportArtifact {
-                                bytes,
-                                receipt,
-                                log_line,
-                            })
-                        }
+                    let frame_cols: Vec<franken_snowflake_frame::SnowflakeColumn> = rows
+                        .columns
+                        .iter()
+                        .map(|column| {
+                            franken_snowflake_frame::SnowflakeColumn::new(
+                                column.name.clone(),
+                                column.type_name.clone(),
+                            )
+                            .nullable(column.nullable)
+                        })
+                        .collect();
+                    let frame_partitions = vec![franken_snowflake_frame::ResultPartition::new(
+                        0,
+                        rows.rows.clone(),
+                    )];
+                    match franken_snowflake_frame::materialize_partitions(
+                        &frame_cols,
+                        frame_partitions,
+                    ) {
+                        Ok(frame) => match serde_json::to_vec_pretty(&frame) {
+                            Ok(bytes) => {
+                                let content_address =
+                                    franken_snowflake_export::ContentAddress::blake3(&bytes);
+                                let receipt = franken_snowflake_export::ExportReceipt::new(
+                                    franken_snowflake_export::ExportReceiptKind::LocalJsonl,
+                                    Some(franken_snowflake_export::ExportFormat::Jsonl),
+                                    target_label.clone(),
+                                    content_address,
+                                    Some(frame.row_count as u64),
+                                    None,
+                                    None,
+                                    created_at_ms,
+                                    vec!["format:frame".to_string()],
+                                );
+                                let log_line = serde_json::to_string(&receipt).unwrap_or_default();
+                                Ok(franken_snowflake_export::LocalExportArtifact {
+                                    bytes,
+                                    receipt,
+                                    log_line,
+                                })
+                            }
+                            Err(err) => Err(franken_snowflake_export::ExportError::Json {
+                                message: err.to_string(),
+                            }),
+                        },
                         Err(err) => Err(franken_snowflake_export::ExportError::Json {
                             message: err.to_string(),
                         }),
-                    },
-                    Err(err) => Err(franken_snowflake_export::ExportError::Json {
-                        message: err.to_string(),
-                    }),
+                    }
+                }
+                #[cfg(not(feature = "frankenpandas"))]
+                {
+                    unreachable!("guarded above");
                 }
             }
-            #[cfg(not(feature = "frankenpandas"))]
-            {
-                unreachable!("guarded above");
+            other => Err(franken_snowflake_export::ExportError::Json {
+                message: format!("format `{other}` is written by the streaming path"),
+            }),
+        };
+        let artifact = match artifact {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                return fail(&SnowflakeError::new(
+                    SnowflakeErrorCode::UsageError,
+                    format!("local export failed: {error}"),
+                ));
             }
-        }
-        _ => export_jsonl(&input, target_label.clone(), created_at_ms),
-    };
-    let artifact = match artifact {
-        Ok(artifact) => artifact,
-        Err(error) => {
+        };
+        if let Err(error) = crate::export_path::write_artifact(&target, &artifact.bytes) {
             return fail(&SnowflakeError::new(
-                SnowflakeErrorCode::UsageError,
-                format!("local export failed: {error}"),
+                SnowflakeErrorCode::Internal,
+                format!("could not write {target_label}: {error}"),
             ));
         }
+        (rows, artifact.receipt, artifact.log_line)
     };
-    if let Err(error) = crate::export_path::write_artifact(&target, &artifact.bytes) {
-        return fail(&SnowflakeError::new(
-            SnowflakeErrorCode::Internal,
-            format!("could not write {target_label}: {error}"),
-        ));
-    }
     let (receipt_hash, mut warnings) = record_receipt(
         "export.run",
         &conn,
@@ -1660,14 +1721,15 @@ pub fn export_run_outcome(
         "export_written",
         serde_json::json!({
             "format": export_format,
-            "export_id": artifact.receipt.export_id,
-            "content_hash": artifact.receipt.content_address.digest_hex,
-            "byte_len": artifact.receipt.content_address.byte_len,
+            "export_id": receipt.export_id,
+            "content_hash": receipt.content_address.digest_hex,
+            "byte_len": receipt.content_address.byte_len,
+            "streamed": text_format.is_some(),
         }),
     );
     if let (Some(receipt_id), Ok(store)) = (receipt_hash.as_ref(), local_store::open_store()) {
         let record = ExportRecord {
-            export_id: artifact.receipt.export_id.clone(),
+            export_id: receipt.export_id.clone(),
             receipt_id: receipt_id.clone(),
             export_kind: if export_format == "csv" {
                 ExportKind::LocalCsv
@@ -1680,11 +1742,11 @@ pub fn export_run_outcome(
             },
             target_uri_redacted: target_label.clone(),
             content_address: CacheAddress {
-                algorithm: artifact.receipt.content_address.algorithm.clone(),
-                digest_hex: artifact.receipt.content_address.digest_hex.clone(),
-                byte_len: artifact.receipt.content_address.byte_len,
+                algorithm: receipt.content_address.algorithm.clone(),
+                digest_hex: receipt.content_address.digest_hex.clone(),
+                byte_len: receipt.content_address.byte_len,
             },
-            row_count: artifact.receipt.row_count,
+            row_count: receipt.row_count,
             created_at_ms,
         };
         if let Err(error) = store.cache.append_export(record) {
@@ -1708,13 +1770,18 @@ pub fn export_run_outcome(
             ("overwrote", Json::Bool(target.overwrite)),
             (
                 "bytes_written",
-                Json::Number(i64::try_from(artifact.bytes.len()).unwrap_or(i64::MAX)),
+                Json::Number(i64::try_from(receipt.content_address.byte_len).unwrap_or(i64::MAX)),
             ),
             ("row_count", Json::Number(rows.total_rows)),
-            ("export_receipt", Json::from_value(&artifact.receipt)),
+            ("streamed", Json::Bool(text_format.is_some())),
+            (
+                "max_rows",
+                Json::Number(i64::try_from(max_rows).unwrap_or(i64::MAX)),
+            ),
+            ("export_receipt", Json::from_value(&receipt)),
             (
                 "export_log_line",
-                json_string(artifact.log_line.trim_end().to_string()),
+                json_string(log_line.trim_end().to_string()),
             ),
         ]),
     );
@@ -1725,6 +1792,186 @@ pub fn export_run_outcome(
         status: CoreExitCode::Success,
         body: Body::Envelope { envelope, format },
     }
+}
+
+/// Default `--max-rows` for `export run` (reality-check bead E5).
+const DEFAULT_EXPORT_MAX_ROWS: usize = 1_000_000;
+
+/// `--max-rows`, else `<PREFIX>_EXPORT_MAX_ROWS`, else 1,000,000.
+fn export_max_rows(flag: Option<&str>, profile: &str) -> Result<usize, SnowflakeError> {
+    let env_name = format!("{}_EXPORT_MAX_ROWS", crate::profile_env_prefix(profile));
+    let (raw, source) = match flag {
+        Some(value) => (Some(value.to_owned()), "--max-rows".to_owned()),
+        None => (env_value(&env_name), env_name),
+    };
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_EXPORT_MAX_ROWS);
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(value) if value > 0 => Ok(value),
+        _ => Err(SnowflakeError::new(
+            SnowflakeErrorCode::UsageError,
+            format!("{source} must be a positive row count (got `{raw}`)"),
+        )),
+    }
+}
+
+fn max_rows_error(max_rows: usize) -> SnowflakeError {
+    SnowflakeError::new(
+        SnowflakeErrorCode::RowCapExceeded,
+        format!(
+            "the result has more than {max_rows} rows (--max-rows); raise --max-rows, or unload it in Snowflake with `export plan` (COPY INTO a stage)"
+        ),
+    )
+}
+
+/// Writes a streaming CSV/JSONL export as rows arrive; refuses once the
+/// export would pass `--max-rows` (the driver then cancels the statement).
+struct ExportSink {
+    format: TextFormat,
+    file: Option<crate::export_path::ArtifactFile>,
+    writer: Option<StreamingTextExport<crate::export_path::ArtifactFile>>,
+    max_rows: usize,
+}
+
+impl RowSink for ExportSink {
+    fn accept(
+        &mut self,
+        result_set: &ResultSet,
+        rows: Vec<Vec<Option<String>>>,
+    ) -> Result<(), SnowflakeError> {
+        let export_error = |error: franken_snowflake_export::ExportError| {
+            SnowflakeError::new(
+                SnowflakeErrorCode::UsageError,
+                format!("local export failed: {error}"),
+            )
+        };
+        if self.writer.is_none() {
+            let columns = result_set
+                .result_set_meta_data
+                .row_type
+                .iter()
+                .map(|column| {
+                    ExportColumn::new(column.name.clone(), column.column_type.clone())
+                        .nullable(column.nullable)
+                        .precision_scale(
+                            column.precision.and_then(|p| u32::try_from(p).ok()),
+                            column.scale.and_then(|s| u32::try_from(s).ok()),
+                        )
+                })
+                .collect();
+            let Some(file) = self.file.take() else {
+                return Err(SnowflakeError::new(
+                    SnowflakeErrorCode::Internal,
+                    "the export file is already in use",
+                ));
+            };
+            self.writer =
+                Some(StreamingTextExport::new(self.format, columns, file).map_err(export_error)?);
+        }
+        let Some(writer) = self.writer.as_mut() else {
+            return Err(SnowflakeError::new(
+                SnowflakeErrorCode::Internal,
+                "the export writer is missing",
+            ));
+        };
+        let written = usize::try_from(writer.rows_written()).unwrap_or(usize::MAX);
+        if written.saturating_add(rows.len()) > self.max_rows {
+            return Err(max_rows_error(self.max_rows));
+        }
+        writer.write_rows(&rows).map_err(export_error)
+    }
+}
+
+/// [`execute`], handing rows to `sink` as each fetch window completes; the
+/// returned rows carry the metadata only. The sink is owned so it can ride
+/// into the runtime and come back.
+fn execute_streaming<S: RowSink + 'static>(
+    conn: &LiveConn,
+    sql: &str,
+    options: QueryRequestOptions,
+    sink: S,
+) -> Result<(LiveRows, S), SnowflakeError> {
+    let fixed_request_id = options.sql_api_request_id.clone();
+    let request = build_request(conn, sql, options);
+    let query_tag = request
+        .parameters
+        .as_ref()
+        .and_then(|parameters| parameters.get("QUERY_TAG"))
+        .cloned();
+    let sql_api_request_id = fixed_request_id.unwrap_or_else(unique_request_id);
+    #[cfg(test)]
+    if let Some(script) = &conn.script {
+        let mut sink = sink;
+        let (mut done, stats, id) = script.execute(request, None, &sql_api_request_id)?;
+        let rows = std::mem::take(&mut done.rows);
+        sink.accept(&done.result_set, rows)?;
+        let mut live = into_rows(done, stats, id);
+        live.query_tag = query_tag;
+        return Ok((live, sink));
+    }
+    let params = SubmitQueryParams {
+        request_id: Some(sql_api_request_id.clone()),
+        retry: true,
+        asynchronous: false,
+        nullable: None,
+    };
+    let poll_plan = PollPlan::with_max_polls(conn.max_polls)
+        .with_partition_concurrency(conn.partition_concurrency);
+    let (outcome, stats, sink) = with_runtime(conn, move |cx, client, auth| {
+        Box::pin(async move {
+            let mut sink = sink;
+            let (outcome, stats) =
+                run_statement_streaming(cx, client, auth, request, params, poll_plan, &mut sink)
+                    .await;
+            Ok((outcome, stats, sink))
+        })
+    })?;
+    let done = outcome_into_result(outcome, "the statement", true)?;
+    let mut live = into_rows(done, stats, sql_api_request_id);
+    live.query_tag = query_tag;
+    Ok((live, sink))
+}
+
+/// Stream a CSV/JSONL export into `file` and commit it; the receipt's content
+/// address covers exactly the bytes written.
+fn stream_text_export(
+    conn: &LiveConn,
+    sql: &str,
+    file: crate::export_path::ArtifactFile,
+    format: TextFormat,
+    max_rows: usize,
+    target_label: &str,
+    created_at_ms: u64,
+) -> Result<(LiveRows, ExportReceipt, String), SnowflakeError> {
+    let sink = ExportSink {
+        format,
+        file: Some(file),
+        writer: None,
+        max_rows,
+    };
+    let (rows, sink) = execute_streaming(conn, sql, QueryRequestOptions::default(), sink)?;
+    let Some(writer) = sink.writer else {
+        return Err(SnowflakeError::new(
+            SnowflakeErrorCode::Internal,
+            "the statement completed without result metadata",
+        ));
+    };
+    let (file, receipt, log_line) = writer
+        .finish(target_label.to_owned(), created_at_ms)
+        .map_err(|error| {
+            SnowflakeError::new(
+                SnowflakeErrorCode::UsageError,
+                format!("local export failed: {error}"),
+            )
+        })?;
+    file.commit().map_err(|message| {
+        SnowflakeError::new(
+            SnowflakeErrorCode::Internal,
+            format!("could not write {target_label}: {message}"),
+        )
+    })?;
+    Ok((rows, receipt, log_line))
 }
 
 // ---------------------------------------------------------------------------
@@ -4458,6 +4705,53 @@ mod tests {
             env["receipt_hash"].as_str().map(str::len),
             Some(64),
             "{env}"
+        );
+        Ok(())
+    }
+
+    /// Reality-check bead E5: --max-rows refuses an oversized streaming export
+    /// with FSNOW-3004 and leaves no file behind.
+    #[test]
+    fn scripted_export_run_refuses_past_max_rows_and_leaves_no_file() -> Result<(), String> {
+        install(
+            "demo",
+            None,
+            None,
+            vec![Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000ff02",
+                &[("ID", "FIXED"), ("NAME", "TEXT")],
+                &[vec![Some("1"), Some("alpha")], vec![Some("2"), None]],
+            ))],
+        );
+        let out = std::env::temp_dir().join(format!(
+            "fsnow-scripted-export-cap-{}-{}.csv",
+            std::process::id(),
+            local_store::now_unix_ms()
+        ));
+        let spec = ExportPlanSpec {
+            profile: Some("demo".to_owned()),
+            sql: Some("select id, name from events".to_owned()),
+            format: Some("csv".to_owned()),
+            max_rows: Some("1".to_owned()),
+            ..Default::default()
+        };
+        let env = envelope(export_run_outcome(
+            OutputFormat::Json,
+            "req-export-cap".to_owned(),
+            spec,
+            Some(out.display().to_string()),
+            false,
+        ));
+        assert_eq!(env["ok"], false, "{env}");
+        assert_eq!(env["error"]["code"], "FSNOW-3004", "{env}");
+        assert!(!out.exists(), "a refused export leaves no file");
+        assert_eq!(
+            export_max_rows(Some("0"), "demo").map_err(|e| e.code).err(),
+            Some(SnowflakeErrorCode::UsageError)
+        );
+        assert_eq!(
+            export_max_rows(None, "demo").ok(),
+            Some(DEFAULT_EXPORT_MAX_ROWS)
         );
         Ok(())
     }

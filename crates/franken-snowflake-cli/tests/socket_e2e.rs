@@ -1411,3 +1411,103 @@ fn receipt_refetch_reads_the_result_cache_by_query_id() {
         "an unknown receipt reaches no server"
     );
 }
+
+/// `export run` streams CSV to the file over TLS (reality-check bead E5):
+/// every partition's rows in order, temporal cells as typed text; `--max-rows`
+/// refuses a larger result, cancels the statement and leaves no file.
+#[test]
+fn export_run_streams_csv_and_max_rows_refuses_without_a_file() {
+    const HANDLE: &str = "01b2c3d4-0000-0000-0000-00000000f140";
+    let cert = TestCert::mint();
+    let server = MockServer::start(&cert, |request, _| {
+        if request.is_submit() {
+            return completed_multi(HANDLE);
+        }
+        if request.method == "POST" && request.path().ends_with("/cancel") {
+            return scenarios::cancel();
+        }
+        match request.query("partition") {
+            Some("1") => scenarios::gzip_partition(),
+            Some("2") => MockHttpResponse::json(200, br#"{"data":[["5","epsilon"]]}"#.to_vec()),
+            _ => not_found(),
+        }
+    });
+    let h = Harness::new("export", &cert);
+    let out = h.dir.join("events.csv");
+    let out_arg = out.to_string_lossy().into_owned();
+    let sql = "select event_date, entity_id from events";
+    let run = h.run(
+        server.port,
+        &[
+            "export",
+            "run",
+            "--profile",
+            "sock",
+            "--sql",
+            sql,
+            "--format",
+            "csv",
+            "--out",
+            &out_arg,
+            "--json",
+        ],
+    );
+    assert_eq!(run.exit, 0, "{}", run.context());
+    assert_eq!(run.envelope["data"]["streamed"], true, "{}", run.context());
+    let written = fs::read_to_string(&out).expect("export file");
+    assert_eq!(
+        written,
+        "EVENT_DATE,ENTITY_ID\n2020-01-01,ENTITY123\n2020-01-02,ENTITY124\n\
+         1970-01-04,gamma\n1970-01-05,delta\n1970-01-06,epsilon\n"
+    );
+    assert_eq!(
+        run.envelope["data"]["bytes_written"],
+        written.len(),
+        "{}",
+        run.context()
+    );
+
+    let capped = h.dir.join("capped.csv");
+    let capped_arg = capped.to_string_lossy().into_owned();
+    let args = [
+        "export",
+        "run",
+        "--profile",
+        "sock",
+        "--sql",
+        sql,
+        "--format",
+        "csv",
+        "--out",
+        &capped_arg,
+        "--max-rows",
+        "3",
+        "--json",
+    ];
+    let mut command = h.command(server.port, &args);
+    // One partition per window, so the limit trips while the statement still
+    // has partitions to fetch.
+    command.env("FRANKEN_SNOWFLAKE_SOCK_PARTITION_CONCURRENCY", "1");
+    let refused = h.finish(&args, command.output().expect("spawn"));
+    assert_eq!(
+        refused.envelope["error"]["code"],
+        "FSNOW-3004",
+        "{}",
+        refused.context()
+    );
+    assert!(!capped.exists(), "a refused export leaves no file");
+    let leftovers = fs::read_dir(&h.dir)
+        .expect("harness dir")
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().contains("fsnow-tmp"))
+        .count();
+    assert_eq!(leftovers, 0, "no temporary file is left behind");
+    assert!(
+        server
+            .seen()
+            .iter()
+            .any(|s| s.method == "POST" && s.path() == format!("{SUBMIT_PATH}/{HANDLE}/cancel")),
+        "the oversized statement was cancelled: {:?}",
+        server.seen()
+    );
+}
