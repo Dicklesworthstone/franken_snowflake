@@ -22,6 +22,7 @@
 //!   secret-leak redactor over the whole envelope before output.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -53,12 +54,13 @@ use franken_snowflake_core::ids::{
 };
 use franken_snowflake_core::outcome::{DataSource, OutcomeKind};
 use franken_snowflake_core::redact::redact;
+use franken_snowflake_core::typed::{ColumnCodec, JsonRepr, TYPED_ROW_ENCODING, WIRE_ROW_ENCODING};
 use franken_snowflake_export::{
     CopySource, ExportColumn, LocalExportInput, ResultPartition, export_csv, export_jsonl,
 };
 use franken_snowflake_http::{
     AuthorizationDescriptor, CancelHttpRequest, SnowflakeAuthTokenType, SnowflakeEndpoint,
-    SnowflakeHttpClient, StatusClass, TransportConfig,
+    SnowflakeHttpClient, StatusClass, TlsRootPolicy, TransportConfig, TransportError,
 };
 use franken_snowflake_sqlapi::driver::{AuthProvider, DriverStats, run_statement_with_auth};
 use franken_snowflake_sqlapi::lifecycle::{
@@ -176,7 +178,7 @@ pub fn run_query_outcome(
         failure_outcome(
             format,
             "query.run",
-            "fsnow.query.run.v1",
+            "fsnow.query.run.v2",
             request_id.clone(),
             profile,
             error,
@@ -225,10 +227,11 @@ pub fn run_query_outcome(
                 request_id,
                 profile.clone(),
                 "query.run",
-                "fsnow.query.run.v1",
+                "fsnow.query.run.v2",
                 Vec::new(),
                 &rows,
                 emit_cap,
+                RowEncoding::from_raw_cells(options.raw_cells),
                 receipt_hash.clone(),
                 warnings,
                 vec![
@@ -264,7 +267,7 @@ pub fn run_dataset_query_outcome(
     let planned = match crate::dataset_mode::plan_dataset(
         format,
         "query.run",
-        "fsnow.query.run.v1",
+        "fsnow.query.run.v2",
         &request_id,
         &spec,
     ) {
@@ -276,7 +279,7 @@ pub fn run_dataset_query_outcome(
         failure_outcome(
             format,
             "query.run",
-            "fsnow.query.run.v1",
+            "fsnow.query.run.v2",
             request_id.clone(),
             profile.clone(),
             error,
@@ -356,10 +359,11 @@ pub fn run_dataset_query_outcome(
         request_id,
         profile,
         "query.run",
-        "fsnow.query.run.v1",
+        "fsnow.query.run.v2",
         crate::dataset_mode::plan_json(&planned),
         &rows,
         emit_cap,
+        RowEncoding::from_raw_cells(options.raw_cells),
         receipt_hash.clone(),
         warnings,
         vec![
@@ -557,6 +561,8 @@ fn write_success(
     let returned = rows.rows.len().min(ROW_EMIT_CAP);
     let truncated = rows.rows.len() > ROW_EMIT_CAP;
     let rows_affected = dml_rows_affected(rows);
+    let projected = project_rows(rows, returned, RowEncoding::Typed);
+    warnings.extend(projected.warnings);
 
     let mut envelope = base_envelope(
         true,
@@ -584,8 +590,9 @@ fn write_success(
                 "rows_affected",
                 rows_affected.map_or(Json::Null, Json::Number),
             ),
-            ("columns", columns_json(rows)),
-            ("rows", rows_json(rows, returned)),
+            ("row_encoding", json_string(RowEncoding::Typed.token())),
+            ("columns", projected.columns),
+            ("rows", projected.rows),
             ("result_row_count", Json::Number(rows.total_rows)),
             ("returned_rows", Json::Number(returned as i64)),
             ("partition_count", Json::Number(rows.partition_count as i64)),
@@ -1817,6 +1824,9 @@ struct LiveConn {
     role: Option<String>,
     statement_timeout_seconds: u32,
     endpoint: SnowflakeEndpoint,
+    /// `<PREFIX>_CA_BUNDLE`: verify the server against this PEM bundle instead
+    /// of the OS trust store (a TLS-intercepting proxy's CA).
+    tls_roots: TlsRootPolicy,
     auth_profile: AuthProfile,
     max_polls: u32,
     /// Partition fetch window (`<PREFIX>_PARTITION_CONCURRENCY`, default 4).
@@ -1902,9 +1912,13 @@ impl LiveConn {
         }
 
         let account = account.unwrap_or_default();
-        let endpoint = SnowflakeEndpoint::parse(endpoint_url(&account)).map_err(|error| {
+        let endpoint = live_endpoint(&account).map_err(|error| {
             SnowflakeError::new(SnowflakeErrorCode::ProfileInvalid, error.message)
         })?;
+        let tls_roots = env_value(&name(&prefix, "CA_BUNDLE"))
+            .map_or(TlsRootPolicy::NativeRoots, |path| {
+                TlsRootPolicy::ExplicitPemBundle(PathBuf::from(path))
+            });
         let auth_profile = build_auth_profile(&prefix, &lane)?;
         let statement_timeout_seconds = overrides
             .statement_timeout
@@ -1931,6 +1945,7 @@ impl LiveConn {
                 .or_else(|| env_value(&name(&prefix, "ROLE"))),
             statement_timeout_seconds,
             endpoint,
+            tls_roots,
             auth_profile,
             max_polls: env_u32(&name(&prefix, "MAX_POLLS")).unwrap_or(DEFAULT_MAX_POLLS),
             partition_concurrency: env_u32(&name(&prefix, "PARTITION_CONCURRENCY"))
@@ -2098,10 +2113,14 @@ where
                 "async runtime did not install an ambient context",
             )
         })?;
-        let client = SnowflakeHttpClient::default_for_runtime(
-            TransportConfig::new(conn.endpoint.clone()),
-            &cx,
-        );
+        let mut config = TransportConfig::new(conn.endpoint.clone());
+        config.tls_roots = conn.tls_roots.clone();
+        let client = SnowflakeHttpClient::for_runtime(config).map_err(|error| {
+            SnowflakeError::new(
+                SnowflakeErrorCode::ProfileInvalid,
+                format!("the profile's CA bundle was refused: {}", error.message),
+            )
+        })?;
         let mut mechanism = conn
             .auth_profile
             .resolve(&ProcessSecretResolver, &conn.account, &conn.user)
@@ -2136,6 +2155,22 @@ where
         let _in_flight = InFlight::enter();
         cancel_on_signal(&cx, body(&cx, &client, &mut auth)).await
     })
+}
+
+/// The SQL API endpoint for a profile's account. Production builds accept only
+/// a Snowflake host. A `testkit-endpoint` build (never a release) also accepts
+/// a loopback `https://127.0.0.1:<port>`, and only when the run opts in with
+/// `FRANKEN_SNOWFLAKE_TESTKIT_ENDPOINT=1`, so the socket e2e reaches its mock
+/// while every other test keeps the production refusal.
+fn live_endpoint(account: &str) -> Result<SnowflakeEndpoint, TransportError> {
+    #[cfg(feature = "testkit-endpoint")]
+    if SnowflakeEndpoint::parse(endpoint_url(account)).is_err()
+        && env_value("FRANKEN_SNOWFLAKE_TESTKIT_ENDPOINT").as_deref() == Some("1")
+        && let Ok(loopback) = SnowflakeEndpoint::parse_testkit_loopback(account)
+    {
+        return Ok(loopback);
+    }
+    SnowflakeEndpoint::parse(endpoint_url(account))
 }
 
 // ---------------------------------------------------------------------------
@@ -2854,38 +2889,111 @@ fn into_rows(done: CompletedStatement, stats: DriverStats, sql_api_request_id: S
     }
 }
 
-fn columns_json(rows: &LiveRows) -> Json {
-    json_array(
-        rows.columns
-            .iter()
-            .map(|column| {
-                json_object(vec![
-                    ("name", json_string(column.name.clone())),
-                    ("type", json_string(column.type_name.clone())),
-                    ("nullable", Json::Bool(column.nullable)),
-                ])
-            })
-            .collect(),
-    )
+/// How result cells are rendered (reality-check bead C1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowEncoding {
+    /// `typed.v1`: one JSON representation per column, chosen from its rowType.
+    Typed,
+    /// `jsonv2.wire`: the SQL API strings as received (`--raw-cells`).
+    Wire,
 }
 
-fn rows_json(rows: &LiveRows, returned: usize) -> Json {
-    json_array(
-        rows.rows
-            .iter()
-            .take(returned)
-            .map(|row| {
-                json_array(
-                    row.iter()
-                        .map(|cell| match cell {
-                            Some(value) => json_string(value.clone()),
-                            None => Json::Null,
-                        })
-                        .collect(),
-                )
-            })
-            .collect(),
-    )
+impl RowEncoding {
+    fn from_raw_cells(raw_cells: bool) -> Self {
+        if raw_cells { Self::Wire } else { Self::Typed }
+    }
+
+    fn token(self) -> &'static str {
+        match self {
+            Self::Typed => TYPED_ROW_ENCODING,
+            Self::Wire => WIRE_ROW_ENCODING,
+        }
+    }
+}
+
+/// An envelope's `columns` and `rows`, plus a warning per column that could not
+/// be typed.
+struct ProjectedRows {
+    columns: Json,
+    rows: Json,
+    warnings: Vec<Json>,
+}
+
+/// Render the first `returned` rows. In `typed.v1` every column gets one
+/// representation from its rowType (`columns[].json_repr`); a column holding a
+/// cell that does not match its wire convention keeps the wire strings for all
+/// of its cells (`json_repr: "wire"`) and is named in a warning. Cell values
+/// never appear in a warning.
+fn project_rows(rows: &LiveRows, returned: usize, encoding: RowEncoding) -> ProjectedRows {
+    let shown = rows.rows.get(..returned).unwrap_or(rows.rows.as_slice());
+    let mut cells: Vec<Vec<Json>> = shown
+        .iter()
+        .map(|_| Vec::with_capacity(rows.columns.len()))
+        .collect();
+    let mut columns = Vec::with_capacity(rows.columns.len());
+    let mut warnings = Vec::new();
+    for (index, column) in rows.columns.iter().enumerate() {
+        let codec = ColumnCodec::new(
+            &column.type_name,
+            column.precision.map(i64::from),
+            column.scale.map(i64::from),
+        );
+        let wire = |row: &Vec<Option<String>>| row.get(index).cloned().flatten();
+        let typed = match encoding {
+            RowEncoding::Wire => None,
+            RowEncoding::Typed => match shown
+                .iter()
+                .map(|row| codec.decode(wire(row).as_deref()).map(Json::from_serde))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(typed) => Some(typed),
+                Err(error) => {
+                    warnings.push(json_string(format!(
+                        "column `{}` ({}): a cell {error}; the column keeps the jsonv2 wire strings",
+                        column.name, column.type_name
+                    )));
+                    None
+                }
+            },
+        };
+        let json_repr = if typed.is_some() {
+            codec.json_repr()
+        } else {
+            JsonRepr::Wire
+        };
+        let values = typed.unwrap_or_else(|| {
+            shown
+                .iter()
+                .map(|row| wire(row).map_or(Json::Null, json_string))
+                .collect()
+        });
+        for (row_cells, value) in cells.iter_mut().zip(values) {
+            row_cells.push(value);
+        }
+        columns.push(json_object(vec![
+            ("name", json_string(column.name.clone())),
+            ("type", json_string(column.type_name.clone())),
+            ("nullable", Json::Bool(column.nullable)),
+            (
+                "precision",
+                column
+                    .precision
+                    .map_or(Json::Null, |precision| Json::Number(i64::from(precision))),
+            ),
+            (
+                "scale",
+                column
+                    .scale
+                    .map_or(Json::Null, |scale| Json::Number(i64::from(scale))),
+            ),
+            ("json_repr", json_string(json_repr.as_str())),
+        ]));
+    }
+    ProjectedRows {
+        columns: json_array(columns),
+        rows: json_array(cells.into_iter().map(json_array).collect()),
+        warnings,
+    }
 }
 
 /// Build a `data_source = "live"` success envelope carrying assembled rows. The
@@ -2901,15 +3009,19 @@ fn rows_success(
     mut leading: Vec<(&'static str, Json)>,
     rows: &LiveRows,
     emit_cap: usize,
+    encoding: RowEncoding,
     receipt_hash: Option<String>,
     mut warnings: Vec<Json>,
     safe_next_commands: Vec<String>,
 ) -> crate::Outcome {
     let returned = rows.rows.len().min(emit_cap);
     let truncated = rows.rows.len() > emit_cap;
+    let projected = project_rows(rows, returned, encoding);
+    warnings.extend(projected.warnings);
     leading.extend(vec![
-        ("columns", columns_json(rows)),
-        ("rows", rows_json(rows, returned)),
+        ("row_encoding", json_string(encoding.token())),
+        ("columns", projected.columns),
+        ("rows", projected.rows),
         ("row_count", Json::Number(rows.total_rows)),
         ("returned_rows", Json::Number(returned as i64)),
         ("partition_count", Json::Number(rows.partition_count as i64)),
@@ -3239,6 +3351,7 @@ mod test_support {
                     .statement_timeout
                     .unwrap_or(DEFAULT_STATEMENT_TIMEOUT_SECONDS),
                 endpoint: SnowflakeEndpoint::parse(endpoint_url(account)).ok()?,
+                tls_roots: TlsRootPolicy::NativeRoots,
                 auth_profile: build_auth_profile("FSNOW_SCRIPTED", "pat").ok()?,
                 max_polls: 10,
                 partition_concurrency: DEFAULT_PARTITION_CONCURRENCY,
@@ -4287,6 +4400,101 @@ mod tests {
             crate::render_json(&data).contains(r#""expires_in_seconds":null"#),
             "opaque token: lifetime unknown"
         );
+    }
+
+    /// Reality-check bead C1: the documented jsonv2 conventions become typed
+    /// cells with one representation per column; `--raw-cells` keeps the wire
+    /// strings; a column holding a cell that breaks its convention keeps the
+    /// wire strings for every cell, with a warning that never echoes the value.
+    #[test]
+    fn rows_are_typed_per_column_or_kept_on_the_wire() {
+        use franken_snowflake_sqlapi::lifecycle::{Progress, StatementMachine};
+        use franken_snowflake_sqlapi::status::ResponseClass;
+        let fixture = include_bytes!(
+            "../../franken-snowflake-testkit/fixtures/sqlapi/jsonv2_codec_cells.json"
+        );
+        let mut machine = StatementMachine::new(PollPlan::default());
+        let Ok(Progress::Complete(done)) = machine.on_submit(ResponseClass::Completed, fixture)
+        else {
+            panic!("the codec fixture is a completed statement");
+        };
+        let mut rows = into_rows(done, DriverStats::default(), "req".to_owned());
+        let parse = |json: &Json| -> serde_json::Value {
+            serde_json::from_str(&crate::render_json(json)).unwrap_or_default()
+        };
+
+        let typed = project_rows(&rows, 1, RowEncoding::Typed);
+        assert!(typed.warnings.is_empty(), "{:?}", typed.warnings);
+        assert_eq!(
+            parse(&typed.rows),
+            serde_json::json!([[
+                "12345678901234567.89",
+                "99999999999999999999",
+                1.25,
+                "1.2345678901234567890123456789012345678E+39",
+                true,
+                "2020-01-01",
+                "23:01:59.000000000",
+                "2021-01-28T22:09:37.123456789",
+                "2021-01-28T22:09:37.123456789Z",
+                "2021-03-19T18:06:59.000000000+01:00",
+                "DEADBEEF",
+                {"k": [1, 2]},
+                {"nested": {"ok": true}},
+                [1, "two", null],
+                null
+            ]])
+        );
+        let reprs = |columns: &Json| -> Vec<String> {
+            parse(columns)
+                .as_array()
+                .map(|columns| {
+                    columns
+                        .iter()
+                        .map(|column| column["json_repr"].as_str().unwrap_or("").to_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            reprs(&typed.columns),
+            [
+                "decimal_string",
+                "decimal_string",
+                "float",
+                "decimal_string",
+                "bool",
+                "date",
+                "time",
+                "timestamp_ntz",
+                "timestamp_utc",
+                "timestamp_offset",
+                "hex",
+                "json",
+                "json",
+                "json",
+                "string"
+            ]
+        );
+        assert_eq!(parse(&typed.columns)[0]["scale"], 2);
+
+        let wire = project_rows(&rows, 1, RowEncoding::Wire);
+        assert_eq!(parse(&wire.rows)[0][5], "18262");
+        assert_eq!(parse(&wire.rows)[0][11], r#"{"k":[1,2]}"#);
+        assert!(reprs(&wire.columns).iter().all(|repr| repr == "wire"));
+
+        // One malformed DATE cell: that column falls back, the others stay typed.
+        if let Some(cell) = rows.rows.get_mut(0).and_then(|row| row.get_mut(5)) {
+            *cell = Some("not-a-day-count".to_owned());
+        }
+        let degraded = project_rows(&rows, 1, RowEncoding::Typed);
+        assert_eq!(reprs(&degraded.columns)[5], "wire");
+        assert_eq!(parse(&degraded.rows)[0][5], "not-a-day-count");
+        assert_eq!(parse(&degraded.rows)[0][4], true);
+        assert_eq!(degraded.warnings.len(), 1);
+        let warning = crate::render_json(&degraded.warnings[0]);
+        assert!(warning.contains("EVENT_DATE"), "{warning}");
+        assert!(!warning.contains("not-a-day-count"), "{warning}");
     }
 
     #[test]

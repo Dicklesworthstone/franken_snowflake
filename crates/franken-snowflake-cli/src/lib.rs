@@ -188,6 +188,10 @@ struct QueryRunOptions {
     /// (`--require-live`); success on the live paths always stamps
     /// `data_source = "live"`, so this only fires on non-live substitution.
     require_live: bool,
+    /// Emit the SQL API jsonv2 wire strings instead of `typed.v1` cells
+    /// (`--raw-cells`, reality-check bead C1). Read by the live transport only.
+    #[cfg_attr(not(feature = "live"), allow(dead_code))]
+    raw_cells: bool,
     /// Inline typed bindings for embedded callers (the TUI executor): the
     /// same JSON shape `--bindings-env` carries, parsed with the same
     /// validation. `None` keeps the env-var path.
@@ -462,8 +466,8 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "query.run",
-        invocation: "franken-snowflake query [run] --profile <profile> (--sql <sql> | --dataset <id> [--entity <v>] [--from <t>] [--to <t>] [--as-of <t>] [--select a,b] [--filter <json>]) [--limit <rows>] [--role <role>] [--warehouse <wh>] [--statement-timeout <secs>] [--bindings-env <env-var>] [--query-tag <tag>] --json",
-        output_contract_id: "fsnow.query.run.v1",
+        invocation: "franken-snowflake query [run] --profile <profile> (--sql <sql> | --dataset <id> [--entity <v>] [--from <t>] [--to <t>] [--as-of <t>] [--select a,b] [--filter <json>]) [--limit <rows>] [--role <role>] [--warehouse <wh>] [--statement-timeout <secs>] [--bindings-env <env-var>] [--query-tag <tag>] [--raw-cells] --json",
+        output_contract_id: "fsnow.query.run.v2",
         description: "Submit a SQL API statement; `query --sql` shorthand maps to this surface.",
         read_only: true,
         provider_network: true,
@@ -955,7 +959,7 @@ fn parse_query(args: &[String], output: OutputFormat) -> Result<Command, Outcome
                 && (raw_value_after(args, "--sql").is_some()
                     || value_after(args, "--dataset").is_some()) =>
         {
-            let dataset = dataset_spec(args, output, "query.run", "fsnow.query.run.v1")?;
+            let dataset = dataset_spec(args, output, "query.run", "fsnow.query.run.v2")?;
             Ok(Command::QueryRun {
                 profile: resolve_profile(value_after(args, "--profile")),
                 sql: raw_value_after(args, "--sql"),
@@ -972,7 +976,7 @@ fn parse_query(args: &[String], output: OutputFormat) -> Result<Command, Outcome
             })
         }
         Some("run") => {
-            let dataset = dataset_spec(args, output, "query.run", "fsnow.query.run.v1")?;
+            let dataset = dataset_spec(args, output, "query.run", "fsnow.query.run.v2")?;
             Ok(Command::QueryRun {
                 profile: resolve_profile(value_after(args, "--profile")),
                 sql: raw_value_after(args, "--sql"),
@@ -1134,6 +1138,7 @@ fn query_run_options(args: &[String]) -> QueryRunOptions {
         warehouse: value_after(args, "--warehouse"),
         statement_timeout: value_after(args, "--statement-timeout"),
         require_live: has_flag(args, "--require-live"),
+        raw_cells: has_flag(args, "--raw-cells"),
         bindings_json: None,
     }
 }
@@ -2464,6 +2469,12 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
                     false,
                     "Hard-refuse (FSNOW-3003) unless served by the live transport (--require-live)",
                 ),
+                input(
+                    "raw_cells",
+                    "boolean",
+                    false,
+                    "Emit the SQL API jsonv2 wire strings instead of typed.v1 cells (--raw-cells)",
+                ),
             ];
             inputs.extend(
                 dataset_mode_inputs()
@@ -3528,7 +3539,7 @@ fn query_run_outcome(
         return usage_error(
             format,
             "query.run",
-            "fsnow.query.run.v1",
+            "fsnow.query.run.v2",
             "Missing --profile for `query run`. Pass --profile <profile> or set FRANKEN_SNOWFLAKE_DEFAULT_PROFILE.",
             vec!["franken-snowflake query run --profile <profile> --sql <sql> --json".to_string()],
             vec![],
@@ -3539,7 +3550,7 @@ fn query_run_outcome(
         return usage_error(
             format,
             "query.run",
-            "fsnow.query.run.v1",
+            "fsnow.query.run.v2",
             "Missing --sql for `query run`.",
             vec!["franken-snowflake query run --profile <profile> --sql <sql> --json".to_string()],
             vec![],
@@ -3554,7 +3565,7 @@ fn query_run_outcome(
         return refusal(
             format,
             "query.run",
-            "fsnow.query.run.v1",
+            "fsnow.query.run.v2",
             request_id,
             profile.clone(),
             SnowflakeErrorCode::MultiStatementRefused,
@@ -3566,7 +3577,7 @@ fn query_run_outcome(
         return refusal(
             format,
             "query.run",
-            "fsnow.query.run.v1",
+            "fsnow.query.run.v2",
             request_id,
             profile.clone(),
             SnowflakeErrorCode::MultiStatementRefused,
@@ -3578,7 +3589,7 @@ fn query_run_outcome(
         return refusal(
             format,
             "query.run",
-            "fsnow.query.run.v1",
+            "fsnow.query.run.v2",
             request_id,
             profile.clone(),
             SnowflakeErrorCode::MutationRefused,
@@ -3590,7 +3601,7 @@ fn query_run_outcome(
         return refusal(
             format,
             "query.run",
-            "fsnow.query.run.v1",
+            "fsnow.query.run.v2",
             request_id,
             profile.clone(),
             SnowflakeErrorCode::MutationRefused,
@@ -3641,7 +3652,7 @@ fn query_run_dispatch(
     live_transport_required_with_data(
         format,
         "query.run",
-        "fsnow.query.run.v1",
+        "fsnow.query.run.v2",
         request_id,
         profile,
         json_object(vec![
@@ -4653,7 +4664,7 @@ fn dataset_run_dispatch(
     let planned = match dataset_mode::plan_dataset(
         format,
         "query.run",
-        "fsnow.query.run.v1",
+        "fsnow.query.run.v2",
         &request_id,
         &spec,
     ) {
@@ -4671,7 +4682,7 @@ fn dataset_run_dispatch(
     live_transport_required_with_data(
         format,
         "query.run",
-        "fsnow.query.run.v1",
+        "fsnow.query.run.v2",
         request_id,
         Some(planned.profile.clone()),
         json_object(data),
@@ -5556,10 +5567,10 @@ fn live_transport_available() -> bool {
 }
 
 // Shared by `capabilities` and the `onboard` mega-command so the two surfaces
-// can never drift on what this binary actually has compiled in. `live`/`mcp`/
-// `tui`/`toon` are real CLI-crate features (reported via `cfg!`); `testkit` is
-// NOT a feature of this binary — that surface lives in a sibling crate — so it
-// is definitionally false for any `franken-snowflake`/`fsnow` build.
+// can never drift on what this binary actually has compiled in. Every flag is
+// computed with `cfg!`. `testkit` is the test-only `testkit-endpoint` feature
+// (a loopback SQL API endpoint for the socket e2e); a release build reports
+// false, and docs/RELEASE.md requires it.
 /// The commit and toolchain this binary was built from (reality-check bead
 /// H1; see `build.rs`). `dirty` is null when unknown. With `exe_hash`, also the
 /// SHA-256 of the running executable, computed from inside the process so a
@@ -5572,6 +5583,7 @@ fn build_identity_json(exe_hash: bool) -> Json {
         ("toon", toon_output_available()),
         ("frankenpandas", cfg!(feature = "frankenpandas")),
         ("frankensearch", cfg!(feature = "frankensearch")),
+        ("testkit-endpoint", cfg!(feature = "testkit-endpoint")),
     ]
     .into_iter()
     .filter(|(_, enabled)| *enabled)
@@ -5627,7 +5639,7 @@ fn current_exe_sha256() -> std::io::Result<String> {
 fn feature_flags_json() -> Json {
     json_object(vec![
         ("live", Json::Bool(live_transport_available())),
-        ("testkit", Json::Bool(false)),
+        ("testkit", Json::Bool(cfg!(feature = "testkit-endpoint"))),
         ("mcp", Json::Bool(mcp_surface_available())),
         ("tui", Json::Bool(cfg!(feature = "tui"))),
         ("toon", Json::Bool(toon_output_available())),
@@ -6170,8 +6182,8 @@ mod tests {
             );
         };
         expect("live", cfg!(feature = "live"));
-        // testkit/tui are not features of the CLI binary — always false here.
-        expect("testkit", false);
+        // `testkit` is the test-only loopback endpoint (`testkit-endpoint`).
+        expect("testkit", cfg!(feature = "testkit-endpoint"));
         expect("tui", cfg!(feature = "tui"));
         expect("mcp", cfg!(feature = "mcp"));
         expect("toon", cfg!(feature = "toon"));

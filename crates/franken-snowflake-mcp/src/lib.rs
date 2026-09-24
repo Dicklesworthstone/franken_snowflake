@@ -612,6 +612,11 @@ mod fastmcp_surface {
                     "Set true to enforce a hard refusal if live transport is unavailable.",
                     false,
                 ),
+                ParamSpec::boolean(
+                    "raw_cells",
+                    "Set true for the SQL API jsonv2 wire strings instead of typed.v1 cells.",
+                    false,
+                ),
             ]);
         }
         params
@@ -677,6 +682,9 @@ mod fastmcp_surface {
             }
             if optional_bool(arguments, "require_live")?.unwrap_or(false) {
                 args.push("--require-live".to_string());
+            }
+            if optional_bool(arguments, "raw_cells")?.unwrap_or(false) {
+                args.push("--raw-cells".to_string());
             }
         }
         args.push("--json".to_string());

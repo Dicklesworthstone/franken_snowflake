@@ -64,6 +64,11 @@ live = [
     "dep:asupersync",
     "dep:signal-hook",
 ]
+# Test-only: lets the live transport reach a loopback mock SQL API over real
+# TLS (`<PREFIX>_ACCOUNT=https://127.0.0.1:<port>`) for the hermetic socket e2e
+# (`tests/socket_e2e.rs`, reality-check bead F1). Never enabled by a release
+# build; `capabilities` reports it as `feature_flags.testkit`.
+testkit-endpoint = ["live", "franken-snowflake-http/testkit-endpoint"]
 
 [build-dependencies]
 # Source digest for the build identity (build.rs); already in the graph.
@@ -99,3 +104,14 @@ sha2 = "0.10"
 getrandom = "0.3"
 hmac = "0.12"
 toon = { package = "tru", version = "0.2.3", default-features = false, optional = true }
+
+[dev-dependencies]
+# The socket e2e mints a throwaway CA per run (pure Rust, ring backend; ring is
+# already in the graph through rustls) and replays the testkit's SQL API
+# fixtures over a real TLS listener.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+franken-snowflake-testkit = { path = "../franken-snowflake-testkit" }
+# A throwaway RSA key for the key-pair JWT re-sign scenario (both already in
+# the graph through franken-snowflake-auth).
+rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
+rand = "0.8"

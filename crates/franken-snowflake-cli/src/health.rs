@@ -764,6 +764,7 @@ pub fn profile_handle_presence(profile: &str) -> HandlePresence {
         "STATEMENT_TIMEOUT_SECONDS",
         "PARTITION_CONCURRENCY",
         "QUERY_TAG",
+        "CA_BUNDLE",
     ] {
         push(key, false, false);
     }
