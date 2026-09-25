@@ -86,8 +86,8 @@ pub struct EnvelopeMeta {
     pub output_contract_id: String,
     /// Envelope schema version.
     pub schema_version: u32,
-    /// Payload provenance; omitted when unspecified.
-    #[serde(skip_serializing_if = "DataSource::is_unspecified")]
+    /// Payload provenance; omitted when unspecified (and read back as such).
+    #[serde(default, skip_serializing_if = "DataSource::is_unspecified")]
     pub data_source: DataSource,
     /// Profile used (never a secret).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -331,6 +331,20 @@ mod tests {
         assert!(json.contains("\"schema_version\":1"));
         assert!(json.contains("\"data\":{"));
         assert!(json.contains("\"rows\":[]"));
+        Ok(())
+    }
+
+    /// Bead kd43: a serialized envelope reads back, in the default build and
+    /// under serde_json's `arbitrary_precision` (on in any build with FastMCP
+    /// 0.10). It did not in either: an omitted `data_source` (unspecified) was
+    /// a missing field.
+    #[test]
+    fn an_envelope_reads_back() -> Result<(), serde_json::Error> {
+        let mut meta = EnvelopeMeta::success("query-run", "rows.v1");
+        meta.duration_ms = 1_234;
+        let envelope = Envelope::new(meta, serde_json::json!({ "rows": [1, 2.5] }));
+        let back: Envelope<serde_json::Value> = serde_json::from_str(&envelope.to_json_string()?)?;
+        assert_eq!(back, envelope);
         Ok(())
     }
 }
