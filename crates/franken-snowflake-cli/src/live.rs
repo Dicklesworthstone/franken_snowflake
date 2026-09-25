@@ -73,7 +73,8 @@ use franken_snowflake_sqlapi::driver::{
     run_multi_statement_hooked, run_statement_hooked,
 };
 use franken_snowflake_sqlapi::lifecycle::{
-    CompletedStatement, DEFAULT_PARTITION_CONCURRENCY, MAX_PARTITION_CONCURRENCY, PollPlan,
+    CompletedStatement, CostQuota, DEFAULT_PARTITION_CONCURRENCY, MAX_PARTITION_CONCURRENCY,
+    PollPlan,
 };
 use franken_snowflake_sqlapi::request::{Binding, SubmitQueryParams, SubmitStatementRequest};
 use franken_snowflake_sqlapi::response::ResultSet;
@@ -407,7 +408,8 @@ fn execute_batch(
     let poll_plan = PollPlan::with_max_polls(conn.max_polls)
         .with_partition_concurrency(conn.partition_concurrency)
         .with_row_cap(row_cap)
-        .with_execution_timeout(conn.execution_timeout_for(count));
+        .with_execution_timeout(conn.execution_timeout_for(count))
+        .with_cost_quota(conn.cost_quota()?);
     let progress = conn.progress;
     let (outcome, stats, facts) = with_runtime(conn, move |cx, client, auth| {
         Box::pin(async move {
@@ -2271,7 +2273,8 @@ fn execute_streaming<S: RowSink + 'static>(
     if let Some(script) = &conn.script {
         let mut sink = sink;
         let plan = PollPlan::with_max_polls(conn.max_polls)
-            .with_execution_timeout(conn.execution_timeout());
+            .with_execution_timeout(conn.execution_timeout())
+            .with_cost_quota(conn.cost_quota()?);
         let (mut done, stats, id) = script.execute(request, plan, &sql_api_request_id)?;
         let rows = std::mem::take(&mut done.rows);
         sink.accept(&done.result_set, rows)?;
@@ -2287,7 +2290,8 @@ fn execute_streaming<S: RowSink + 'static>(
     };
     let poll_plan = PollPlan::with_max_polls(conn.max_polls)
         .with_partition_concurrency(conn.partition_concurrency)
-        .with_execution_timeout(conn.execution_timeout());
+        .with_execution_timeout(conn.execution_timeout())
+        .with_cost_quota(conn.cost_quota()?);
     let progress = conn.progress;
     let (outcome, stats, sink, facts) = with_runtime(conn, move |cx, client, auth| {
         Box::pin(async move {
@@ -2867,6 +2871,14 @@ struct LiveConn {
     query_tag: Option<String>,
     /// `--progress`: NDJSON progress events on stderr (reality-check bead E5).
     progress: bool,
+    /// `<PREFIX>_MAX_CREDITS`: the advisory credit cap per request, in
+    /// millionths of a credit (reality-check bead E3).
+    max_microcredits: Option<u64>,
+    /// `<PREFIX>_WAREHOUSE_CREDITS_PER_HOUR`: the warehouse's rate when the
+    /// profile states it (else `SHOW WAREHOUSES` supplies it), in millionths.
+    microcredits_per_hour: Option<u64>,
+    /// The resolved credit cap, looked up once per invocation.
+    cost_quota: std::cell::OnceCell<Result<Option<CostQuota>, SnowflakeError>>,
     /// Test-only: answers every `execute_request` from a script instead of the
     /// SQL API (see `test_support`). Always `None` in production builds.
     #[cfg(test)]
@@ -2878,6 +2890,30 @@ impl LiveConn {
     /// (`0`, Snowflake's "no limit", sets none).
     fn execution_timeout(&self) -> Option<Duration> {
         self.execution_timeout_for(1)
+    }
+
+    /// The credit cap for this invocation's requests: `None` unless the profile
+    /// sets `MAX_CREDITS`. The warehouse's rate is the profile's
+    /// `WAREHOUSE_CREDITS_PER_HOUR` or, once per invocation, `SHOW WAREHOUSES`
+    /// (which also says whether the warehouse is suspended, i.e. whether the
+    /// run pays the resume minimum). A stated rate assumes a running warehouse.
+    fn cost_quota(&self) -> Result<Option<CostQuota>, SnowflakeError> {
+        self.cost_quota
+            .get_or_init(|| {
+                let Some(max_microcredits) = self.max_microcredits else {
+                    return Ok(None);
+                };
+                let (microcredits_per_hour, resumes_warehouse) = match self.microcredits_per_hour {
+                    Some(rate) => (rate, false),
+                    None => warehouse_rate(self)?,
+                };
+                Ok(Some(CostQuota {
+                    microcredits_per_hour,
+                    max_microcredits,
+                    resumes_warehouse,
+                }))
+            })
+            .clone()
     }
 
     /// The bound for a request running `statements` statements one after
@@ -3003,6 +3039,9 @@ impl LiveConn {
             query_tag_policy: query_tag_policy(env_value(&name(&prefix, "QUERY_TAG")).as_deref())?,
             query_tag: None,
             progress: false,
+            max_microcredits: env_microcredits(&name(&prefix, "MAX_CREDITS"))?,
+            microcredits_per_hour: env_microcredits(&name(&prefix, "WAREHOUSE_CREDITS_PER_HOUR"))?,
+            cost_quota: std::cell::OnceCell::new(),
             #[cfg(test)]
             script: None,
         })
@@ -3534,20 +3573,35 @@ fn progress_line(event: &DriverEvent, elapsed_ms: u64) -> String {
     value.to_string()
 }
 
-/// Submit one prepared request and drive it to completion. Returns the completed
-/// statement, the driver's poll/partition stats, and the SQL API `requestId`.
+/// Submit one prepared request and drive it to completion under the profile's
+/// bounds and credit cap. Returns the completed statement, the driver's
+/// stats, and the SQL API `requestId`.
 fn execute_request(
     conn: &LiveConn,
     request: SubmitStatementRequest,
     row_cap: Option<usize>,
     fixed_request_id: Option<String>,
 ) -> Result<(CompletedStatement, DriverStats, String), SnowflakeError> {
+    let cost_quota = conn.cost_quota()?;
+    drive_request(conn, request, row_cap, fixed_request_id, cost_quota)
+}
+
+/// [`execute_request`] with an explicit credit cap (the rate lookup's own
+/// `SHOW WAREHOUSES` runs without one).
+fn drive_request(
+    conn: &LiveConn,
+    request: SubmitStatementRequest,
+    row_cap: Option<usize>,
+    fixed_request_id: Option<String>,
+    cost_quota: Option<CostQuota>,
+) -> Result<(CompletedStatement, DriverStats, String), SnowflakeError> {
     let sql_api_request_id = fixed_request_id.unwrap_or_else(unique_request_id);
     LAST_RUN.with(RefCell::take);
     let poll_plan = PollPlan::with_max_polls(conn.max_polls)
         .with_partition_concurrency(conn.partition_concurrency)
         .with_row_cap(row_cap)
-        .with_execution_timeout(conn.execution_timeout());
+        .with_execution_timeout(conn.execution_timeout())
+        .with_cost_quota(cost_quota);
     #[cfg(test)]
     if let Some(script) = &conn.script {
         return script.execute(request, poll_plan, &sql_api_request_id);
@@ -3819,22 +3873,192 @@ fn stamp_live(
     envelope.budget_consumed = budget_consumed(rows.stats.polls, &rows.stats, rows.total_rows);
 }
 
-/// `budget_consumed` for a live run: what was measured (polls, rows) beside the
-/// bounds each statement ran under: the poll quota and the client-side
-/// execution deadline in milliseconds (absent when none was set).
+/// `budget_consumed` for a live run: what was measured (polls, execution
+/// time, rows) beside the bounds each statement ran under: the poll quota, the
+/// client-side execution deadline (absent when none was set) and, with a credit
+/// cap, the warehouse rate, the cap and the estimate, in millionths of a credit.
 fn budget_consumed(polls: u32, bounds: &DriverStats, rows: i64) -> Json {
+    let millis =
+        |duration: Duration| Json::Number(i64::try_from(duration.as_millis()).unwrap_or(i64::MAX));
+    let micro = |value: u64| Json::Number(i64::try_from(value).unwrap_or(i64::MAX));
     let mut fields = vec![
         ("polls", Json::Number(i64::from(polls))),
         ("poll_quota", Json::Number(i64::from(bounds.poll_quota))),
     ];
     if let Some(timeout) = bounds.execution_timeout {
+        fields.push(("execution_timeout_ms", millis(timeout)));
+    }
+    if let Some(execution) = bounds.execution {
+        fields.push(("execution_ms", millis(execution)));
+    }
+    if let Some(quota) = bounds.cost_quota {
+        fields.push(("microcredits_per_hour", micro(quota.microcredits_per_hour)));
+        fields.push(("max_microcredits", micro(quota.max_microcredits)));
         fields.push((
-            "execution_timeout_ms",
-            Json::Number(i64::try_from(timeout.as_millis()).unwrap_or(i64::MAX)),
+            "estimated_microcredits",
+            micro(quota.estimate(bounds.execution.unwrap_or_default())),
         ));
     }
     fields.push(("rows", Json::Number(rows)));
     json_object(fields)
+}
+
+/// `<PREFIX>_MAX_CREDITS` / `<PREFIX>_WAREHOUSE_CREDITS_PER_HOUR`: a positive
+/// decimal number of credits with at most six decimals, in millionths.
+fn env_microcredits(key: &str) -> Result<Option<u64>, SnowflakeError> {
+    let Some(value) = env_value(key) else {
+        return Ok(None);
+    };
+    parse_microcredits(&value).map(Some).ok_or_else(|| {
+        SnowflakeError::new(
+            SnowflakeErrorCode::ProfileInvalid,
+            format!("{key} must be a positive number of credits with at most six decimals"),
+        )
+    })
+}
+
+/// A positive decimal (`0.05`, `1`, `.25`) in millionths, exactly.
+fn parse_microcredits(text: &str) -> Option<u64> {
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    let digits = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
+    if (whole.is_empty() && fraction.is_empty())
+        || !digits(whole)
+        || !digits(fraction)
+        || fraction.len() > 6
+    {
+        return None;
+    }
+    let whole: u64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().ok()?
+    };
+    let fraction: u64 = format!("{fraction:0<6}").parse().ok()?;
+    let micro = whole.checked_mul(1_000_000)?.checked_add(fraction)?;
+    (micro > 0).then_some(micro)
+}
+
+/// Where the rates of warehouses without a published per-size rate live
+/// (Gen2 standard and Snowpark-optimized; consulted 2026-09-25).
+const CREDIT_TABLE_URL: &str = "https://www.snowflake.com/legal-files/CreditConsumptionTable.pdf";
+
+/// The warehouse's rate (millionths of a credit per hour) and whether it is
+/// suspended, from `SHOW WAREHOUSES`. Only Gen1 standard warehouses have a
+/// published per-size rate; any other warehouse is refused with the profile
+/// variable that states the rate.
+fn warehouse_rate(conn: &LiveConn) -> Result<(u64, bool), SnowflakeError> {
+    let quoted = conn
+        .warehouse
+        .strip_prefix('"')
+        .and_then(|name| name.strip_suffix('"'));
+    let wanted = quoted.map_or_else(|| conn.warehouse.clone(), |name| name.replace("\"\"", "\""));
+    let sql = format!("SHOW WAREHOUSES LIKE '{}'", wanted.replace('\'', "''"));
+    let request = build_request(conn, &sql, QueryRequestOptions::default());
+    let (done, stats, id) = drive_request(conn, request, None, None, None)?;
+    let listed = into_rows(done, stats, id);
+    let column = |name: &str| {
+        listed
+            .columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case(name))
+    };
+    let (name_at, state_at, type_at, size_at, generation_at) = (
+        column("name"),
+        column("state"),
+        column("type"),
+        column("size"),
+        column("generation"),
+    );
+    let cell = |row: &Vec<Option<String>>, at: Option<usize>| {
+        at.and_then(|at| row.get(at)).and_then(|cell| cell.clone())
+    };
+    let row = listed
+        .rows
+        .iter()
+        .find(|row| {
+            cell(row, name_at).is_some_and(|name| {
+                if quoted.is_some() {
+                    name == wanted
+                } else {
+                    name.eq_ignore_ascii_case(&wanted)
+                }
+            })
+        })
+        .ok_or_else(|| {
+            SnowflakeError::new(
+                SnowflakeErrorCode::ProfileInvalid,
+                format!(
+                    "MAX_CREDITS needs the warehouse's credit rate, and SHOW WAREHOUSES does not list {} for this role",
+                    conn.warehouse
+                ),
+            )
+        })?;
+    warehouse_row_rate(
+        cell(row, type_at).as_deref(),
+        cell(row, size_at).as_deref(),
+        cell(row, generation_at).as_deref(),
+        cell(row, state_at).as_deref(),
+    )
+    .map_err(|what| {
+        let prefix = crate::profile_env_prefix(&conn.profile);
+        SnowflakeError::new(
+            SnowflakeErrorCode::ProfileInvalid,
+            format!(
+                "the credit rate of {what} is not published in Snowflake's docs; set {} to its credits per hour ({CREDIT_TABLE_URL})",
+                name(&prefix, "WAREHOUSE_CREDITS_PER_HOUR")
+            ),
+        )
+    })
+}
+
+/// A `SHOW WAREHOUSES` row's rate and whether the warehouse is suspended, or
+/// what makes its rate unknown.
+fn warehouse_row_rate(
+    kind: Option<&str>,
+    size: Option<&str>,
+    generation: Option<&str>,
+    state: Option<&str>,
+) -> Result<(u64, bool), String> {
+    let kind = kind.unwrap_or("STANDARD");
+    if !kind.eq_ignore_ascii_case("STANDARD") {
+        return Err(format!("a {kind} warehouse"));
+    }
+    if let Some(generation) = generation.filter(|generation| generation.trim() != "1") {
+        return Err(format!("a generation {generation} standard warehouse"));
+    }
+    let size = size.unwrap_or("(no size)");
+    let rate =
+        gen1_microcredits_per_hour(size).ok_or_else(|| format!("a warehouse of size {size}"))?;
+    Ok((
+        rate,
+        state.is_some_and(|state| state.eq_ignore_ascii_case("SUSPENDED")),
+    ))
+}
+
+/// The Gen1 standard warehouse rate for a `SHOW WAREHOUSES` size, in millionths
+/// of a credit per hour
+/// (<https://docs.snowflake.com/en/user-guide/warehouses-overview>, consulted
+/// 2026-09-25: X-Small 1 credit per hour, doubling per size to 6X-Large 512).
+fn gen1_microcredits_per_hour(size: &str) -> Option<u64> {
+    let key: String = size
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+    let credits: u64 = match key.as_str() {
+        "xsmall" => 1,
+        "small" => 2,
+        "medium" => 4,
+        "large" => 8,
+        "xlarge" => 16,
+        "2xlarge" | "x2large" | "xxlarge" => 32,
+        "3xlarge" | "x3large" | "xxxlarge" => 64,
+        "4xlarge" | "x4large" => 128,
+        "5xlarge" | "x5large" => 256,
+        "6xlarge" | "x6large" => 512,
+        _ => return None,
+    };
+    Some(credits * 1_000_000)
 }
 
 /// The copy-pasteable `receipt show` command for a given receipt hash.
@@ -4548,6 +4772,8 @@ mod test_support {
                         partitions_fetched: 0,
                         poll_quota: poll_plan.max_polls,
                         execution_timeout: poll_plan.execution_timeout,
+                        cost_quota: poll_plan.cost_quota,
+                        execution: None,
                     },
                     format!("scripted-request-{ordinal}"),
                 )),
@@ -4645,6 +4871,9 @@ mod test_support {
                 query_tag_policy: QueryTagPolicy::Generated,
                 query_tag: None,
                 progress: false,
+                max_microcredits: None,
+                microcredits_per_hour: None,
+                cost_quota: std::cell::OnceCell::new(),
                 script: Some(scripted.script.clone()),
             })
         })
@@ -5914,6 +6143,60 @@ mod tests {
                 .is_some_and(|e| e.message.contains("panicked: index out of bounds")),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn credit_settings_parse_as_exact_millionths() {
+        assert_eq!(parse_microcredits("0.05"), Some(50_000));
+        assert_eq!(parse_microcredits("1"), Some(1_000_000));
+        assert_eq!(parse_microcredits(".000001"), Some(1));
+        assert_eq!(parse_microcredits("2.5"), Some(2_500_000));
+        for bad in [
+            "0",
+            "0.0",
+            "-1",
+            "1e3",
+            "abc",
+            "0.0000001",
+            "",
+            ".",
+            "1.2.3",
+        ] {
+            assert_eq!(parse_microcredits(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn warehouse_rates_come_from_the_published_gen1_table_only() {
+        assert_eq!(
+            warehouse_row_rate(
+                Some("STANDARD"),
+                Some("X-Small"),
+                Some("1"),
+                Some("STARTED")
+            ),
+            Ok((1_000_000, false))
+        );
+        assert_eq!(
+            warehouse_row_rate(Some("STANDARD"), Some("6X-Large"), None, Some("SUSPENDED")),
+            Ok((512_000_000, true))
+        );
+        assert_eq!(
+            warehouse_row_rate(
+                Some("STANDARD"),
+                Some("Medium"),
+                Some("1"),
+                Some("RESIZING")
+            ),
+            Ok((4_000_000, false))
+        );
+        assert_eq!(gen1_microcredits_per_hour("X5LARGE"), Some(256_000_000));
+        // Negatives: no published rate is refused, never guessed.
+        assert!(warehouse_row_rate(Some("STANDARD"), Some("X-Small"), Some("2"), None).is_err());
+        assert!(
+            warehouse_row_rate(Some("SNOWPARK-OPTIMIZED"), Some("Medium"), None, None).is_err()
+        );
+        assert!(warehouse_row_rate(Some("STANDARD"), Some("Enormous"), Some("1"), None).is_err());
     }
 
     /// Reality-check bead C6: a cancelled statement is not an internal error at

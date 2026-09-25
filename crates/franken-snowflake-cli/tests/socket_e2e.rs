@@ -900,6 +900,10 @@ fn stable_envelope(mut envelope: serde_json::Value) -> serde_json::Value {
     if let Some(data) = envelope["data"].as_object_mut() {
         data.remove("sql_api_request_id");
     }
+    // Measured per run, like `duration_ms`.
+    if let Some(budget) = envelope["budget_consumed"].as_object_mut() {
+        budget.remove("execution_ms");
+    }
     envelope
 }
 
@@ -1307,6 +1311,197 @@ fn a_statement_past_its_timeout_is_cancelled_by_the_client() {
         elapsed >= Duration::from_secs(6) && elapsed < Duration::from_secs(40),
         "{elapsed:?}"
     );
+}
+
+/// Reality-check bead E3: a `SHOW WAREHOUSES` answer for the profile's warehouse.
+fn show_warehouses(handle: &str, state: &str) -> MockHttpResponse {
+    result_set(
+        handle,
+        &[
+            ("name", "TEXT", None, None),
+            ("state", "TEXT", None, None),
+            ("type", "TEXT", None, None),
+            ("size", "TEXT", None, None),
+            ("generation", "TEXT", None, None),
+        ],
+        &[vec![
+            Some("SOCK_WH"),
+            Some(state),
+            Some("STANDARD"),
+            Some("X-Small"),
+            Some("1"),
+        ]],
+    )
+}
+
+/// Reality-check bead E3: with `MAX_CREDITS` and a stated rate, a statement the
+/// server never finishes is cancelled once its estimate reaches the cap
+/// (0.001 credit at 1 credit/hour: 3.6 s), with the cost kind and the SQL API
+/// cancel; the stated rate means no `SHOW WAREHOUSES`.
+#[test]
+fn a_credit_cap_cancels_a_statement_that_would_exceed_it() {
+    const HANDLE: &str = "01b2c3d4-0000-0000-0000-00000000f1b0";
+    let cert = TestCert::mint();
+    let server = MockServer::start(&cert, |request, _| {
+        if request.is_submit() || request.is_poll_of(HANDLE) {
+            return running(HANDLE);
+        }
+        if request.method == "POST" && request.path() == format!("{SUBMIT_PATH}/{HANDLE}/cancel") {
+            return scenarios::cancel();
+        }
+        not_found()
+    });
+    let h = Harness::new("creditcap", &cert);
+    let args = [
+        "query",
+        "run",
+        "--profile",
+        "sock",
+        "--sql",
+        "select 1",
+        "--json",
+    ];
+    let started = Instant::now();
+    let output = h
+        .command(server.port, &args)
+        .env("FRANKEN_SNOWFLAKE_SOCK_MAX_CREDITS", "0.001")
+        .env("FRANKEN_SNOWFLAKE_SOCK_WAREHOUSE_CREDITS_PER_HOUR", "1")
+        .output()
+        .expect("spawn");
+    let elapsed = started.elapsed();
+    let run = h.finish(&args, output);
+    assert_eq!(run.exit, 2, "{}", run.context());
+    assert_eq!(
+        run.envelope["outcome_kind"],
+        "cancelled",
+        "{}",
+        run.context()
+    );
+    assert!(
+        run.envelope.to_string().contains("CostBudget"),
+        "{}",
+        run.context()
+    );
+    let seen = server.seen();
+    assert!(
+        seen.iter()
+            .any(|s| s.method == "POST" && s.path() == format!("{SUBMIT_PATH}/{HANDLE}/cancel")),
+        "the statement was cancelled server-side: {seen:?}"
+    );
+    assert_eq!(seen.iter().filter(|s| s.is_submit()).count(), 1, "{seen:?}");
+    assert!(
+        elapsed >= Duration::from_millis(3_600) && elapsed < Duration::from_secs(30),
+        "{elapsed:?}"
+    );
+}
+
+/// Reality-check bead E3: a cap below what resuming a suspended warehouse is
+/// billed (a minute at least: 1/60 credit for an X-Small) refuses the query
+/// before it is submitted; only the `SHOW WAREHOUSES` lookup reaches the server.
+#[test]
+fn a_credit_cap_below_the_resume_minimum_submits_no_query() {
+    const SHOW: &str = "01b2c3d4-0000-0000-0000-00000000f1b1";
+    const QUERY: &str = "01b2c3d4-0000-0000-0000-00000000f1b2";
+    let cert = TestCert::mint();
+    let server = MockServer::start(&cert, |request, _| {
+        if request.is_submit() {
+            let statement = request.body_json()["statement"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            return if statement.starts_with("SHOW WAREHOUSES") {
+                show_warehouses(SHOW, "SUSPENDED")
+            } else {
+                completed_single(QUERY)
+            };
+        }
+        not_found()
+    });
+    let h = Harness::new("creditmin", &cert);
+    let args = [
+        "query",
+        "run",
+        "--profile",
+        "sock",
+        "--sql",
+        "select 1",
+        "--json",
+    ];
+    let output = h
+        .command(server.port, &args)
+        .env("FRANKEN_SNOWFLAKE_SOCK_MAX_CREDITS", "0.001")
+        .output()
+        .expect("spawn");
+    let run = h.finish(&args, output);
+    assert_eq!(run.exit, 2, "{}", run.context());
+    assert_eq!(
+        run.envelope["error"]["code"],
+        "FSNOW-3005",
+        "{}",
+        run.context()
+    );
+    let submits: Vec<String> = server
+        .seen()
+        .iter()
+        .filter(|s| s.is_submit())
+        .map(|s| String::from_utf8_lossy(&s.body).into_owned())
+        .collect();
+    assert_eq!(submits.len(), 1, "{submits:?}");
+    assert!(
+        submits[0].contains("SHOW WAREHOUSES LIKE 'SOCK_WH'"),
+        "{submits:?}"
+    );
+}
+
+/// Reality-check bead E3: under a cap the running warehouse can afford, the
+/// query completes and `budget_consumed` reports the rate `SHOW WAREHOUSES`
+/// gave, the cap, and the estimate (millionths of a credit).
+#[test]
+fn a_credit_cap_reports_the_rate_and_the_estimate() {
+    const SHOW: &str = "01b2c3d4-0000-0000-0000-00000000f1b3";
+    const QUERY: &str = "01b2c3d4-0000-0000-0000-00000000f1b4";
+    let cert = TestCert::mint();
+    let server = MockServer::start(&cert, |request, _| {
+        if request.is_submit() {
+            let statement = request.body_json()["statement"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            return if statement.starts_with("SHOW WAREHOUSES") {
+                show_warehouses(SHOW, "STARTED")
+            } else {
+                completed_single(QUERY)
+            };
+        }
+        not_found()
+    });
+    let h = Harness::new("creditok", &cert);
+    let args = [
+        "query",
+        "run",
+        "--profile",
+        "sock",
+        "--sql",
+        "select 1",
+        "--json",
+    ];
+    let output = h
+        .command(server.port, &args)
+        .env("FRANKEN_SNOWFLAKE_SOCK_MAX_CREDITS", "0.5")
+        .output()
+        .expect("spawn");
+    let run = h.finish(&args, output);
+    assert_eq!(run.exit, 0, "{}", run.context());
+    let budget = &run.envelope["budget_consumed"];
+    assert_eq!(budget["microcredits_per_hour"], 1_000_000, "{budget}");
+    assert_eq!(budget["max_microcredits"], 500_000, "{budget}");
+    assert!(
+        budget["estimated_microcredits"]
+            .as_u64()
+            .is_some_and(|estimate| estimate < 500_000),
+        "{budget}"
+    );
+    assert!(budget["execution_ms"].as_u64().is_some(), "{budget}");
 }
 
 /// A partition that cannot be fetched fails the run AND cancels the

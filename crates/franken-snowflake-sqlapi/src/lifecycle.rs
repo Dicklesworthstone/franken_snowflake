@@ -27,6 +27,65 @@ use crate::status::ResponseClass;
 /// milliseconds and provoke server-side `429` rate limiting).
 pub const MIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Snowflake's billing minimum each time a warehouse starts or resumes
+/// (<https://docs.snowflake.com/en/user-guide/cost-understanding-compute>,
+/// consulted 2026-09-25: per-second billing, "with a 60-second (i.e. 1-minute)
+/// minimum" each time a warehouse is started or resumed).
+pub const RESUME_BILLING_MINIMUM: Duration = Duration::from_secs(60);
+
+/// An advisory client-side credit cap for one statement (reality-check bead E3).
+///
+/// The driver turns the cap into a time bound on execution and cancels with
+/// `CancelKind::CostBudget` past it, and it refuses to submit when resuming the
+/// warehouse alone would exceed the cap. Advisory: the warehouse's real bill
+/// (other queries, extra clusters) is Snowflake's to compute, and the server's
+/// statement timeout stays the enforceable guard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CostQuota {
+    /// The warehouse's rate, in millionths of a credit per hour.
+    pub microcredits_per_hour: u64,
+    /// The cap, in millionths of a credit.
+    pub max_microcredits: u64,
+    /// Whether the statement resumes a suspended warehouse (billed
+    /// [`RESUME_BILLING_MINIMUM`] at least).
+    pub resumes_warehouse: bool,
+}
+
+impl CostQuota {
+    /// How long the statement may execute before its estimate reaches the cap
+    /// (`None` for a zero rate, which never does).
+    #[must_use]
+    pub fn time_bound(&self) -> Option<Duration> {
+        if self.microcredits_per_hour == 0 {
+            return None;
+        }
+        let millis =
+            u128::from(self.max_microcredits) * 3_600_000 / u128::from(self.microcredits_per_hour);
+        Some(Duration::from_millis(
+            u64::try_from(millis).unwrap_or(u64::MAX),
+        ))
+    }
+
+    /// Estimated microcredits for `execution`: the rate for that long, and at
+    /// least the resume minimum when this statement resumes the warehouse.
+    #[must_use]
+    pub fn estimate(&self, execution: Duration) -> u64 {
+        let billed = if self.resumes_warehouse {
+            execution.max(RESUME_BILLING_MINIMUM)
+        } else {
+            execution
+        };
+        let micro = u128::from(self.microcredits_per_hour) * billed.as_millis() / 3_600_000;
+        u64::try_from(micro).unwrap_or(u64::MAX)
+    }
+
+    /// Whether resuming the warehouse alone would exceed the cap.
+    #[must_use]
+    pub fn below_resume_minimum(&self) -> bool {
+        self.resumes_warehouse && self.estimate(Duration::ZERO) > self.max_microcredits
+    }
+}
+
 /// How a `202` handle is polled: how many times, and how long to wait between
 /// `GET`s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +112,9 @@ pub struct PollPlan {
     /// are not counted, and one in-flight poll exchange can overrun it by at
     /// most the transport's per-exchange bound.
     pub execution_timeout: Option<Duration>,
+    /// Advisory credit cap: past its time bound the driver cancels with
+    /// `CancelKind::CostBudget`, remote cancel included.
+    pub cost_quota: Option<CostQuota>,
 }
 
 /// Default partition fetch window.
@@ -68,6 +130,7 @@ impl Default for PollPlan {
             partition_concurrency: DEFAULT_PARTITION_CONCURRENCY,
             row_cap: None,
             execution_timeout: None,
+            cost_quota: None,
         }
     }
 }
@@ -118,6 +181,14 @@ impl PollPlan {
     #[must_use]
     pub fn with_execution_timeout(mut self, execution_timeout: Option<Duration>) -> Self {
         self.execution_timeout = execution_timeout;
+        self
+    }
+
+    /// Cap the statement's estimated credits (see [`CostQuota`]); `None` sets no
+    /// cap.
+    #[must_use]
+    pub fn with_cost_quota(mut self, cost_quota: Option<CostQuota>) -> Self {
+        self.cost_quota = cost_quota;
         self
     }
 
@@ -699,6 +770,41 @@ mod tests {
             ..PollPlan::default()
         };
         assert_eq!(hand_set.effective_poll_interval(), MIN_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn a_credit_cap_becomes_a_time_bound_and_an_estimate() {
+        // An X-Small warehouse: 1 credit per hour.
+        let running = CostQuota {
+            microcredits_per_hour: 1_000_000,
+            max_microcredits: 1_000,
+            resumes_warehouse: false,
+        };
+        assert_eq!(running.time_bound(), Some(Duration::from_millis(3_600)));
+        assert_eq!(running.estimate(Duration::from_millis(3_600)), 1_000);
+        assert!(!running.below_resume_minimum());
+
+        // Resuming bills a minute at least: 1/60 credit, over a 0.001 cap.
+        let resuming = CostQuota {
+            resumes_warehouse: true,
+            ..running
+        };
+        assert_eq!(resuming.estimate(Duration::ZERO), 16_666);
+        assert_eq!(resuming.estimate(Duration::from_secs(120)), 33_333);
+        assert!(resuming.below_resume_minimum());
+        let enough = CostQuota {
+            max_microcredits: 20_000,
+            ..resuming
+        };
+        assert!(!enough.below_resume_minimum());
+        assert_eq!(enough.time_bound(), Some(Duration::from_secs(72)));
+
+        let free = CostQuota {
+            microcredits_per_hour: 0,
+            ..running
+        };
+        assert_eq!(free.time_bound(), None);
+        assert_eq!(free.estimate(Duration::from_secs(60)), 0);
     }
 
     #[test]

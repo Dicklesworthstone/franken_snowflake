@@ -34,7 +34,7 @@ use franken_snowflake_http::{
 };
 
 use crate::lifecycle::{
-    CompletedStatement, MIN_POLL_INTERVAL, PollPlan, Progress, StatementMachine,
+    CompletedStatement, CostQuota, MIN_POLL_INTERVAL, PollPlan, Progress, StatementMachine,
 };
 use crate::request::{SubmitQueryParams, SubmitStatementRequest};
 use crate::response::ResultSet;
@@ -171,6 +171,11 @@ pub struct DriverStats {
     /// The client-side execution bound it ran under, if any
     /// ([`PollPlan::execution_timeout`]).
     pub execution_timeout: Option<Duration>,
+    /// The credit cap it ran under, if any ([`PollPlan::cost_quota`]).
+    pub cost_quota: Option<CostQuota>,
+    /// How long it executed: from the submit (or resume) to its terminal
+    /// status, partition downloads excluded.
+    pub execution: Option<Duration>,
 }
 
 /// Submit a statement and drive it to completion: submit -> poll/await ->
@@ -724,9 +729,16 @@ async fn drive_statement<T: StatementTransport, A: AuthProvider>(
     let poll_interval = poll_plan.effective_poll_interval();
     stats.poll_quota = poll_plan.max_polls;
     stats.execution_timeout = poll_plan.execution_timeout;
-    let execution_deadline = poll_plan
-        .execution_timeout
-        .map(|timeout| asupersync::time::wall_now() + timeout);
+    stats.cost_quota = poll_plan.cost_quota;
+    let started = asupersync::time::wall_now();
+    let bounds = ExecutionBounds {
+        deadline: poll_plan.execution_timeout.map(|timeout| started + timeout),
+        cost: poll_plan
+            .cost_quota
+            .and_then(|quota| quota.time_bound())
+            .map(|bound| started + bound),
+    };
+    let cost_quota = poll_plan.cost_quota;
     let mut machine = StatementMachine::new(poll_plan);
     // A statement resumed by its handle has already run: poll it at once.
     let mut poll_now = false;
@@ -736,6 +748,17 @@ async fn drive_statement<T: StatementTransport, A: AuthProvider>(
             Progress::PollAgain(handle)
         }
         Start::Submit { request, params } => {
+            if let Some(quota) = cost_quota.filter(CostQuota::below_resume_minimum) {
+                return SnowflakeOutcome::err(SnowflakeError::new(
+                    SnowflakeErrorCode::SafetyLimitExceeded,
+                    format!(
+                        "not submitted: resuming the suspended warehouse is billed a minute at \
+                         least (~{} millionths of a credit), over the {}-millionth credit cap",
+                        quota.estimate(Duration::ZERO),
+                        quota.max_microcredits
+                    ),
+                ));
+            }
             let progress = match submit(
                 cx,
                 client,
@@ -764,7 +787,14 @@ async fn drive_statement<T: StatementTransport, A: AuthProvider>(
         }
     };
 
+    // Execution lasts while the statement is being polled; it is measured up
+    // to its first non-polling progress (terminal status or partitions).
+    let mut executing = true;
     loop {
+        if executing {
+            stats.execution = Some(elapsed_since(started));
+            executing = matches!(progress, Progress::PollAgain(_));
+        }
         match progress {
             Progress::Complete(mut completed) => {
                 notify(
@@ -801,9 +831,8 @@ async fn drive_statement<T: StatementTransport, A: AuthProvider>(
                     return cancel_locally(cx, client, &auth, &handle, local_cancel_reason(cx))
                         .await;
                 }
-                if deadline_passed(execution_deadline) {
-                    return cancel_locally(cx, client, &auth, &handle, CancelReason::deadline())
-                        .await;
+                if let Some(reason) = bounds.passed() {
+                    return cancel_locally(cx, client, &auth, &handle, reason).await;
                 }
                 // Pace the 202 poll loop: a still-running statement returns 202
                 // immediately (the transport only backs off on retryable 429/5xx),
@@ -811,15 +840,14 @@ async fn drive_statement<T: StatementTransport, A: AuthProvider>(
                 // API and burn the poll quota in milliseconds. A cancellation
                 // during the wait still fires the remote cancel for the live handle.
                 if !std::mem::take(&mut poll_now)
-                    && let Err(reason) =
-                        wait_poll_interval(cx, until_deadline(poll_interval, execution_deadline))
-                            .await
+                    && let Err(reason) = wait_poll_interval(cx, bounds.cap(poll_interval)).await
                 {
                     return cancel_locally(cx, client, &auth, &handle, reason).await;
                 }
-                if deadline_passed(execution_deadline) {
-                    return cancel_locally(cx, client, &auth, &handle, CancelReason::deadline())
-                        .await;
+                // Still executing after the wait (a bound may end it here).
+                stats.execution = Some(elapsed_since(started));
+                if let Some(reason) = bounds.passed() {
+                    return cancel_locally(cx, client, &auth, &handle, reason).await;
                 }
                 stats.polls = stats.polls.saturating_add(1);
                 // Re-derive the bearer so a near-expiry JWT is re-signed before
@@ -1223,19 +1251,42 @@ fn terminal_failure_error(
     SnowflakeError::new(code, redact(&failure.message).into_owned())
 }
 
-/// Whether a client-side execution deadline ([`PollPlan::execution_timeout`])
-/// has passed.
-fn deadline_passed(deadline: Option<asupersync::Time>) -> bool {
-    deadline.is_some_and(|deadline| asupersync::time::wall_now() >= deadline)
+/// Wall time since `started`.
+fn elapsed_since(started: asupersync::Time) -> Duration {
+    Duration::from_nanos(asupersync::time::wall_now().duration_since(started))
 }
 
-/// The wait before the next poll, cut short to end at the execution deadline.
-fn until_deadline(delay: Duration, deadline: Option<asupersync::Time>) -> Duration {
-    deadline.map_or(delay, |deadline| {
-        delay.min(Duration::from_nanos(
-            deadline.duration_since(asupersync::time::wall_now()),
-        ))
-    })
+/// The client-side bounds on one statement's execution: the deadline
+/// ([`PollPlan::execution_timeout`]) and the credit cap's time bound
+/// ([`PollPlan::cost_quota`]).
+#[derive(Clone, Copy)]
+struct ExecutionBounds {
+    deadline: Option<asupersync::Time>,
+    cost: Option<asupersync::Time>,
+}
+
+impl ExecutionBounds {
+    /// The cancel reason of a bound that has passed (the cost bound first).
+    fn passed(&self) -> Option<CancelReason> {
+        let now = asupersync::time::wall_now();
+        if self.cost.is_some_and(|cost| now >= cost) {
+            Some(CancelReason::cost_budget())
+        } else if self.deadline.is_some_and(|deadline| now >= deadline) {
+            Some(CancelReason::deadline())
+        } else {
+            None
+        }
+    }
+
+    /// The wait before the next poll, cut short to end at the nearer bound.
+    fn cap(&self, delay: Duration) -> Duration {
+        let now = asupersync::time::wall_now();
+        [self.deadline, self.cost]
+            .into_iter()
+            .flatten()
+            .map(|bound| Duration::from_nanos(bound.duration_since(now)))
+            .fold(delay, Duration::min)
+    }
 }
 
 /// Wait `delay` between poll `GET`s, cancel-aware. Returns the cancellation reason
@@ -2925,6 +2976,84 @@ mod tests {
             // The stats name the bounds the statement ran under.
             assert_eq!(stats.poll_quota, 200);
             assert_eq!(stats.execution_timeout, Some(Duration::from_millis(40)));
+        });
+    }
+
+    #[test]
+    fn a_credit_cap_cancels_before_the_deadline_with_the_cost_kind() {
+        asupersync::test_utils::run_test(|| async {
+            let transport =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            for _ in 0..200 {
+                transport
+                    .polls
+                    .borrow_mut()
+                    .push(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            }
+            // 3.6 credits/hour and a 40-millionth cap: a 40 ms bound, well
+            // inside the 10 s deadline.
+            let quota = CostQuota {
+                microcredits_per_hour: 3_600_000,
+                max_microcredits: 40,
+                resumes_warehouse: false,
+            };
+            let (outcome, stats) = run_statement_with_stats(
+                &Cx::for_testing(),
+                &transport,
+                fake_auth(),
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                PollPlan {
+                    max_polls: 200,
+                    poll_interval: Duration::from_millis(5),
+                    ..PollPlan::default()
+                }
+                .with_execution_timeout(Some(Duration::from_secs(10)))
+                .with_cost_quota(Some(quota)),
+            )
+            .await;
+            assert!(
+                matches!(&outcome, SnowflakeOutcome::Cancelled(reason) if reason.is_kind(CancelKind::CostBudget)),
+                "{outcome:?}"
+            );
+            let cancels = transport.cancels_after_local.borrow();
+            assert_eq!(cancels.len(), 1);
+            assert_eq!(cancels[0].1, CancelKind::CostBudget);
+            assert_eq!(stats.cost_quota, Some(quota));
+            let execution = stats.execution.unwrap_or_default();
+            assert!(
+                execution >= Duration::from_millis(40) && execution < Duration::from_secs(10),
+                "{stats:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_credit_cap_below_the_resume_minimum_submits_nothing() {
+        asupersync::test_utils::run_test(|| async {
+            let transport =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            // Resuming an X-Small warehouse bills ~16667 millionths at least.
+            let quota = CostQuota {
+                microcredits_per_hour: 1_000_000,
+                max_microcredits: 1_000,
+                resumes_warehouse: true,
+            };
+            let (outcome, _) = run_statement_with_stats(
+                &Cx::for_testing(),
+                &transport,
+                fake_auth(),
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                PollPlan::default().with_cost_quota(Some(quota)),
+            )
+            .await;
+            assert!(
+                matches!(&outcome, SnowflakeOutcome::Err(error) if error.code == SnowflakeErrorCode::SafetyLimitExceeded),
+                "{outcome:?}"
+            );
+            assert!(transport.auth_seen.borrow().is_empty(), "nothing was sent");
+            assert!(transport.cancels_after_local.borrow().is_empty());
         });
     }
 

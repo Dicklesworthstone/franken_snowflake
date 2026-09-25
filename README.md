@@ -159,7 +159,11 @@ path and every deadline, budget, shutdown, or user cancellation fires a
 best-effort remote cancel, and the
 server-side `STATEMENT_TIMEOUT_IN_SECONDS` (60 s by default) is sent with every
 request as the backstop. Each HTTP exchange is bounded (300 s), so a stalled
-connection ends as a `timeout` with the remote cancel instead of hanging. The retry loop is the project's own, built on that
+connection ends as a `timeout` with the remote cancel instead of hanging, and a
+statement still running 5 s past its statement timeout is cancelled by the client
+(outcome `timeout`, remote cancel sent). With `MAX_CREDITS` set, a statement whose
+estimated credits reach the cap is cancelled the same way (cancel kind
+`CostBudget`). The retry loop is the project's own, built on that
 client. While a statement runs, Ctrl-C (SIGINT) or SIGTERM cancels it the same
 way: the envelope reads `cancelled` and the exit status is 130 (SIGINT) or 143
 (SIGTERM), as for any interrupted command; a second signal exits at once. The
@@ -167,8 +171,8 @@ receipt of a run that ended without rows names the statement handle, says
 whether Snowflake ever accepted the statement (`accepted_by_snowflake`), and
 records whether the remote cancel was acknowledged (`remote_cancel`). A
 process killed with SIGKILL still leaves
-it to the server timeout. Not yet wired: a drop guard for the statement handle,
-capability-row narrowing, and a cost budget on the live path. The testkit explores a model of the driver's
+it to the server timeout. Not yet wired: a drop guard for the statement handle
+and capability-row narrowing. The testkit explores a model of the driver's
 cancel and retry interleavings with DPOR.
 
 **Deterministic tests.** The protocol is exercised without a warehouse. Two
@@ -760,7 +764,9 @@ normalized to `_`, then prefixed with `FRANKEN_SNOWFLAKE_`. The profile
 | `<PREFIX>_SCHEMA` | Optional default schema (overridden by `--schema`) |
 | `<PREFIX>_ROLE` | Optional role |
 | `<PREFIX>_MAX_POLLS` | Optional poll budget (default 120) |
-| `<PREFIX>_STATEMENT_TIMEOUT_SECONDS` | Optional SQL API statement timeout in seconds (default 60; `--statement-timeout` overrides per run) |
+| `<PREFIX>_STATEMENT_TIMEOUT_SECONDS` | Optional SQL API statement timeout in seconds (default 60; `--statement-timeout` overrides per run). The client also cancels a statement still running 5 s past it (outcome `timeout`, remote cancel sent) |
+| `<PREFIX>_MAX_CREDITS` | Optional advisory credit cap per request, e.g. `0.05`. A statement whose estimate reaches it is cancelled (outcome `cancelled`, cancel kind `CostBudget`, remote cancel sent), and a query is refused before it is submitted when resuming a suspended warehouse (billed 60 s at least) would already exceed it. The estimate is the warehouse's rate times execution time; Snowflake's bill (other queries, extra clusters) can differ, and the statement timeout stays the enforceable guard |
+| `<PREFIX>_WAREHOUSE_CREDITS_PER_HOUR` | Optional warehouse rate for `MAX_CREDITS`. Without it the rate comes from `SHOW WAREHOUSES` (published Gen1 standard rates: X-Small 1 credit/hour, doubling per size); Gen2 and Snowpark-optimized warehouses have no published per-size rate, so they need this set |
 | `<PREFIX>_PARTITION_CONCURRENCY` | Optional partition fetch window, 1-16 (default 4): how many result partitions are downloaded at once; assembly stays in order |
 | `<PREFIX>_QUERY_TAG` | Optional. Unset: every live statement carries `QUERY_TAG = fsnow:<command_id>:<request_id>`, so Snowflake's query history ties back to the envelope and its receipt; a value fixes the tag for the profile; `off` sends none. `--query-tag` overrides it per run |
 | `<PREFIX>_EXPORT_MAX_ROWS` | Optional row limit for `export run` (default 1000000; `--max-rows` overrides per run): a larger result is refused (`FSNOW-3004`) and leaves no file |
