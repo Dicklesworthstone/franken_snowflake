@@ -35,7 +35,16 @@ CRATES = [
     ("franken-snowflake-cli", False),
 ]
 
-TARGET_VERSION = "0.0.4"
+def workspace_version() -> str:
+    """The version to publish: `workspace.package.version` in the root Cargo.toml
+    (a hardcoded constant went stale between releases)."""
+    import tomllib
+
+    with open("/data/projects/franken_snowflake/Cargo.toml", "rb") as manifest:
+        return tomllib.load(manifest)["workspace"]["package"]["version"]
+
+
+TARGET_VERSION = workspace_version()
 
 
 def is_already_published(crate_name: str, version: str) -> bool:
