@@ -740,6 +740,86 @@ fn sigint_cancels_the_statement_in_flight() {
     );
 }
 
+/// Ctrl-C on Windows (reality-check bead E1, w0i.14): the binary runs in a
+/// console of its own, and a helper attaches to that console and raises a real
+/// CTRL_C_EVENT, which the C runtime delivers as SIGINT. The in-flight
+/// statement is cancelled server-side and the run exits 130, as on Unix. The
+/// helper is PowerShell with P/Invoke because this crate forbids unsafe code.
+#[cfg(windows)]
+#[test]
+fn ctrl_c_cancels_the_statement_in_flight_on_windows() {
+    use std::os::windows::process::CommandExt as _;
+    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+    const HANDLE: &str = "01b2c3d4-0000-0000-0000-00000000f1c0";
+    let cert = TestCert::mint();
+    let server = MockServer::start(&cert, |request, _| {
+        if request.is_submit() || request.is_poll_of(HANDLE) {
+            return running(HANDLE);
+        }
+        if request.method == "POST" && request.path() == format!("{SUBMIT_PATH}/{HANDLE}/cancel") {
+            return scenarios::cancel();
+        }
+        not_found()
+    });
+    let h = Harness::new("ctrlc", &cert);
+    let args = [
+        "query",
+        "run",
+        "--profile",
+        "sock",
+        "--sql",
+        "select system$wait(600)",
+        "--json",
+    ];
+    let mut child = h
+        .command(server.port, &args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .creation_flags(CREATE_NEW_CONSOLE)
+        .spawn()
+        .expect("spawn");
+    server.wait_for("the first poll", |seen| {
+        seen.iter().any(|s| s.is_poll_of(HANDLE))
+    });
+    let script = format!(
+        "Add-Type -Name K -Namespace W -MemberDefinition '\
+         [DllImport(\"kernel32.dll\")] public static extern bool FreeConsole();\
+         [DllImport(\"kernel32.dll\")] public static extern bool AttachConsole(uint p);\
+         [DllImport(\"kernel32.dll\")] public static extern bool SetConsoleCtrlHandler(System.IntPtr h, bool a);\
+         [DllImport(\"kernel32.dll\")] public static extern bool GenerateConsoleCtrlEvent(uint e, uint g);';\
+         [W.K]::FreeConsole() | Out-Null;\
+         if (-not [W.K]::AttachConsole({pid})) {{ exit 2 }};\
+         [W.K]::SetConsoleCtrlHandler([System.IntPtr]::Zero, $true) | Out-Null;\
+         if (-not [W.K]::GenerateConsoleCtrlEvent(0, 0)) {{ exit 3 }};\
+         exit 0",
+        pid = child.id()
+    );
+    let sent = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .status()
+        .expect("run the Ctrl-C helper");
+    if !sent.success() {
+        let _ = child.kill();
+    }
+    assert!(sent.success(), "the helper could not send Ctrl-C: {sent:?}");
+    // Without the Ctrl-C the run would end only at its 65 s execution deadline.
+    let output = child.wait_with_output().expect("binary exits after Ctrl-C");
+    let run = h.finish(&args, output);
+    let seen = server.seen();
+    assert!(
+        seen.iter()
+            .any(|s| s.method == "POST" && s.path() == format!("{SUBMIT_PATH}/{HANDLE}/cancel")),
+        "the in-flight statement was cancelled server-side: {seen:?}"
+    );
+    assert_eq!(
+        run.envelope["outcome_kind"],
+        "cancelled",
+        "{}",
+        run.context()
+    );
+    assert_eq!(run.exit, 130, "{}", run.context());
+}
+
 /// Reality-check bead E2: over `mcp serve --stdio`, a `notifications/cancelled`
 /// for a running `query_run` cancels the statement server-side while the call
 /// is still running, and the call answers `cancelled`.
