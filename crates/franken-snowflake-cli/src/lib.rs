@@ -47,7 +47,12 @@ const CLI_REDACTION_MARKER: &str = "core.redact";
 /// `fsnow` alias, are thin wrappers over this one compiled body.
 #[must_use]
 pub fn run() -> ExitCode {
-    write_outcome(execute(env::args().skip(1).collect()))
+    let code = write_outcome(execute(env::args().skip(1).collect()));
+    // A statement whose driver was dropped mid-flight is cancelled from a
+    // detached thread, which would die with the process: give it its bound.
+    #[cfg(feature = "live")]
+    franken_snowflake_sqlapi::driver::wait_for_dropped_cancels(std::time::Duration::from_secs(10));
+    code
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

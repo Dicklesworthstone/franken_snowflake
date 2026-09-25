@@ -81,6 +81,13 @@ pub trait StatementTransport {
         auth: AuthorizationDescriptor,
         statement_handle: StatementHandle,
     ) -> impl Future<Output = TransportOutcome<CancelHttpResponse>>;
+    /// Remote cancel for a running statement whose driver future was dropped
+    /// before it ended (reality-check bead E1): `Drop` has no `Cx` and cannot
+    /// await, so this must not block on, or depend on, the caller's runtime.
+    /// The default sends nothing.
+    fn cancel_on_drop(&self, auth: AuthorizationDescriptor, statement_handle: StatementHandle) {
+        let _ = (auth, statement_handle);
+    }
 }
 
 impl<H: RawHttp> StatementTransport for SnowflakeHttpClient<H> {
@@ -125,6 +132,64 @@ impl<H: RawHttp> StatementTransport for SnowflakeHttpClient<H> {
         statement_handle: StatementHandle,
     ) -> TransportOutcome<CancelHttpResponse> {
         Self::cancel_orphaned_statement(self, cx, auth, statement_handle).await
+    }
+
+    /// A fresh client (connections belong to the runtime that opened them) on
+    /// its own thread and runtime; the cancel exchange keeps its short bound.
+    fn cancel_on_drop(&self, auth: AuthorizationDescriptor, statement_handle: StatementHandle) {
+        let config = self.config().clone();
+        spawn_detached_cancel(move || async move {
+            let (Some(cx), Ok(client)) = (Cx::current(), SnowflakeHttpClient::for_runtime(config))
+            else {
+                return;
+            };
+            let _ = client
+                .cancel_orphaned_statement(&cx, auth, statement_handle)
+                .await;
+        });
+    }
+}
+
+/// Remote cancels of dropped statements still in flight (see
+/// [`wait_for_dropped_cancels`]).
+static DROPPED_CANCELS: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Run `cancel` on a thread and runtime of its own, so a dropped statement's
+/// cancel neither blocks the dropping thread nor needs its runtime (which may
+/// be unwinding).
+fn spawn_detached_cancel<F, Fut>(cancel: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()>,
+{
+    let spawned = std::thread::Builder::new()
+        .name("fsnow-drop-cancel".to_owned())
+        .spawn(move || {
+            if let Ok(runtime) = asupersync::runtime::RuntimeBuilder::current_thread().build() {
+                runtime.block_on(cancel());
+            }
+        });
+    if let (Ok(thread), Ok(mut pending)) = (spawned, DROPPED_CANCELS.lock()) {
+        pending.retain(|thread| !thread.is_finished());
+        pending.push(thread);
+    }
+}
+
+/// Wait up to `timeout` for the remote cancels of dropped statements to
+/// finish; a binary calls this before it exits, since a detached cancel dies
+/// with the process. Returns how many were still running.
+pub fn wait_for_dropped_cancels(timeout: Duration) -> usize {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let running = DROPPED_CANCELS.lock().map_or(0, |mut pending| {
+            pending.retain(|thread| !thread.is_finished());
+            pending.len()
+        });
+        if running == 0 || std::time::Instant::now() >= deadline {
+            return running;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -608,6 +673,10 @@ impl<T: StatementTransport> StatementTransport for CancelRecorder<'_, T> {
         self.record(&statement_handle, &outcome);
         outcome
     }
+
+    fn cancel_on_drop(&self, auth: AuthorizationDescriptor, statement_handle: StatementHandle) {
+        self.inner.cancel_on_drop(auth, statement_handle);
+    }
 }
 
 /// Run the statement, then report each remote cancel it fired to the
@@ -714,6 +783,28 @@ async fn drive_statement<T: StatementTransport, A: AuthProvider>(
     stats: &mut DriverStats,
     hooks: StatementHooks<'_>,
 ) -> StatementOutcome {
+    // A dropped driver future must not orphan an accepted statement: the guard,
+    // armed once the statement runs, cancels it unless the drive ends first.
+    let mut guard = DropGuard::new(client);
+    let outcome = drive_guarded(
+        cx, client, provider, start, poll_plan, stats, hooks, &mut guard,
+    )
+    .await;
+    guard.disarm();
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_guarded<T: StatementTransport, A: AuthProvider>(
+    cx: &Cx,
+    client: &T,
+    provider: &mut A,
+    start: Start,
+    poll_plan: PollPlan,
+    stats: &mut DriverStats,
+    hooks: StatementHooks<'_>,
+    guard: &mut DropGuard<'_, T>,
+) -> StatementOutcome {
     let StatementHooks {
         mut sink,
         mut observer,
@@ -787,6 +878,9 @@ async fn drive_statement<T: StatementTransport, A: AuthProvider>(
         }
     };
 
+    // From here the statement is accepted and, while it runs, guarded.
+    guard.arm(&auth, &progress);
+
     // Execution lasts while the statement is being polled; it is measured up
     // to its first non-polling progress (terminal status or partitions).
     let mut executing = true;
@@ -858,6 +952,7 @@ async fn drive_statement<T: StatementTransport, A: AuthProvider>(
                         return abandon_with_error(cx, client, &auth, &handle, error).await;
                     }
                 };
+                guard.track(&auth);
                 let poll = client
                     .poll_statement(
                         cx,
@@ -890,6 +985,7 @@ async fn drive_statement<T: StatementTransport, A: AuthProvider>(
                     match refresh_after_unauthorized(provider, &mut reauth_left, "poll") {
                         Ok(fresh) => {
                             auth = fresh;
+                            guard.track(&auth);
                             progress = Progress::PollAgain(handle);
                             continue;
                         }
@@ -973,6 +1069,7 @@ async fn drive_statement<T: StatementTransport, A: AuthProvider>(
                         return abandon_with_error(cx, client, &auth, &handle, error).await;
                     }
                 };
+                guard.track(&auth);
                 let window =
                     u32::try_from(poll_plan.effective_partition_concurrency()).unwrap_or(u32::MAX);
                 let window_end = next.saturating_add(window).min(total);
@@ -1020,6 +1117,7 @@ async fn drive_statement<T: StatementTransport, A: AuthProvider>(
                                         .await;
                                 }
                             };
+                            guard.track(&auth);
                         }
                         stats.partitions_fetched = stats.partitions_fetched.saturating_add(1);
                         let refetch = client
@@ -1126,6 +1224,54 @@ async fn drive_statement<T: StatementTransport, A: AuthProvider>(
                     }
                 };
             }
+        }
+    }
+}
+
+/// Owns a running statement's handle while the driver drives it. Dropped
+/// before [`DropGuard::disarm`] (the driver future itself was dropped
+/// mid-flight), it asks the transport to cancel the statement; every path the
+/// driver returns through leaves the statement terminal or already cancelled
+/// and disarms it first.
+struct DropGuard<'t, T: StatementTransport> {
+    transport: &'t T,
+    armed: Option<(AuthorizationDescriptor, StatementHandle)>,
+}
+
+impl<'t, T: StatementTransport> DropGuard<'t, T> {
+    const fn new(transport: &'t T) -> Self {
+        Self {
+            transport,
+            armed: None,
+        }
+    }
+
+    /// Hold the statement's handle when it is still running.
+    fn arm(&mut self, auth: &AuthorizationDescriptor, progress: &Progress) {
+        self.armed = match progress {
+            Progress::PollAgain(handle) | Progress::FetchPartition { handle, .. } => {
+                Some((auth.clone(), handle.clone()))
+            }
+            Progress::Complete(_) | Progress::TimedOut(_) | Progress::Failed(_) => None,
+        };
+    }
+
+    /// Cancel with the latest bearer (a JWT is re-signed while polling).
+    fn track(&mut self, auth: &AuthorizationDescriptor) {
+        if let Some((held, _)) = self.armed.as_mut() {
+            held.clone_from(auth);
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = None;
+    }
+}
+
+impl<T: StatementTransport> Drop for DropGuard<'_, T> {
+    fn drop(&mut self) {
+        if let Some((auth, handle)) = self.armed.take() {
+            self.transport.cancel_on_drop(auth, handle);
         }
     }
 }
@@ -1401,6 +1547,8 @@ mod tests {
         /// When set, partition fetches and orphan cleanup stay pending for one
         /// poll so that draining and concurrent fetches interleave observably.
         yield_once: Cell<bool>,
+        /// Every statement whose driver future was dropped mid-flight.
+        dropped_cancels: RefCell<Vec<StatementHandle>>,
     }
 
     impl FakeTransport {
@@ -1419,6 +1567,7 @@ mod tests {
                 auth_seen: RefCell::new(Vec::new()),
                 partition_events: RefCell::new(Vec::new()),
                 yield_once: Cell::new(false),
+                dropped_cancels: RefCell::new(Vec::new()),
             }
         }
 
@@ -1568,6 +1717,14 @@ mod tests {
                     TransportOutcome::panicked(PanicPayload::new(*message))
                 }
             }
+        }
+
+        fn cancel_on_drop(
+            &self,
+            _auth: AuthorizationDescriptor,
+            statement_handle: StatementHandle,
+        ) {
+            self.dropped_cancels.borrow_mut().push(statement_handle);
         }
     }
 
@@ -2976,6 +3133,62 @@ mod tests {
             // The stats name the bounds the statement ran under.
             assert_eq!(stats.poll_quota, 200);
             assert_eq!(stats.execution_timeout, Some(Duration::from_millis(40)));
+        });
+    }
+
+    #[test]
+    fn dropping_the_driver_mid_poll_cancels_the_statement() {
+        asupersync::test_utils::run_test(|| async {
+            let transport =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            let cx = Cx::for_testing();
+            {
+                let mut running = std::pin::pin!(run_statement_with_stats(
+                    &cx,
+                    &transport,
+                    fake_auth(),
+                    SubmitStatementRequest::new("select 1"),
+                    SubmitQueryParams::default(),
+                    PollPlan::default(),
+                ));
+                // One poll: submitted, now waiting to poll the running statement.
+                let first = std::future::poll_fn(|task| {
+                    Poll::Ready(running.as_mut().poll(task).is_pending())
+                })
+                .await;
+                assert!(first, "the statement is still running");
+                assert!(transport.dropped_cancels.borrow().is_empty());
+            } // the driver future is dropped here, mid-flight
+            assert_eq!(*transport.dropped_cancels.borrow(), vec![fixture_handle()]);
+            assert!(transport.cancels_after_local.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_statement_driven_to_its_end_is_not_cancelled_on_drop() {
+        asupersync::test_utils::run_test(|| async {
+            // Completed, failed in a poll, and never accepted: nothing to cancel.
+            let completed =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            completed.polls.borrow_mut().push(Scripted::Ok(
+                StatusClass::Completed,
+                RESP_200_SINGLE.to_vec(),
+            ));
+            let failed = FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            failed.polls.borrow_mut().push(Scripted::Err);
+            let refused = FakeTransport::new(Scripted::Err);
+            for transport in [&completed, &failed, &refused] {
+                let _ = run_statement_with_stats(
+                    &Cx::for_testing(),
+                    transport,
+                    fake_auth(),
+                    SubmitStatementRequest::new("select 1"),
+                    SubmitQueryParams::default(),
+                    fast_poll_plan(5),
+                )
+                .await;
+                assert!(transport.dropped_cancels.borrow().is_empty());
+            }
         });
     }
 

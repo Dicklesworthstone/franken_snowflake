@@ -171,8 +171,11 @@ receipt of a run that ended without rows names the statement handle, says
 whether Snowflake ever accepted the statement (`accepted_by_snowflake`), and
 records whether the remote cancel was acknowledged (`remote_cancel`). A
 process killed with SIGKILL still leaves
-it to the server timeout. Not yet wired: a drop guard for the statement handle
-and capability-row narrowing. The testkit explores a model of the driver's
+it to the server timeout. A running statement is also held by a drop guard: if
+the driver's future is dropped mid-flight (a library caller abandons it, a panic
+unwinds through it), the remote cancel is still sent, from a thread and runtime
+of its own, and the binary waits up to 10 s for it before exiting. Not yet wired:
+capability-row narrowing. The testkit explores a model of the driver's
 cancel and retry interleavings with DPOR.
 
 **Deterministic tests.** The protocol is exercised without a warehouse. Two
