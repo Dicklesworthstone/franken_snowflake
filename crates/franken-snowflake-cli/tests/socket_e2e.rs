@@ -1261,6 +1261,54 @@ fn statement_timeout_on_poll_is_typed() {
     );
 }
 
+/// Reality-check bead E3: a statement the server never finishes is cancelled
+/// by the client once `--statement-timeout` plus the client margin (5 s) has
+/// passed: the SQL API cancel goes out and the run reads `timeout`, long before
+/// the poll quota (120 polls at 1 s) would end it.
+#[test]
+fn a_statement_past_its_timeout_is_cancelled_by_the_client() {
+    const HANDLE: &str = "01b2c3d4-0000-0000-0000-00000000f1a0";
+    let cert = TestCert::mint();
+    let server = MockServer::start(&cert, |request, _| {
+        if request.is_submit() || request.is_poll_of(HANDLE) {
+            return running(HANDLE);
+        }
+        if request.method == "POST" && request.path() == format!("{SUBMIT_PATH}/{HANDLE}/cancel") {
+            return scenarios::cancel();
+        }
+        not_found()
+    });
+    let h = Harness::new("deadline", &cert);
+    let started = Instant::now();
+    let run = h.run(
+        server.port,
+        &[
+            "query",
+            "run",
+            "--profile",
+            "sock",
+            "--sql",
+            "select 1",
+            "--statement-timeout",
+            "1",
+            "--json",
+        ],
+    );
+    let elapsed = started.elapsed();
+    assert_eq!(run.exit, 5, "{}", run.context());
+    assert_eq!(run.envelope["outcome_kind"], "timeout", "{}", run.context());
+    let seen = server.seen();
+    assert!(
+        seen.iter()
+            .any(|s| s.method == "POST" && s.path() == format!("{SUBMIT_PATH}/{HANDLE}/cancel")),
+        "the statement was cancelled server-side: {seen:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(6) && elapsed < Duration::from_secs(40),
+        "{elapsed:?}"
+    );
+}
+
 /// A partition that cannot be fetched fails the run AND cancels the
 /// statement server-side (no orphan keeps the warehouse busy).
 #[test]

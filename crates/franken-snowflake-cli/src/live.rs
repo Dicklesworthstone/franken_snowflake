@@ -93,6 +93,9 @@ const DEFAULT_STATEMENT_TIMEOUT_SECONDS: u32 = 60;
 const MAX_STATEMENT_TIMEOUT_SECONDS: u32 = 86_400;
 /// Poll budget if a profile does not override `<PREFIX>_MAX_POLLS`.
 const DEFAULT_MAX_POLLS: u32 = 120;
+/// How long past the statement timeout the client waits before cancelling on
+/// its own: a healthy server reports its own timeout first.
+const CLIENT_DEADLINE_MARGIN: Duration = Duration::from_secs(5);
 /// Maximum rows materialized into a single response envelope by default. The
 /// driver still assembles the full result; this only bounds the JSON payload an
 /// agent sees. `--limit` overrides it up to [`MAX_ROW_EMIT_CAP`].
@@ -2288,7 +2291,8 @@ fn execute_streaming<S: RowSink + 'static>(
         nullable: None,
     };
     let poll_plan = PollPlan::with_max_polls(conn.max_polls)
-        .with_partition_concurrency(conn.partition_concurrency);
+        .with_partition_concurrency(conn.partition_concurrency)
+        .with_execution_timeout(conn.execution_timeout());
     let progress = conn.progress;
     let (outcome, stats, sink, facts) = with_runtime(conn, move |cx, client, auth| {
         Box::pin(async move {
@@ -2875,6 +2879,14 @@ struct LiveConn {
 }
 
 impl LiveConn {
+    /// The client-side execution bound: the statement timeout plus a margin
+    /// (`0`, Snowflake's "no limit", sets none).
+    fn execution_timeout(&self) -> Option<Duration> {
+        (self.statement_timeout_seconds > 0).then(|| {
+            Duration::from_secs(u64::from(self.statement_timeout_seconds)) + CLIENT_DEADLINE_MARGIN
+        })
+    }
+
     fn resolve(profile: &str, overrides: &SessionOverrides) -> Result<Self, SnowflakeError> {
         #[cfg(test)]
         if let Some(conn) = test_support::scripted_conn(profile, overrides) {
@@ -3540,7 +3552,8 @@ fn execute_request(
     let max_polls = conn.max_polls;
     let poll_plan = PollPlan::with_max_polls(max_polls)
         .with_partition_concurrency(conn.partition_concurrency)
-        .with_row_cap(row_cap);
+        .with_row_cap(row_cap)
+        .with_execution_timeout(conn.execution_timeout());
     let progress = conn.progress;
     let (outcome, stats, facts) = with_runtime(conn, move |cx, client, auth| {
         Box::pin(async move {

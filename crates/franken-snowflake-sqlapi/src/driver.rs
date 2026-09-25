@@ -716,6 +716,9 @@ async fn drive_statement<T: StatementTransport, A: AuthProvider>(
     // Captured before the machine takes ownership; `PollPlan` is `Copy`. The 202
     // poll loop waits this long between GETs (see `wait_poll_interval`).
     let poll_interval = poll_plan.effective_poll_interval();
+    let execution_deadline = poll_plan
+        .execution_timeout
+        .map(|timeout| asupersync::time::wall_now() + timeout);
     let mut machine = StatementMachine::new(poll_plan);
     // A statement resumed by its handle has already run: poll it at once.
     let mut poll_now = false;
@@ -790,15 +793,25 @@ async fn drive_statement<T: StatementTransport, A: AuthProvider>(
                     return cancel_locally(cx, client, &auth, &handle, local_cancel_reason(cx))
                         .await;
                 }
+                if deadline_passed(execution_deadline) {
+                    return cancel_locally(cx, client, &auth, &handle, CancelReason::deadline())
+                        .await;
+                }
                 // Pace the 202 poll loop: a still-running statement returns 202
                 // immediately (the transport only backs off on retryable 429/5xx),
                 // so without this cancel-aware wait the loop would hammer the SQL
                 // API and burn the poll quota in milliseconds. A cancellation
                 // during the wait still fires the remote cancel for the live handle.
                 if !std::mem::take(&mut poll_now)
-                    && let Err(reason) = wait_poll_interval(cx, poll_interval).await
+                    && let Err(reason) =
+                        wait_poll_interval(cx, until_deadline(poll_interval, execution_deadline))
+                            .await
                 {
                     return cancel_locally(cx, client, &auth, &handle, reason).await;
+                }
+                if deadline_passed(execution_deadline) {
+                    return cancel_locally(cx, client, &auth, &handle, CancelReason::deadline())
+                        .await;
                 }
                 stats.polls = stats.polls.saturating_add(1);
                 // Re-derive the bearer so a near-expiry JWT is re-signed before
@@ -1200,6 +1213,21 @@ fn terminal_failure_error(
     failure: crate::response::QueryFailureStatus,
 ) -> SnowflakeError {
     SnowflakeError::new(code, redact(&failure.message).into_owned())
+}
+
+/// Whether a client-side execution deadline ([`PollPlan::execution_timeout`])
+/// has passed.
+fn deadline_passed(deadline: Option<asupersync::Time>) -> bool {
+    deadline.is_some_and(|deadline| asupersync::time::wall_now() >= deadline)
+}
+
+/// The wait before the next poll, cut short to end at the execution deadline.
+fn until_deadline(delay: Duration, deadline: Option<asupersync::Time>) -> Duration {
+    deadline.map_or(delay, |deadline| {
+        delay.min(Duration::from_nanos(
+            deadline.duration_since(asupersync::time::wall_now()),
+        ))
+    })
 }
 
 /// Wait `delay` between poll `GET`s, cancel-aware. Returns the cancellation reason
@@ -2844,6 +2872,46 @@ mod tests {
             assert!(matches!(outcome, SnowflakeOutcome::Err(_)));
             assert_eq!(stats.partitions_fetched, 1);
             assert_eq!(transport.orphan_cancels.borrow().len(), 1);
+        });
+    }
+
+    #[test]
+    fn the_execution_timeout_cancels_a_statement_that_keeps_running() {
+        asupersync::test_utils::run_test(|| async {
+            let transport =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            for _ in 0..200 {
+                transport
+                    .polls
+                    .borrow_mut()
+                    .push(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            }
+            // No budget on the Cx: only the plan bounds execution. Unenforced,
+            // the loop would run into the poll quota instead.
+            let cx = Cx::for_testing();
+            let (outcome, stats) = run_statement_with_stats(
+                &cx,
+                &transport,
+                fake_auth(),
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                PollPlan {
+                    max_polls: 200,
+                    poll_interval: Duration::from_millis(5),
+                    ..PollPlan::default()
+                }
+                .with_execution_timeout(Some(Duration::from_millis(40))),
+            )
+            .await;
+            assert!(
+                matches!(&outcome, SnowflakeOutcome::Cancelled(reason) if reason.is_kind(CancelKind::Deadline)),
+                "{outcome:?}"
+            );
+            let cancels = transport.cancels_after_local.borrow();
+            assert_eq!(cancels.len(), 1);
+            assert_eq!(cancels[0].0, fixture_handle());
+            assert_eq!(cancels[0].1, CancelKind::Deadline);
+            assert!(stats.polls < 200, "{stats:?}");
         });
     }
 

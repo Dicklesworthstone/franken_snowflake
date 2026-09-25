@@ -46,6 +46,13 @@ pub struct PollPlan {
     /// assembled. The statement then completes early and reports itself
     /// partial (`CompletedStatement::is_partial`).
     pub row_cap: Option<usize>,
+    /// Client-side bound on execution, from submit (or resume) to a terminal
+    /// status: past it the driver cancels the statement with
+    /// `CancelKind::Deadline`, remote cancel included. A backstop for the
+    /// server's own statement timeout; partition downloads after completion
+    /// are not counted, and one in-flight poll exchange can overrun it by at
+    /// most the transport's per-exchange bound.
+    pub execution_timeout: Option<Duration>,
 }
 
 /// Default partition fetch window.
@@ -60,6 +67,7 @@ impl Default for PollPlan {
             poll_interval: Duration::from_millis(1_000),
             partition_concurrency: DEFAULT_PARTITION_CONCURRENCY,
             row_cap: None,
+            execution_timeout: None,
         }
     }
 }
@@ -102,6 +110,14 @@ impl PollPlan {
     #[must_use]
     pub fn with_row_cap(mut self, row_cap: Option<usize>) -> Self {
         self.row_cap = row_cap;
+        self
+    }
+
+    /// Bound execution client-side (see [`PollPlan::execution_timeout`]);
+    /// `None` leaves it to the server.
+    #[must_use]
+    pub fn with_execution_timeout(mut self, execution_timeout: Option<Duration>) -> Self {
+        self.execution_timeout = execution_timeout;
         self
     }
 
