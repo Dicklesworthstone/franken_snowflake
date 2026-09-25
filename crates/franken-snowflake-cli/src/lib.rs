@@ -2157,11 +2157,7 @@ fn base_envelope(
         safe_next_commands: vec![],
         repair_commands: vec![],
         did_you_mean: vec![],
-        budget_consumed: json_object(vec![
-            ("deadline_ms", Json::Number(0)),
-            ("polls", Json::Number(0)),
-            ("rows", Json::Number(0)),
-        ]),
+        budget_consumed: json_object(vec![("polls", Json::Number(0)), ("rows", Json::Number(0))]),
         redactions_applied: vec![],
         data,
         error: None,

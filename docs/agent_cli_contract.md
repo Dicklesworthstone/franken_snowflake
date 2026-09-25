@@ -87,7 +87,7 @@ Every JSON envelope includes:
 | `started_at` / `finished_at` / `duration_ms` | Timing. |
 | `warnings` | Non-fatal findings. |
 | `safe_next_commands` | Suggested follow-ups. |
-| `budget_consumed` | Deadline / poll-quota / cost-quota usage. |
+| `budget_consumed` | Measured `polls` and `rows`. A live run adds the bounds it ran under: `poll_quota` and `execution_timeout_ms` (the client-side execution deadline, `--statement-timeout` + 5 s per statement; absent when the timeout is 0). |
 | `redactions_applied` | Redaction markers. |
 
 Error envelopes additionally carry a stable `error.code`, `retryable`,

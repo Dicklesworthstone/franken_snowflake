@@ -158,13 +158,19 @@ impl AuthProvider for AuthorizationDescriptor {
     }
 }
 
-/// Observed effort for one driven statement, for `budget_consumed` reporting.
+/// Observed effort for one driven statement, and the bounds it ran under, for
+/// `budget_consumed` reporting.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DriverStats {
     /// Number of `GET /statements/{handle}` polls issued after the submit.
     pub polls: u32,
     /// Number of non-inline partitions fetched.
     pub partitions_fetched: u32,
+    /// The poll quota it ran under ([`PollPlan::max_polls`]).
+    pub poll_quota: u32,
+    /// The client-side execution bound it ran under, if any
+    /// ([`PollPlan::execution_timeout`]).
+    pub execution_timeout: Option<Duration>,
 }
 
 /// Submit a statement and drive it to completion: submit -> poll/await ->
@@ -716,6 +722,8 @@ async fn drive_statement<T: StatementTransport, A: AuthProvider>(
     // Captured before the machine takes ownership; `PollPlan` is `Copy`. The 202
     // poll loop waits this long between GETs (see `wait_poll_interval`).
     let poll_interval = poll_plan.effective_poll_interval();
+    stats.poll_quota = poll_plan.max_polls;
+    stats.execution_timeout = poll_plan.execution_timeout;
     let execution_deadline = poll_plan
         .execution_timeout
         .map(|timeout| asupersync::time::wall_now() + timeout);
@@ -2361,7 +2369,9 @@ mod tests {
                 }
             };
             assert_eq!(payload.message(), "submit panic");
-            assert_eq!(stats, DriverStats::default());
+            // No effort recorded; the stats still name the plan's bound.
+            assert_eq!((stats.polls, stats.partitions_fetched), (0, 0));
+            assert_eq!(stats.poll_quota, 5);
             assert!(transport.orphan_cancels.borrow().is_empty());
             assert!(transport.cancels_after_local.borrow().is_empty());
             assert!(!transport.orphan_cleanup_finished.get());
@@ -2912,6 +2922,9 @@ mod tests {
             assert_eq!(cancels[0].0, fixture_handle());
             assert_eq!(cancels[0].1, CancelKind::Deadline);
             assert!(stats.polls < 200, "{stats:?}");
+            // The stats name the bounds the statement ran under.
+            assert_eq!(stats.poll_quota, 200);
+            assert_eq!(stats.execution_timeout, Some(Duration::from_millis(40)));
         });
     }
 

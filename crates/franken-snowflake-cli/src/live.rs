@@ -406,7 +406,8 @@ fn execute_batch(
     };
     let poll_plan = PollPlan::with_max_polls(conn.max_polls)
         .with_partition_concurrency(conn.partition_concurrency)
-        .with_row_cap(row_cap);
+        .with_row_cap(row_cap)
+        .with_execution_timeout(conn.execution_timeout_for(count));
     let progress = conn.progress;
     let (outcome, stats, facts) = with_runtime(conn, move |cx, client, auth| {
         Box::pin(async move {
@@ -1406,25 +1407,17 @@ pub fn run_catalog_scan_outcome(
         json_object(data),
     );
     stamp_live(&mut envelope, &profile, &scan.tables, receipt_hash);
-    envelope.budget_consumed = json_object(vec![
-        ("deadline_ms", Json::Number(0)),
-        (
-            "polls",
-            Json::Number(
-                i64::from(scan.tables.stats.polls)
-                    + i64::from(scan.columns.stats.polls)
-                    + i64::from(scan.relation_polls),
-            ),
-        ),
-        (
-            "rows",
-            Json::Number(
-                scan.tables
-                    .total_rows
-                    .saturating_add(scan.columns.total_rows),
-            ),
-        ),
-    ]);
+    envelope.budget_consumed = budget_consumed(
+        scan.tables
+            .stats
+            .polls
+            .saturating_add(scan.columns.stats.polls)
+            .saturating_add(scan.relation_polls),
+        &scan.tables.stats,
+        scan.tables
+            .total_rows
+            .saturating_add(scan.columns.total_rows),
+    );
     envelope.warnings = warnings;
     let example_dataset = scan
         .snapshot
@@ -2277,7 +2270,9 @@ fn execute_streaming<S: RowSink + 'static>(
     #[cfg(test)]
     if let Some(script) = &conn.script {
         let mut sink = sink;
-        let (mut done, stats, id) = script.execute(request, None, &sql_api_request_id)?;
+        let plan = PollPlan::with_max_polls(conn.max_polls)
+            .with_execution_timeout(conn.execution_timeout());
+        let (mut done, stats, id) = script.execute(request, plan, &sql_api_request_id)?;
         let rows = std::mem::take(&mut done.rows);
         sink.accept(&done.result_set, rows)?;
         let mut live = into_rows(done, stats, id);
@@ -2882,8 +2877,18 @@ impl LiveConn {
     /// The client-side execution bound: the statement timeout plus a margin
     /// (`0`, Snowflake's "no limit", sets none).
     fn execution_timeout(&self) -> Option<Duration> {
+        self.execution_timeout_for(1)
+    }
+
+    /// The bound for a request running `statements` statements one after
+    /// another (a multi-statement batch's parent spans all of them): the
+    /// statement timeout for each, plus one margin.
+    fn execution_timeout_for(&self, statements: usize) -> Option<Duration> {
         (self.statement_timeout_seconds > 0).then(|| {
-            Duration::from_secs(u64::from(self.statement_timeout_seconds)) + CLIENT_DEADLINE_MARGIN
+            let statements = u32::try_from(statements.max(1)).unwrap_or(u32::MAX);
+            Duration::from_secs(u64::from(self.statement_timeout_seconds))
+                .saturating_mul(statements)
+                + CLIENT_DEADLINE_MARGIN
         })
     }
 
@@ -3539,9 +3544,13 @@ fn execute_request(
 ) -> Result<(CompletedStatement, DriverStats, String), SnowflakeError> {
     let sql_api_request_id = fixed_request_id.unwrap_or_else(unique_request_id);
     LAST_RUN.with(RefCell::take);
+    let poll_plan = PollPlan::with_max_polls(conn.max_polls)
+        .with_partition_concurrency(conn.partition_concurrency)
+        .with_row_cap(row_cap)
+        .with_execution_timeout(conn.execution_timeout());
     #[cfg(test)]
     if let Some(script) = &conn.script {
-        return script.execute(request, row_cap, &sql_api_request_id);
+        return script.execute(request, poll_plan, &sql_api_request_id);
     }
     let params = SubmitQueryParams {
         request_id: Some(sql_api_request_id.clone()),
@@ -3549,11 +3558,6 @@ fn execute_request(
         asynchronous: false,
         nullable: None,
     };
-    let max_polls = conn.max_polls;
-    let poll_plan = PollPlan::with_max_polls(max_polls)
-        .with_partition_concurrency(conn.partition_concurrency)
-        .with_row_cap(row_cap)
-        .with_execution_timeout(conn.execution_timeout());
     let progress = conn.progress;
     let (outcome, stats, facts) = with_runtime(conn, move |cx, client, auth| {
         Box::pin(async move {
@@ -3812,11 +3816,25 @@ fn stamp_live(
     envelope.statement_handle = Some(rows.statement_handle.clone());
     envelope.query_id = Some(rows.statement_handle.clone());
     envelope.receipt_hash = receipt_hash;
-    envelope.budget_consumed = json_object(vec![
-        ("deadline_ms", Json::Number(0)),
-        ("polls", Json::Number(i64::from(rows.stats.polls))),
-        ("rows", Json::Number(rows.total_rows)),
-    ]);
+    envelope.budget_consumed = budget_consumed(rows.stats.polls, &rows.stats, rows.total_rows);
+}
+
+/// `budget_consumed` for a live run: what was measured (polls, rows) beside the
+/// bounds each statement ran under: the poll quota and the client-side
+/// execution deadline in milliseconds (absent when none was set).
+fn budget_consumed(polls: u32, bounds: &DriverStats, rows: i64) -> Json {
+    let mut fields = vec![
+        ("polls", Json::Number(i64::from(polls))),
+        ("poll_quota", Json::Number(i64::from(bounds.poll_quota))),
+    ];
+    if let Some(timeout) = bounds.execution_timeout {
+        fields.push((
+            "execution_timeout_ms",
+            Json::Number(i64::try_from(timeout.as_millis()).unwrap_or(i64::MAX)),
+        ));
+    }
+    fields.push(("rows", Json::Number(rows)));
+    json_object(fields)
 }
 
 /// The copy-pasteable `receipt show` command for a given receipt hash.
@@ -4509,15 +4527,17 @@ mod test_support {
     pub(super) struct Script(Rc<RefCell<ScriptState>>);
 
     impl Script {
+        /// Stands in for the driver: answers the next scripted response and,
+        /// like the driver, reports the plan's bounds in the stats.
         pub(super) fn execute(
             &self,
             request: SubmitStatementRequest,
-            row_cap: Option<usize>,
+            poll_plan: PollPlan,
             sql_api_request_id: &str,
         ) -> Result<(CompletedStatement, DriverStats, String), SnowflakeError> {
             let mut state = self.0.borrow_mut();
             state.submitted.push(request);
-            state.row_caps.push(row_cap);
+            state.row_caps.push(poll_plan.row_cap);
             state.request_ids.push(sql_api_request_id.to_owned());
             let ordinal = state.submitted.len();
             match state.responses.pop_front() {
@@ -4526,6 +4546,8 @@ mod test_support {
                     DriverStats {
                         polls: 1,
                         partitions_fetched: 0,
+                        poll_quota: poll_plan.max_polls,
+                        execution_timeout: poll_plan.execution_timeout,
                     },
                     format!("scripted-request-{ordinal}"),
                 )),
@@ -5027,6 +5049,11 @@ mod tests {
         assert_eq!(env["data"]["rows"].as_array().map(Vec::len), Some(2));
         assert_eq!(env["data"]["truncated"], true);
         assert_eq!(env["budget_consumed"]["polls"], 1);
+        // Beside the measured polls, the bounds the statement ran under: the
+        // profile's poll quota and this run's --statement-timeout 120 + 5 s.
+        assert_eq!(env["budget_consumed"]["poll_quota"], 10);
+        assert_eq!(env["budget_consumed"]["execution_timeout_ms"], 125_000);
+        assert!(env["budget_consumed"].get("deadline_ms").is_none(), "{env}");
         let hash = env["receipt_hash"].as_str().unwrap_or("").to_owned();
         assert_eq!(hash.len(), 64, "{hash}");
 
