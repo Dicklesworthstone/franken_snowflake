@@ -2,7 +2,7 @@
 # workspace-wide lint policy.
 #
 # The toolchain is pinned in rust-toolchain.toml. Asupersync is pinned to one
-# exact version below (`=0.3.5`), and scripts/check-asupersync-single-version.sh
+# exact version below (`=0.5.0`), and scripts/check-asupersync-single-version.sh
 # fails if the lockfile ever carries a second one. FrankenSuite dependencies
 # resolve from crates.io; local sibling checkouts are an opt-in `paths` override
 # in a gitignored .cargo/config.toml. scripts/check-dependency-admissibility.py
@@ -63,7 +63,7 @@ todo = "deny"
 dbg_macro = "deny"
 
 [workspace.dependencies]
-asupersync = { version = "=0.3.5", default-features = false, features = ["proc-macros", "tls", "tls-native-roots", "compression"] }
+asupersync = { version = "=0.5.0", default-features = false, features = ["proc-macros", "tls", "tls-native-roots", "compression"] }
 
 # Local FrankenSuite candidate graph. These patches do not admit a crate into
 # the production feature graph; they only force one local checkout per crate

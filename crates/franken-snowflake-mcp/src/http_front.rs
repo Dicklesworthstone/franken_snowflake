@@ -31,11 +31,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use asupersync::runtime::RuntimeHandle;
 use fastmcp_rust::bidirectional::TransportSendFn;
 use fastmcp_rust::http::{HttpMethod, HttpRequest, HttpResponse, HttpStatus, HttpTransport};
 use fastmcp_rust::{
-    Cx, JsonRpcRequest, NotificationSender, PendingRequests, RequestSender, Server, Session,
+    Budget, Cx, JsonRpcRequest, NotificationSender, PendingRequests, RequestSender, Session,
 };
+use fastmcp_server::Server;
 use franken_snowflake_core::error::SnowflakeErrorCode;
 use serde_json::{Value, json};
 
@@ -381,6 +383,7 @@ fn serve_connection(
     server: &Server,
     session: &Arc<Mutex<Session>>,
     policy: &HttpPolicy,
+    requests: &RuntimeHandle,
 ) {
     let Ok(reader_stream) = stream.try_clone() else {
         return;
@@ -393,7 +396,7 @@ fn serve_connection(
     let (response, dispatched) = match policy.decide(&request) {
         Decision::Respond(response) => (response, false),
         Decision::Dispatch { cors_origin } => {
-            let cx = Cx::for_request();
+            let cx: Cx = requests.request_cx_with_budget(Budget::INFINITE);
             let response = dispatch_body(
                 server,
                 &cx,
@@ -505,6 +508,9 @@ pub fn run_secure_http(server: Server, options: &HttpServeOptions, read_only_too
         server.capabilities().clone(),
     )));
     let server = Arc::new(server);
+    // Kept alive for the server's lifetime; each request's Cx comes from it.
+    let runtime = crate::fastmcp_surface::mcp_runtime();
+    let requests = runtime.handle();
     eprintln!(
         "franken-snowflake MCP HTTP server listening on http://{local}{MCP_PATH} (bearer token from {MCP_TOKEN_ENV}; tools: {})",
         policy
@@ -519,7 +525,8 @@ pub fn run_secure_http(server: Server, options: &HttpServeOptions, read_only_too
         let server = Arc::clone(&server);
         let session = Arc::clone(&session);
         let policy = Arc::clone(&policy);
-        std::thread::spawn(move || serve_connection(stream, &server, &session, &policy));
+        let requests = requests.clone();
+        std::thread::spawn(move || serve_connection(stream, &server, &session, &policy, &requests));
     }
     std::process::exit(0)
 }

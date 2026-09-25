@@ -20,7 +20,11 @@ workspace = true
 
 [dependencies]
 franken-snowflake-core = { path = "../franken-snowflake-core", version = "0.0.5" }
-frankensearch = { version = "0.3.2", default-features = false, features = ["hash", "lexical"], optional = true }
+# `lexical-tantivy` keeps the Tantivy BM25 index format (Frankensearch 0.6's
+# `lexical` feature is its Quill engine). 0.6.0, not 0.6.1: 0.6.1's index crate
+# pins `rustix =1.1.5` while fastmcp 0.10 pins `=1.1.4`, and the workspace
+# resolves one lockfile.
+frankensearch = { version = "0.6.0", default-features = false, features = ["hash", "lexical-tantivy"], optional = true }
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]

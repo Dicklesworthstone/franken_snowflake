@@ -297,9 +297,44 @@ impl ColumnCodec {
                         reason: "holds a number a JSON number cannot carry exactly",
                     });
                 }
-                serde_json::from_str(wire).map_err(|_| TypedCellError { reason: "not JSON" })
+                serde_json::from_str(wire)
+                    .map(canonical_numbers)
+                    .map_err(|_| TypedCellError { reason: "not JSON" })
             }
         }
+    }
+}
+
+/// Rebuild every number as the `i64` or `f64` JSON number the exactness check
+/// admitted, so a cell decodes to the same value whether or not serde_json's
+/// `arbitrary_precision` feature is on in the build (it keeps a literal's
+/// spelling: `1.5e-3` rather than `0.0015`). One spelling still differs: that
+/// parser reads the integer literal `-0` as `0`, the default one as `-0.0`.
+fn canonical_numbers(value: Value) -> Value {
+    match value {
+        Value::Number(number) => canonical_number(number),
+        Value::Array(items) => Value::Array(items.into_iter().map(canonical_numbers).collect()),
+        Value::Object(entries) => Value::Object(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key, canonical_numbers(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn canonical_number(number: serde_json::Number) -> Value {
+    let text = number.to_string();
+    let integer = text
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b'-');
+    if integer && let Some(value) = number.as_i64() {
+        return Value::from(value);
+    }
+    match number.as_f64().and_then(serde_json::Number::from_f64) {
+        Some(float) => Value::Number(float),
+        None => Value::Number(number),
     }
 }
 
@@ -718,6 +753,12 @@ mod tests {
             ),
             serde_json::json!({"id": i64::MIN, "x": 0.0015})
         );
+        // The same value in every build, whatever the literal's spelling.
+        assert_eq!(
+            decode("variant", None, None, "[1e2, 7, 2.50]"),
+            serde_json::json!([100.0, 7, 2.5])
+        );
+        assert_eq!(decode("variant", None, None, "-0").as_f64(), Some(0.0));
         // Digits inside strings are text, not numbers.
         assert_eq!(
             decode("variant", None, None, r#"{"s":"99999999999999999999\"1"}"#),

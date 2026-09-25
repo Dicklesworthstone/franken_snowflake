@@ -518,14 +518,17 @@ pub mod frankensearch_adapter {
     use std::sync::Arc;
 
     use frankensearch::{
-        Cx, Embedder, EmbedderStack, HashEmbedder, IndexBuildStats, IndexBuilder, ScoredResult,
-        SearchError, SearchResult, TantivyIndex, TwoTierConfig, TwoTierIndex, TwoTierMetrics,
-        TwoTierSearcher,
+        Cx, Embedder, EmbedderStack, HashEmbedder, IndexBuildStats, IndexBuilder,
+        IndexableDocument, LexicalWrite, ScoredResult, SearchError, SearchResult, TantivyIndex,
+        TwoTierConfig, TwoTierIndex, TwoTierMetrics, TwoTierSearcher,
     };
 
     use super::TextChunk;
 
-    /// Build a hash + lexical index from validated text chunks.
+    /// Build a hash + lexical index from validated text chunks: the vector
+    /// tiers through Frankensearch's builder, then the Tantivy lexical arm under
+    /// `index_dir/lexical`. (Frankensearch 0.6's builder writes only its Quill
+    /// engine; with `lexical-tantivy` alone it writes no lexical arm.)
     pub async fn build_hash_lexical_index(
         cx: &Cx,
         index_dir: impl AsRef<Path>,
@@ -534,23 +537,29 @@ pub mod frankensearch_adapter {
         let fast = Arc::new(HashEmbedder::default_256()) as Arc<dyn Embedder>;
         let quality = Arc::new(HashEmbedder::default_384()) as Arc<dyn Embedder>;
         let stack = EmbedderStack::from_parts(fast, Some(quality));
-        let mut builder = IndexBuilder::new(index_dir.as_ref()).with_embedder_stack(stack);
+        let mut documents = Vec::with_capacity(chunks.len());
         for chunk in chunks {
             chunk.validate().map_err(|err| SearchError::InvalidConfig {
                 field: "chunks.text".to_owned(),
                 value: chunk.handle.to_string(),
                 reason: err.to_string(),
             })?;
-            builder = match &chunk.title {
-                Some(title) => builder.add_document_with_title(
-                    chunk.handle.as_str(),
-                    chunk.text.as_str(),
-                    title.as_str(),
-                ),
-                None => builder.add_document(chunk.handle.as_str(), chunk.text.as_str()),
+            let document = IndexableDocument::new(chunk.handle.as_str(), chunk.text.as_str());
+            let document = match &chunk.title {
+                Some(title) => document.with_title(title.as_str()),
+                None => document,
             };
+            documents.push(document);
         }
-        builder.build(cx).await
+        let stats = IndexBuilder::new(index_dir.as_ref())
+            .with_embedder_stack(stack)
+            .add_documents(documents.iter().cloned())
+            .build(cx)
+            .await?;
+        let lexical = TantivyIndex::create(&index_dir.as_ref().join("lexical"))?;
+        lexical.index_documents(cx, &documents).await?;
+        lexical.commit(cx).await?;
+        Ok(stats)
     }
 
     /// Open a hash + lexical searcher over a previously built index.
@@ -829,12 +838,27 @@ mod tests {
             let build = build_hash_lexical_index(&cx, &index_path, &chunks).await;
             assert!(build.as_ref().is_ok_and(|stats| stats.doc_count == 2));
 
-            let search = query_hash_lexical_index(&cx, &index_path, "transcript margin", 3).await;
-            assert!(
-                search
-                    .as_ref()
-                    .is_ok_and(|(results, _)| !results.is_empty())
+            // Frankensearch answers a short keyword query over a hash-embedded
+            // index from the lexical arm alone ("lexical short circuit"), so the
+            // attached Tantivy arm shows in the candidate count and the top hit.
+            let first = chunks[0].handle.to_string();
+            let (results, metrics) =
+                query_hash_lexical_index(&cx, &index_path, "transcript margin", 3)
+                    .await
+                    .expect("query");
+            assert_eq!(metrics.lexical_candidates, 1, "{metrics:?}");
+            assert_eq!(
+                results.first().map(|hit| hit.doc_id.as_str()),
+                Some(first.as_str())
             );
+
+            // Negative: a term in neither document draws no lexical candidate
+            // and no hit.
+            let (results, metrics) = query_hash_lexical_index(&cx, &index_path, "zeppelin", 3)
+                .await
+                .expect("query");
+            assert_eq!(metrics.lexical_candidates, 0, "{metrics:?}");
+            assert!(results.is_empty(), "{results:?}");
         });
         Ok(())
     }

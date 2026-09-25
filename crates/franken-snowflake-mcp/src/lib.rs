@@ -45,9 +45,9 @@ mod fastmcp_surface {
     use std::sync::Arc;
 
     use fastmcp_rust::{
-        Content, McpContext, McpError, McpErrorCode, McpResult, Server, Tool, ToolAnnotations,
-        ToolHandler,
+        Content, McpContext, McpError, McpErrorCode, McpResult, Tool, ToolAnnotations, ToolHandler,
     };
+    use fastmcp_server::Server;
     use franken_snowflake_core::redact::redact;
     use serde_json::{Map, Value, json};
 
@@ -140,6 +140,47 @@ mod fastmcp_surface {
         if hash == 0 { OFFSET } else { hash }
     }
 
+    /// The one handshake-era protocol version FastMCP 0.10 serves.
+    const LEGACY_MCP_VERSION: &str = "2024-11-05";
+
+    /// Version negotiation for a stdio `initialize`. FastMCP's stdio loop
+    /// refuses (`-32600`) an `initialize` naming any version but 2024-11-05,
+    /// yet MCP clients send later revisions (2025-03-26 ... 2025-11-25), and
+    /// the MCP lifecycle says a server that does not support the requested
+    /// version answers with one it does. So such an `initialize` (one without
+    /// the 2026 per-request protocol metadata, which FastMCP classifies on its
+    /// own) asks for 2024-11-05, and the result names that version for the
+    /// client to accept or refuse, as the HTTP transport already answers.
+    fn negotiate_initialize(line: Vec<u8>) -> Vec<u8> {
+        let Ok(mut message) = serde_json::from_slice::<Value>(&line) else {
+            return line;
+        };
+        if message.get("method").and_then(Value::as_str) != Some("initialize") {
+            return line;
+        }
+        let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) else {
+            return line;
+        };
+        let modern = params
+            .get("_meta")
+            .and_then(|meta| meta.get("io.modelcontextprotocol/protocolVersion"))
+            .is_some();
+        let requested = params.get("protocolVersion").and_then(Value::as_str);
+        if modern || requested.is_none_or(|version| version == LEGACY_MCP_VERSION) {
+            return line;
+        }
+        params.insert(
+            "protocolVersion".to_owned(),
+            Value::from(LEGACY_MCP_VERSION),
+        );
+        let Ok(mut rewritten) = serde_json::to_vec(&message) else {
+            return line;
+        };
+        let body_len = line.trim_ascii_end().len();
+        rewritten.extend_from_slice(line.get(body_len..).unwrap_or_default());
+        rewritten
+    }
+
     static CANCELLATIONS: std::sync::LazyLock<std::sync::Arc<RequestCancellations>> =
         std::sync::LazyLock::new(std::sync::Arc::default);
 
@@ -186,7 +227,7 @@ mod fastmcp_surface {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {
                         state.observe(&line);
-                        if sender.send(line).is_err() {
+                        if sender.send(negotiate_initialize(line)).is_err() {
                             break;
                         }
                     }
@@ -282,7 +323,7 @@ mod fastmcp_surface {
     struct ToolSpec {
         name: &'static str,
         description: &'static str,
-        open_world_hint: &'static str,
+        open_world_hint: bool,
         read_only: bool,
         params: Vec<ParamSpec>,
         tags: &'static [&'static str],
@@ -294,7 +335,7 @@ mod fastmcp_surface {
                 Self::Capabilities => ToolSpec {
                     name: "capabilities",
                     description: "Return the franken-snowflake read-only capability registry as the CLI JSON envelope.",
-                    open_world_hint: "offline",
+                    open_world_hint: false,
                     read_only: true,
                     params: Vec::new(),
                     tags: &["discovery", "offline"],
@@ -302,7 +343,7 @@ mod fastmcp_surface {
                 Self::Onboard => ToolSpec {
                     name: "onboard",
                     description: "Mega-command: capabilities + exit codes + first commands + local health in one call, via the CLI onboard handler.",
-                    open_world_hint: "offline",
+                    open_world_hint: false,
                     read_only: true,
                     params: Vec::new(),
                     tags: &["discovery", "offline"],
@@ -310,7 +351,7 @@ mod fastmcp_surface {
                 Self::Doctor => ToolSpec {
                     name: "doctor",
                     description: "Run local, non-live readiness checks through the CLI doctor handler.",
-                    open_world_hint: "offline",
+                    open_world_hint: false,
                     read_only: true,
                     params: Vec::new(),
                     tags: &["diagnostics", "offline"],
@@ -318,7 +359,7 @@ mod fastmcp_surface {
                 Self::AgentHandbook => ToolSpec {
                     name: "agent_handbook",
                     description: "Return the embedded agent handbook with envelope, exit-code, and recovery contract details.",
-                    open_world_hint: "offline",
+                    open_world_hint: false,
                     read_only: true,
                     params: Vec::new(),
                     tags: &["discovery", "offline"],
@@ -326,7 +367,7 @@ mod fastmcp_surface {
                 Self::RobotDocsGuide => ToolSpec {
                     name: "robot_docs_guide",
                     description: "Return the first-contact robot guide through the CLI robot-docs handler.",
-                    open_world_hint: "offline",
+                    open_world_hint: false,
                     read_only: true,
                     params: Vec::new(),
                     tags: &["discovery", "offline"],
@@ -334,7 +375,7 @@ mod fastmcp_surface {
                 Self::Selftest => ToolSpec {
                     name: "selftest",
                     description: "Run the offline selftest surface and return the same CLI envelope.",
-                    open_world_hint: "offline",
+                    open_world_hint: false,
                     read_only: true,
                     params: Vec::new(),
                     tags: &["diagnostics", "offline"],
@@ -342,7 +383,7 @@ mod fastmcp_surface {
                 Self::ProfileValidate => ToolSpec {
                     name: "profile_validate",
                     description: "Validate a profile shape without reading secret values or performing live I/O.",
-                    open_world_hint: "offline",
+                    open_world_hint: false,
                     read_only: true,
                     params: vec![ParamSpec::string(
                         "profile",
@@ -354,7 +395,7 @@ mod fastmcp_surface {
                 Self::ProfileDoctor => ToolSpec {
                     name: "profile_doctor",
                     description: "Inspect profile readiness using the CLI profile doctor contract; online probes remain explicit.",
-                    open_world_hint: "snowflake",
+                    open_world_hint: true,
                     read_only: true,
                     params: vec![
                         ParamSpec::string(
@@ -373,7 +414,7 @@ mod fastmcp_surface {
                 Self::CatalogScan => ToolSpec {
                     name: "catalog_scan",
                     description: "Scan catalog metadata through the CLI catalog scan handler and return its envelope.",
-                    open_world_hint: "snowflake",
+                    open_world_hint: true,
                     read_only: true,
                     params: vec![
                         ParamSpec::string(
@@ -404,7 +445,7 @@ mod fastmcp_surface {
                 Self::CatalogGraph => ToolSpec {
                     name: "catalog_graph",
                     description: "Render the catalog lineage graph from the local store's latest snapshot for the database (run catalog_scan first); set refresh=true to rescan live before rendering; format may be json, mermaid, or svg.",
-                    open_world_hint: "snowflake",
+                    open_world_hint: true,
                     read_only: true,
                     params: vec![
                         ParamSpec::string(
@@ -439,7 +480,7 @@ mod fastmcp_surface {
                 Self::CatalogDiff => ToolSpec {
                     name: "catalog_diff",
                     description: "Compare two catalog snapshots or audit schema drift across historical scans from the local store.",
-                    open_world_hint: "offline",
+                    open_world_hint: false,
                     read_only: true,
                     params: vec![
                         ParamSpec::string("profile", "Profile id to inspect.", true),
@@ -465,7 +506,7 @@ mod fastmcp_surface {
                 Self::CatalogRelates => ToolSpec {
                     name: "catalog_relates",
                     description: "What relates to a catalog object (node key, dataset id, or DB.SCHEMA.OBJECT[.COLUMN]) within `depth` hops, from the local snapshot.",
-                    open_world_hint: "offline",
+                    open_world_hint: false,
                     read_only: true,
                     params: vec![
                         ParamSpec::string("profile", "Profile id whose snapshot to read.", true),
@@ -483,7 +524,7 @@ mod fastmcp_surface {
                 Self::CatalogLineage => ToolSpec {
                     name: "catalog_lineage",
                     description: "Everything above (direction up) or below (down) a catalog object in the catalog graph, from the local snapshot.",
-                    open_world_hint: "offline",
+                    open_world_hint: false,
                     read_only: true,
                     params: vec![
                         ParamSpec::string("profile", "Profile id whose snapshot to read.", true),
@@ -506,7 +547,7 @@ mod fastmcp_surface {
                 Self::CatalogSearch => ToolSpec {
                     name: "catalog_search",
                     description: "Find datasets in the local snapshot whose names, columns, comments, or tags contain the query's words; ranked, offline.",
-                    open_world_hint: "offline",
+                    open_world_hint: false,
                     read_only: true,
                     params: vec![
                         ParamSpec::string("profile", "Profile id whose snapshot to search.", true),
@@ -528,7 +569,7 @@ mod fastmcp_surface {
                 Self::CatalogCycles => ToolSpec {
                     name: "catalog_cycles",
                     description: "Dependency cycles in the catalog graph, from the local snapshot.",
-                    open_world_hint: "offline",
+                    open_world_hint: false,
                     read_only: true,
                     params: vec![
                         ParamSpec::string("profile", "Profile id whose snapshot to read.", true),
@@ -540,7 +581,7 @@ mod fastmcp_surface {
                 Self::DatasetInspect => ToolSpec {
                     name: "dataset_inspect",
                     description: "Return the dataset manifest surface through the CLI dataset inspect handler.",
-                    open_world_hint: "offline",
+                    open_world_hint: false,
                     read_only: true,
                     params: vec![ParamSpec::string(
                         "dataset_id",
@@ -552,7 +593,7 @@ mod fastmcp_surface {
                 Self::DatasetProfile => ToolSpec {
                     name: "dataset_profile",
                     description: "Build the pushed-down APPROX_COUNT_DISTINCT / null-count / min-max profiling statement for a dataset from the local snapshot; set execute=true to run it live and return the stats.",
-                    open_world_hint: "snowflake",
+                    open_world_hint: true,
                     read_only: true,
                     params: vec![
                         ParamSpec::string("dataset_id", "Dataset identifier to profile.", true),
@@ -567,7 +608,7 @@ mod fastmcp_surface {
                 Self::DatasetValidateManifest => ToolSpec {
                     name: "dataset_validate_manifest",
                     description: "Parse the non-secret dataset manifest overlay (field roles, limits, rights class) and check each entry against the datasets in the local store.",
-                    open_world_hint: "offline",
+                    open_world_hint: false,
                     read_only: true,
                     params: Vec::new(),
                     tags: &["dataset", "offline"],
@@ -575,7 +616,7 @@ mod fastmcp_surface {
                 Self::DatasetDescribeOperator => ToolSpec {
                     name: "dataset_describe_operator",
                     description: "Return JSON Schema for a supported dataset predicate operator.",
-                    open_world_hint: "offline",
+                    open_world_hint: false,
                     read_only: true,
                     params: vec![ParamSpec::string(
                         "operator",
@@ -587,7 +628,7 @@ mod fastmcp_surface {
                 Self::QueryPlan => ToolSpec {
                     name: "query_plan",
                     description: "Validate and explain a read-only plan without submitting it: raw sql, or dataset mode (dataset_id plus entity/from/to/as_of/select/filter/limit compiled through the catalog planner with typed positional bindings).",
-                    open_world_hint: "offline",
+                    open_world_hint: false,
                     read_only: true,
                     params: query_params(false),
                     tags: &["query", "offline"],
@@ -595,7 +636,7 @@ mod fastmcp_surface {
                 Self::QueryRun => ToolSpec {
                     name: "query_run",
                     description: "Run a read-only query through the CLI query run handler (raw sql or dataset mode); every flag is honored or rejected; write tools are not exposed here.",
-                    open_world_hint: "snowflake",
+                    open_world_hint: true,
                     read_only: true,
                     params: query_params(true),
                     tags: &["query", "snowflake"],
@@ -603,7 +644,7 @@ mod fastmcp_surface {
                 Self::QueryCancel => ToolSpec {
                     name: "query_cancel",
                     description: "POST to the SQL API cancel endpoint for a statement handle with the profile's credentials.",
-                    open_world_hint: "snowflake",
+                    open_world_hint: true,
                     read_only: false,
                     params: vec![
                         ParamSpec::string(
@@ -622,7 +663,7 @@ mod fastmcp_surface {
                 Self::ReceiptShow => ToolSpec {
                     name: "receipt_show",
                     description: "Look up a content-addressed query receipt through the CLI receipt show handler.",
-                    open_world_hint: "offline",
+                    open_world_hint: false,
                     read_only: true,
                     params: vec![ParamSpec::string(
                         "receipt_hash",
@@ -634,7 +675,7 @@ mod fastmcp_surface {
                 Self::ReceiptRefetch => ToolSpec {
                     name: "receipt_refetch",
                     description: "Re-read a completed statement's rows from Snowflake's result cache (RESULT_SCAN on the receipt's query id, about 24 h) without running it again.",
-                    open_world_hint: "snowflake",
+                    open_world_hint: true,
                     read_only: true,
                     params: vec![
                         ParamSpec::string(
@@ -659,7 +700,7 @@ mod fastmcp_surface {
                 Self::ExportPlan => ToolSpec {
                     name: "export_plan",
                     description: "Build a content-addressed COPY INTO <stage> plan (Snowflake-side unload) and the exact `query write` command that executes it; nothing runs.",
-                    open_world_hint: "offline",
+                    open_world_hint: false,
                     read_only: true,
                     params: export_params(true),
                     tags: &["export", "offline"],
@@ -667,7 +708,7 @@ mod fastmcp_surface {
                 Self::ExportRun => ToolSpec {
                     name: "export_run",
                     description: "Run a read-only query live and write a content-addressed local CSV, JSONL, or Parquet file at `out`; records an export receipt in the local store.",
-                    open_world_hint: "snowflake",
+                    open_world_hint: true,
                     read_only: false,
                     params: export_params(false),
                     tags: &["export", "snowflake"],
@@ -1266,10 +1307,11 @@ mod fastmcp_surface {
                 name: spec.name.to_string(),
                 description: Some(spec.description.to_string()),
                 input_schema: input_schema(&spec.params),
-                output_schema: Some(json!({
-                    "type": "string",
-                    "description": "The exact stdout payload produced by the matching franken-snowflake CLI read command."
-                })),
+                // No output schema: a tool answers with the CLI envelope as
+                // text content, and an MCP output schema describes an object
+                // `structuredContent` (FastMCP 0.10 refuses to register a tool
+                // whose output schema is `{"type": "string"}`).
+                output_schema: None,
                 icon: None,
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 tags: spec.tags.iter().map(|tag| (*tag).to_string()).collect(),
@@ -1328,6 +1370,20 @@ mod fastmcp_surface {
         builder.build()
     }
 
+    /// The runtime the MCP server's request contexts come from: FastMCP 0.10
+    /// runs a transport and dispatches a request under an explicit `Cx`, and
+    /// Asupersync 0.5 mints production ones with `request_cx_with_budget`. It
+    /// lives as long as the server (whose entry points never return).
+    pub(crate) fn mcp_runtime() -> asupersync::runtime::Runtime {
+        match asupersync::runtime::RuntimeBuilder::current_thread().build() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("mcp serve: the async runtime did not start: {error}");
+                std::process::exit(70)
+            }
+        }
+    }
+
     /// How `mcp serve` listens.
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub enum McpServeMode {
@@ -1360,7 +1416,9 @@ mod fastmcp_surface {
                     watched_stdin(std::sync::Arc::clone(&CANCELLATIONS)),
                     std::io::stdout(),
                 );
-                build_mcp_server(runner).run_transport(transport)
+                let runtime = mcp_runtime();
+                let cx = runtime.request_cx_with_budget(fastmcp_rust::Budget::INFINITE);
+                build_mcp_server(runner).run_transport_with_cx(&cx, transport)
             }
             McpServeMode::Http(options) => crate::http_front::run_secure_http(
                 build_mcp_server(runner),
@@ -1608,9 +1666,35 @@ mod fastmcp_surface {
         }
 
         #[test]
+        fn a_later_initialize_version_is_negotiated_down_to_the_served_one() {
+            let later = negotiate_initialize(
+                br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}"#
+                    .iter()
+                    .copied()
+                    .chain(*b"\r\n")
+                    .collect(),
+            );
+            assert!(later.ends_with(b"}\r\n"), "line ending kept");
+            let later: Value = serde_json::from_slice(&later).expect("json");
+            assert_eq!(later["params"]["protocolVersion"], LEGACY_MCP_VERSION);
+            assert_eq!(later["params"]["clientInfo"]["name"], "c");
+
+            // Negatives: bytes pass through untouched.
+            for line in [
+                &br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}"#[..],
+                br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}"#,
+                br#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"protocolVersion":"2025-06-18"}}"#,
+                b"not json\n",
+            ] {
+                assert_eq!(negotiate_initialize(line.to_vec()), line.to_vec());
+            }
+        }
+
+        #[test]
         fn tool_annotations_match_cli_contract_safety() {
+            // Every verb registers: FastMCP logs and drops a tool it refuses.
             let tools = build_mcp_server(fake_runner).tools();
-            assert!(tools.len() >= 10);
+            assert_eq!(tools.len(), READ_VERBS.len());
             for tool in &tools {
                 let read_only = tool
                     .annotations

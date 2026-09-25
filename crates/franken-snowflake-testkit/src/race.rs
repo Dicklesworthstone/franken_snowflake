@@ -1203,7 +1203,7 @@ fn perform_virtual_http_exchange(
         .create_task(region, Budget::INFINITE, async move {
             let result = Http1Client::request_with_io(client_io, request)
                 .await
-                .map(|(response, _)| response)
+                .map(|(response, _, _)| response)
                 .map_err(|error| error.to_string());
             match client_slot.lock() {
                 Ok(mut slot) => *slot = Some(result),
@@ -1295,7 +1295,7 @@ fn perform_virtual_http_exchange_raced(
         .create_task(region, Budget::INFINITE, async move {
             let result = Http1Client::request_with_io(client_io, request)
                 .await
-                .map(|(response, _)| response)
+                .map(|(response, _, _)| response)
                 .map_err(|error| error.to_string());
             match client_slot.lock() {
                 Ok(mut slot) => *slot = Some(result),

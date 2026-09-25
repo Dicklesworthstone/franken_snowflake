@@ -369,6 +369,31 @@ impl Drop for Harness {
     }
 }
 
+/// A spawned `mcp serve` killed and reaped however its test ends: a failing
+/// assertion otherwise orphaned `mcp serve --http` (on Windows the orphan held
+/// the test's pipes open and locked the binary against the next link).
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl std::ops::Deref for KillOnDrop {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 fn files_under(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
@@ -734,13 +759,14 @@ fn an_mcp_cancel_notification_cancels_the_running_statement() {
         not_found()
     });
     let h = Harness::new("mcpcancel", &cert);
-    let mut child = h
-        .command(server.port, &["mcp", "serve", "--stdio"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn mcp serve --stdio");
+    let mut child = KillOnDrop(
+        h.command(server.port, &["mcp", "serve", "--stdio"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn mcp serve --stdio"),
+    );
     let stdout = child.stdout.take().expect("stdout");
     let (lines, received) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -968,14 +994,15 @@ fn mcp_over_http_matches_the_cli_and_a_cancel_notification_cancels_the_call() {
     );
     assert_eq!(cli.exit, 0, "{}", cli.context());
 
-    let mut child = h
-        .command(server.port, &["mcp", "serve", "--http", "127.0.0.1:0"])
-        .env("FRANKEN_SNOWFLAKE_MCP_TOKEN", TOKEN)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn mcp serve --http");
+    let mut child = KillOnDrop(
+        h.command(server.port, &["mcp", "serve", "--http", "127.0.0.1:0"])
+            .env("FRANKEN_SNOWFLAKE_MCP_TOKEN", TOKEN)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn mcp serve --http"),
+    );
     let stderr = child.stderr.take().expect("stderr");
     let (lines, received) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {

@@ -16,7 +16,9 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use asupersync::http::compress::{Decompressor, GzipDecompressor, IdentityDecompressor};
+use asupersync::http::compress::{
+    DecompressionLimit, Decompressor, GzipDecompressor, IdentityDecompressor,
+};
 use asupersync::http::h1::Http1Client;
 use asupersync::http::{
     Client as AsupersyncHttpClient, ClientError as AsupersyncClientError, Method, ParsedUrl,
@@ -214,7 +216,9 @@ impl RawHttp for PemBundleHttp {
                 )
                 .body(body)
                 .build();
-            let (response, _connection) =
+            // The third value says whether the body was withheld (the
+            // connection must not be reused); each exchange opens its own.
+            let (response, _connection, _body_withheld) =
                 Http1Client::request_with_io_and_max_body_size(tls, request, self.max_body_bytes)
                     .await?;
             Ok(response)
@@ -1710,7 +1714,7 @@ fn decode_partition_response(
                 .and_then(|()| decompressor.finish(&mut decoded))
         }
         ContentEncoding::Gzip => {
-            let mut decompressor = GzipDecompressor::new(Some(max_uncompressed));
+            let mut decompressor = GzipDecompressor::new(DecompressionLimit::new(max_uncompressed));
             decompressor
                 .decompress(response.body.as_slice(), &mut decoded)
                 .and_then(|()| decompressor.finish(&mut decoded))

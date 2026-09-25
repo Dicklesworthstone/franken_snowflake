@@ -682,8 +682,8 @@ pub fn gzip_compress(input: &[u8]) -> ExportResult<Vec<u8>> {
 
 /// Gzip-decompress payload bytes using asupersync's embedded decompressor.
 pub fn gzip_decompress(compressed: &[u8]) -> ExportResult<Vec<u8>> {
-    use asupersync::http::compress::{Decompressor, GzipDecompressor};
-    let mut decompressor = GzipDecompressor::new(Some(64 * 1024 * 1024));
+    use asupersync::http::compress::{DecompressionLimit, Decompressor, GzipDecompressor};
+    let mut decompressor = GzipDecompressor::new(DecompressionLimit::new(64 * 1024 * 1024));
     let mut out = Vec::new();
     decompressor
         .decompress(compressed, &mut out)

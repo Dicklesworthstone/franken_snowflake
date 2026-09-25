@@ -12,7 +12,8 @@ The first supported tiers are:
 
 - `hash`: deterministic Frankensearch hash embedder for cheap lexical-like
   retrieval and no model downloads.
-- `lexical`: Frankensearch's Tantivy BM25 backend.
+- `lexical`: Frankensearch's Tantivy BM25 backend (Frankensearch 0.6's
+  `lexical-tantivy` feature; its `lexical` feature is now the Quill engine).
 
 The lane must not enable `semantic`, `model2vec`, `fastembed`, `download`,
 `full`, `persistent`, `durable`, `ann`, `api`, or `fastembed-reranker`. Those
@@ -28,7 +29,7 @@ catalog-search path, never an initial retriever, and never enabled by default.
 | Feature | Default | Dependencies | Contract |
 |---|---:|---|---|
 | none | yes | `franken-snowflake-core`, `serde` | Stable text chunk, handle, rights, and reranker contracts only. |
-| `frankensearch` | no | `frankensearch` with `default-features = false`, `features = ["hash", "lexical"]` | Build/query adapters using `IndexBuilder::add_document` and `TwoTierSearcher` with a Tantivy lexical backend. |
+| `frankensearch` | no | `frankensearch` 0.6 with `default-features = false`, `features = ["hash", "lexical-tantivy"]` | Build/query adapters: `IndexBuilder` for the hash vector tiers, a Tantivy lexical arm the adapter writes, and `TwoTierSearcher` over both. |
 | `rerank` | no | none in this bead | Exposes the top-K policy seam. A future native reranker implementation may attach here after a separate forbidden-dependency proof. |
 
 The default workspace build excludes both Frankensearch and rerank. The
@@ -105,10 +106,9 @@ same stable handle.
    read-only rights policy.
 2. Build `TextChunk` values with stable handles, rights metadata, and redacted
    provenance.
-3. With the `frankensearch` feature enabled, call Frankensearch
-   `IndexBuilder::add_document(handle, text)` for each chunk. The adapter pins a
-   hash embedder stack and relies on Frankensearch to write the optional lexical
-   index under `index_dir/lexical`.
+3. With the `frankensearch` feature enabled, add each chunk to a Frankensearch
+   `IndexBuilder` (id = handle) with a pinned hash embedder stack, then write
+   the same documents to a Tantivy lexical index under `index_dir/lexical`.
 4. Query with `TwoTierSearcher::search_collect`, attaching the Tantivy lexical
    backend from `index_dir/lexical`.
 5. Map `doc_id` values back to `TextDocumentHandle` and then to receipt/source

@@ -13,7 +13,9 @@ publish.workspace = true
 [features]
 default = []
 mcp = [
+    "dep:asupersync",
     "dep:fastmcp-rust",
+    "dep:fastmcp-server",
     "dep:serde_json",
 ]
 
@@ -22,5 +24,11 @@ workspace = true
 
 [dependencies]
 franken-snowflake-core = { path = "../franken-snowflake-core", version = "0.0.5" }
-fastmcp-rust = { version = "0.3.1", optional = true }
+# The runtime whose `request_cx_with_budget` mints the server's request contexts
+# (the facade re-exports Asupersync only under its `testing-lab` feature).
+asupersync = { workspace = true, optional = true }
+fastmcp-rust = { version = "0.10.0", optional = true }
+# `Server` (with `dispatch_request_concurrent`, which the secured HTTP front
+# drives) is no longer re-exported by the facade in 0.10.
+fastmcp-server = { version = "0.10.0", optional = true }
 serde_json = { version = "1", optional = true }
