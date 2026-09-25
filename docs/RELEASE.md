@@ -70,9 +70,9 @@ in a scanned lane blocks release.
 ## Required Cross-Platform Proof (dsr, never GitHub Actions)
 
 This repository does not use GitHub Actions: Actions are disabled in the
-repository settings, and no workflow may be added. The one leftover file,
-`.github/workflows/ci.yml`, is still tracked; deleting it awaits an explicit
-operator go-ahead. Cross-platform builds, tests, and release
+repository settings, and no workflow may be added (the leftover
+`.github/workflows/ci.yml` was removed on 2026-09-24 with the operator's
+go-ahead). Cross-platform builds, tests, and release
 artifacts run through `dsr` (Doodlestein Self-Releaser) on its Linux, macOS,
 and Windows build hosts. The repository is registered with `dsr` as the tool
 `franken_snowflake` (six targets: x86_64/aarch64 Linux, macOS, and Windows;

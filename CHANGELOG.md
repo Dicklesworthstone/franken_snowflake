@@ -398,8 +398,8 @@ closes those gaps:
   created jobs that were never assigned a hosted runner). Per project policy
   this repository never uses Actions: Actions are disabled in the repository
   settings, and `docs/RELEASE.md` specifies the `dsr` cross-platform proof
-  instead. `.github/workflows/ci.yml` is still tracked; deleting it awaits an
-  explicit operator go-ahead.
+  instead. The leftover `.github/workflows/ci.yml` was removed on 2026-09-24
+  with the operator's go-ahead.
 - **Local store.** `franken-snowflake-cache` gained an append-only JSONL
   `FileCache` backend (first-write-wins, tamper-detected receipts, malformed
   lines skipped and counted), a platform data-dir resolver
