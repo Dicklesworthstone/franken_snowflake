@@ -19,7 +19,7 @@ rerank = []
 workspace = true
 
 [dependencies]
-franken-snowflake-core = { path = "../franken-snowflake-core", version = "0.0.4" }
+franken-snowflake-core = { path = "../franken-snowflake-core", version = "0.0.5" }
 frankensearch = { version = "0.3.2", default-features = false, features = ["hash", "lexical"], optional = true }
 serde = { version = "1", features = ["derive"] }
 

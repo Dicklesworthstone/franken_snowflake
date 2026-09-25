@@ -75,21 +75,21 @@ testkit-endpoint = ["live", "franken-snowflake-http/testkit-endpoint"]
 sha2 = "0.10"
 
 [dependencies]
-franken-snowflake-core = { path = "../franken-snowflake-core", version = "0.0.4" }
+franken-snowflake-core = { path = "../franken-snowflake-core", version = "0.0.5" }
 # The finished library crates the CLI surfaces are built on: catalog discovery
 # + manifests + planner, the local store (receipts/audit/snapshots), the lineage
 # graph renderer, and COPY INTO / local export planning. All offline-capable.
-franken-snowflake-catalog = { path = "../franken-snowflake-catalog", version = "0.0.4" }
-franken-snowflake-cache = { path = "../franken-snowflake-cache", version = "0.0.4" }
-franken-snowflake-graph = { path = "../franken-snowflake-graph", version = "0.0.4" }
-franken-snowflake-export = { path = "../franken-snowflake-export", features = ["export"], version = "0.0.4" }
-franken-snowflake-frame = { path = "../franken-snowflake-frame", optional = true, version = "0.0.4" }
-franken-snowflake-text-indexing = { path = "../franken-snowflake-text-indexing", optional = true, version = "0.0.4" }
-franken-snowflake-mcp = { path = "../franken-snowflake-mcp", optional = true, version = "0.0.4" }
-franken-snowflake-tui = { path = "../franken-snowflake-tui", optional = true, version = "0.0.4" }
-franken-snowflake-sqlapi = { path = "../franken-snowflake-sqlapi", optional = true, version = "0.0.4" }
-franken-snowflake-http = { path = "../franken-snowflake-http", optional = true, version = "0.0.4" }
-franken-snowflake-auth = { path = "../franken-snowflake-auth", optional = true, version = "0.0.4" }
+franken-snowflake-catalog = { path = "../franken-snowflake-catalog", version = "0.0.5" }
+franken-snowflake-cache = { path = "../franken-snowflake-cache", version = "0.0.5" }
+franken-snowflake-graph = { path = "../franken-snowflake-graph", version = "0.0.5" }
+franken-snowflake-export = { path = "../franken-snowflake-export", features = ["export"], version = "0.0.5" }
+franken-snowflake-frame = { path = "../franken-snowflake-frame", optional = true, version = "0.0.5" }
+franken-snowflake-text-indexing = { path = "../franken-snowflake-text-indexing", optional = true, version = "0.0.5" }
+franken-snowflake-mcp = { path = "../franken-snowflake-mcp", optional = true, version = "0.0.5" }
+franken-snowflake-tui = { path = "../franken-snowflake-tui", optional = true, version = "0.0.5" }
+franken-snowflake-sqlapi = { path = "../franken-snowflake-sqlapi", optional = true, version = "0.0.5" }
+franken-snowflake-http = { path = "../franken-snowflake-http", optional = true, version = "0.0.5" }
+franken-snowflake-auth = { path = "../franken-snowflake-auth", optional = true, version = "0.0.5" }
 asupersync = { workspace = true, optional = true }
 # SIGINT/SIGTERM handling for in-flight live statements (bead E1), through the
 # safe flag API; already in the graph through asupersync.

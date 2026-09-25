@@ -21,6 +21,6 @@ mcp = [
 workspace = true
 
 [dependencies]
-franken-snowflake-core = { path = "../franken-snowflake-core", version = "0.0.4" }
+franken-snowflake-core = { path = "../franken-snowflake-core", version = "0.0.5" }
 fastmcp-rust = { version = "0.3.1", optional = true }
 serde_json = { version = "1", optional = true }

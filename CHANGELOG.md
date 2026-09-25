@@ -3,7 +3,7 @@
 All notable changes to `franken_snowflake` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at the
-workspace version (`0.0.4`). All 14 crates are published on crates.io (first
+workspace version (`0.0.5`). All 14 crates are published on crates.io (first
 published 2026-09-12).
 
 ## Scope and method
@@ -68,6 +68,7 @@ implementation first and the test/hardening pass follows in a later wave. The
 | 2026-08-24 | GitHub Release [`v0.0.2`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.2) — standalone buildability, Windows x64 via cargo-xwin, but default-feature binaries (no `live`/`mcp`) and no Windows-installer coverage |
 | 2026-09-02 → 2026-09-04 | Reality-check remediation wave: every CLI surface wired to real implementations, safe live writes, receipts + audit trail, in-flight-cancel DPOR race case, `--require-live` gate, TUI executor bridge — shipped as [`v0.0.3`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.3) (2026-09-04, six native dsr targets with `live,mcp`) |
 | 2026-09-04 → 2026-09-11 | Hardening, dependency currency, and release readiness: TUI executor typed bindings, jsonv2 golden validation loop, feature-lane clippy cleanups, library upgrades, and crates.io publishing enablement — shipped as [`v0.0.4`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.4) (2026-09-11) |
+| 2026-09-23 → 2026-09-25 | Reality-check bridge work: security fixes (MCP HTTP auth and origin checks, export path confinement, secret redaction in stored SQL, one shared SQL lexer), typed result rows, socket-level e2e over real TLS, cancellation on signals and MCP requests, streaming exports, catalog relations and search, query batches, a downstream adapter, native macOS/Windows test runs — shipped as [`v0.0.5`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.5) (2026-09-25) |
 
 ---
 
@@ -107,6 +108,46 @@ implementation first and the test/hardening pass follows in a later wave. The
 ---
 
 ## [Unreleased]
+
+Nothing yet.
+
+---
+
+## [v0.0.5] — 2026-09-25
+
+### Security advisory
+
+Affected: franken-snowflake v0.0.4 and earlier. Upgrade to v0.0.5.
+
+- `mcp serve --http` accepted requests without authentication and echoed any
+  `Origin`, so a web page open in the operator's browser could call the MCP
+  tools cross-origin, including live Snowflake reads with the serving shell's
+  credentials and `export_run` writing a file at any path. v0.0.5 requires a
+  bearer token (`FRANKEN_SNOWFLAKE_MCP_TOKEN`), refuses foreign `Host` and
+  `Origin` headers, binds loopback unless `--allow-remote`, and exposes only
+  read-only tools unless `--allow-tool` names more. If you cannot upgrade, do
+  not use `--http`; use `mcp serve --stdio`.
+- The MCP `export_run` tool wrote to any path, and `export run --out`
+  overwrote existing files. Both are confined now (see below).
+- Secret values in SQL text (`PASSWORD = '...'`, `CREDENTIALS = (...)`,
+  `MASTER_KEY`, ...) were stored unredacted in the append-only audit log,
+  receipts and envelopes, including on `--dry-run`. If such SQL ran through
+  v0.0.4 or earlier, treat the local store (`FRANKEN_SNOWFLAKE_DATA_DIR`, or the
+  platform data directory) as holding those secrets and rotate them.
+- A `$$`-quoted string could hide a second statement from the one-statement
+  read guard, and live submits did not pin `MULTI_STATEMENT_COUNT=1`.
+
+Also fixed in this release: Parquet exports truncated scaled NUMBER values
+(`1.50` became `1`); on Windows every live command and `mcp serve` crashed with
+a main-thread stack overflow in a debug build (whether the published v0.0.4
+Windows binaries were affected on the live path is not known); catalog text
+carrying terminal escape sequences reached the terminal raw under `--toon`,
+`--mermaid` and `--svg`.
+
+Proof: the local proof in `docs/RELEASE.md`, and native macOS and Windows
+runs of the workspace suite, every feature lane, and the socket-level e2e
+(`docs/RELEASE.md`, Cross-OS test runs). Nothing in this release was exercised
+against a live Snowflake account.
 
 ### Security
 
