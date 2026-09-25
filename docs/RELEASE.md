@@ -6,13 +6,48 @@ requiring live Snowflake credentials.
 
 ## Current Release State
 
-- Package version: `0.0.4` (GitHub Release 2026-09-11). Built by `dsr` (run
-  `dd041529`, manifest source `edd80c7`) on all six targets with
-  `--features live,mcp`. `capabilities` reported `live=true, mcp=true` on every
-  artifact that was executed; `aarch64-pc-windows-msvc` has never been executed.
-- Publish state: all 14 crates are published on crates.io at `0.0.4` (first
+- Package version: `0.0.5`, a security release (GitHub Release 2026-09-25, tag
+  `v0.0.5` at `07ef0af`). Built by `dsr` in one run (`39a0a638`) on all six
+  targets with `--features live,mcp`; every binary reports `build.git_sha
+  07ef0af`, `dirty: false`, `profile: release`, `testkit: false` and source
+  digest `68cb0560...`. See "v0.0.5 release record" below.
+- Publish state: all 14 crates are published on crates.io at `0.0.5` (first
   published 2026-09-12); they configure `publish = ["crates-io"]` and declare
-  version requirements across internal path dependencies.
+  version requirements across internal path dependencies (sqlapi's testkit
+  dev-dependency is path-only: testkit depends on sqlapi).
+
+### v0.0.5 release record (2026-09-25)
+
+- Operator go-ahead: 2026-09-24, in this session ("Go: build and release", and
+  "Also publish crates" for crates.io).
+- Linux proof on `07ef0af`'s tree: every lane of "Required Local Proof" through
+  rch, plus `dsr quality franken_snowflake` 13/13 (receipt
+  `~/.local/state/dsr/quality-logs/franken_snowflake/20260925T023047-3245208`,
+  bound to `5666a1b`, whose crate sources and `Cargo.lock` are byte-identical to
+  `07ef0af`: same source digest). A first quality run passed 13/13 but was
+  invalidated by dsr because `HEAD` moved during it; it was rerun on a frozen
+  tree rather than accepted.
+- macOS and Windows: see "Cross-OS test runs" below.
+- Build: `dsr build franken_snowflake` (run `39a0a638`, 2385 s). The build
+  identity came from `FSNOW_BUILD_SHA`/`FSNOW_BUILD_DIRTY` set in
+  `repos.d/franken_snowflake.yaml` `env:` for this build only (dsr buildroots
+  carry no `.git`); set it again, naming the release commit, before the next
+  release build. dsr's rsync to the Windows host failed on its path conversion,
+  so the tagged tree reached it through `git archive` (verified by SHA-256).
+- Artifacts executed: Linux x86_64 (here), macOS arm64 and x86_64 (Rosetta) on
+  mmini, Windows x86_64 on wlap: `capabilities`, `selftest`, `doctor`, the
+  credential refusal (exit 3, `FSNOW-2003`), `mcp serve --http` startup. Linux
+  arm64 ran the same checks under qemu user-mode emulation.
+  `aarch64-pc-windows-msvc` has not been executed; its embedded git sha and
+  source digest match.
+- Release: `dsr release franken_snowflake 0.0.5 --verify-tag` (14 assets: six
+  archives, six `.sha256`, `SHA256SUMS`, the dsr manifest; no signatures);
+  `dsr release verify` passed. Notes carry the security advisory.
+- Installer smoke: `install.sh --version 0.0.5 --dest <empty dir> --verify` in a
+  clean `HOME`; the installed binary reports 0.0.5 and `07ef0af`.
+- crates.io: `scripts/publish-crates.py` stopped after four crates on the
+  sqlapi/testkit dev-dependency cycle; fixed in `e3c60d0` (path-only
+  dev-dependency) and resumed; all 14 crates at 0.0.5.
 - License metadata: workspace crates inherit `license-file = "LICENSE"` because
   the repository uses MIT plus the OpenAI/Anthropic rider.
 - Default feature policy: default features are intentionally lean; live, MCP,
