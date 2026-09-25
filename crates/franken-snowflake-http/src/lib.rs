@@ -624,7 +624,7 @@ impl<H: RawHttp> SnowflakeHttpClient<H> {
                     wire.body.clone(),
                     sooner(
                         budget_timeout_at(attempt_budget, budget_now),
-                        self.config.attempt_timeout,
+                        self.config.attempt_timeout_for(route_kind),
                     ),
                 )
                 .await;
@@ -765,6 +765,12 @@ impl<H: RawHttp> SnowflakeHttpClient<H> {
 /// ever cuts a stalled connection.
 pub const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Longest one remote-cancel exchange may take (reality-check bead E3: the
+/// cancel runs under a short, masked bound). A cancel is a small POST Snowflake
+/// answers at once; a stalled one must not hold a command that is already
+/// ending (Ctrl-C, a deadline, a credit cap) for the full exchange bound.
+pub const DEFAULT_CANCEL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Immutable transport configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransportConfig {
@@ -785,6 +791,9 @@ pub struct TransportConfig {
     /// command, since the HTTP client imposes no timeout of its own). The
     /// ambient budget's deadline still applies when it is sooner.
     pub attempt_timeout: Option<Duration>,
+    /// Longest one remote-cancel exchange may take (the sooner of this and
+    /// `attempt_timeout` applies to a cancel).
+    pub cancel_attempt_timeout: Option<Duration>,
 }
 
 impl TransportConfig {
@@ -799,6 +808,20 @@ impl TransportConfig {
             retry: RetryPolicy::default(),
             log: AttemptLogPolicy::default(),
             attempt_timeout: Some(DEFAULT_ATTEMPT_TIMEOUT),
+            cancel_attempt_timeout: Some(DEFAULT_CANCEL_ATTEMPT_TIMEOUT),
+        }
+    }
+
+    /// The bound on one exchange of `route_kind`: the sooner of the cancel
+    /// bound and the exchange bound for a remote cancel, the exchange bound
+    /// otherwise.
+    #[must_use]
+    pub fn attempt_timeout_for(&self, route_kind: TransportRouteKind) -> Option<Duration> {
+        match route_kind {
+            TransportRouteKind::Cancel => sooner(self.attempt_timeout, self.cancel_attempt_timeout),
+            TransportRouteKind::Submit
+            | TransportRouteKind::Poll
+            | TransportRouteKind::Partition => self.attempt_timeout,
         }
     }
 }
@@ -3499,6 +3522,29 @@ mod tests {
                 SnowflakeHttpClient::new(config, ScriptedRaw::new(vec![ok_json(200, "{}")]));
             let _ = unbounded.poll_statement(&cx, poll_request()).await;
             assert_eq!(unbounded.client.requests()[0].timeout, None);
+
+            // A remote cancel gets the short cancel bound, not the 300 s one.
+            let cancel = CancelHttpRequest {
+                auth: auth(),
+                statement_handle: StatementHandle::new("stmt-cancel-1"),
+                reason_kind: CancelKind::User,
+            };
+            let canceller = scripted_client(1, vec![ok_json(200, "{}")]);
+            let _ = canceller.cancel_statement(&cx, cancel.clone()).await;
+            assert_eq!(
+                canceller.client.requests()[0].timeout,
+                Some(DEFAULT_CANCEL_ATTEMPT_TIMEOUT)
+            );
+            // A tighter exchange bound still wins.
+            let mut config = fast_retry_config(1);
+            config.attempt_timeout = Some(Duration::from_secs(2));
+            let tight =
+                SnowflakeHttpClient::new(config, ScriptedRaw::new(vec![ok_json(200, "{}")]));
+            let _ = tight.cancel_statement(&cx, cancel).await;
+            assert_eq!(
+                tight.client.requests()[0].timeout,
+                Some(Duration::from_secs(2))
+            );
         });
     }
 
