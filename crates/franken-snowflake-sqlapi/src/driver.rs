@@ -6,7 +6,8 @@
 //! [`crate::lifecycle`]; this module only performs the network steps the machine
 //! asks for and, crucially, **fires the SQL API cancel endpoint when the
 //! ambient `Cx` is cancelled after a statement handle exists** — so no Snowflake
-//! statement is orphaned (the obligation/`bracket` contract from
+//! statement is orphaned. A running statement is an Asupersync `Lease`
+//! obligation of the driving task, resolved on every path (see `DropGuard` and
 //! `docs/asupersync_leverage.md`).
 //!
 //! The cancel path delegates to the transport's own
@@ -22,6 +23,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use asupersync::Cx;
+use asupersync::record::{ObligationAbortReason, ObligationKind};
+use asupersync::runtime::obligation_mailbox::ObligationToken;
 use franken_snowflake_core::cancel::CancelReason;
 use franken_snowflake_core::error::{SnowflakeError, SnowflakeErrorCode};
 use franken_snowflake_core::ids::StatementHandle;
@@ -790,7 +793,7 @@ async fn drive_statement<T: StatementTransport, A: AuthProvider>(
         cx, client, provider, start, poll_plan, stats, hooks, &mut guard,
     )
     .await;
-    guard.disarm();
+    guard.settle(&outcome);
     outcome
 }
 
@@ -879,7 +882,7 @@ async fn drive_guarded<T: StatementTransport, A: AuthProvider>(
     };
 
     // From here the statement is accepted and, while it runs, guarded.
-    guard.arm(&auth, &progress);
+    guard.arm(cx, &auth, &progress);
 
     // Execution lasts while the statement is being polled; it is measured up
     // to its first non-polling progress (terminal status or partitions).
@@ -891,6 +894,7 @@ async fn drive_guarded<T: StatementTransport, A: AuthProvider>(
         }
         match progress {
             Progress::Complete(mut completed) => {
+                guard.finish();
                 notify(
                     &mut observer,
                     DriverEvent::Completed {
@@ -909,12 +913,14 @@ async fn drive_guarded<T: StatementTransport, A: AuthProvider>(
                 return SnowflakeOutcome::ok(completed);
             }
             Progress::TimedOut(failure) => {
+                guard.finish();
                 return SnowflakeOutcome::err(terminal_failure_error(
                     SnowflakeErrorCode::StatementTimeout,
                     failure,
                 ));
             }
             Progress::Failed(failure) => {
+                guard.finish();
                 return SnowflakeOutcome::err(terminal_failure_error(
                     SnowflakeErrorCode::StatementFailed,
                     failure,
@@ -1036,6 +1042,7 @@ async fn drive_guarded<T: StatementTransport, A: AuthProvider>(
                 {
                     return match machine.complete_early() {
                         Ok(mut done) => {
+                            guard.finish();
                             notify(
                                 &mut observer,
                                 DriverEvent::Completed {
@@ -1229,13 +1236,24 @@ async fn drive_guarded<T: StatementTransport, A: AuthProvider>(
 }
 
 /// Owns a running statement's handle while the driver drives it. Dropped
-/// before [`DropGuard::disarm`] (the driver future itself was dropped
+/// before [`DropGuard::settle`] (the driver future itself was dropped
 /// mid-flight), it asks the transport to cancel the statement; every path the
 /// driver returns through leaves the statement terminal or already cancelled
-/// and disarms it first.
+/// and settles it first.
+///
+/// The handle is also an Asupersync [`ObligationKind::Lease`] held by the
+/// driving task, so the runtime sees every accepted statement resolved:
+/// committed once it ended server-side, aborted with
+/// [`ObligationAbortReason::Cancel`] when the driver cancelled it or was
+/// dropped (the remote cancel is then in flight), and with
+/// [`ObligationAbortReason::Error`] when a local failure abandoned it behind a
+/// best-effort cancel. A statement left neither way is a leaked lease, which
+/// the lab runtime's obligation oracle reports. A `Cx` built without a runtime
+/// (tests, request-scoped contexts) holds no lease; the guard still cancels.
 struct DropGuard<'t, T: StatementTransport> {
     transport: &'t T,
     armed: Option<(AuthorizationDescriptor, StatementHandle)>,
+    lease: Option<ObligationToken>,
 }
 
 impl<'t, T: StatementTransport> DropGuard<'t, T> {
@@ -1243,17 +1261,27 @@ impl<'t, T: StatementTransport> DropGuard<'t, T> {
         Self {
             transport,
             armed: None,
+            lease: None,
         }
     }
 
-    /// Hold the statement's handle when it is still running.
-    fn arm(&mut self, auth: &AuthorizationDescriptor, progress: &Progress) {
+    /// Hold the statement's handle, and take its lease, when it is still
+    /// running. A refused lease (the region is closing) leaves the statement
+    /// guarded by the cancel alone: it runs already, and the next checkpoint
+    /// cancels it.
+    fn arm(&mut self, cx: &Cx, auth: &AuthorizationDescriptor, progress: &Progress) {
         self.armed = match progress {
             Progress::PollAgain(handle) | Progress::FetchPartition { handle, .. } => {
                 Some((auth.clone(), handle.clone()))
             }
             Progress::Complete(_) | Progress::TimedOut(_) | Progress::Failed(_) => None,
         };
+        if self.armed.is_some() {
+            self.lease = cx
+                .try_register_obligation_checked(ObligationKind::Lease, cx.task_id())
+                .ok()
+                .flatten();
+        }
     }
 
     /// Cancel with the latest bearer (a JWT is re-signed while polling).
@@ -1263,13 +1291,35 @@ impl<'t, T: StatementTransport> DropGuard<'t, T> {
         }
     }
 
-    fn disarm(&mut self) {
+    /// The statement ended server-side: nothing is left to cancel.
+    fn finish(&mut self) {
         self.armed = None;
+        if let Some(lease) = self.lease.take() {
+            let _ = lease.commit();
+        }
+    }
+
+    /// The driver returned `outcome`. A lease still held means it gave up on a
+    /// live handle, and its remote cancel was already sent.
+    fn settle(&mut self, outcome: &StatementOutcome) {
+        self.armed = None;
+        if let Some(lease) = self.lease.take() {
+            let _ = match outcome {
+                SnowflakeOutcome::Ok(_) => lease.commit(),
+                SnowflakeOutcome::Cancelled(_) => lease.abort(ObligationAbortReason::Cancel),
+                SnowflakeOutcome::Err(_) | SnowflakeOutcome::Panicked(_) => {
+                    lease.abort(ObligationAbortReason::Error)
+                }
+            };
+        }
     }
 }
 
 impl<T: StatementTransport> Drop for DropGuard<'_, T> {
     fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            let _ = lease.abort(ObligationAbortReason::Cancel);
+        }
         if let Some((auth, handle)) = self.armed.take() {
             self.transport.cancel_on_drop(auth, handle);
         }
@@ -1499,6 +1549,9 @@ const fn response_class(status: StatusClass) -> ResponseClass {
 mod tests {
     use super::*;
     use crate::response::QueryFailureStatus;
+    use asupersync::lab::runtime::InvariantViolation;
+    use asupersync::lab::{LabConfig, LabRuntime};
+    use asupersync::trace::{TraceData, TraceEventKind};
     use asupersync::{Budget, CancelKind, PanicPayload, Time};
     use franken_snowflake_core::outcome::{OutcomeKind, SnowflakeOutcomeExt};
     use franken_snowflake_http::{
@@ -3190,6 +3243,307 @@ mod tests {
                 assert!(transport.dropped_cancels.borrow().is_empty());
             }
         });
+    }
+
+    /// What the lab runtime saw of one task's statement leases.
+    #[derive(Debug)]
+    struct LabRun {
+        /// The runtime's invariant violations (the obligation-leak oracle
+        /// among them).
+        violations: Vec<InvariantViolation>,
+        /// Leases reserved.
+        reserved: usize,
+        /// Each resolution in trace order: the event and, for an abort, why.
+        resolved: Vec<(TraceEventKind, Option<ObligationAbortReason>)>,
+        /// Nothing left to run and no obligation pending.
+        quiescent: bool,
+        /// Obligations the runtime itself marked leaked.
+        leaks: u64,
+        /// The run report's oracle failures.
+        oracle_failures: Vec<String>,
+    }
+
+    /// Run `body` as a scheduled task of a lab runtime that collects obligation
+    /// leaks instead of panicking, then return its result and what the runtime
+    /// saw. `body` drives the statement future by hand, inside the task, so
+    /// the task is the lease's real holder. A pending lease keeps the lab from
+    /// quiescing, so the run is bounded. The result travels through a slot:
+    /// a task whose own `Cx` was cancelled joins as cancelled.
+    fn in_lab_task<R: Send + 'static>(body: impl FnOnce(&Cx) -> R + Send + 'static) -> (R, LabRun) {
+        let mut lab = LabRuntime::new(LabConfig::new(0x0045).panic_on_leak(false).max_steps(1_000));
+        let root = lab.state.create_root_region(Budget::INFINITE);
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let filled = std::sync::Arc::clone(&slot);
+        let (task, _handle) = lab
+            .state
+            .create_task(root, Budget::INFINITE, async move {
+                let cx = Cx::current().expect("a lab task has a runtime context");
+                let result = body(&cx);
+                *filled.lock().expect("the slot is not poisoned") = Some(result);
+            })
+            .expect("the lab admits the task");
+        lab.scheduler.lock().schedule(task, 0);
+        let report = lab.run_until_quiescent_with_report();
+        let quiescent = lab.is_quiescent();
+        let result = slot
+            .lock()
+            .expect("the slot is not poisoned")
+            .take()
+            .expect("the task ran to its end");
+        let violations = lab.check_invariants();
+        let mut reserved = 0;
+        let mut resolved = Vec::new();
+        for event in lab.trace().snapshot() {
+            if let TraceData::Obligation {
+                kind: ObligationKind::Lease,
+                abort_reason,
+                ..
+            } = event.data
+            {
+                if event.kind == TraceEventKind::ObligationReserve {
+                    reserved += 1;
+                } else {
+                    resolved.push((event.kind, abort_reason));
+                }
+            }
+        }
+        let run = LabRun {
+            violations,
+            reserved,
+            resolved,
+            quiescent,
+            leaks: lab.state.leak_count(),
+            oracle_failures: report
+                .oracle_report
+                .failures()
+                .iter()
+                .map(|failure| format!("{}: {:?}", failure.invariant, failure.violation))
+                .collect(),
+        };
+        (result, run)
+    }
+
+    /// No leak, nothing pending, and the leases resolved exactly as `resolved`.
+    fn assert_resolved(run: &LabRun, resolved: &[(TraceEventKind, Option<ObligationAbortReason>)]) {
+        assert!(run.violations.is_empty(), "{run:?}");
+        assert!(run.oracle_failures.is_empty(), "{run:?}");
+        assert_eq!(run.leaks, 0, "{run:?}");
+        assert!(run.quiescent, "{run:?}");
+        assert_eq!(run.reserved, resolved.len(), "{run:?}");
+        assert_eq!(run.resolved, resolved, "{run:?}");
+    }
+
+    /// Poll `future` once, by hand (the driver future is not `Send`, so a lab
+    /// task cannot hold it across an await).
+    fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+        future.poll(&mut Context::from_waker(std::task::Waker::noop()))
+    }
+
+    /// Cancels the ambient `Cx` as soon as the statement is accepted.
+    struct CancelOnSubmit(Cx);
+
+    impl DriverObserver for CancelOnSubmit {
+        fn event(&mut self, event: DriverEvent) {
+            if matches!(event, DriverEvent::Submitted { running: true, .. }) {
+                self.0
+                    .cancel_with(CancelKind::User, Some("the caller gave up"));
+            }
+        }
+    }
+
+    /// Bead oj0.45: a running statement is an Asupersync lease its driving task
+    /// holds, and the lab runtime sees every one resolved: dropped mid-flight it
+    /// is aborted as cancelled while the remote cancel goes out; driven to its
+    /// end it is committed; abandoned after a transport error it is aborted as
+    /// an error; cancelled locally it is aborted as cancelled. The leak oracle
+    /// finds nothing in any of them.
+    #[test]
+    fn every_statement_lease_is_resolved_under_the_lab_obligation_oracle() {
+        use ObligationAbortReason::{Cancel, Error};
+        use TraceEventKind::{ObligationAbort, ObligationCommit};
+        const FIRST: &str = "01b2c3d4-0000-0000-0000-0000000000a1";
+        const SECOND: &str = "01b2c3d4-0000-0000-0000-0000000000a2";
+
+        let (dropped, run) = in_lab_task(|cx| {
+            let transport =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            {
+                let running = std::pin::pin!(run_statement_with_stats(
+                    cx,
+                    &transport,
+                    fake_auth(),
+                    SubmitStatementRequest::new("select 1"),
+                    SubmitQueryParams::default(),
+                    PollPlan::default(),
+                ));
+                assert!(poll_once(running).is_pending(), "the statement runs");
+            } // dropped here, mid-flight
+            transport.dropped_cancels.take()
+        });
+        assert_eq!(dropped, [fixture_handle()]);
+        assert_resolved(&run, &[(ObligationAbort, Some(Cancel))]);
+
+        let (polled, run) = in_lab_task(|cx| {
+            let transport = FakeTransport::new(Scripted::Ok(
+                StatusClass::Completed,
+                multi_parent(&[FIRST, SECOND]),
+            ));
+            *transport.polls.borrow_mut() = vec![
+                one_value_result(FIRST, "first"),
+                one_value_result(SECOND, "second"),
+            ];
+            let mut auth = fake_auth();
+            let running = std::pin::pin!(run_multi_statement_hooked(
+                cx,
+                &transport,
+                &mut auth,
+                SubmitStatementRequest::new("select 'first'; select 'second'"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5),
+                None,
+            ));
+            let Poll::Ready((outcome, _)) = poll_once(running) else {
+                panic!("both statements were already complete");
+            };
+            assert!(matches!(outcome, SnowflakeOutcome::Ok(_)), "{outcome:?}");
+            assert!(transport.dropped_cancels.borrow().is_empty());
+            transport.polled.take()
+        });
+        assert_eq!(polled, [FIRST, SECOND]);
+        assert_resolved(&run, &[(ObligationCommit, None), (ObligationCommit, None)]);
+
+        let (abandoned, run) = in_lab_task(|cx| {
+            let transport =
+                FakeTransport::new(Scripted::Ok(StatusClass::Completed, multi_parent(&[FIRST])));
+            *transport.polls.borrow_mut() = vec![Scripted::Err];
+            let mut auth = fake_auth();
+            let running = std::pin::pin!(run_multi_statement_hooked(
+                cx,
+                &transport,
+                &mut auth,
+                SubmitStatementRequest::new("select 'first'; select 'second'"),
+                SubmitQueryParams::default(),
+                fast_poll_plan(5),
+                None,
+            ));
+            let Poll::Ready((outcome, _)) = poll_once(running) else {
+                panic!("the failed poll ends the request");
+            };
+            assert!(matches!(outcome, SnowflakeOutcome::Err(_)), "{outcome:?}");
+            transport.orphan_cancels.take()
+        });
+        assert_eq!(abandoned, [StatementHandle::new(FIRST)]);
+        assert_resolved(&run, &[(ObligationAbort, Some(Error))]);
+
+        let (cancelled, run) = in_lab_task(|cx| {
+            let transport =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            let mut auth = fake_auth();
+            let mut observer = CancelOnSubmit(cx.clone());
+            let running = std::pin::pin!(run_statement_hooked(
+                cx,
+                &transport,
+                &mut auth,
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                PollPlan::default(),
+                StatementHooks {
+                    sink: None,
+                    observer: Some(&mut observer),
+                },
+            ));
+            let Poll::Ready((outcome, _)) = poll_once(running) else {
+                panic!("a cancelled statement ends at its next checkpoint");
+            };
+            assert!(
+                matches!(outcome, SnowflakeOutcome::Cancelled(_)),
+                "{outcome:?}"
+            );
+            transport.cancels_after_local.take()
+        });
+        assert_eq!(cancelled, [(fixture_handle(), CancelKind::User)]);
+        assert_resolved(&run, &[(ObligationAbort, Some(Cancel))]);
+    }
+
+    /// The oracle has teeth: a driver future that is never dropped (so its
+    /// guard never runs) leaves its statement's lease unresolved when the
+    /// holding task ends, and the runtime reports exactly that lease leaked.
+    #[test]
+    fn a_statement_whose_driver_is_leaked_is_reported_as_a_leaked_lease() {
+        let (dropped, run) = in_lab_task(|cx| {
+            let transport =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            let mut running = Box::pin(run_statement_with_stats(
+                cx,
+                &transport,
+                fake_auth(),
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                PollPlan::default(),
+            ));
+            assert!(
+                poll_once(running.as_mut()).is_pending(),
+                "the statement runs"
+            );
+            std::mem::forget(running);
+            transport.dropped_cancels.take()
+        });
+        assert!(dropped.is_empty(), "the guard never ran");
+        assert_eq!(run.reserved, 1, "{run:?}");
+        assert_eq!(
+            run.resolved,
+            [(TraceEventKind::ObligationLeak, None)],
+            "{run:?}"
+        );
+        assert_eq!(run.leaks, 1, "{run:?}");
+        assert_eq!(run.oracle_failures.len(), 1, "{run:?}");
+    }
+
+    /// The CLI drives statements from `block_on` on a current-thread runtime,
+    /// whose root task holds real leases: a dropped driver resolves its lease,
+    /// and a leaked one trips the runtime's production leak response (panic).
+    #[test]
+    fn the_cli_runtime_flavor_tracks_statement_leases() {
+        fn drive(leak: bool) -> Vec<StatementHandle> {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("the runtime starts");
+            runtime.block_on(async move {
+                let cx = Cx::current().expect("block_on installs a context");
+                let transport =
+                    FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+                let mut running = Box::pin(run_statement_with_stats(
+                    &cx,
+                    &transport,
+                    fake_auth(),
+                    SubmitStatementRequest::new("select 1"),
+                    SubmitQueryParams::default(),
+                    PollPlan::default(),
+                ));
+                assert!(
+                    poll_once(running.as_mut()).is_pending(),
+                    "the statement runs"
+                );
+                if leak {
+                    std::mem::forget(running);
+                } else {
+                    drop(running);
+                }
+                transport.dropped_cancels.take()
+            })
+        }
+        assert_eq!(drive(false), [fixture_handle()]);
+        let payload = std::panic::catch_unwind(|| drive(true))
+            .expect_err("the runtime refuses to retire a task holding a lease");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            message.starts_with("obligation leak:") && message.contains(" Lease holder="),
+            "{message}"
+        );
     }
 
     #[test]

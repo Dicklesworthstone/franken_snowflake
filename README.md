@@ -174,7 +174,12 @@ process killed with SIGKILL still leaves
 it to the server timeout. A running statement is also held by a drop guard: if
 the driver's future is dropped mid-flight (a library caller abandons it, a panic
 unwinds through it), the remote cancel is still sent, from a thread and runtime
-of its own, and the binary waits up to 10 s for it before exiting. Not yet wired:
+of its own, and the binary waits up to 10 s for it before exiting. The running
+statement is also an Asupersync `Lease` obligation held by the task that drives
+it: committed when the statement ends, aborted as cancelled when it is cancelled
+or dropped, aborted as an error when a local failure abandons it. A lab-runtime
+test checks all four endings under the obligation-leak oracle, and a driver
+leaked without being dropped trips the runtime's leak check. Not yet wired:
 capability-row narrowing. The testkit explores a model of the driver's
 cancel and retry interleavings with DPOR.
 
