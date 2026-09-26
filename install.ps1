@@ -392,6 +392,9 @@ function Expand-Artifact {
 function Install-FromArtifact {
     param([string]$Archive, [string]$TarName)
     Test-Checksum -File $Archive -TarName $TarName
+    # Releases publish no signature yet, and this installer verifies none: say
+    # so rather than leave the checksum looking like a signature check.
+    Write-Warn 'Signature not verified: only the SHA-256 checksum was checked'
     Expand-Artifact -Archive $Archive
 
     $bin = Join-Path $script:Tmp "$BinaryName.exe"

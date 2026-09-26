@@ -566,21 +566,30 @@ verify_checksum() {
   fi
 }
 
-# ── Sigstore verification (best-effort; soft-skip without cosign) ───────────
+# ── Signature verification (Sigstore bundle, when one is published) ─────────
+# Always say what was verified: a release without a published signature, or a
+# host without cosign, leaves only the SHA-256 checksum verified.
 verify_sigstore() {
   local file="$1" tarname="$2"
-  command -v cosign >/dev/null 2>&1 || return 0
+  if [ -z "$VERSION" ]; then
+    warn "Signature not verified: no release version to fetch a signature for"
+    return 0
+  fi
   local bundle="$TMP/${tarname}.sigstore"
   local bundle_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${tarname}.sigstore"
-  if curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 15 --max-time 45 "$bundle_url" -o "$bundle" 2>/dev/null; then
-    info "Verifying Sigstore bundle"
-    if cosign verify-blob --bundle "$bundle" "$file" >/dev/null 2>&1; then
-      ok "Sigstore signature verified"
-    else
-      err "Sigstore verification FAILED for ${tarname}"; exit 1
-    fi
+  if ! curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 15 --max-time 45 "$bundle_url" -o "$bundle" 2>/dev/null; then
+    warn "Signature not verified: ${VERSION} publishes no signature (only the SHA-256 checksum was checked)"
+    return 0
+  fi
+  if ! command -v cosign >/dev/null 2>&1; then
+    warn "Signature not verified: a Sigstore bundle is published but cosign is not installed"
+    return 0
+  fi
+  info "Verifying Sigstore bundle"
+  if cosign verify-blob --bundle "$bundle" "$file" >/dev/null 2>&1; then
+    ok "Sigstore signature verified"
   else
-    info "No Sigstore bundle published; skipping signature verification"
+    err "Sigstore verification FAILED for ${tarname}"; exit 1
   fi
 }
 

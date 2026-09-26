@@ -305,7 +305,7 @@ To build the live-capable binary from source in one shot, pass both
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_snowflake/main/install.sh | bash -s -- --from-source --live
 ```
 
-> `--from-source` builds from a fresh standalone clone: the FrankenSuite
+> `--from-source` builds from a fresh standalone clone: the FrankenSuite <!-- claim:fresh-clone-source-build -->
 > dependencies resolve from crates.io, so no local sibling checkout is required.
 
 On Windows the `irm ... | iex` one-liner cannot forward arguments, so download

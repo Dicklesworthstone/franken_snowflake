@@ -202,3 +202,11 @@ evidence = [
   "test:franken-snowflake-sqlapi::opt_in_live_sql_api_proof_lanes",
   "test:franken-snowflake-cli::cli_live_proof_end_to_end",
 ]
+
+[[claim]]
+id = "fresh-clone-source-build"
+heading = "PowerShell (Windows)"
+text = "`--from-source` builds from a fresh standalone clone: the FrankenSuite"
+evidence = ["manual:clean rust:latest container with no local checkout; install.sh --from-source --live --dest /tmp/fsnow --verify cloned tag v0.0.5 and built it (2m39s); selftest and the capabilities smoke passed; capabilities: version 0.0.5, git_sha 07ef0af, dirty false, profile release, live true, testkit false"]
+date = "2026-09-26"
+max_age_days = 90

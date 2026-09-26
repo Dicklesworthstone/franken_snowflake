@@ -54,6 +54,86 @@ requiring live Snowflake credentials.
   TUI, export, frame materialization, graph, and Frankensearch helpers stay
   feature-gated or opt-in according to `AGENTS.md`.
 
+### v0.0.4 release record (backfilled 2026-09-26)
+
+No record was written when v0.0.4 shipped; this one is reconstructed from dsr's
+own state and says what was never captured.
+
+- Source: tag `v0.0.4` at `edd80c7` (the dsr manifest's `source.git_sha`).
+- Build: `dsr build franken_snowflake` run `dd041529-ef5c-4620-8a5e-cfc1b7de2c3e`,
+  2026-09-12T03:10:41Z, 4005 s, 6/6 targets succeeded, dsr method `native` for
+  each: Linux x86_64 and aarch64 on trj (149 s, 150 s), macOS arm64 and x86_64
+  on mmini (1612 s, 536 s), Windows x86_64 and aarch64 on wlap (762 s, 746 s).
+  Manifest `franken_snowflake-v0.0.4-manifest.json`, SHA-256 `809b5cca...`.
+- Artifacts: six archives with SHA-256 in the manifest, all `signed: false`.
+- Never recorded: which proof lanes ran against `edd80c7`, which artifacts were
+  executed where, and any installer smoke. `aarch64-pc-windows-msvc` was
+  linked, not executed.
+- Shipped defects found by the 2026-09-23 audit: `mcp serve --http` was
+  exploitable cross-origin (fixed in v0.0.5); the Parquet export truncated
+  scaled `NUMBER`s, saturated large ones and mistyped timestamps (fixed after
+  v0.0.5); README claims had outlived their evidence.
+
+## Release Gates (every release)
+
+A release is cut only when every gate below has passed on the release commit,
+and its release record (template below) cites a receipt for each. A gate that
+cannot run is recorded as not run, with the reason; it is never skipped silently.
+
+1. Claims ledger: `python3 scripts/check-claims.py --self-test` and
+   `python3 scripts/check-claims.py` (`docs/claims.toml`), with
+   `--release-sha <sha>` once the README carries live claims.
+2. "Required Local Proof" below, every lane.
+3. Socket e2e: `scripts/e2e/socket_e2e.sh`; cite its `summary.json`.
+4. Security suite: the tests that pin the v0.0.5 fixes, all inside the lanes
+   above; the record names the lane that ran them:
+   `http_transport_refuses_the_cross_origin_exploit_and_requires_the_token`,
+   `http_without_a_token_refuses_to_start`, `missing_or_wrong_token_is_401`,
+   `foreign_origin_is_refused_even_with_a_valid_token` (MCP over HTTP);
+   `sandbox_refuses_absolute_parent_and_empty_paths` (export paths);
+   `read_guard_handles_nested_block_comments_fail_closed`,
+   `read_guard_closes_the_dollar_quote_bypass_and_side_effects` (read guard);
+   `confirmation_tokens_are_random_bound_and_expiring`,
+   `a_mismatched_confirm_token_is_refused_in_the_default_mode` (write ladder);
+   `secret_sql_literals_never_leave_the_process` (redaction);
+   `no_crate_derives_debug_over_a_credential` (Debug leak gate);
+   `workload_identity_lane_is_refused_before_any_request` (quarantined lane).
+5. `dsr quality franken_snowflake` and the cross-OS test runs of "Required
+   Cross-Platform Proof" (Linux, macOS, Windows).
+6. Live battery (`scripts/live-proof-cli.sh`) passed within 14 days on the
+   release build's sha, recorded in `docs/live_proof_state.json`. Until
+   credentials exist no release can run it: the release notes say so, and the
+   README carries no `live:` claim (the claims ledger enforces that part).
+7. Fresh-clone source build: in a container with no local checkout,
+   `install.sh --from-source --live --dest <tmp> --verify`, and `capabilities`
+   reports the release version and build sha.
+8. Artifacts executed on each target's platform; `aarch64-pc-windows-msvc`
+   stays "linked, not executed" until an ARM Windows host exists.
+9. Signatures: the record states whether the artifacts are signed. They are
+   not yet: dsr signing (minisign, `dsr signing init`) needs an operator-held
+   key, and none exists. `install.sh` verifies a Sigstore bundle only when one
+   is published and `cosign` is installed, and otherwise says the signature
+   was not verified; `install.ps1` always says so.
+
+Release record template:
+
+```text
+### vX.Y.Z release record (YYYY-MM-DD)
+- Operator go-ahead: <quote, date>
+- Source: tag vX.Y.Z at <sha>
+- Claims ledger: <check-claims.py summary line>
+- Local proof: <receipt per lane>
+- Socket e2e: <summary.json>
+- Security suite: <lane that ran each named test>
+- dsr quality: <receipt>; cross-OS tests: <host: result>
+- Live battery: <step dates on this sha> | not run: <reason>
+- Fresh-clone build: <log, version, build sha>
+- Build: dsr run <id>, manifest SHA-256, host per target
+- Artifacts executed: <per target>
+- Signatures: <how signed> | unsigned: <reason>
+- Release: dsr release ... ; dsr release verify
+```
+
 ## Required Local Proof
 
 Run these from the workspace root:
@@ -387,3 +467,5 @@ with one inside the repository.
 4. Tag the release and build release artifacts from the clean tag.
 5. Publish checksums and install smoke-test the artifact in a clean environment.
 6. Update `CHANGELOG.md` with the tag date, commit range, and proof evidence.
+7. Write the release record ("Release Gates" template) under "Current Release
+   State".
