@@ -42,6 +42,14 @@ const HEADER_TOKEN_TYPE: &str = "X-Snowflake-Authorization-Token-Type";
 const HEADER_CONTENT_TYPE: &str = "Content-Type";
 const HEADER_ACCEPT: &str = "Accept";
 const HEADER_ACCEPT_ENCODING: &str = "Accept-Encoding";
+const HEADER_USER_AGENT: &str = "User-Agent";
+/// The `User-Agent` every request carries. The SQL API reference lists the
+/// header as required ("the name and version of your application", RFC 7231
+/// product syntax; "Request headers for all operations", consulted 2026-09-26:
+/// <https://docs.snowflake.com/en/developer-guide/sql-api/reference>). Without
+/// it, the CA-bundle transport sent none and the pooled client sent its own
+/// `asupersync/<version>`.
+pub const USER_AGENT: &str = concat!("franken-snowflake/", env!("CARGO_PKG_VERSION"));
 const HEADER_CONTENT_ENCODING: &str = "Content-Encoding";
 const JSON_MEDIA_TYPE: &str = "application/json";
 const PARTITION_ACCEPT_ENCODING: &str = "gzip, identity";
@@ -740,6 +748,7 @@ impl<H: RawHttp> SnowflakeHttpClient<H> {
 
         let mut headers = auth.wire_headers()?;
         headers.push(Header::new(HEADER_ACCEPT, JSON_MEDIA_TYPE)?);
+        headers.push(Header::new(HEADER_USER_AGENT, USER_AGENT)?);
         if matches!(route_kind, TransportRouteKind::Partition) {
             headers.push(Header::new(
                 HEADER_ACCEPT_ENCODING,
@@ -3146,6 +3155,49 @@ mod tests {
         assert_eq!(plan.method, Method::Post);
         assert!(plan.headers.iter().any(|h| h.name == HEADER_ACCEPT));
         assert!(plan.headers.iter().any(|h| h.name == HEADER_CONTENT_TYPE));
+        Ok(())
+    }
+
+    /// Every route names the application once, the way the SQL API requires.
+    /// The raw transport receives the header too, so the CA-bundle path (which
+    /// adds no default of its own) sends it.
+    #[test]
+    fn every_route_names_the_application_in_user_agent() -> Result<(), String> {
+        let client = SnowflakeHttpClient::new(
+            TransportConfig::new(endpoint()),
+            AsupersyncHttpClient::new(),
+        );
+        let handle = StatementHandle::new("stmt-1");
+        let routes = [
+            TransportRoute::Submit,
+            TransportRoute::Poll {
+                handle: handle.clone(),
+            },
+            TransportRoute::Partition {
+                handle: handle.clone(),
+                partition: 1,
+            },
+            TransportRoute::Cancel { handle },
+        ];
+        for route in routes {
+            let kind = route.kind();
+            let body = if kind.method() == Method::Post {
+                b"{}".to_vec()
+            } else {
+                Vec::new()
+            };
+            let wire = client
+                .wire_request(kind.method(), route, body, &auth(), false)
+                .map_err(|error| format!("{kind:?}: {error}"))?;
+            let agents: Vec<&str> = wire
+                .headers
+                .iter()
+                .filter(|header| header.name.eq_ignore_ascii_case("user-agent"))
+                .map(|header| header.value.as_str())
+                .collect();
+            assert_eq!(agents, [USER_AGENT], "{kind:?}");
+        }
+        assert_eq!(USER_AGENT, format!("franken-snowflake/{VERSION}"));
         Ok(())
     }
 

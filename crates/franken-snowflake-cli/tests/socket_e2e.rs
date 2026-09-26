@@ -598,6 +598,16 @@ fn query_run_polls_and_streams_gzip_partitions_over_tls() {
         submit.header("X-Snowflake-Authorization-Token-Type"),
         Some("PROGRAMMATIC_ACCESS_TOKEN")
     );
+    // The SQL API requires a User-Agent; this lane runs the CA-bundle
+    // transport, which adds none of its own. Every request carries ours.
+    for request in &seen {
+        assert!(
+            request
+                .header("User-Agent")
+                .is_some_and(|agent| agent.starts_with("franken-snowflake/")),
+            "{request:?}"
+        );
+    }
     assert!(submit.query("requestId").is_some(), "{}", submit.target);
     let body = submit.body_json();
     assert_eq!(body["statement"], sql);
