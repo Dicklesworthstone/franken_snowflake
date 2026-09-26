@@ -130,6 +130,11 @@ run output:
 - `python3 scripts/check-golden-lf.py`
 - `cargo test --workspace --locked` plus every optional feature lane listed
   above
+- `scripts/e2e/socket_e2e.sh`: the hermetic socket-level e2e (the real binary
+  over TLS to a loopback mock SQL API, every scenario of
+  `crates/franken-snowflake-cli/tests/socket_e2e.rs`); its run directory keeps
+  each scenario's requests, envelopes and store plus `summary.json`, and it
+  exits non-zero when a scenario fails
 
 The Linux lint lane must also pass:
 
@@ -175,6 +180,15 @@ path is unknown). The first two are covered since 2026-09-25 (Asupersync 0.5
 tree): socket e2e `ctrl_c_cancels_the_statement_in_flight_on_windows` raises a
 real console CTRL_C_EVENT (28/28 on wlap), and `cargo test -p
 franken-snowflake-cache --features frankensqlite` passes 29/29 there.
+
+2026-09-25, Asupersync 0.5 tree (b541d30 plus the socket e2e artifact
+harness), file SHA-256 verified on each host:
+
+| host | platform | ran | result |
+|---|---|---|---|
+| mmini | macOS 26.2 arm64 | `scripts/e2e/socket_e2e.sh`; `cargo test --workspace`; every feature lane above | all green (socket e2e 28/28, cache frankensqlite 29/29) |
+| wlap | Windows 10.0.26220 x64 | `cargo test --workspace`; cli `live,mcp,testkit-endpoint,frankenpandas`; cache `frankensqlite`; text-indexing `frankensearch`; tui | all green (socket e2e 28/28 incl. the Ctrl-C scenario) |
+| rch workers | Linux x64 | workspace default and `--all-features` tests, the cli lanes, clippy `-D warnings` both configurations; `scripts/e2e/socket_e2e.sh` as an rch job | all green (socket e2e 28/28) |
 
 ## Cross-Compile Status (2026-09-03, local, `--features live,mcp --locked`)
 

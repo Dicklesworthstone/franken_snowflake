@@ -124,6 +124,55 @@ struct MockServer {
     seen: Arc<Mutex<Vec<Seen>>>,
 }
 
+/// Keep what the mock saw with the scenario's evidence (see [`artifact_dir`]),
+/// bearer tokens replaced.
+impl Drop for MockServer {
+    fn drop(&mut self) {
+        let Some(dir) = artifact_dir() else {
+            return;
+        };
+        let lines: Vec<String> = self
+            .seen()
+            .iter()
+            .map(|seen| {
+                let headers: Vec<(String, String)> = seen
+                    .headers
+                    .iter()
+                    .map(|(name, value)| {
+                        let value = if name.eq_ignore_ascii_case("authorization") {
+                            "<redacted>".to_owned()
+                        } else {
+                            value.clone()
+                        };
+                        (name.clone(), value)
+                    })
+                    .collect();
+                serde_json::json!({
+                    "method": seen.method,
+                    "target": seen.target,
+                    "headers": headers,
+                    "body": String::from_utf8_lossy(&seen.body),
+                })
+                .to_string()
+            })
+            .collect();
+        let _ = fs::write(dir.join("requests.jsonl"), lines.join("\n") + "\n");
+    }
+}
+
+/// Where a run keeps each scenario's evidence (bead oj0.31): set by
+/// `scripts/e2e/socket_e2e.sh` through `FSNOW_E2E_ARTIFACTS_DIR`, one
+/// directory per test (the test thread carries its name). Unset, nothing is
+/// kept.
+fn artifact_dir() -> Option<PathBuf> {
+    let root = std::env::var_os("FSNOW_E2E_ARTIFACTS_DIR")?;
+    let current = std::thread::current();
+    let scenario = current.name().unwrap_or("unnamed").replace("::", "-");
+    let dir = PathBuf::from(root).join("socket").join(scenario);
+    fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
 impl MockServer {
     fn start(
         cert: &TestCert,
@@ -353,6 +402,22 @@ impl Harness {
                 file.display()
             );
         }
+        if let Some(dir) = artifact_dir() {
+            let line = serde_json::json!({
+                "args": args,
+                "exit": output.status.code(),
+                "stdout": stdout,
+                "stderr": stderr,
+            });
+            let _ = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("runs.jsonl"))
+                .and_then(|mut file| {
+                    use std::io::Write as _;
+                    writeln!(file, "{line}")
+                });
+        }
         let envelope = serde_json::from_str(&stdout)
             .unwrap_or_else(|error| panic!("stdout is not JSON ({error}): {stdout}\n{stderr}"));
         Run {
@@ -365,6 +430,23 @@ impl Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
+        // With a run directory, the store the binary left is evidence: keep a
+        // copy, minus key material (the local write-confirmation key).
+        if let Some(dir) = artifact_dir() {
+            let store = self.dir.join("store");
+            for file in files_under(&store)
+                .into_iter()
+                .filter(|file| file.extension().is_none_or(|extension| extension != "key"))
+            {
+                if let Ok(relative) = file.strip_prefix(&store) {
+                    let target = dir.join("store").join(relative);
+                    if let Some(parent) = target.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let _ = fs::copy(&file, target);
+                }
+            }
+        }
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
