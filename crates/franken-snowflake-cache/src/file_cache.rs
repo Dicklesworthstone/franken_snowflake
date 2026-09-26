@@ -112,37 +112,59 @@ impl FileCache {
         self.skipped_lines.get()
     }
 
+    /// Replay every table log, in file order, into `target`: the one-shot
+    /// import of this store into another backend (the FrankenSQLite store,
+    /// reality-check bead oj0.40). Appends replay first-write-wins and upserts
+    /// replay in order, so the target then answers every lookup as this store
+    /// does, and a replay repeated after an interruption changes nothing.
+    /// Returns how many lines were not replayed (malformed, or refused by the
+    /// target).
+    ///
+    /// # Errors
+    /// An unreadable table log.
+    pub fn replay_into(&self, target: &dyn CacheBackend) -> CacheResult<u64> {
+        let before = self.skipped_lines.get();
+        let replayed = self.replay_logs(target);
+        let not_replayed = self.skipped_lines.get().saturating_sub(before);
+        self.skipped_lines.set(before);
+        replayed.map(|()| not_replayed)
+    }
+
     fn load_all(&self) -> CacheResult<()> {
+        self.replay_logs(&self.inner)
+    }
+
+    fn replay_logs(&self, target: &dyn CacheBackend) -> CacheResult<()> {
         self.load_table(Table::Profiles, |record: ProfileRecord| {
-            self.inner.upsert_profile(record)
+            target.upsert_profile(record)
         })?;
         self.load_table(Table::CatalogSnapshots, |record: CatalogSnapshotRecord| {
-            self.inner.insert_catalog_snapshot(record)
+            target.insert_catalog_snapshot(record)
         })?;
         self.load_table(Table::DatasetManifests, |record: DatasetManifestRecord| {
-            self.inner.upsert_dataset_manifest(record)
+            target.upsert_dataset_manifest(record)
         })?;
         self.load_table(Table::QueryPlans, |record: QueryPlanRecord| {
-            self.inner.upsert_query_plan(record)
+            target.upsert_query_plan(record)
         })?;
         self.load_table(Table::QueryReceipts, |record: QueryReceiptRecord| {
-            self.inner.append_query_receipt(record)
+            target.append_query_receipt(record)
         })?;
         self.load_table(
             Table::PartitionMetadata,
-            |record: PartitionMetadataRecord| self.inner.append_partition_metadata(record),
+            |record: PartitionMetadataRecord| target.append_partition_metadata(record),
         )?;
         self.load_table(Table::Exports, |record: ExportRecord| {
-            self.inner.append_export(record)
+            target.append_export(record)
         })?;
         self.load_table(Table::CostHistory, |record: CostHistoryRecord| {
-            self.inner.append_cost_history(record)
+            target.append_cost_history(record)
         })?;
         self.load_table(Table::ReplayBundles, |record: OfflineReplayBundleRecord| {
-            self.inner.append_replay_bundle(record)
+            target.append_replay_bundle(record)
         })?;
         self.load_table(Table::AuditLog, |record: AuditEventRecord| {
-            self.inner.append_audit_event(record)
+            target.append_audit_event(record)
         })?;
         Ok(())
     }
@@ -404,6 +426,121 @@ mod tests {
             event_json: "{}".to_owned(),
             created_at_ms,
         }
+    }
+
+    /// One of every record the CLI writes, with a duplicate receipt id so
+    /// first-write-wins is part of what is compared.
+    #[cfg(feature = "frankensqlite")]
+    fn fill(backend: &dyn CacheBackend) -> CacheResult<()> {
+        backend.upsert_query_plan(QueryPlanRecord {
+            plan_id: "plan-a".to_owned(),
+            profile_id: "demo".to_owned(),
+            dataset_id: None,
+            mode: "raw_sql".to_owned(),
+            normalized_sql_hash: "hash-a".to_owned(),
+            normalized_sql_redacted: "select 1".to_owned(),
+            bindings_shape_json: "[]".to_owned(),
+            safety_class: "read".to_owned(),
+            estimated_row_limit: Some(10),
+            requires_export: false,
+            created_at_ms: 5,
+        })?;
+        backend.append_query_receipt(receipt("r1", "plan-a", "ok", 10))?;
+        backend.append_query_receipt(receipt("r2", "plan-a", "ok", 20))?;
+        backend.append_query_receipt(receipt("r1", "plan-a", "error", 30))?;
+        backend.append_partition_metadata(PartitionMetadataRecord {
+            receipt_id: "r1".to_owned(),
+            partition_index: 0,
+            row_count: 3,
+            compressed_bytes: Some(10),
+            uncompressed_bytes: Some(30),
+            payload_hash: Some("p0".to_owned()),
+            content_encoding: None,
+        })?;
+        backend.append_export(ExportRecord {
+            export_id: "x1".to_owned(),
+            receipt_id: "r1".to_owned(),
+            export_kind: crate::ExportKind::LocalCsv,
+            target_uri_redacted: "file:///tmp/out.csv".to_owned(),
+            content_address: ContentAddress::blake3(b"a,b\n"),
+            row_count: Some(1),
+            created_at_ms: 40,
+        })?;
+        for (id, schema, at) in [("s1", "PUBLIC", 50), ("s2", "ANALYTICS", 60)] {
+            backend.insert_catalog_snapshot(CatalogSnapshotRecord {
+                snapshot_id: id.to_owned(),
+                profile_id: "demo".to_owned(),
+                source_kind: "information_schema".to_owned(),
+                database_name: Some("DB".to_owned()),
+                schema_name: Some(schema.to_owned()),
+                captured_at_ms: at,
+                payload: payload(&format!("{{\"snapshot\":\"{id}\"}}")),
+            })?;
+        }
+        backend.upsert_dataset_manifest(DatasetManifestRecord {
+            dataset_id: "events".to_owned(),
+            profile_id: "demo".to_owned(),
+            snapshot_id: Some("s1".to_owned()),
+            database_name: "DB".to_owned(),
+            schema_name: "PUBLIC".to_owned(),
+            object_name: "EVENTS".to_owned(),
+            rights_class: "internal".to_owned(),
+            default_limit: 100,
+            max_rows_without_export: 1_000,
+            manifest: payload("{\"dataset\":\"events\"}"),
+            created_at_ms: 70,
+        })?;
+        backend.append_audit_event(audit("e2", 200))?;
+        backend.append_audit_event(audit("e1", 100))?;
+        Ok(())
+    }
+
+    /// Every lookup the CLI makes, as one comparable value.
+    #[cfg(feature = "frankensqlite")]
+    fn lookups(backend: &dyn CacheBackend) -> CacheResult<String> {
+        Ok(format!(
+            "{:?}",
+            (
+                backend.query_plan("plan-a")?,
+                backend.query_receipt("r1")?,
+                backend.latest_successful_receipt("plan-a")?,
+                backend.receipt_by_snowflake_query_id("demo", "qid-r2")?,
+                backend.partitions_for_receipt("r1")?,
+                backend.exports_for_receipt("r1")?,
+                backend.export("x1")?,
+                backend.latest_catalog_snapshot("demo", Some("DB"), None)?,
+                backend.catalog_snapshots("demo", None, None)?,
+                backend.dataset_manifest("events")?,
+                backend.dataset_ids()?,
+                backend.audit_events()?,
+            )
+        ))
+    }
+
+    /// Bead oj0.40: the file store and the FrankenSQLite store answer every
+    /// lookup alike for the same writes, and replaying a file store into an
+    /// empty FrankenSQLite store reproduces it (a second replay changes
+    /// nothing).
+    #[cfg(feature = "frankensqlite")]
+    #[test]
+    fn the_file_and_sqlite_stores_answer_alike_and_a_replay_reproduces_one() -> CacheResult<()> {
+        let dir = temp_dir("parity");
+        let file = FileCache::open(&dir)?;
+        let sqlite = crate::FrankenSqliteCache::open_memory()?;
+        fill(&file)?;
+        fill(&sqlite)?;
+        let expected = lookups(&file)?;
+        assert_eq!(lookups(&sqlite)?, expected);
+
+        let imported = crate::FrankenSqliteCache::open_memory()?;
+        assert_ne!(lookups(&imported)?, expected, "an empty store differs");
+        let reopened = FileCache::open(&dir)?;
+        assert_eq!(reopened.replay_into(&imported)?, 0);
+        assert_eq!(lookups(&imported)?, expected);
+        assert_eq!(reopened.replay_into(&imported)?, 0);
+        assert_eq!(lookups(&imported)?, expected);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[test]

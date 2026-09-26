@@ -4,7 +4,7 @@
 //! it reads the local store that `catalog scan` populates and the built-in
 //! operator catalog. The live build reuses the same renderers after a scan.
 
-use franken_snowflake_cache::{CacheBackend, CacheError, CatalogSnapshotRecord};
+use franken_snowflake_cache::{CacheError, CatalogSnapshotRecord};
 use franken_snowflake_catalog::diff::CatalogDiff;
 use franken_snowflake_catalog::model::{
     CatalogRelation, CatalogSnapshot, ColumnCatalogEntry, DatasetManifest, DtypeClass, FieldRole,

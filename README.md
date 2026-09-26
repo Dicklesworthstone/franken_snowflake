@@ -1029,8 +1029,9 @@ confirmation required, `FSNOW-3009` DDL not opted in) with an exact next command
   is refused, never rounded. Arrow IPC is not implemented locally, and large
   export uses Snowflake-side `COPY INTO`.
 - The local store is an append-only JSONL file store; the FrankenSQLite-backed
-  store exists in the cache crate behind its `frankensqlite` feature (built and
-  tested on Linux, macOS and Windows) but the CLI has no selector for it yet.
+  store is opt-in: a build with `--features sqlite-store` and
+  `FRANKEN_SNOWFLAKE_STORE=sqlite` uses it (built and tested on Linux, macOS and
+  Windows), importing the JSONL store in the same directory on first open.
 - The TUI is opt-in (`--features tui`): it browses the persisted snapshot and
   plans raw SQL through the shared planner. Submitting a planned query from
   inside the session executes through the live path when `--features live` is

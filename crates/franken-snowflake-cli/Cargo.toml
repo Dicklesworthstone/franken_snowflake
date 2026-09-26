@@ -47,6 +47,9 @@ frankenpandas = [
     "dep:franken-snowflake-frame",
     "franken-snowflake-frame/frankenpandas",
 ]
+# Opt-in FrankenSQLite local store, selected at run time with
+# FRANKEN_SNOWFLAKE_STORE=sqlite (the append-only JSONL store stays the default).
+sqlite-store = ["franken-snowflake-cache/frankensqlite"]
 # Opt-in text indexing contracts and Frankensearch hash+lexical indexing.
 frankensearch = [
     "dep:franken-snowflake-text-indexing",

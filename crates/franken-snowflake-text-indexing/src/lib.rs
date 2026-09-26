@@ -286,8 +286,6 @@ pub struct TextIndexingFeatureReport {
     pub schema_version: u16,
     /// Whether Frankensearch adapters are compiled in.
     pub frankensearch_enabled: bool,
-    /// Whether the rerank seam feature is compiled in.
-    pub rerank_feature_enabled: bool,
     /// Retrieval tiers allowed by this crate.
     pub allowed_tiers: Vec<TextRetrievalTier>,
 }
@@ -299,7 +297,6 @@ impl TextIndexingFeatureReport {
         Self {
             schema_version: TEXT_INDEX_SCHEMA_VERSION,
             frankensearch_enabled: cfg!(feature = "frankensearch"),
-            rerank_feature_enabled: cfg!(feature = "rerank"),
             allowed_tiers: vec![TextRetrievalTier::Hash, TextRetrievalTier::Lexical],
         }
     }
@@ -794,7 +791,6 @@ mod tests {
             report.frankensearch_enabled,
             cfg!(feature = "frankensearch")
         );
-        assert_eq!(report.rerank_feature_enabled, cfg!(feature = "rerank"));
     }
 
     #[test]

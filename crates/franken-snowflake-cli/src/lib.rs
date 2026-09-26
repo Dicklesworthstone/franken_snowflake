@@ -6262,6 +6262,7 @@ fn build_identity_json(exe_hash: bool) -> Json {
         ("toon", toon_output_available()),
         ("frankenpandas", cfg!(feature = "frankenpandas")),
         ("frankensearch", cfg!(feature = "frankensearch")),
+        ("sqlite-store", cfg!(feature = "sqlite-store")),
         ("testkit-endpoint", cfg!(feature = "testkit-endpoint")),
     ]
     .into_iter()
@@ -6324,6 +6325,7 @@ fn feature_flags_json() -> Json {
         ("toon", Json::Bool(toon_output_available())),
         ("frankenpandas", Json::Bool(cfg!(feature = "frankenpandas"))),
         ("frankensearch", Json::Bool(cfg!(feature = "frankensearch"))),
+        ("sqlite_store", Json::Bool(cfg!(feature = "sqlite-store"))),
     ])
 }
 
@@ -6591,7 +6593,6 @@ mod tests {
     /// Persist a small fixture snapshot (one dataset, three columns) into the
     /// per-process test store so dataset-mode commands can resolve it.
     fn seed_fixture_dataset(dataset_id: &str) -> Result<(), String> {
-        use franken_snowflake_cache::CacheBackend;
         use franken_snowflake_catalog::model::{
             CatalogSnapshot, ColumnCatalogEntry, DataSourceClass, DatasetField, DatasetKind,
             DatasetManifest, DtypeClass, FieldRole, Provenance, ProvenanceSource, RightsClass,
@@ -6868,6 +6869,7 @@ mod tests {
         expect("toon", cfg!(feature = "toon"));
         expect("frankenpandas", cfg!(feature = "frankenpandas"));
         expect("frankensearch", cfg!(feature = "frankensearch"));
+        expect("sqlite_store", cfg!(feature = "sqlite-store"));
     }
 
     // Regression for the short-alias surface: capabilities advertises the

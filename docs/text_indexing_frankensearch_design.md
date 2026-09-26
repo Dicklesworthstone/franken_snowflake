@@ -30,7 +30,7 @@ catalog-search path, never an initial retriever, and never enabled by default.
 |---|---:|---|---|
 | none | yes | `franken-snowflake-core`, `serde` | Stable text chunk, handle, rights, and reranker contracts only. |
 | `frankensearch` | no | `frankensearch` 0.6 with `default-features = false`, `features = ["hash", "lexical-tantivy"]` | Build/query adapters: `IndexBuilder` for the hash vector tiers, a Tantivy lexical arm the adapter writes, and `TwoTierSearcher` over both. |
-| `rerank` | no | none in this bead | Exposes the top-K policy seam. A future native reranker implementation may attach here after a separate forbidden-dependency proof. |
+| (no feature) | always | none | The top-K reranker seam (`TextReranker`, `NoopReranker`, `RerankPolicy`) is always compiled; a former empty `rerank` feature was removed (it compiled nothing). A future native reranker gets its own feature once it exists, after a separate forbidden-dependency proof. |
 
 The default workspace build excludes both Frankensearch and rerank. The
 feature-gated check lane is:

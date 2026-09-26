@@ -1393,6 +1393,63 @@ fn a_statement_past_its_timeout_is_cancelled_by_the_client() {
     );
 }
 
+/// Reality-check bead oj0.40: `FRANKEN_SNOWFLAKE_STORE=sqlite` imports the
+/// JSONL store on first open and then keeps new receipts in FrankenSQLite: a
+/// receipt written by the file store reads back through SQLite, and one
+/// written through SQLite is absent from the JSONL logs.
+#[cfg(feature = "sqlite-store")]
+#[test]
+fn the_sqlite_store_imports_the_file_store_and_keeps_new_receipts() {
+    const FIRST: &str = "01b2c3d4-0000-0000-0000-00000000f1d0";
+    let cert = TestCert::mint();
+    let server = MockServer::start(&cert, |request, _| {
+        if request.is_submit() {
+            return completed_single(FIRST);
+        }
+        not_found()
+    });
+    let h = Harness::new("sqlitestore", &cert);
+    let query = [
+        "query",
+        "run",
+        "--profile",
+        "sock",
+        "--sql",
+        "select 1",
+        "--json",
+    ];
+    let with_store = |store: &str, args: &[&str]| {
+        let output = h
+            .command(server.port, args)
+            .env("FRANKEN_SNOWFLAKE_STORE", store)
+            .output()
+            .expect("spawn");
+        h.finish(args, output)
+    };
+    let hash = |run: &Run| {
+        run.envelope["receipt_hash"]
+            .as_str()
+            .expect("receipt")
+            .to_owned()
+    };
+
+    let on_file = with_store("file", &query);
+    assert_eq!(on_file.exit, 0, "{}", on_file.context());
+    let first = hash(&on_file);
+    let shown = with_store("sqlite", &["receipt", "show", &first, "--json"]);
+    assert_eq!(shown.exit, 0, "imported: {}", shown.context());
+
+    let on_sqlite = with_store("sqlite", &query);
+    assert_eq!(on_sqlite.exit, 0, "{}", on_sqlite.context());
+    let second = hash(&on_sqlite);
+    assert_ne!(first, second);
+    let read_back = with_store("sqlite", &["receipt", "show", &second, "--json"]);
+    assert_eq!(read_back.exit, 0, "{}", read_back.context());
+    // Negative: the file store never saw the SQLite-era receipt.
+    let from_file = with_store("file", &["receipt", "show", &second, "--json"]);
+    assert_ne!(from_file.exit, 0, "{}", from_file.context());
+}
+
 /// Reality-check bead E3: a `SHOW WAREHOUSES` answer for the profile's warehouse.
 fn show_warehouses(handle: &str, state: &str) -> MockHttpResponse {
     result_set(

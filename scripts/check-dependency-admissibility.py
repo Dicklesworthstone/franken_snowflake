@@ -189,7 +189,7 @@ PRODUCTION_FEATURES = {
     "graph",
     "live",
     "mcp",
-    "rerank",
+    "sqlite-store",
     "toon",
     "tui",
 }
@@ -569,7 +569,10 @@ def run_self_test() -> None:
     )
 
     feature_packages: list[dict[str, object]] = [
-        {"name": "franken-snowflake-cli", "features": {"default": [], "toon": []}},
+        {
+            "name": "franken-snowflake-cli",
+            "features": {"default": [], "toon": [], "sqlite-store": []},
+        },
         {"name": "franken-snowflake-export", "features": {"export": []}},
         {"name": "franken-snowflake-frame", "features": {"frankenpandas": []}},
         {"name": "franken-snowflake-graph", "features": {"default": [], "graph": []}},
@@ -580,7 +583,7 @@ def run_self_test() -> None:
         {"name": "franken-snowflake-mcp", "features": {"mcp": []}},
         {
             "name": "franken-snowflake-text-indexing",
-            "features": {"frankensearch": [], "rerank": []},
+            "features": {"frankensearch": []},
         },
         {"name": "franken-snowflake-tui", "features": {"tui": []}},
     ]

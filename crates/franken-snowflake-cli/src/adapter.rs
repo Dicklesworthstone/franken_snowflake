@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use franken_snowflake_cache::{CacheBackend, ContentAddress, ExportKind, FileCache};
+use franken_snowflake_cache::{ContentAddress, ExportKind};
 use franken_snowflake_catalog::model::{
     CatalogSnapshot, DataSourceClass, DatasetManifest, DtypeClass, FieldRole, Provenance,
     RightsClass as CatalogRights,
@@ -60,10 +60,13 @@ impl LocalStoreAdapter {
     /// # Errors
     /// `CacheError` when no store can be opened.
     pub fn open_with_env(env: EnvLookup) -> Result<Self, SnowflakeError> {
-        let store = local_store::open_store().map_err(|error| {
-            SnowflakeError::new(SnowflakeErrorCode::CacheError, error.message())
+        let dir = local_store::data_dir().ok_or_else(|| {
+            SnowflakeError::new(
+                SnowflakeErrorCode::CacheError,
+                local_store::StoreError::NoDataDir.message(),
+            )
         })?;
-        Ok(Self { store, env })
+        Self::open_at(&dir, env)
     }
 
     /// The store in `dir` (what `FRANKEN_SNOWFLAKE_DATA_DIR` names for the
@@ -72,11 +75,10 @@ impl LocalStoreAdapter {
     /// # Errors
     /// `CacheError` when the store cannot be opened.
     pub fn open_at(dir: &Path, env: EnvLookup) -> Result<Self, SnowflakeError> {
-        let cache = FileCache::open(dir).map_err(cache_error)?;
-        let store = Store {
-            cache,
-            dir: dir.to_path_buf(),
-        };
+        // The same backend the CLI would open for these handles.
+        let store = local_store::StoreBackend::from_setting(env(local_store::STORE_ENV).as_deref())
+            .and_then(|backend| local_store::open_store_at(dir, backend))
+            .map_err(|error| cache_error(error.message()))?;
         Ok(Self { store, env })
     }
 

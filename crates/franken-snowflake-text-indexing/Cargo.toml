@@ -13,7 +13,6 @@ publish.workspace = true
 [features]
 default = []
 frankensearch = ["dep:frankensearch"]
-rerank = []
 
 [lints]
 workspace = true

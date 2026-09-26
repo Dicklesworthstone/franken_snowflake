@@ -2,11 +2,13 @@
 //! snapshots, and dataset manifests live between invocations.
 //!
 //! Backed by [`franken_snowflake_cache::FileCache`] under the platform data
-//! directory (`FRANKEN_SNOWFLAKE_DATA_DIR` overrides it). Every command that
-//! needs the store opens it lazily; a store that cannot be opened degrades to a
-//! typed warning or a `FSNOW-7001` error, never a fabricated result.
+//! directory (`FRANKEN_SNOWFLAKE_DATA_DIR` overrides it), or by FrankenSQLite
+//! with `FRANKEN_SNOWFLAKE_STORE=sqlite` (the `sqlite-store` build). Every
+//! command that needs the store opens it lazily; a store that cannot be opened
+//! degrades to a typed warning or a `FSNOW-7001` error, never a fabricated
+//! result.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(not(test))]
@@ -15,10 +17,61 @@ use franken_snowflake_cache::{
     AuditEventRecord, CacheBackend, CacheError, ContentAddress, DATA_DIR_ENV, FileCache,
 };
 
+/// `FRANKEN_SNOWFLAKE_STORE`: the local store backend, `file` (the default:
+/// append-only JSONL logs) or `sqlite` (FrankenSQLite, in a build with the
+/// `sqlite-store` feature). The first `sqlite` open imports the JSONL store
+/// in the same directory, once (reality-check bead oj0.40).
+pub const STORE_ENV: &str = "FRANKEN_SNOWFLAKE_STORE";
+/// The FrankenSQLite database file inside the data directory.
+#[cfg(feature = "sqlite-store")]
+pub const SQLITE_STORE_FILE: &str = "store.sqlite3";
+/// Written once the JSONL store was imported into the database.
+#[cfg(feature = "sqlite-store")]
+pub const SQLITE_IMPORT_MARKER: &str = "store.sqlite3.imported";
+
+/// Which local store backend a process uses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreBackend {
+    /// The append-only JSONL store.
+    File,
+    /// The FrankenSQLite store.
+    Sqlite,
+}
+
+impl StoreBackend {
+    /// The backend a `FRANKEN_SNOWFLAKE_STORE` value names (unset or empty:
+    /// the file store).
+    ///
+    /// # Errors
+    /// Any other value.
+    pub fn from_setting(value: Option<&str>) -> Result<Self, StoreError> {
+        match value.map(str::trim).filter(|value| !value.is_empty()) {
+            None | Some("file") => Ok(Self::File),
+            Some("sqlite") => Ok(Self::Sqlite),
+            Some(other) => Err(StoreError::Open(format!(
+                "{STORE_ENV} must be file or sqlite (got {other})"
+            ))),
+        }
+    }
+
+    /// The setting's spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Sqlite => "sqlite",
+        }
+    }
+}
+
 /// An opened local store plus the directory it lives in.
 pub struct Store {
-    /// The append-only file-backed cache.
-    pub cache: FileCache,
+    /// The store: the same repository contract whichever backend it is.
+    pub cache: Box<dyn CacheBackend>,
+    /// Which backend is open.
+    pub backend: StoreBackend,
+    /// Log lines the file store could not read on open (0 for SQLite).
+    pub skipped_lines: u64,
     /// Resolved data directory.
     pub dir: PathBuf,
 }
@@ -59,11 +112,68 @@ pub fn data_dir() -> Option<PathBuf> {
     }
 }
 
-/// Open the local store at the resolved data directory.
+/// Open the local store at the resolved data directory, with the backend
+/// `FRANKEN_SNOWFLAKE_STORE` names.
 pub fn open_store() -> Result<Store, StoreError> {
     let dir = data_dir().ok_or(StoreError::NoDataDir)?;
-    let cache = FileCache::open(&dir).map_err(|error| StoreError::Open(error.to_string()))?;
-    Ok(Store { cache, dir })
+    let backend = StoreBackend::from_setting(std::env::var(STORE_ENV).ok().as_deref())?;
+    open_store_at(&dir, backend)
+}
+
+/// Open the store in `dir` with `backend`.
+pub fn open_store_at(dir: &Path, backend: StoreBackend) -> Result<Store, StoreError> {
+    match backend {
+        StoreBackend::File => {
+            let cache = FileCache::open(dir).map_err(open_error)?;
+            Ok(Store {
+                skipped_lines: cache.skipped_lines(),
+                cache: Box::new(cache),
+                backend,
+                dir: dir.to_path_buf(),
+            })
+        }
+        StoreBackend::Sqlite => open_sqlite(dir),
+    }
+}
+
+fn open_error(error: impl std::fmt::Display) -> StoreError {
+    StoreError::Open(error.to_string())
+}
+
+/// The FrankenSQLite store in `dir`. Its first open replays the JSONL store
+/// found there into the database (idempotent, so an import interrupted before
+/// its marker is written is simply redone).
+#[cfg(feature = "sqlite-store")]
+fn open_sqlite(dir: &Path) -> Result<Store, StoreError> {
+    std::fs::create_dir_all(dir)
+        .map_err(|error| StoreError::Open(format!("create {}: {error}", dir.display())))?;
+    let database = dir.join(SQLITE_STORE_FILE);
+    let cache = franken_snowflake_cache::FrankenSqliteCache::open_file(database.to_string_lossy())
+        .map_err(open_error)?;
+    let marker = dir.join(SQLITE_IMPORT_MARKER);
+    if !marker.exists() {
+        let not_replayed = FileCache::open(dir)
+            .and_then(|file| file.replay_into(&cache))
+            .map_err(open_error)?;
+        std::fs::write(
+            &marker,
+            format!("{{\"imported_from\":\"jsonl\",\"lines_not_replayed\":{not_replayed}}}\n"),
+        )
+        .map_err(|error| StoreError::Open(format!("write {}: {error}", marker.display())))?;
+    }
+    Ok(Store {
+        cache: Box::new(cache),
+        backend: StoreBackend::Sqlite,
+        skipped_lines: 0,
+        dir: dir.to_path_buf(),
+    })
+}
+
+#[cfg(not(feature = "sqlite-store"))]
+fn open_sqlite(_dir: &Path) -> Result<Store, StoreError> {
+    Err(StoreError::Open(format!(
+        "{STORE_ENV}=sqlite needs a build with the sqlite-store feature"
+    )))
 }
 
 /// Milliseconds since the Unix epoch (0 if the clock is before the epoch).
@@ -610,7 +720,9 @@ mod tests {
             now_unix_ms()
         ));
         let store = Store {
-            cache: FileCache::open(&dir)?,
+            cache: Box::new(FileCache::open(&dir)?),
+            backend: StoreBackend::File,
+            skipped_lines: 0,
             dir: dir.clone(),
         };
         let partitions = [
@@ -732,7 +844,9 @@ mod tests {
             now_unix_ms()
         ));
         let store = Store {
-            cache: FileCache::open(&dir)?,
+            cache: Box::new(FileCache::open(&dir)?),
+            backend: StoreBackend::File,
+            skipped_lines: 0,
             dir: dir.clone(),
         };
         let a = random_id()?;

@@ -291,7 +291,7 @@ pub fn build_snapshot_from_information_schema(
 
 /// Persist a snapshot and every dataset manifest through the local cache
 /// repository contract.
-pub fn persist_snapshot<B: CacheBackend>(
+pub fn persist_snapshot<B: CacheBackend + ?Sized>(
     cache: &B,
     input: &CatalogDiscoveryInput,
     snapshot: &CatalogSnapshot,

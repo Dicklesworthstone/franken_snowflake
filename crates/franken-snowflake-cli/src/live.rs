@@ -36,7 +36,7 @@ use franken_snowflake_auth::{
     ReauthDecision, SecretSource, SnowflakeAuth,
 };
 use franken_snowflake_cache::{
-    CacheBackend, CatalogSnapshotRecord, ContentAddress as CacheAddress, ExportKind, ExportRecord,
+    CatalogSnapshotRecord, ContentAddress as CacheAddress, ExportKind, ExportRecord,
     QueryReceiptRecord, VerifiedPayload,
 };
 use franken_snowflake_catalog::discovery::{
@@ -1232,7 +1232,7 @@ fn scan_catalog(
                 Some(prev) => franken_snowflake_catalog::diff::diff_snapshots(prev, &snapshot),
                 None => franken_snowflake_catalog::diff::CatalogDiff::initial_scan(&snapshot),
             };
-            let dir = match persist_snapshot(&store.cache, &input, &snapshot, now_ms) {
+            let dir = match persist_snapshot(&*store.cache, &input, &snapshot, now_ms) {
                 Ok(()) => Some(store.dir.display().to_string()),
                 Err(error) => {
                     warnings.push(json_string(format!(

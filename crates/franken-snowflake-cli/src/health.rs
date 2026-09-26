@@ -183,13 +183,14 @@ fn local_store_check() -> Json {
                 .audit_events()
                 .map(|events| events.len())
                 .unwrap_or(0);
-            let skipped = store.cache.skipped_lines();
+            let skipped = store.skipped_lines;
             check_json_owned(
                 "local_store",
                 if skipped == 0 { "pass" } else { "warn" },
                 format!(
-                    "opened {} (schema v{}); {manifests} dataset manifests, {audit} audit events, {skipped} unreadable log lines",
+                    "opened {} ({} store, schema v{}); {manifests} dataset manifests, {audit} audit events, {skipped} unreadable log lines",
                     store.dir.display(),
+                    store.backend.as_str(),
                     store.cache.schema_version().0
                 ),
             )
