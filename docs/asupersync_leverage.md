@@ -47,8 +47,9 @@ This is the target contract; not every line below is wired yet.
   driver, not by `Budget`'s cost quota.
 - Not wired yet: capability rows (the types exist in
   `franken-snowflake-core::capabilities`, but no call path narrows its `Cx`);
-  `web::request_region` around MCP calls; `cli::progress` events; the declared
-  `PoolConfig`; backup requests.
+  `web::request_region` itself (an MCP-over-HTTP call whose client hangs up is
+  cancelled by the HTTP front's own hang-up watch instead); `cli::progress`
+  events; the declared `PoolConfig`; backup requests.
 - The LabRuntime/DPOR suite (testkit `race`) explores a model of the driver's
   cancel and retry interleavings and, since 2026-09-26, the production driver
   itself: `run_statement_hooked` over `SnowflakeHttpClient`, each request a

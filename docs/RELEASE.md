@@ -150,6 +150,10 @@ python3 scripts/check-golden-lf.py
 python3 scripts/check-claims.py --self-test
 python3 scripts/check-claims.py
 cargo test --workspace --locked
+# Coverage floor per crate (docs/proof_lanes.md "Coverage Floor"); needs
+# cargo-llvm-cov and the pinned nightly's llvm-tools on the host running it
+# (the rch workers have neither):
+python3 scripts/check-coverage-floor.py
 cargo test --locked -p franken-snowflake-cli --features live,mcp
 # Socket e2e: the real binary over real TLS to a loopback mock SQL API
 # (tests/socket_e2e.rs). `testkit-endpoint` is test-only: a release artifact

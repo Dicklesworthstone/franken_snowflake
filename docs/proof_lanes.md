@@ -196,14 +196,45 @@ connection pool, DNS, or Snowflake's actual responses. Those remain Lane 3
 ## Cross-Cutting Standards
 
 - Unit tests live beside the code; each public behavior has ≥ 1 positive and ≥ 1
-  negative/refusal case. Coverage is tracked with a CI-enforced floor so it
-  cannot silently regress.
+  negative/refusal case. Coverage is tracked against a per-crate floor that the
+  release proof enforces, so it cannot silently regress (see "Coverage Floor").
 - Every test emits structured JSON-line logs (one event per step: `trace_id`,
   `command_id`, step name, timing, outcome) to a per-run artifacts directory, so
   a failed run is legible and replayable without re-instrumentation.
 - A deterministic injected clock and fixed seeds make timings and ordering
   reproducible; canonicalization zeroes time/host/hash fields before golden
   comparison and reports IEEE-754 bits on float mismatch.
+
+## Coverage Floor
+
+Per-crate line coverage of the library sources (`crates/<crate>/src/`) under
+the default workspace test lane, measured with `cargo llvm-cov --workspace`
+(pinned nightly, llvm-tools) on 2026-09-26 at `f504075`: 37,970 lines, 83.9%
+covered. The floor is the baseline minus 2 points; `python3
+scripts/check-coverage-floor.py` measures again and fails when a crate drops
+below its floor, disappears, or appears without a row. The floor is a
+regression guard, never a target: no test is written to raise the number. A
+change to a row is a reviewed doc change (`--print-baseline` prints fresh rows
+and never writes them). `franken-snowflake-mcp` compiles nothing in the default
+lane (its surface is behind the `mcp` feature), so its floor is 0.
+
+<!-- coverage-floor:begin -->
+| Crate | Baseline line % | Floor |
+|---|---|---|
+| `franken-snowflake-auth` | 71.9 | 69.9 |
+| `franken-snowflake-cache` | 79.0 | 77.0 |
+| `franken-snowflake-catalog` | 93.0 | 91.0 |
+| `franken-snowflake-cli` | 72.4 | 70.4 |
+| `franken-snowflake-core` | 88.2 | 86.2 |
+| `franken-snowflake-export` | 89.4 | 87.4 |
+| `franken-snowflake-graph` | 95.0 | 93.0 |
+| `franken-snowflake-http` | 85.1 | 83.1 |
+| `franken-snowflake-mcp` | 0.0 | 0.0 |
+| `franken-snowflake-sqlapi` | 90.8 | 88.8 |
+| `franken-snowflake-testkit` | 88.3 | 86.3 |
+| `franken-snowflake-text-indexing` | 98.1 | 96.1 |
+| `franken-snowflake-tui` | 81.6 | 79.6 |
+<!-- coverage-floor:end -->
 
 ## Shared Harness (implemented)
 
