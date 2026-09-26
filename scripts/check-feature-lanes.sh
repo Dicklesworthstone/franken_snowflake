@@ -51,10 +51,6 @@ emit() { printf '{"gate":"feature-lanes","event":"%s",%s}\n' "$1" "$2"; }
 for lane in "${LANES[@]}"; do
   scope="${lane%%|*}"
   features="${lane#*|}"
-  if [ "$features" = "frankensqlite" ] && [ "$(uname -s)" != "Linux" ] && [ "$(uname -s)" != "Darwin" ]; then
-    emit lane_skipped "\"scope\":\"$scope\",\"features\":\"$features\",\"reason\":\"fsqlite is Unix-only\""
-    continue
-  fi
   for attempt in 1 2 3 4 5; do
     # shellcheck disable=SC2086
     if [ -n "$features" ]; then

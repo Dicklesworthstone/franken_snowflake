@@ -412,12 +412,10 @@ Export:
 
 ## Cross-Platform Constraint
 
-Do not target the cache crate for Windows until the upstream FrankenSQLite
-prerequisite is fixed: `fsqlite-vfs` and `fsqlite-mvcc` currently gate the
-Unix-only `nix` dependency under `cfg(not(target_arch = "wasm32"))`, which is true
-on Windows. The dependency must be re-gated to `cfg(unix)` upstream, and
-FrankenSQLite CI must include a full-workspace Windows build before this cache
-crate can claim Windows support.
+The FrankenSQLite backend builds and passes its tests on Windows since the
+FrankenSQLite 0.4.x crates (fsqlite 0.4.4; native run on the Windows build
+host, 2026-09-25). Earlier releases gated the Unix-only `nix` dependency under
+`cfg(not(target_arch = "wasm32"))`, which broke the Windows build.
 
 The cache crate itself should still avoid Unix path assumptions. Use the shared
 config/cache/artifact directory policy: explicit flag > environment variable >

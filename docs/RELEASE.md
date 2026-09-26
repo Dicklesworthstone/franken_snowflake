@@ -129,18 +129,16 @@ run output:
 - `python3 scripts/check-dependency-admissibility.py`
 - `python3 scripts/check-golden-lf.py`
 - `cargo test --workspace --locked` plus every optional feature lane listed
-  above (the `frankensqlite` lane is Unix-only)
+  above
 
 The Linux lint lane must also pass:
 
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `scripts/check-asupersync-single-version.sh`
 
-The cache crate currently depends on FrankenSQLite candidate crates. On Windows,
-keep the fsqlite `cfg(unix)` prerequisite documented in
-`docs/dependency_admissibility.md` and set `FSNOW_SKIP_FSQLITE_WINDOWS_PREREQ`
-only for that known upstream prerequisite, not for forbidden-dependency
-failures.
+The cache crate's `frankensqlite` feature builds on Windows since FrankenSQLite
+0.4.x (fsqlite 0.4.4 with sqlmodel-frankensqlite 0.5.0): its 29 tests passed
+natively on wlap on 2026-09-25, so no lane is skipped on Windows any more.
 
 History: through 2026-09-03 the GitHub Actions workflow never executed a job
 (52 runs failed at workflow parse; the 10 after a fix were never assigned a
@@ -170,10 +168,13 @@ The first Windows run failed 20 of 23 socket scenarios and 2 of 3 MCP HTTP
 tests. Two defects, both fixed: every live command and `mcp serve` overflowed
 the 1 MiB Windows main-thread stack in a debug build (the CLI build script now
 links the binaries with an 8 MiB stack, the Unix default), and the MCP HTTP test
-scrubbed `SYSTEMROOT`, which Windows sockets need. Not covered: Ctrl-C on
+scrubbed `SYSTEMROOT`, which Windows sockets need. Not covered then: Ctrl-C on
 Windows, the `frankensqlite` lane on Windows, and a release-profile live run on
 Windows (whether the published v0.0.4 Windows binary also overflows on the live
-path is unknown).
+path is unknown). The first two are covered since 2026-09-25 (Asupersync 0.5
+tree): socket e2e `ctrl_c_cancels_the_statement_in_flight_on_windows` raises a
+real console CTRL_C_EVENT (28/28 on wlap), and `cargo test -p
+franken-snowflake-cache --features frankensqlite` passes 29/29 there.
 
 ## Cross-Compile Status (2026-09-03, local, `--features live,mcp --locked`)
 
