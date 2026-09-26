@@ -68,14 +68,14 @@ warehouse before any live credential exists.
 | Capability | What you get |
 |---|---|
 | Rust-first, memory-safe | `forbid(unsafe_code)` workspace-wide; lints `deny` `unwrap`/`expect`/`panic`/`todo`/`dbg!` |
-| No hidden async runtime | Built on Asupersync; production crates forbid Tokio, reqwest, hyper, axum, tower, sqlx, diesel, sea-orm |
-| Agent-ergonomic by default | Deterministic `--json` (or the alternate `--toon` encoding), `capabilities` with per-command JSON Schema inputs, `agent-handbook`, `onboard`, `did_you_mean`, stable exit codes |
-| Callable as a tool | Optional `mcp serve` exposing the same handlers and envelope contract over stdio or HTTP |
+| No hidden async runtime | Built on Asupersync; production crates forbid Tokio, reqwest, hyper, axum, tower, sqlx, diesel, sea-orm <!-- claim:no-hidden-runtime --> |
+| Agent-ergonomic by default | Deterministic `--json` (or the alternate `--toon` encoding), `capabilities` with per-command JSON Schema inputs <!-- claim:json-schema-registry -->, `agent-handbook`, `onboard`, `did_you_mean`, stable exit codes |
+| Callable as a tool | Optional `mcp serve` exposing the same handlers and envelope contract over stdio or HTTP <!-- claim:mcp-same-contract --> |
 | Deterministic tests | A mock SQL API server and a codec lane under a lab runtime exercise the contracts with no warehouse |
-| Never a fixture posing as live data | `data_source` provenance on every envelope; the live path refuses cleanly when credentials are absent |
-| Safe writes | `query write` runs DML and COPY INTO directly once a profile sets `WRITE_ENABLED`; `--dry-run` previews and binds a (profile, SQL) confirmation token, `WRITE_REQUIRE_CONFIRM` re-arms that ceremony, and DDL needs a separate opt-in |
-| Secrets stay secret | No secret in config, `Debug`, JSON, or panic text; a compile-time leak gate enforces it |
-| Auditable after the fact | Every live execution writes a BLAKE3 content-addressed receipt plus partition evidence and an append-only audit event to a local store; `receipt show <hash>` reads them back |
+| Never a fixture posing as live data | `data_source` provenance on every envelope; the live path refuses cleanly when credentials are absent <!-- claim:provenance-and-refusal --> |
+| Safe writes | `query write` runs DML and COPY INTO directly once a profile sets `WRITE_ENABLED`; `--dry-run` previews and binds a (profile, SQL) confirmation token <!-- claim:safe-writes -->, `WRITE_REQUIRE_CONFIRM` re-arms that ceremony, and DDL needs a separate opt-in |
+| Secrets stay secret | No secret in config, `Debug`, JSON, or panic text; a compile-time leak gate enforces it <!-- claim:secrets-leak-gate --> |
+| Auditable after the fact | Every live execution writes a BLAKE3 content-addressed receipt plus partition evidence and an append-only audit event to a local store; `receipt show <hash>` reads them back <!-- claim:receipts --> |
 
 ---
 
@@ -84,7 +84,7 @@ warehouse before any live credential exists.
 The commands below cover discovery, self-description, and offline planning, and
 they need no credentials. Read commands emit a deterministic JSON envelope on
 stdout (`--json`, the default) or the alternate `--toon` encoding (same data,
-round-trips exactly; byte size is comparable, token savings depend on your
+round-trips exactly <!-- claim:toon-round-trip -->; byte size is comparable, token savings depend on your
 tokenizer and payload shape).
 Diagnostics go to stderr. An empty-but-valid result is exit 0 with an empty
 payload, never a non-zero exit.
@@ -154,37 +154,37 @@ observations, and the project's own conformance fixtures.
 HTTP/TLS client and gzip carry the transport, and the statement driver returns
 Asupersync's four-valued `Outcome` (`Ok` / `Err` / `Cancelled` / `Panicked`),
 which reaches the CLI envelope intact (a cancellation reads `cancelled` or
-`timeout`, never an internal error). Once a statement is submitted, every error
+`timeout`, never an internal error) <!-- claim:outcome-intact -->. Once a statement is submitted, every error
 path and every deadline, budget, shutdown, or user cancellation fires a
-best-effort remote cancel. A cancel that arrives while the submit itself is in
-flight waits for Snowflake's answer, which names the statement (a synchronous
+best-effort remote cancel. <!-- claim:remote-cancel-every-path --> A cancel that arrives while the submit itself is in
+flight waits for Snowflake's answer <!-- claim:masked-submit -->, which names the statement (a synchronous
 submit is answered within 45 s, with the result or the handle), then cancels it;
 a second Ctrl-C exits at once. The
 server-side `STATEMENT_TIMEOUT_IN_SECONDS` (60 s by default) is sent with every
 request as the backstop. Each HTTP exchange is bounded (300 s), so a stalled
 connection ends as a `timeout` with the remote cancel instead of hanging, and a
-statement still running 5 s past its statement timeout is cancelled by the client
+statement still running 5 s past its statement timeout is cancelled by the client <!-- claim:client-deadline -->
 (outcome `timeout`, remote cancel sent). With `MAX_CREDITS` set, a statement whose
-estimated credits reach the cap is cancelled the same way (cancel kind
+estimated credits reach the cap is cancelled the same way <!-- claim:credit-cap --> (cancel kind
 `CostBudget`). The retry loop is the project's own, built on that
 client. While a statement runs, Ctrl-C (SIGINT) or SIGTERM cancels it the same
 way: the envelope reads `cancelled` and the exit status is 130 (SIGINT) or 143
-(SIGTERM), as for any interrupted command; a second signal exits at once. The
+(SIGTERM) <!-- claim:signals -->, as for any interrupted command; a second signal exits at once. The
 receipt of a run that ended without rows names the statement handle, says
 whether Snowflake ever accepted the statement (`accepted_by_snowflake`), and
 records whether the remote cancel was acknowledged (`remote_cancel`). A
 process killed with SIGKILL still leaves
 it to the server timeout. A running statement is also held by a drop guard: if
 the driver's future is dropped mid-flight (a library caller abandons it, a panic
-unwinds through it), the remote cancel is still sent, from a thread and runtime
+unwinds through it), the remote cancel is still sent <!-- claim:drop-guard -->, from a thread and runtime
 of its own, and the binary waits up to 10 s for it before exiting. The running
 statement is also an Asupersync `Lease` obligation held by the task that drives
-it: committed when the statement ends, aborted as cancelled when it is cancelled
+it <!-- claim:lease-obligation -->: committed when the statement ends, aborted as cancelled when it is cancelled
 or dropped, aborted as an error when a local failure abandons it. A lab-runtime
 test checks all four endings under the obligation-leak oracle, and a driver
 leaked without being dropped trips the runtime's leak check. Not yet wired:
 capability-row narrowing. The testkit explores cancel and retry interleavings
-with DPOR, over a model of the driver and over the production driver itself: a
+with DPOR, over a model of the driver and over the production driver itself <!-- claim:dpor-production-driver -->: a
 cancel raced against a running statement, every request a real HTTP/1 exchange
 over virtual TCP, and a lost submit answer recovered by the idempotent
 resubmit (one execution).
@@ -193,34 +193,34 @@ resubmit (one execution).
 lanes carry the proof: a deterministic codec lane over a virtual TCP transport
 under the lab runtime, and an integration lane against a mock SQL API server.
 Live tests are opt-in and emit a typed skip or refusal when credentials are
-absent, rather than silently passing.
+absent, rather than silently passing. <!-- claim:live-tests-opt-in -->
 
 **Agent-ergonomic JSON contracts.** Every command returns a versioned envelope
 with a typed `outcome_kind`, a `data_source` provenance field, a stable error
 code from a central registry that gives each code a default recovery path,
 `did_you_mean` suggestions, and a documented exit-code scheme where an
-empty-but-valid result is exit 0. The CLI and the MCP server share the exact
-same handlers, so the two surfaces cannot drift into two contracts.
+empty-but-valid result is exit 0 <!-- claim:empty-exit-zero -->. The CLI and the MCP server share the exact
+same handlers, so the two surfaces cannot drift into two contracts. <!-- claim:cli-mcp-same-handlers -->
 
 **Forbid-unsafe and deny-panic.** The workspace sets `unsafe_code = "forbid"`
 and denies `clippy::unwrap_used`, `expect_used`, `panic`, `todo`, and
 `dbg_macro`. Every crate inherits the policy through `[lints] workspace = true`,
-and the policy is verified to actually fail a build or clippy run.
+and the policy is verified to actually fail a build or clippy run <!-- claim:lint-policy-verified -->.
 
 **Safe writes, redaction, guardrails, and budgets.** Secrets never appear in
 config, `Debug`, JSON output, or panic text: the auth crate's build fails if one
 of its credential-shaped fields derives `Debug`, and a workspace test fails if
 any crate's struct or enum would print one through `Debug` (derived, or a
 manual impl that prints the field or never redacts). Reads pass the
-one-statement read guard; a write reaches the SQL API only with a
-`WriteAuthorization`, which only the core write-intent ladder can mint (the
+one-statement read guard <!-- claim:read-guard -->; a write reaches the SQL API only with a
+`WriteAuthorization`, which only the core write-intent ladder can mint <!-- claim:write-authorization --> (the
 type cannot be built anywhere else, a compile-fail test holds that) and which
 covers only the statement it was minted for. Writes are gated behind a per-profile `WRITE_ENABLED` opt-in
 and execute directly once enabled; `--dry-run` previews and binds a confirmation
 token to the exact statement, and `WRITE_REQUIRE_CONFIRM` makes that ceremony
 mandatory for cautious profiles. Cost and safety
 guardrails bound work before it is dispatched, and result rows are capped into a
-response envelope with an explicit `truncated` flag so an agent never receives
+response envelope with an explicit `truncated` flag <!-- claim:truncated-flag --> so an agent never receives
 an unbounded payload by surprise.
 
 **Deterministic testkit.** A shared golden framework, a JSON-line logger, a

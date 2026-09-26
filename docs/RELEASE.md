@@ -65,6 +65,10 @@ cargo check --workspace --no-default-features
 python3 scripts/check-dependency-admissibility.py
 scripts/check-asupersync-single-version.sh
 python3 scripts/check-golden-lf.py
+# README capability claims against their evidence (docs/claims.toml): every
+# tagged claim names tests that exist, and live evidence is fresh.
+python3 scripts/check-claims.py --self-test
+python3 scripts/check-claims.py
 cargo test --workspace --locked
 cargo test --locked -p franken-snowflake-cli --features live,mcp
 # Socket e2e: the real binary over real TLS to a loopback mock SQL API

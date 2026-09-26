@@ -1,0 +1,204 @@
+# Claims ledger (bead oj0.4): each load-bearing README capability claim, the
+# README section it sits in, a verbatim piece of it, and the evidence behind it.
+# scripts/check-claims.py enforces it in the release proof; see that script for
+# the field rules. A claim whose evidence is gone or stale fails the gate:
+# correct the README or refresh the evidence, never the other way round.
+
+[[claim]]
+id = "no-hidden-runtime"
+heading = "Why franken_snowflake?"
+text = "production crates forbid Tokio, reqwest, hyper, axum, tower, sqlx, diesel, sea-orm"
+evidence = ["dsr:franken_snowflake quality 20260925T023047-3245208 (scripts/check-dependency-admissibility.py, every lane 0 violations)"]
+date = "2026-09-25"
+max_age_days = 30
+
+[[claim]]
+id = "json-schema-registry"
+heading = "Why franken_snowflake?"
+text = "`capabilities` with per-command JSON Schema inputs"
+evidence = [
+  "test:franken-snowflake-cli::capabilities_registry_documents_every_command_with_input_schemas",
+  "test:franken-snowflake-cli::tests::capabilities_input_schemas_describe_every_command_and_flag",
+]
+
+[[claim]]
+id = "mcp-same-contract"
+heading = "Why franken_snowflake?"
+text = "Optional `mcp serve` exposing the same handlers and envelope contract over stdio or HTTP"
+evidence = [
+  "test:franken-snowflake-cli::mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes",
+  "test:franken-snowflake-cli::mcp_over_http_matches_the_cli_and_a_cancel_notification_cancels_the_call",
+]
+
+[[claim]]
+id = "provenance-and-refusal"
+heading = "Why franken_snowflake?"
+text = "`data_source` provenance on every envelope; the live path refuses cleanly when credentials are absent"
+evidence = [
+  "test:franken-snowflake-core::guardrails::tests::require_live_and_data_source_stamp_are_enforced",
+  "test:franken-snowflake-cli::live_surfaces_refuse_cleanly_without_transport_or_before_any_socket",
+]
+
+[[claim]]
+id = "safe-writes"
+heading = "Why franken_snowflake?"
+text = "`query write` runs DML and COPY INTO directly once a profile sets `WRITE_ENABLED`; `--dry-run` previews and binds a (profile, SQL) confirmation token"
+evidence = [
+  "test:franken-snowflake-cli::query_plan_and_write_ladder_behave_offline",
+  "test:franken-snowflake-cli::confirmation_tokens_are_random_bound_and_expiring",
+  "test:franken-snowflake-cli::a_confirmed_write_submits_its_dry_run_id_and_is_single_use",
+  "test:franken-snowflake-core::write_intent::tests::ddl_is_refused_even_with_enabled_dry_run_policy",
+]
+
+[[claim]]
+id = "secrets-leak-gate"
+heading = "Why franken_snowflake?"
+text = "No secret in config, `Debug`, JSON, or panic text; a compile-time leak gate enforces it"
+evidence = [
+  "test:franken-snowflake-testkit::no_crate_derives_debug_over_a_credential",
+  "test:franken-snowflake-testkit::the_scanner_catches_every_leak_shape",
+  "test:franken-snowflake-cli::secret_sql_literals_never_leave_the_process",
+]
+
+[[claim]]
+id = "receipts"
+heading = "Why franken_snowflake?"
+text = "Every live execution writes a BLAKE3 content-addressed receipt plus partition evidence and an append-only audit event to a local store; `receipt show <hash>` reads them back"
+evidence = [
+  "test:franken-snowflake-cli::live::tests::scripted_query_run_shapes_the_request_and_records_a_readable_receipt",
+  "test:franken-snowflake-cache::tests::append_only_audit_lint_rejects_update_and_delete",
+]
+
+[[claim]]
+id = "toon-round-trip"
+heading = "Quick Example"
+text = "the alternate `--toon` encoding (same data, round-trips exactly"
+evidence = ["test:franken-snowflake-cli::tests::toon_output_round_trips_to_same_logical_envelope"]
+
+[[claim]]
+id = "outcome-intact"
+heading = "Design Philosophy"
+text = "which reaches the CLI envelope intact (a cancellation reads `cancelled` or `timeout`, never an internal error)"
+evidence = ["test:franken-snowflake-cli::live::tests::scripted_cancellations_reach_the_envelope_by_kind"]
+
+[[claim]]
+id = "remote-cancel-every-path"
+heading = "Design Philosophy"
+text = "Once a statement is submitted, every error path and every deadline, budget, shutdown, or user cancellation fires a best-effort remote cancel."
+evidence = [
+  "test:franken-snowflake-sqlapi::driver::tests::deadline_during_poll_routes_through_the_policy_cancel_with_deadline_kind",
+  "test:franken-snowflake-sqlapi::driver::tests::one_failed_fetch_in_a_window_abandons_the_statement_after_the_window_settles",
+  "test:franken-snowflake-cli::a_failed_partition_fetch_cancels_the_statement",
+  "test:franken-snowflake-cli::sigint_cancels_the_statement_in_flight",
+]
+
+[[claim]]
+id = "masked-submit"
+heading = "Design Philosophy"
+text = "A cancel that arrives while the submit itself is in flight waits for Snowflake's answer"
+evidence = [
+  "test:franken-snowflake-testkit::race::tests::default_race_suite_proves_cancel_retry_invariants",
+  "test:franken-snowflake-sqlapi::driver::tests::an_already_expired_deadline_submits_nothing",
+]
+
+[[claim]]
+id = "client-deadline"
+heading = "Design Philosophy"
+text = "a statement still running 5 s past its statement timeout is cancelled by the client"
+evidence = ["test:franken-snowflake-cli::a_statement_past_its_timeout_is_cancelled_by_the_client"]
+
+[[claim]]
+id = "credit-cap"
+heading = "Design Philosophy"
+text = "With `MAX_CREDITS` set, a statement whose estimated credits reach the cap is cancelled the same way"
+evidence = [
+  "test:franken-snowflake-cli::a_credit_cap_cancels_a_statement_that_would_exceed_it",
+  "test:franken-snowflake-cli::a_credit_cap_below_the_resume_minimum_submits_no_query",
+]
+
+[[claim]]
+id = "signals"
+heading = "Design Philosophy"
+text = "Ctrl-C (SIGINT) or SIGTERM cancels it the same way: the envelope reads `cancelled` and the exit status is 130 (SIGINT) or 143 (SIGTERM)"
+evidence = [
+  "test:franken-snowflake-cli::sigint_cancels_the_statement_in_flight",
+  "test:franken-snowflake-cli::live::tests::signal_cancelled_runs_exit_130_or_143",
+]
+
+[[claim]]
+id = "drop-guard"
+heading = "Design Philosophy"
+text = "if the driver's future is dropped mid-flight (a library caller abandons it, a panic unwinds through it), the remote cancel is still sent"
+evidence = ["test:franken-snowflake-sqlapi::driver::tests::dropping_the_driver_mid_poll_cancels_the_statement"]
+
+[[claim]]
+id = "lease-obligation"
+heading = "Design Philosophy"
+text = "The running statement is also an Asupersync `Lease` obligation held by the task that drives it"
+evidence = [
+  "test:franken-snowflake-sqlapi::driver::tests::every_statement_lease_is_resolved_under_the_lab_obligation_oracle",
+  "test:franken-snowflake-sqlapi::driver::tests::a_statement_whose_driver_is_leaked_is_reported_as_a_leaked_lease",
+  "test:franken-snowflake-sqlapi::driver::tests::the_cli_runtime_flavor_tracks_statement_leases",
+]
+
+[[claim]]
+id = "dpor-production-driver"
+heading = "Design Philosophy"
+text = "The testkit explores cancel and retry interleavings with DPOR, over a model of the driver and over the production driver itself"
+evidence = ["test:franken-snowflake-testkit::race::tests::default_race_suite_proves_cancel_retry_invariants"]
+
+[[claim]]
+id = "empty-exit-zero"
+heading = "Design Philosophy"
+text = "a documented exit-code scheme where an empty-but-valid result is exit 0"
+evidence = ["test:franken-snowflake-core::outcome::tests::empty_ok_is_still_success_exit_zero"]
+
+[[claim]]
+id = "cli-mcp-same-handlers"
+heading = "Design Philosophy"
+text = "The CLI and the MCP server share the exact same handlers, so the two surfaces cannot drift into two contracts."
+evidence = [
+  "test:franken-snowflake-cli::mcp_over_http_matches_the_cli_and_a_cancel_notification_cancels_the_call",
+  "test:franken-snowflake-cli::mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes",
+]
+
+[[claim]]
+id = "lint-policy-verified"
+heading = "Design Philosophy"
+text = "the policy is verified to actually fail a build or clippy run"
+evidence = ["manual:unwrap, expect, panic!, todo!, dbg! and an unsafe block planted in franken-snowflake-core (dangling commit bc90128); cargo clippy -p franken-snowflake-core --all-targets -- -D warnings failed on each"]
+date = "2026-09-26"
+max_age_days = 180
+
+[[claim]]
+id = "read-guard"
+heading = "Design Philosophy"
+text = "Reads pass the one-statement read guard"
+evidence = [
+  "test:franken-snowflake-cli::tests::read_guard_handles_nested_block_comments_fail_closed",
+  "test:franken-snowflake-cli::tests::read_guard_closes_the_dollar_quote_bypass_and_side_effects",
+]
+
+[[claim]]
+id = "write-authorization"
+heading = "Design Philosophy"
+text = "a write reaches the SQL API only with a `WriteAuthorization`, which only the core write-intent ladder can mint"
+evidence = ["test:franken-snowflake-cli::tests::an_authorization_for_one_statement_refuses_another"]
+
+[[claim]]
+id = "truncated-flag"
+heading = "Design Philosophy"
+text = "result rows are capped into a response envelope with an explicit `truncated` flag"
+evidence = [
+  "test:franken-snowflake-cli::live::tests::scripted_query_run_shapes_the_request_and_records_a_readable_receipt",
+  "test:franken-snowflake-sqlapi::driver::tests::row_cap_stops_fetching_early_and_reports_a_partial_prefix",
+]
+
+[[claim]]
+id = "live-tests-opt-in"
+heading = "Design Philosophy"
+text = "Live tests are opt-in and emit a typed skip or refusal when credentials are absent, rather than silently passing."
+evidence = [
+  "test:franken-snowflake-sqlapi::opt_in_live_sql_api_proof_lanes",
+  "test:franken-snowflake-cli::cli_live_proof_end_to_end",
+]
