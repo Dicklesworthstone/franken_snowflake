@@ -834,6 +834,9 @@ pub fn run_dataset_query_outcome(
 /// identifiers the receipt envelope surfaces. No SQL is submitted until the CLI
 /// has the authorized plan in hand.
 pub struct AuthorizedWrite<'a> {
+    /// The ladder's proof: only core's write-intent ladder mints one, so no
+    /// read path can build an `AuthorizedWrite` (reality-check bead oj0.29).
+    pub grant: &'a franken_snowflake_core::write_intent::WriteAuthorization,
     /// The exact mutating statement the ladder authorized.
     pub sql: &'a str,
     /// Stable statement-kind token (e.g. `insert`, `copy_into_table`).
@@ -863,6 +866,19 @@ pub fn run_write_outcome(
     profile: String,
     write: &AuthorizedWrite<'_>,
 ) -> crate::Outcome {
+    if !write.grant.covers(write.sql) {
+        return failure_outcome(
+            format,
+            "query.write",
+            "fsnow.query.write.v1",
+            request_id,
+            profile,
+            &SnowflakeError::new(
+                SnowflakeErrorCode::MutationRefused,
+                "the write authorization does not cover this statement",
+            ),
+        );
+    }
     let overrides = SessionOverrides {
         database: write.database.clone(),
         schema: write.schema.clone(),
@@ -6316,7 +6332,9 @@ mod tests {
         };
         let script = install("demo", None, None, vec![rows_inserted(), rows_inserted()]);
         let confirm_id = local_store::random_id().unwrap();
+        let grant = crate::tests::authorized_insert().unwrap();
         let write = |confirmed: Option<String>| AuthorizedWrite {
+            grant: &grant,
             sql: "insert into t values (1)",
             statement_kind: "insert",
             safety_class: "dml",

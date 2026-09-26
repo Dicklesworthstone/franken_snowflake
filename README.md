@@ -200,8 +200,11 @@ and the policy is verified to actually fail a build or clippy run.
 config, `Debug`, JSON output, or panic text: the auth crate's build fails if one
 of its credential-shaped fields derives `Debug`, and a workspace test fails if
 any crate's struct or enum would print one through `Debug` (derived, or a
-manual impl that prints the field or never redacts). Reads run with read-only
-capabilities, while writes are gated behind a per-profile `WRITE_ENABLED` opt-in
+manual impl that prints the field or never redacts). Reads pass the
+one-statement read guard; a write reaches the SQL API only with a
+`WriteAuthorization`, which only the core write-intent ladder can mint (the
+type cannot be built anywhere else, a compile-fail test holds that) and which
+covers only the statement it was minted for. Writes are gated behind a per-profile `WRITE_ENABLED` opt-in
 and execute directly once enabled; `--dry-run` previews and binds a confirmation
 token to the exact statement, and `WRITE_REQUIRE_CONFIRM` makes that ceremony
 mandatory for cautious profiles. Cost and safety

@@ -47,8 +47,15 @@ The type-level capability rows stay ordered as:
 Only the ladder may ever request `WriteCaps`. Read commands, read-side MCP
 tools, catalog scans, and result partition fetchers are meant to stay under
 narrower capability rows. These row types exist in `franken-snowflake-core`,
-but the executor that landed does not yet compile through them: read-only is
-enforced at runtime by the SQL guard and the `WRITE_ENABLED` gate.
+but the executor that landed does not compile through them: read-only is
+enforced at runtime by the SQL guard and the `WRITE_ENABLED` gate. What the type
+system does enforce is the write side: `ExecutionAuthorized` carries a
+`WriteAuthorization` that only `evaluate_write_intent` can construct (its field
+is private; a `compile_fail` doctest proves it), the live write executor takes
+one, and it covers only the statement whose redacted preview the ladder
+evaluated. The planner-cannot-reach-the-transport half is not compile-enforced:
+the catalog planner crate depends on `franken-snowflake-sqlapi`, which carries
+the transport, and Asupersync's ambient `Cx::current()` is reachable anywhere.
 
 ## Ladder Rungs
 

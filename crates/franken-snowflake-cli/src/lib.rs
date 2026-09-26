@@ -27,8 +27,8 @@ use franken_snowflake_core::ids::RequestId;
 use franken_snowflake_core::redact::redact;
 use franken_snowflake_core::sql_lexer::{self, SqlTokenKind};
 use franken_snowflake_core::write_intent::{
-    AppendOnlyAuditIntent, ConfirmationToken, StatementAllowlistEntry, WriteIntentDecision,
-    WriteIntentMode, WriteIntentPlan, WriteIntentPolicy, WriteIntentRefusal,
+    AppendOnlyAuditIntent, ConfirmationToken, StatementAllowlistEntry, WriteAuthorization,
+    WriteIntentDecision, WriteIntentMode, WriteIntentPlan, WriteIntentPolicy, WriteIntentRefusal,
     WriteIntentRefusalCode, WriteIntentRequest, WriteSafetyClass, WriteStatementKind,
     classify_write_statement, evaluate_write_intent,
 };
@@ -4474,12 +4474,12 @@ fn query_write_outcome(
             }
             outcome
         }
-        WriteIntentDecision::ExecutionAuthorized { plan } => query_write_execute_dispatch(
+        WriteIntentDecision::ExecutionAuthorized { grant } => query_write_execute_dispatch(
             format,
             request_id,
             profile,
             &sql_text,
-            &plan,
+            &grant,
             confirm.is_some(),
         ),
     };
@@ -4940,11 +4940,13 @@ fn query_write_execute_dispatch(
     request_id: String,
     profile: String,
     sql: &str,
-    plan: &WriteIntentPlan,
+    grant: &WriteAuthorization,
     confirmed: bool,
 ) -> Outcome {
+    let plan = grant.plan();
     let idempotency_request_id = plan.receipt.request_id.as_str().to_string();
     let write = live::AuthorizedWrite {
+        grant,
         sql,
         statement_kind: plan.statement_kind.as_token(),
         safety_class: safety_class_token(plan.safety_class),
@@ -4967,9 +4969,10 @@ fn query_write_execute_dispatch(
     request_id: String,
     profile: String,
     _sql: &str,
-    plan: &WriteIntentPlan,
+    grant: &WriteAuthorization,
     _confirmed: bool,
 ) -> Outcome {
+    let plan = grant.plan();
     live_transport_required_with_data(
         format,
         "query.write",
@@ -8359,7 +8362,7 @@ mod tests {
         }
     }
 
-    fn authorized_insert_plan() -> Result<WriteIntentPlan, String> {
+    pub(crate) fn authorized_insert() -> Result<WriteAuthorization, String> {
         let policy = enabled_write_policy(WriteStatementKind::Insert, false);
         let mut req = WriteIntentRequest::new(
             WriteIntentMode::PrepareExecution,
@@ -8369,7 +8372,7 @@ mod tests {
         req.allowlist_id = Some(cli_allowlist_id(WriteStatementKind::Insert));
         req.request_id = Some(RequestId::new("exec-req"));
         match evaluate_write_intent(&req, &policy) {
-            WriteIntentDecision::ExecutionAuthorized { plan } => Ok(plan),
+            WriteIntentDecision::ExecutionAuthorized { grant } => Ok(grant),
             other => Err(format!("expected execution authorization, got {other:?}")),
         }
     }
@@ -8705,13 +8708,13 @@ mod tests {
     #[cfg(not(feature = "live"))]
     #[test]
     fn authorized_write_without_live_transport_refuses_cleanly() -> Result<(), String> {
-        let plan = authorized_insert_plan()?;
+        let grant = authorized_insert()?;
         let outcome = query_write_execute_dispatch(
             OutputFormat::Json,
             "req-test".to_string(),
             "demo".to_string(),
             "insert into t values (1)",
-            &plan,
+            &grant,
             false,
         );
         assert_ne!(outcome.status.code(), 0, "no-transport build must refuse");
@@ -8724,19 +8727,39 @@ mod tests {
         Ok(())
     }
 
+    // Bead oj0.29: an authorization covers only the statement the ladder
+    // evaluated; any other statement is refused before anything else runs.
+    #[cfg(feature = "live")]
+    #[test]
+    fn an_authorization_for_one_statement_refuses_another() -> Result<(), String> {
+        let grant = authorized_insert()?;
+        let outcome = query_write_execute_dispatch(
+            OutputFormat::Json,
+            "req-test".to_string(),
+            "no_creds_profile".to_string(),
+            "delete from t",
+            &grant,
+            false,
+        );
+        let rendered = render_outcome(outcome);
+        assert!(rendered.contains("FSNOW-3001"), "{rendered}");
+        assert!(rendered.contains("does not cover"), "{rendered}");
+        Ok(())
+    }
+
     // Live build, credential-less profile: the executor IS reachable behind the
     // `live` cfg, but with no credentials it must produce a typed error and never
     // claim live data. Credential resolution fails before any network I/O.
     #[cfg(feature = "live")]
     #[test]
     fn authorized_write_without_credentials_refuses_cleanly_live() -> Result<(), String> {
-        let plan = authorized_insert_plan()?;
+        let grant = authorized_insert()?;
         let outcome = query_write_execute_dispatch(
             OutputFormat::Json,
             "req-test".to_string(),
             "no_creds_profile".to_string(),
             "insert into t values (1)",
-            &plan,
+            &grant,
             false,
         );
         assert_ne!(
