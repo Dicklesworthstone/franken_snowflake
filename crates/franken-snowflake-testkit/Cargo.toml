@@ -22,6 +22,8 @@ franken-snowflake-core = { path = "../franken-snowflake-core", version = "0.0.5"
 # kx6 protocol schemas remain the sibling source of truth for fixture shape;
 # this edge also keeps the existing lockfile graph stable for code-first checks.
 franken-snowflake-sqlapi = { path = "../franken-snowflake-sqlapi", version = "0.0.5" }
+# The race suite drives the production `SnowflakeHttpClient` over virtual TCP.
+franken-snowflake-http = { path = "../franken-snowflake-http", version = "0.0.5" }
 asupersync = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

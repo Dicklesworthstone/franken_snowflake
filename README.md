@@ -156,7 +156,10 @@ Asupersync's four-valued `Outcome` (`Ok` / `Err` / `Cancelled` / `Panicked`),
 which reaches the CLI envelope intact (a cancellation reads `cancelled` or
 `timeout`, never an internal error). Once a statement is submitted, every error
 path and every deadline, budget, shutdown, or user cancellation fires a
-best-effort remote cancel, and the
+best-effort remote cancel. A cancel that arrives while the submit itself is in
+flight waits for Snowflake's answer, which names the statement (a synchronous
+submit is answered within 45 s, with the result or the handle), then cancels it;
+a second Ctrl-C exits at once. The
 server-side `STATEMENT_TIMEOUT_IN_SECONDS` (60 s by default) is sent with every
 request as the backstop. Each HTTP exchange is bounded (300 s), so a stalled
 connection ends as a `timeout` with the remote cancel instead of hanging, and a
@@ -180,8 +183,11 @@ it: committed when the statement ends, aborted as cancelled when it is cancelled
 or dropped, aborted as an error when a local failure abandons it. A lab-runtime
 test checks all four endings under the obligation-leak oracle, and a driver
 leaked without being dropped trips the runtime's leak check. Not yet wired:
-capability-row narrowing. The testkit explores a model of the driver's
-cancel and retry interleavings with DPOR.
+capability-row narrowing. The testkit explores cancel and retry interleavings
+with DPOR, over a model of the driver and over the production driver itself: a
+cancel raced against a running statement, every request a real HTTP/1 exchange
+over virtual TCP, and a lost submit answer recovered by the idempotent
+resubmit (one execution).
 
 **Deterministic tests.** The protocol is exercised without a warehouse. Two
 lanes carry the proof: a deterministic codec lane over a virtual TCP transport
@@ -911,7 +917,7 @@ statement handle.
 
    testkit  (parallel to all of the above; no warehouse required)
    deterministic codec lane under the lab runtime · mock SQL API server
-   replay · DPOR model of the driver's cancel/retry races · golden/clock/canary/logger harness
+   replay · DPOR over the driver's cancel/retry races · golden/clock/canary/logger harness
 ```
 
 Once a statement is submitted, the driver fires a best-effort remote cancel on

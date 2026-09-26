@@ -49,8 +49,13 @@ This is the target contract; not every line below is wired yet.
   `franken-snowflake-core::capabilities`, but no call path narrows its `Cx`);
   `web::request_region` around MCP calls; `cli::progress` events; the declared
   `PoolConfig`; backup requests.
-- The LabRuntime/DPOR suite explores a model of the driver's cancel and retry
-  interleavings in the testkit, not the production driver itself.
+- The LabRuntime/DPOR suite (testkit `race`) explores a model of the driver's
+  cancel and retry interleavings and, since 2026-09-26, the production driver
+  itself: `run_statement_hooked` over `SnowflakeHttpClient`, each request a
+  real HTTP/1 exchange over `VirtualTcpStream`, raced by a canceller task, with
+  the leak verdict read from the runtime's obligation arena (the driver's own
+  `Lease`). It found that a cancel landing during the submit exchange orphaned
+  the accepted statement; the submit now runs under the cancellation mask.
 
 ## Mapping
 

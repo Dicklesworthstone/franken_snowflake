@@ -8,22 +8,46 @@
 //! [`StatementMachine`](franken_snowflake_sqlapi::lifecycle::StatementMachine).
 //! The suite intentionally stays at the protocol/testkit layer rather than
 //! opening an ambient Snowflake endpoint.
+//!
+//! Two cases run the production driver itself rather than the sequential model:
+//! `run_statement_hooked` over `SnowflakeHttpClient`, every request a real
+//! HTTP/1 exchange with the mock over a virtual TCP pair.
+//! [`RaceCaseKind::DriverCancelInFlight`] races a canceller task against it;
+//! [`RaceCaseKind::DriverResubmitAfterLostAnswer`] loses the first submit's
+//! answer. The statement's obligation is the `Lease` the driver mints, read
+//! back from the runtime's obligation arena.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Poll, Waker};
 use std::time::Duration;
 
+use asupersync::Cx;
 use asupersync::http::h1::{
     Http1Client, Http1Config, Http1Server, Method as H1Method, Request as H1Request,
     Response as H1Response, Version, server::HostPolicy,
 };
+use asupersync::http::{
+    ClientError as HttpClientError, Method as HttpMethod, ParsedUrl, Request as HttpRequest,
+    Response as HttpResponse,
+};
 use asupersync::lab::{DporExplorer, ExplorationReport, ExplorerConfig, LabRuntime};
 use asupersync::net::tcp::VirtualTcpStream;
+use asupersync::record::{ObligationKind, ObligationState};
 use asupersync::types::{Budget, CancelReason};
+use franken_snowflake_core::outcome::SnowflakeOutcome;
+use franken_snowflake_http::{
+    AuthorizationDescriptor, RawHttp, SnowflakeAuthTokenType, SnowflakeEndpoint,
+    SnowflakeHttpClient, TransportConfig,
+};
+use franken_snowflake_sqlapi::driver::{
+    DriverEvent, DriverObserver, StatementHooks, run_statement_hooked,
+};
 use franken_snowflake_sqlapi::lifecycle::{PollPlan, Progress, StatementMachine};
+use franken_snowflake_sqlapi::request::{SubmitQueryParams, SubmitStatementRequest};
 use franken_snowflake_sqlapi::status::ResponseClass;
 use serde::{Deserialize, Serialize};
 
@@ -93,6 +117,15 @@ pub enum RaceCaseKind {
     /// obligation contract: the abandoned exchange still fires the remote
     /// cancel, and every minted statement obligation is resolved.
     CancelRacesPollExchange,
+    /// The production driver over `SnowflakeHttpClient` (not the model) runs as
+    /// a lab task while a canceller task aborts it; wherever the cancel lands,
+    /// an accepted statement is completed or cancelled at the server, and the
+    /// `Lease` the driver minted for it is resolved.
+    DriverCancelInFlight,
+    /// The production driver's first submit runs the statement but its answer
+    /// is lost (a `500`); the client resubmits with the same `requestId` and
+    /// `retry=true`, and the statement runs once and completes.
+    DriverResubmitAfterLostAnswer,
 }
 
 impl RaceCaseKind {
@@ -107,10 +140,12 @@ impl RaceCaseKind {
             Self::PartialPartitionFailure => "partial_partition_failure",
             Self::UnsafeSubmitRetryRefusal => "unsafe_submit_retry_refusal",
             Self::CancelRacesPollExchange => "cancel_races_poll_exchange",
+            Self::DriverCancelInFlight => "driver_cancel_in_flight",
+            Self::DriverResubmitAfterLostAnswer => "driver_resubmit_after_lost_answer",
         }
     }
 
-    fn all() -> [Self; 7] {
+    fn all() -> [Self; 9] {
         [
             Self::CancelDuringSubmit,
             Self::CancelDuringPoll,
@@ -119,6 +154,8 @@ impl RaceCaseKind {
             Self::PartialPartitionFailure,
             Self::UnsafeSubmitRetryRefusal,
             Self::CancelRacesPollExchange,
+            Self::DriverCancelInFlight,
+            Self::DriverResubmitAfterLostAnswer,
         ]
     }
 }
@@ -189,6 +226,10 @@ pub struct RaceCaseReport {
     /// committed on completion, aborted (`Cancel` reason) on the cleanup cancel.
     pub no_obligation_leaks: bool,
     pub crashpack_manifest: String,
+    /// What the production driver reported, in order (driver cases only):
+    /// each `DriverEvent`, then how the run ended.
+    #[serde(default)]
+    pub driver_events: Vec<String>,
 }
 
 impl RaceCaseReport {
@@ -528,6 +569,12 @@ fn run_case_inner(
     case: RaceCaseKind,
     retry_limit: u32,
 ) -> Result<RaceCaseReport, RaceError> {
+    if matches!(
+        case,
+        RaceCaseKind::DriverCancelInFlight | RaceCaseKind::DriverResubmitAfterLostAnswer
+    ) {
+        return run_production_driver(runtime, case);
+    }
     let mut driver = RaceDriver::new(runtime, case, retry_limit);
     match case {
         RaceCaseKind::CancelDuringSubmit => driver.cancel_during_submit()?,
@@ -537,8 +584,294 @@ fn run_case_inner(
         RaceCaseKind::PartialPartitionFailure => driver.partial_partition_failure()?,
         RaceCaseKind::UnsafeSubmitRetryRefusal => driver.unsafe_submit_retry_refusal()?,
         RaceCaseKind::CancelRacesPollExchange => driver.cancel_races_poll_exchange()?,
+        RaceCaseKind::DriverCancelInFlight | RaceCaseKind::DriverResubmitAfterLostAnswer => {
+            return Err(RaceError::Lab(format!(
+                "{} runs the production driver, not the model",
+                case.as_str()
+            )));
+        }
     }
     Ok(driver.finish())
+}
+
+/// The production-driver cases ([`RaceCaseKind::DriverCancelInFlight`],
+/// [`RaceCaseKind::DriverResubmitAfterLostAnswer`]): `run_statement_hooked`
+/// submits the way the CLI does (`requestId` plus `retry=true`), raced by a
+/// canceller task in the cancel case.
+fn run_production_driver(
+    runtime: &mut LabRuntime,
+    case: RaceCaseKind,
+) -> Result<RaceCaseReport, RaceError> {
+    let seed = runtime.config().seed;
+    let region = runtime.state.create_root_region(Budget::INFINITE);
+    let server = Arc::new(Mutex::new(RaceServerState::for_case(case)));
+    let ended: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(None));
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut recorder = EventLog(Arc::clone(&events));
+    let inbox = Arc::new(Mutex::new(Inbox::default()));
+    let http = VirtualRawHttp {
+        inbox: Arc::clone(&inbox),
+    };
+    let (server_task, _) = runtime
+        .state
+        .create_task(
+            region,
+            Budget::INFINITE,
+            serve_inbox(inbox, Arc::clone(&server)),
+        )
+        .map_err(|error| RaceError::Lab(format!("server task spawn failed: {error}")))?;
+    // Never dialled: every request goes over a virtual TCP pair.
+    let endpoint = SnowflakeEndpoint::parse("https://race.us-east-1.snowflakecomputing.com")
+        .map_err(|error| RaceError::Lab(format!("race endpoint refused: {}", error.message)))?;
+    let slot = Arc::clone(&ended);
+    let (driver_task, driver_handle) = runtime
+        .state
+        .create_task(region, Budget::INFINITE, async move {
+            let Some(cx) = Cx::current() else {
+                return;
+            };
+            let client = SnowflakeHttpClient::new(TransportConfig::new(endpoint), http);
+            let mut auth = AuthorizationDescriptor::bearer(
+                SnowflakeAuthTokenType::ProgrammaticAccessToken,
+                "race-token",
+                "cred_race",
+            );
+            let params = SubmitQueryParams {
+                request_id: Some("01b2c3d4-0000-4000-8000-00000000race".to_owned()),
+                retry: true,
+                ..SubmitQueryParams::default()
+            };
+            // Boxed: laid out inline, the whole driver (HTTP/1 codec included)
+            // overflows a test thread's stack in a debug build.
+            let (outcome, _) = Box::pin(run_statement_hooked(
+                &cx,
+                &client,
+                &mut auth,
+                SubmitStatementRequest::new("select 1"),
+                params,
+                PollPlan::default(),
+                StatementHooks {
+                    sink: None,
+                    observer: Some(&mut recorder),
+                },
+            ))
+            .await;
+            let (label, ending) = match &outcome {
+                SnowflakeOutcome::Ok(_) => ("ok", "ended: ok".to_owned()),
+                SnowflakeOutcome::Cancelled(reason) => {
+                    ("cancelled", format!("ended: cancelled ({:?})", reason.kind))
+                }
+                SnowflakeOutcome::Err(error) => ("err", format!("ended: error {:?}", error.code)),
+                SnowflakeOutcome::Panicked(_) => ("panicked", "ended: panicked".to_owned()),
+            };
+            recorder
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(ending);
+            *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(label);
+        })
+        .map_err(|error| RaceError::Lab(format!("driver task spawn failed: {error}")))?;
+    let mut scheduler = runtime.scheduler.lock();
+    scheduler.schedule(server_task, 0);
+    scheduler.schedule(driver_task, 0);
+    drop(scheduler);
+    if case == RaceCaseKind::DriverCancelInFlight {
+        let (canceller_task, _) = runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                driver_handle.abort_with_reason(CancelReason::user("the caller gives up"));
+            })
+            .map_err(|error| RaceError::Lab(format!("canceller task spawn failed: {error}")))?;
+        runtime.scheduler.lock().schedule(canceller_task, 0);
+    }
+    // The poll loop sleeps between polls: jump virtual time when idle.
+    runtime.run_with_auto_advance();
+    if !runtime.is_quiescent() {
+        return Err(RaceError::Truncated);
+    }
+
+    let ended = ended
+        .lock()
+        .map_err(|_| RaceError::Poisoned("driver outcome"))?
+        .take();
+    let state = server
+        .lock()
+        .map_err(|_| RaceError::Poisoned("race server state"))?;
+    let counters = state.counters.clone();
+    let completed = ended == Some("ok");
+    let cancelled = ended == Some("cancelled");
+    let orphan_free = match &state.issued_handle {
+        None => true,
+        Some(handle) => completed || state.cancelled_handles.contains(handle),
+    };
+    // The runtime's own record of every lease the driver took: none pending,
+    // none leaked, the runtime counted no leak, and an accepted statement did
+    // hold one (so the verdict is not vacuous).
+    let leases: Vec<ObligationState> = runtime
+        .state
+        .obligations_iter()
+        .filter(|(_, record)| record.kind == ObligationKind::Lease)
+        .map(|(_, record)| record.state)
+        .collect();
+    let leases_resolved = runtime.state.leak_count() == 0
+        && (state.issued_handle.is_none() || !leases.is_empty())
+        && leases
+            .iter()
+            .all(|lease| matches!(lease, ObligationState::Committed | ObligationState::Aborted));
+    Ok(RaceCaseReport {
+        schema_version: RACE_SUITE_SCHEMA_VERSION,
+        case,
+        seed,
+        virtual_tcp_exchanges: counters.virtual_tcp_exchanges,
+        plain_submits: counters.plain_submits,
+        retry_submits: counters.retry_submits,
+        polls: counters.polls,
+        partitions: counters.partitions,
+        cancels: counters.cancels,
+        retry_delays_ms: Vec::new(),
+        manual_clock_ms: 0,
+        completed,
+        cancelled,
+        retry_budget_exhausted: false,
+        unsafe_submit_retry_refused: false,
+        // The statement ran at most once, however often it was submitted.
+        no_double_submit: state.mock.executions() <= 1,
+        cancel_propagated: orphan_free,
+        // Not this case's claim: no retryable answer is scripted.
+        bounded_retries: true,
+        lab_invariants_clean: true,
+        client_aborted_mid_exchange: false,
+        no_orphan_statements: orphan_free,
+        no_obligation_leaks: leases_resolved,
+        step_capped: false,
+        certificate_hash: 0,
+        trace_fingerprint: 0,
+        replay_command: replay_command(case, seed),
+        crashpack_manifest: crashpack_manifest(case, seed),
+        driver_events: events
+            .lock()
+            .map_err(|_| RaceError::Poisoned("driver events"))?
+            .clone(),
+    })
+}
+
+/// Records the production driver's events for the case report.
+struct EventLog(Arc<Mutex<Vec<String>>>);
+
+impl DriverObserver for EventLog {
+    fn event(&mut self, event: DriverEvent) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(format!("{event:?}"));
+    }
+}
+
+/// Connections the production client dials, waiting for the mock's server
+/// task. The mock serves them in a task of its own: a real server does not
+/// share the client's cancellation (served inside the driver's task, it hung
+/// up on the driver's cleanup cancel once the driver was cancelled).
+#[derive(Default)]
+struct Inbox {
+    connections: VecDeque<VirtualTcpStream>,
+    waker: Option<Waker>,
+    closed: bool,
+}
+
+/// The production client's raw transport for the race suite: each request is
+/// one real HTTP/1 exchange over a fresh virtual TCP pair whose other end the
+/// mock's server task serves.
+struct VirtualRawHttp {
+    inbox: Arc<Mutex<Inbox>>,
+}
+
+impl VirtualRawHttp {
+    fn dial(&self) -> VirtualTcpStream {
+        let (client_io, server_io) =
+            VirtualTcpStream::pair(socket_addr(40_000), socket_addr(40_001));
+        let mut inbox = self.inbox.lock().unwrap_or_else(PoisonError::into_inner);
+        inbox.connections.push_back(server_io);
+        if let Some(waker) = inbox.waker.take() {
+            waker.wake();
+        }
+        client_io
+    }
+}
+
+impl Drop for VirtualRawHttp {
+    fn drop(&mut self) {
+        let mut inbox = self.inbox.lock().unwrap_or_else(PoisonError::into_inner);
+        inbox.closed = true;
+        if let Some(waker) = inbox.waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+impl RawHttp for VirtualRawHttp {
+    async fn send(
+        &self,
+        _cx: &Cx,
+        method: HttpMethod,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        _timeout: Option<Duration>,
+    ) -> Result<HttpResponse, HttpClientError> {
+        let parsed = ParsedUrl::parse(&url)?;
+        let request = HttpRequest::builder(method, parsed.path.clone())
+            .header("Host", parsed.authority())
+            .headers(
+                headers
+                    .into_iter()
+                    .filter(|(name, _)| !name.eq_ignore_ascii_case("host")),
+            )
+            .body(body)
+            .build();
+        let (response, _connection, _body_withheld) =
+            Box::pin(Http1Client::request_with_io(self.dial(), request)).await?;
+        Ok(response)
+    }
+}
+
+/// The mock's server task: serve each dialled connection until the client is
+/// gone.
+async fn serve_inbox(inbox: Arc<Mutex<Inbox>>, server_state: Arc<Mutex<RaceServerState>>) {
+    loop {
+        let next = std::future::poll_fn(|context| {
+            let mut inbox = inbox.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(connection) = inbox.connections.pop_front() {
+                Poll::Ready(Some(connection))
+            } else if inbox.closed {
+                Poll::Ready(None)
+            } else {
+                inbox.waker = Some(context.waker().clone());
+                Poll::Pending
+            }
+        })
+        .await;
+        let Some(connection) = next else {
+            break;
+        };
+        let state = Arc::clone(&server_state);
+        let server = Http1Server::with_config(
+            move |request| {
+                let state = Arc::clone(&state);
+                async move {
+                    state
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .respond(request)
+                }
+            },
+            Http1Config::default()
+                .host_policy(HostPolicy::AllowAll)
+                .keep_alive(false)
+                .max_requests(Some(1)),
+        );
+        let _ = Box::pin(server.serve(connection)).await;
+    }
 }
 
 struct RaceDriver<'a> {
@@ -957,6 +1290,7 @@ impl<'a> RaceDriver<'a> {
             trace_fingerprint: 0,
             replay_command: replay_command(self.case, self.runtime.config().seed),
             crashpack_manifest: crashpack_manifest(self.case, self.runtime.config().seed),
+            driver_events: Vec::new(),
         }
     }
 }
@@ -1014,7 +1348,10 @@ impl RaceServerState {
             RaceCaseKind::CancelDuringSubmit | RaceCaseKind::CancelDuringPoll => {
                 Self::default_async(case)
             }
-            RaceCaseKind::CancelRacesPollExchange => Self::default_async(case),
+            RaceCaseKind::CancelRacesPollExchange | RaceCaseKind::DriverCancelInFlight => {
+                Self::default_async(case)
+            }
+            RaceCaseKind::DriverResubmitAfterLostAnswer => Self::lost_submit_answer(),
         };
         state.install_common_scripts();
         state
@@ -1023,6 +1360,17 @@ impl RaceServerState {
     fn default_async(_case: RaceCaseKind) -> Self {
         Self {
             mock: scenarios::default_async_lifecycle(),
+            scripts: BTreeMap::new(),
+            counters: RaceCounters::default(),
+            issued_handle: None,
+            cancelled_handles: BTreeSet::new(),
+        }
+    }
+
+    fn lost_submit_answer() -> Self {
+        Self {
+            mock: scenarios::default_async_lifecycle()
+                .with_lost_submit_answer(MockHttpResponse::json(500, b"{}".to_vec())),
             scripts: BTreeMap::new(),
             counters: RaceCounters::default(),
             issued_handle: None,
@@ -1491,6 +1839,7 @@ fn failed_report(runtime: &LabRuntime, case: RaceCaseKind, error: RaceError) -> 
         trace_fingerprint: trace_fingerprint(runtime),
         replay_command: replay_command(case, seed),
         crashpack_manifest: format!("{}; error={error}", crashpack_manifest(case, seed)),
+        driver_events: Vec::new(),
     }
 }
 
@@ -1523,6 +1872,7 @@ fn poisoned_report(case: RaceCaseKind, seed: u64, name: &'static str) -> RaceCas
         trace_fingerprint: 0,
         replay_command: replay_command(case, seed),
         crashpack_manifest: format!("{}; poisoned={name}", crashpack_manifest(case, seed)),
+        driver_events: Vec::new(),
     }
 }
 
@@ -1571,6 +1921,71 @@ mod tests {
                     && schedule.no_obligation_leaks
                     && schedule.cancels >= 1),
             "raced-exchange schedules must resolve every statement obligation"
+        );
+        // The production driver, raced: every conclusive schedule leaves no
+        // orphan statement and no unresolved lease, and ends completed or
+        // cancelled (or never started).
+        let driver: Vec<&RaceCaseReport> = report
+            .schedules
+            .iter()
+            .filter(|schedule| schedule.case == RaceCaseKind::DriverCancelInFlight)
+            .collect();
+        assert_eq!(driver.len(), DEFAULT_DPOR_RUNS);
+        assert!(
+            driver.iter().all(|schedule| schedule.step_capped
+                || (schedule.no_orphan_statements
+                    && schedule.no_obligation_leaks
+                    && schedule.lab_invariants_clean)),
+            "{driver:#?}"
+        );
+        // A driver that ran ends completed or cancelled (an empty trail: the
+        // cancel landed before it started); and DPOR landed the cancel at more
+        // than one point.
+        assert!(
+            driver.iter().all(|schedule| schedule.step_capped
+                || schedule.completed
+                || schedule.cancelled
+                || schedule.driver_events.is_empty()),
+            "{driver:#?}"
+        );
+        let landings: BTreeSet<(u32, u32, u32, bool)> = driver
+            .iter()
+            .map(|schedule| {
+                (
+                    schedule.plain_submits + schedule.retry_submits,
+                    schedule.polls,
+                    schedule.cancels,
+                    schedule.completed,
+                )
+            })
+            .collect();
+        assert!(landings.len() >= 2, "{driver:#?}");
+        // Not vacuous: some schedule cancelled an accepted statement, and its
+        // remote cancel reached the server.
+        assert!(
+            driver
+                .iter()
+                .any(|schedule| schedule.cancelled && schedule.cancels >= 1),
+            "{driver:#?}"
+        );
+        // The lost answer: two submits carrying the same requestId and
+        // retry=true, one execution, a completed statement, nothing cancelled.
+        let resubmit: Vec<&RaceCaseReport> = report
+            .schedules
+            .iter()
+            .filter(|schedule| schedule.case == RaceCaseKind::DriverResubmitAfterLostAnswer)
+            .collect();
+        assert_eq!(resubmit.len(), DEFAULT_DPOR_RUNS);
+        assert!(
+            resubmit.iter().all(|schedule| schedule.step_capped
+                || (schedule.completed
+                    && schedule.no_double_submit
+                    && schedule.retry_submits == 2
+                    && schedule.plain_submits == 0
+                    && schedule.cancels == 0
+                    && schedule.no_obligation_leaks
+                    && schedule.lab_invariants_clean)),
+            "{resubmit:#?}"
         );
         let jsonl = race_suite_jsonl(&report)?;
         assert_eq!(jsonl.lines().count(), report.schedules.len());

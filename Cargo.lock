@@ -1939,6 +1939,7 @@ version = "0.0.5"
 dependencies = [
  "asupersync",
  "franken-snowflake-core",
+ "franken-snowflake-http",
  "franken-snowflake-sqlapi",
  "serde",
  "serde_json",

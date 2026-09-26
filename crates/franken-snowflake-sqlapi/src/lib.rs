@@ -30,6 +30,11 @@
 //! See `docs/protocol/schema_draft.md` for the field-by-field rationale and
 //! `docs/proof_lanes.md` (Lane 1) for the proof obligations these types satisfy.
 
+// Proving the driver future `Send` (its test, and any crate that spawns it)
+// walks the whole async chain past rustc's default depth of 128
+// (`recursion_depth_exceeding_limit`).
+#![recursion_limit = "256"]
+
 pub mod driver;
 pub mod lifecycle;
 pub mod request;

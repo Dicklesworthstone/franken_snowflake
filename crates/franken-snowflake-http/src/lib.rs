@@ -1987,7 +1987,11 @@ async fn wait_retry_delay(cx: &Cx, delay: Duration) -> Result<(), CancelReason> 
     Ok(())
 }
 
-async fn run_with_cancellation_mask<T>(cx: &Cx, future: impl Future<Output = T>) -> T {
+/// Drive `future` with `cx`'s cancellation masked: its checkpoints and I/O do
+/// not observe a cancel requested meanwhile (deadlines still apply). Used for
+/// requests that must finish once started: the cleanup cancel, and the submit
+/// whose answer names the statement to cancel.
+pub async fn run_with_cancellation_mask<T>(cx: &Cx, future: impl Future<Output = T>) -> T {
     let mut future = Box::pin(future);
     std::future::poll_fn(|task| cx.masked(|| future.as_mut().poll(task))).await
 }

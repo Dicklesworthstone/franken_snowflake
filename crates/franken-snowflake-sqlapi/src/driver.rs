@@ -15,8 +15,8 @@
 //! cleanup request and single-sources the cancel-policy table. Either way the
 //! local outcome is `Cancelled`.
 
-use std::cell::RefCell;
 use std::future::Future;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use std::pin::Pin;
@@ -34,6 +34,7 @@ use franken_snowflake_http::{
     AuthorizationDescriptor, CancelHttpResponse, PartitionBody, PartitionHttpRequest,
     PollHttpRequest, PollHttpResponse, RawHttp, SnowflakeHttpClient, StatusClass,
     SubmitHttpRequest, SubmitHttpResponse, TransportOutcome, TransportRoute,
+    run_with_cancellation_mask,
 };
 
 use crate::lifecycle::{
@@ -304,8 +305,9 @@ pub async fn run_statement_with_auth<T: StatementTransport, A: AuthProvider>(
 }
 
 /// Receives a statement's rows in partition order while it streams
-/// (reality-check bead E5).
-pub trait RowSink {
+/// (reality-check bead E5). `Send`, like every hook, so a statement can be
+/// driven from a spawned task.
+pub trait RowSink: Send {
     /// Take the next rows: the inline rows, then each fetched partition. An
     /// error stops the fetch and cancels the statement server-side.
     ///
@@ -365,7 +367,7 @@ pub enum DriverEvent {
 }
 
 /// Receives [`DriverEvent`]s while a statement runs.
-pub trait DriverObserver {
+pub trait DriverObserver: Send {
     /// One event, in order.
     fn event(&mut self, event: DriverEvent);
 }
@@ -582,7 +584,7 @@ fn refresh_after_unauthorized<A: AuthProvider>(
 /// driver fires; the cancel paths are best-effort and otherwise discard it.
 struct CancelRecorder<'t, T> {
     inner: &'t T,
-    cancels: RefCell<Vec<DriverEvent>>,
+    cancels: Mutex<Vec<DriverEvent>>,
 }
 
 impl<T> CancelRecorder<'_, T> {
@@ -602,7 +604,8 @@ impl<T> CancelRecorder<'_, T> {
             ),
             SnowflakeOutcome::Panicked(_) => (false, "the cancel request panicked".to_owned()),
         };
-        self.cancels.borrow_mut().push(DriverEvent::RemoteCancel {
+        let mut cancels = self.cancels.lock().unwrap_or_else(PoisonError::into_inner);
+        cancels.push(DriverEvent::RemoteCancel {
             statement_handle: handle.as_str().to_owned(),
             acknowledged,
             detail,
@@ -697,7 +700,7 @@ async fn drive<T: StatementTransport, A: AuthProvider>(
 ) -> StatementOutcome {
     let recorder = CancelRecorder {
         inner: client,
-        cancels: RefCell::new(Vec::new()),
+        cancels: Mutex::new(Vec::new()),
     };
     let StatementHooks { sink, mut observer } = hooks;
     let outcome = drive_statement(
@@ -717,7 +720,11 @@ async fn drive<T: StatementTransport, A: AuthProvider>(
         },
     )
     .await;
-    for event in recorder.cancels.take() {
+    let cancels = recorder
+        .cancels
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
+    for event in cancels {
         notify(&mut observer, event);
     }
     outcome
@@ -752,7 +759,18 @@ async fn submit<T: StatementTransport, A: AuthProvider>(
             body: body.clone(),
             retry_resubmit: params.retry,
         };
-        match client.submit_statement(cx, submit).await {
+        // Nothing is sent once the caller has given up.
+        if cx.checkpoint().is_err() {
+            return SnowflakeOutcome::cancelled(local_cancel_reason(cx));
+        }
+        // Once the POST is on the wire Snowflake may accept the statement, and
+        // only its answer names the handle to cancel (a synchronous submit is
+        // answered within 45 s). So a cancel that arrives meanwhile waits for
+        // that answer, bounded by the transport's deadline and attempt timeout,
+        // and the poll loop's first checkpoint then cancels the statement.
+        // Unmasked, the cancel would abandon the answer and orphan the
+        // statement until its server-side timeout.
+        match run_with_cancellation_mask(cx, client.submit_statement(cx, submit)).await {
             SnowflakeOutcome::Ok(response) if response.status == StatusClass::Unauthorized => {
                 // No handle was issued, so a resubmit with the same requestId
                 // is safe; nothing to cancel server-side.
@@ -1330,9 +1348,6 @@ impl<T: StatementTransport> Drop for DropGuard<'_, T> {
 /// outcomes in partition order. Nothing is abandoned mid-window: each fetch runs
 /// to its own terminal outcome, so a cancellation surfaces as `Cancelled` for
 /// that partition rather than as a dropped request.
-/// One in-flight partition fetch inside a window.
-type BoxedFetch<'a> = Pin<Box<dyn Future<Output = TransportOutcome<PartitionBody>> + 'a>>;
-
 async fn fetch_window<T: StatementTransport>(
     cx: &Cx,
     client: &T,
@@ -1340,15 +1355,14 @@ async fn fetch_window<T: StatementTransport>(
     handle: &StatementHandle,
     partitions: std::ops::Range<u32>,
 ) -> Vec<TransportOutcome<PartitionBody>> {
-    let pending: Vec<Option<BoxedFetch<'_>>> = partitions
+    let pending: Vec<_> = partitions
         .map(|partition| {
             let request = PartitionHttpRequest {
                 auth: auth.clone(),
                 statement_handle: handle.clone(),
                 partition,
             };
-            let fetch: BoxedFetch<'_> = Box::pin(client.fetch_partition(cx, request));
-            Some(fetch)
+            Some(Box::pin(client.fetch_partition(cx, request)))
         })
         .collect();
     let done = pending.iter().map(|_| None).collect();
@@ -1357,14 +1371,18 @@ async fn fetch_window<T: StatementTransport>(
 
 /// Drives a fixed set of futures inside the current task: every still-pending
 /// future is polled on each wake, and the join resolves once all have completed,
-/// yielding their outputs in the original order.
-struct JoinInOrder<'a, T> {
-    pending: Vec<Option<Pin<Box<dyn Future<Output = T> + 'a>>>>,
-    done: Vec<Option<T>>,
+/// yielding their outputs in the original order. It holds the futures by their
+/// own type (no trait object), so the join is `Send` whenever they are.
+struct JoinInOrder<F: Future> {
+    pending: Vec<Option<Pin<Box<F>>>>,
+    done: Vec<Option<F::Output>>,
 }
 
-impl<T: Unpin> Future for JoinInOrder<'_, T> {
-    type Output = Vec<T>;
+impl<F: Future> Future for JoinInOrder<F>
+where
+    F::Output: Unpin,
+{
+    type Output = Vec<F::Output>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -1555,8 +1573,8 @@ mod tests {
     use asupersync::{Budget, CancelKind, PanicPayload, Time};
     use franken_snowflake_core::outcome::{OutcomeKind, SnowflakeOutcomeExt};
     use franken_snowflake_http::{
-        CompressionEvidence, ContentEncoding, SnowflakeAuthTokenType, TransportError,
-        TransportErrorCode,
+        CompressionEvidence, ContentEncoding, SnowflakeAuthTokenType, SnowflakeEndpoint,
+        TransportConfig, TransportError, TransportErrorCode,
     };
     use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, VecDeque};
@@ -2949,6 +2967,51 @@ mod tests {
     #[derive(Default)]
     struct CollectingObserver(Vec<DriverEvent>);
 
+    /// Bead o2o: over a `Sync` transport (the production client here) and with
+    /// both hooks set, the driver future is `Send`, so a statement can be
+    /// driven from a spawned task, as the lab runtime's DPOR explorer does.
+    /// A `RefCell` or a non-`Send` trait object held across an await in the
+    /// driver would fail to compile here.
+    #[test]
+    fn the_driver_future_is_send_over_the_production_client() {
+        fn assert_send<F: Future + Send>(_: &F) {}
+        let endpoint = SnowflakeEndpoint::parse("https://xy12345.us-east-1.snowflakecomputing.com")
+            .expect("a valid account endpoint");
+        let client = SnowflakeHttpClient::for_runtime(TransportConfig::new(endpoint))
+            .expect("the native-roots client builds");
+        let cx = Cx::for_testing();
+        let mut auth = fake_auth();
+        let mut sink = CollectingSink {
+            batches: Vec::new(),
+            refuse: false,
+        };
+        let mut observer = CollectingObserver::default();
+        let single = run_statement_hooked(
+            &cx,
+            &client,
+            &mut auth,
+            SubmitStatementRequest::new("select 1"),
+            SubmitQueryParams::default(),
+            PollPlan::default(),
+            StatementHooks {
+                sink: Some(&mut sink),
+                observer: Some(&mut observer),
+            },
+        );
+        assert_send(&single);
+        drop(single);
+        let multi = run_multi_statement_hooked(
+            &cx,
+            &client,
+            &mut auth,
+            SubmitStatementRequest::new("select 1; select 2"),
+            SubmitQueryParams::default(),
+            PollPlan::default(),
+            Some(&mut observer),
+        );
+        assert_send(&multi);
+    }
+
     impl DriverObserver for CollectingObserver {
         fn event(&mut self, event: DriverEvent) {
             self.0.push(event);
@@ -3636,7 +3699,10 @@ mod tests {
                     .borrow_mut()
                     .push(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
             }
-            let cx = Cx::for_testing_with_budget(Budget::new().with_deadline(Time::from_millis(1)));
+            // The deadline falls after the submit, while the statement is polled
+            // (an already expired one submits nothing: see the test below).
+            let deadline = asupersync::time::wall_now() + Duration::from_millis(25);
+            let cx = Cx::for_testing_with_budget(Budget::new().with_deadline(deadline));
             let (outcome, _) = run_statement_with_stats(
                 &cx,
                 &transport,
@@ -3655,6 +3721,37 @@ mod tests {
             assert_eq!(cancels.len(), 1);
             assert_eq!(cancels[0].0, fixture_handle());
             assert_eq!(cancels[0].1, CancelKind::Deadline);
+            assert!(transport.orphan_cancels.borrow().is_empty());
+        });
+    }
+
+    /// Bead o2o: the submit runs under the cancellation mask, so the driver
+    /// checks first: a caller whose deadline has already passed sends nothing,
+    /// and there is nothing to cancel.
+    #[test]
+    fn an_already_expired_deadline_submits_nothing() {
+        asupersync::test_utils::run_test(|| async {
+            let transport =
+                FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+            let cx = Cx::for_testing_with_budget(Budget::new().with_deadline(Time::from_millis(1)));
+            let (outcome, _) = run_statement_with_stats(
+                &cx,
+                &transport,
+                fake_auth(),
+                SubmitStatementRequest::new("select 1"),
+                SubmitQueryParams::default(),
+                PollPlan::default(),
+            )
+            .await;
+            assert!(
+                matches!(&outcome, SnowflakeOutcome::Cancelled(reason) if reason.is_kind(CancelKind::Deadline)),
+                "{outcome:?}"
+            );
+            assert!(
+                transport.auth_seen.borrow().is_empty(),
+                "no request was sent"
+            );
+            assert!(transport.cancels_after_local.borrow().is_empty());
             assert!(transport.orphan_cancels.borrow().is_empty());
         });
     }
