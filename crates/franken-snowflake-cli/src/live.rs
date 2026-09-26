@@ -3474,9 +3474,11 @@ async fn cancel_on_flags<T>(
         if !raised {
             if interrupt.load(Ordering::SeqCst) {
                 cx.cancel_with(CancelKind::User, Some("interrupted (SIGINT)"));
+                signal_notice("SIGINT");
                 raised = true;
             } else if terminate.load(Ordering::SeqCst) {
                 cx.cancel_with(CancelKind::Shutdown, Some("terminated (SIGTERM)"));
+                signal_notice("SIGTERM");
                 raised = true;
             } else if external.as_ref().is_some_and(|cancelled| cancelled()) {
                 cx.cancel_with(
@@ -3487,6 +3489,18 @@ async fn cancel_on_flags<T>(
             }
         }
     }
+}
+
+/// Tell the person at the terminal what the first signal does: the statement
+/// is being cancelled, which can wait for Snowflake to answer a submit still in
+/// flight, and a second signal exits at once. Stderr only; stdout keeps the
+/// envelope.
+fn signal_notice(signal: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "{signal}: cancelling the statement (the remote cancel may wait for Snowflake to answer the submit); send it again to exit at once"
+    );
 }
 
 /// What one statement run learned beyond its outcome: the handle Snowflake

@@ -553,6 +553,12 @@ fn query_run_polls_and_streams_gzip_partitions_over_tls() {
     let env = &run.envelope;
     assert_eq!(env["ok"], true, "{}", run.context());
     assert_eq!(env["data_source"], "live", "{}", run.context());
+    // No signal, no cancel notice.
+    assert!(
+        !run.stderr.contains("cancelling the statement"),
+        "{}",
+        run.context()
+    );
     assert_eq!(env["statement_handle"], HANDLE, "{}", run.context());
     assert!(env["receipt_hash"].is_string(), "{}", run.context());
     assert_eq!(env["data"]["row_count"], 5, "{}", run.context());
@@ -800,6 +806,13 @@ fn sigint_cancels_the_statement_in_flight() {
     );
     // An interrupted command exits 130, as the shell expects.
     assert_eq!(run.exit, 130, "{}", run.context());
+    // The person at the terminal is told the cancel is under way.
+    assert!(
+        run.stderr.contains("SIGINT: cancelling the statement")
+            && run.stderr.contains("send it again to exit at once"),
+        "{}",
+        run.context()
+    );
     assert_eq!(
         run.envelope["statement_handle"],
         HANDLE,

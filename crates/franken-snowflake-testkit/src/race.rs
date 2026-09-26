@@ -14,7 +14,8 @@
 //! HTTP/1 exchange with the mock over a virtual TCP pair.
 //! [`RaceCaseKind::DriverCancelInFlight`] races a canceller task against it;
 //! [`RaceCaseKind::DriverResubmitAfterLostAnswer`] loses the first submit's
-//! answer. The statement's obligation is the `Lease` the driver mints, read
+//! answer; [`RaceCaseKind::DriverCancelDuringPartitions`] races a canceller
+//! against the partition fetch window. The statement's obligation is the `Lease` the driver mints, read
 //! back from the runtime's obligation arena.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -126,6 +127,10 @@ pub enum RaceCaseKind {
     /// is lost (a `500`); the client resubmits with the same `requestId` and
     /// `retry=true`, and the statement runs once and completes.
     DriverResubmitAfterLostAnswer,
+    /// The production driver fetches a completed statement's partitions through
+    /// its concurrent window while a canceller task aborts it; wherever the
+    /// cancel lands, the run ends completed or cancelled with its lease resolved.
+    DriverCancelDuringPartitions,
 }
 
 impl RaceCaseKind {
@@ -142,10 +147,11 @@ impl RaceCaseKind {
             Self::CancelRacesPollExchange => "cancel_races_poll_exchange",
             Self::DriverCancelInFlight => "driver_cancel_in_flight",
             Self::DriverResubmitAfterLostAnswer => "driver_resubmit_after_lost_answer",
+            Self::DriverCancelDuringPartitions => "driver_cancel_during_partitions",
         }
     }
 
-    fn all() -> [Self; 9] {
+    fn all() -> [Self; 10] {
         [
             Self::CancelDuringSubmit,
             Self::CancelDuringPoll,
@@ -156,6 +162,7 @@ impl RaceCaseKind {
             Self::CancelRacesPollExchange,
             Self::DriverCancelInFlight,
             Self::DriverResubmitAfterLostAnswer,
+            Self::DriverCancelDuringPartitions,
         ]
     }
 }
@@ -571,7 +578,9 @@ fn run_case_inner(
 ) -> Result<RaceCaseReport, RaceError> {
     if matches!(
         case,
-        RaceCaseKind::DriverCancelInFlight | RaceCaseKind::DriverResubmitAfterLostAnswer
+        RaceCaseKind::DriverCancelInFlight
+            | RaceCaseKind::DriverResubmitAfterLostAnswer
+            | RaceCaseKind::DriverCancelDuringPartitions
     ) {
         return run_production_driver(runtime, case);
     }
@@ -584,7 +593,9 @@ fn run_case_inner(
         RaceCaseKind::PartialPartitionFailure => driver.partial_partition_failure()?,
         RaceCaseKind::UnsafeSubmitRetryRefusal => driver.unsafe_submit_retry_refusal()?,
         RaceCaseKind::CancelRacesPollExchange => driver.cancel_races_poll_exchange()?,
-        RaceCaseKind::DriverCancelInFlight | RaceCaseKind::DriverResubmitAfterLostAnswer => {
+        RaceCaseKind::DriverCancelInFlight
+        | RaceCaseKind::DriverResubmitAfterLostAnswer
+        | RaceCaseKind::DriverCancelDuringPartitions => {
             return Err(RaceError::Lab(format!(
                 "{} runs the production driver, not the model",
                 case.as_str()
@@ -676,10 +687,29 @@ fn run_production_driver(
     scheduler.schedule(server_task, 0);
     scheduler.schedule(driver_task, 0);
     drop(scheduler);
-    if case == RaceCaseKind::DriverCancelInFlight {
+    if matches!(
+        case,
+        RaceCaseKind::DriverCancelInFlight | RaceCaseKind::DriverCancelDuringPartitions
+    ) {
+        // The window case cancels once a partition request has reached the
+        // server, so DPOR explores the cancel inside the fetch window rather
+        // than before it opens.
+        let wait_for_partitions = case == RaceCaseKind::DriverCancelDuringPartitions;
+        let watched = Arc::clone(&server);
         let (canceller_task, _) = runtime
             .state
             .create_task(region, Budget::INFINITE, async move {
+                while wait_for_partitions
+                    && watched
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .counters
+                        .partitions
+                        == 0
+                    && !driver_handle.is_finished()
+                {
+                    asupersync::runtime::yield_now().await;
+                }
                 driver_handle.abort_with_reason(CancelReason::user("the caller gives up"));
             })
             .map_err(|error| RaceError::Lab(format!("canceller task spawn failed: {error}")))?;
@@ -1340,9 +1370,9 @@ struct RaceServerState {
 impl RaceServerState {
     fn for_case(case: RaceCaseKind) -> Self {
         let mut state = match case {
-            RaceCaseKind::CancelDuringPartitionFetch | RaceCaseKind::PartialPartitionFailure => {
-                Self::multi_partition(case)
-            }
+            RaceCaseKind::CancelDuringPartitionFetch
+            | RaceCaseKind::PartialPartitionFailure
+            | RaceCaseKind::DriverCancelDuringPartitions => Self::multi_partition(case),
             RaceCaseKind::UnsafeSubmitRetryRefusal => Self::unsafe_submit_refusal(case),
             RaceCaseKind::RateLimitStorm => Self::rate_limit_storm(case),
             RaceCaseKind::CancelDuringSubmit | RaceCaseKind::CancelDuringPoll => {
@@ -1967,6 +1997,31 @@ mod tests {
                 .iter()
                 .any(|schedule| schedule.cancelled && schedule.cancels >= 1),
             "{driver:#?}"
+        );
+        // The partition window, raced: every conclusive schedule resolves its
+        // lease and ends completed or cancelled, and some schedule is cancelled
+        // after a partition fetch reached the server.
+        let window: Vec<&RaceCaseReport> = report
+            .schedules
+            .iter()
+            .filter(|schedule| schedule.case == RaceCaseKind::DriverCancelDuringPartitions)
+            .collect();
+        assert_eq!(window.len(), DEFAULT_DPOR_RUNS);
+        assert!(
+            window.iter().all(|schedule| schedule.step_capped
+                || (schedule.no_obligation_leaks
+                    && schedule.lab_invariants_clean
+                    && schedule.no_double_submit
+                    && (schedule.completed
+                        || schedule.cancelled
+                        || schedule.driver_events.is_empty()))),
+            "{window:#?}"
+        );
+        assert!(
+            window
+                .iter()
+                .any(|schedule| schedule.cancelled && schedule.partitions >= 1),
+            "{window:#?}"
         );
         // The lost answer: two submits carrying the same requestId and
         // retry=true, one execution, a completed statement, nothing cancelled.
