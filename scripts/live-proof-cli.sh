@@ -57,7 +57,15 @@ event() {
     '{schema:"franken_snowflake.live_proof_cli.v1",step:$step,status:$status,exit:$exit,ms:$ms,note:$note}' >>"$EVENTS"
 }
 
-now_ms() { local ns; ns=$(date +%s%N); printf '%s' "$((ns / 1000000))"; }
+now_ms() {
+  local ns
+  ns=$(date +%s%N)
+  case "$ns" in
+    # BSD/macOS date has no %N and prints it literally: whole seconds then.
+    '' | *[!0-9]*) printf '%s' "$(($(date +%s) * 1000))" ;;
+    *) printf '%s' "$((ns / 1000000))" ;;
+  esac
+}
 
 # ---------------------------------------------------------------- opt-in gate
 profile_prefix() {
