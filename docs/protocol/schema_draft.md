@@ -153,11 +153,14 @@ Partition 0 ships inline in the first 200 body. Partitions `1..N` are fetched wi
 
 ### Session parameters to pin (determinism)
 
-`TIMEZONE`, the `*_OUTPUT_FORMAT` params (`DATE_OUTPUT_FORMAT`,
-`TIME_OUTPUT_FORMAT`, `TIMESTAMP_*_OUTPUT_FORMAT`), `BINARY_OUTPUT_FORMAT`,
-`USE_CACHED_RESULT`, and `MULTI_STATEMENT_COUNT` (exact N, or `0` for variable).
-Pin these in the request rather than relying on account defaults. Bindings are
-**not** supported in multi-statement mode (a refusal case).
+`TIMEZONE`, `BINARY_OUTPUT_FORMAT` (`HEX`), `USE_CACHED_RESULT`, and
+`MULTI_STATEMENT_COUNT` (exact N, or `0` for variable). Do **not** pin
+`DATE_OUTPUT_FORMAT`, `TIME_OUTPUT_FORMAT` or `TIMESTAMP_*_OUTPUT_FORMAT`: the
+SQL API ignores account- and user-level settings for them, and a value set in
+the request replaces the default encoding in the table below with formatted
+text the codec does not decode (handling-responses, "Formatting the output of
+query results", consulted 2026-09-27). Bindings are **not** supported in
+multi-statement mode (a refusal case).
 
 ## jsonv2 Wire Codec (where bugs hide)
 

@@ -800,6 +800,63 @@ mod tests {
         );
     }
 
+    /// Columns of a `jsonv2_wire_golden.v1` capture (as
+    /// `scripts/capture-jsonv2-golden.sh` writes it) holding a cell their
+    /// codec cannot type, i.e. columns `typed.v1` would leave as wire strings.
+    fn wire_fallbacks(golden: &Value) -> Vec<String> {
+        let columns = golden["columns"].as_array().expect("columns");
+        let rows = golden["rows"].as_array().expect("rows");
+        assert!(!rows.is_empty(), "the capture has rows");
+        columns
+            .iter()
+            .enumerate()
+            .filter(|(index, column)| {
+                let codec = ColumnCodec::new(
+                    column["type"].as_str().unwrap_or_default(),
+                    column["precision"].as_i64(),
+                    column["scale"].as_i64(),
+                );
+                rows.iter()
+                    .any(|row| codec.decode(row[*index].as_str()).is_err())
+            })
+            .map(|(_, column)| format!("{} ({})", column["name"], column["type"]))
+            .collect()
+    }
+
+    /// The live capture (bead w0i.13), once checked in, decodes cell by cell:
+    /// a column left as wire strings is a codec assumption the wire disproves.
+    #[test]
+    fn a_checked_in_live_capture_types_every_column() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../franken-snowflake-frame/tests/captured/jsonv2-wire-golden.json");
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            println!("skip: no live capture at {}", path.display());
+            return;
+        };
+        let golden: Value = serde_json::from_str(&raw).expect("capture is JSON");
+        assert_eq!(wire_fallbacks(&golden), Vec::<String>::new());
+    }
+
+    /// The check has teeth: a DATE captured under a pinned DATE_OUTPUT_FORMAT
+    /// (`"2026-09-04"`, not epoch days) is flagged; the documented encoding is not.
+    #[test]
+    fn a_capture_with_formatted_dates_is_flagged() {
+        let capture = |date: &str| {
+            serde_json::json!({
+                "columns": [
+                    {"name": "N", "type": "fixed", "precision": 10, "scale": 2},
+                    {"name": "D", "type": "date", "precision": null, "scale": null}
+                ],
+                "rows": [["123.45", date], [null, null]]
+            })
+        };
+        assert_eq!(wire_fallbacks(&capture("20700")), Vec::<String>::new());
+        assert_eq!(
+            wire_fallbacks(&capture("2026-09-04")),
+            vec![r#""D" ("date")"#.to_owned()]
+        );
+    }
+
     /// A decode error never carries the cell value (it may be sensitive).
     #[test]
     fn errors_do_not_echo_the_value() {

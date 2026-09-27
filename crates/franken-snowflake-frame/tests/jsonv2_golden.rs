@@ -35,10 +35,8 @@ fn golden_path() -> Option<PathBuf> {
     checked_in.is_file().then_some(checked_in)
 }
 
-/// The deterministic storage dtype a logical type must land in when the
-/// column carries no scale/precision metadata (the capture envelope omits
-/// them). FIXED is excluded: without scale it may legally land Int64 or
-/// DecimalString.
+/// The deterministic storage dtype a logical type must land in. FIXED is
+/// excluded: by scale and precision it lands Int64 or DecimalString.
 fn required_dtype(snowflake_type: &str) -> Option<DType> {
     match snowflake_type.to_ascii_uppercase().as_str() {
         "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "DECFLOAT" => {
@@ -95,8 +93,16 @@ fn captured_wire_golden_decodes_through_the_frame_codec() -> Result<(), String> 
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned(),
-            scale: None,
-            precision: None,
+            // The envelope's columns carry the rowType scale and precision,
+            // which decide FIXED storage (NUMBER(10,2) is a decimal string).
+            scale: column
+                .get("scale")
+                .and_then(Value::as_i64)
+                .and_then(|scale| i32::try_from(scale).ok()),
+            precision: column
+                .get("precision")
+                .and_then(Value::as_i64)
+                .and_then(|precision| i32::try_from(precision).ok()),
             nullable: column
                 .get("nullable")
                 .and_then(Value::as_bool)

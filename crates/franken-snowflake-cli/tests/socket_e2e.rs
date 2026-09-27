@@ -2098,6 +2098,114 @@ fn raw_cells_returns_the_wire_strings() {
     assert_eq!(data["columns"][0]["json_repr"], "wire", "{}", run.context());
 }
 
+/// Date and time cells arrive in the SQL API's default encoding, which is the
+/// one `typed.v1` decodes. The mock answers as Snowflake documents: a
+/// `*_OUTPUT_FORMAT` set in the request body replaces the default encoding
+/// ("Handling responses", consulted 2026-09-27:
+/// <https://docs.snowflake.com/en/developer-guide/sql-api/handling-responses>),
+/// so a CLI that pins one gets formatted strings its decoder cannot type.
+#[test]
+fn date_and_time_cells_keep_the_sql_api_default_encoding() {
+    const HANDLE: &str = "01b2c3d4-0000-0000-0000-00000000f115";
+    // (name, type, default wire encoding, what the pre-2026-09-27 pinned
+    // formats rendered, typed.v1 value, json_repr)
+    let cells = [
+        ("D", "DATE", "18262", "2020-01-01", "2020-01-01", "date"),
+        (
+            "T",
+            "TIME",
+            "82919.000000000",
+            "23:01:59.000000000",
+            "23:01:59.000000000",
+            "time",
+        ),
+        (
+            "NTZ",
+            "TIMESTAMP_NTZ",
+            "1611871777.123456789",
+            "2021-01-28 22:09:37.123456789",
+            "2021-01-28T22:09:37.123456789",
+            "timestamp_ntz",
+        ),
+        (
+            "LTZ",
+            "TIMESTAMP_LTZ",
+            "1611871777.123456789",
+            "2021-01-28 22:09:37.123456789 +0000",
+            "2021-01-28T22:09:37.123456789Z",
+            "timestamp_utc",
+        ),
+        (
+            "TZ",
+            "TIMESTAMP_TZ",
+            "1616173619.000000000 1500",
+            "2021-03-19 18:06:59.000000000 +0100",
+            "2021-03-19T18:06:59.000000000+01:00",
+            "timestamp_offset",
+        ),
+    ];
+    let cert = TestCert::mint();
+    let server = MockServer::start(&cert, move |request, _| {
+        if !request.is_submit() {
+            return not_found();
+        }
+        let parameters = request.body_json()["parameters"].clone();
+        let pinned = |type_name: &str| {
+            let own = format!("{type_name}_OUTPUT_FORMAT");
+            parameters.get(own.as_str()).is_some()
+                || (type_name.starts_with("TIMESTAMP")
+                    && parameters.get("TIMESTAMP_OUTPUT_FORMAT").is_some())
+        };
+        let columns: Vec<(&str, &str, Option<i64>, Option<i64>)> = cells
+            .iter()
+            .map(|(name, kind, ..)| (*name, *kind, None, Some(9)))
+            .collect();
+        let row: Vec<Option<&str>> = cells
+            .iter()
+            .map(|(_, kind, default, formatted, ..)| {
+                Some(if pinned(kind) { *formatted } else { *default })
+            })
+            .collect();
+        result_set(HANDLE, &columns, &[row])
+    });
+    let h = Harness::new("date-time-encoding", &cert);
+    let run = h.run(
+        server.port,
+        &[
+            "query",
+            "run",
+            "--profile",
+            "sock",
+            "--sql",
+            "select 1",
+            "--json",
+        ],
+    );
+    assert_eq!(run.exit, 0, "{}", run.context());
+    let data = &run.envelope["data"];
+    assert_eq!(data["row_encoding"], "typed.v1", "{}", run.context());
+    for (index, (name, _, _, _, typed, repr)) in cells.iter().enumerate() {
+        assert_eq!(
+            data["columns"][index]["json_repr"],
+            *repr,
+            "{name}: {}",
+            run.context()
+        );
+        assert_eq!(data["rows"][0][index], *typed, "{name}: {}", run.context());
+    }
+    assert!(
+        !run.envelope["warnings"]
+            .to_string()
+            .contains("wire strings"),
+        "{}",
+        run.context()
+    );
+    let seen = server.seen();
+    let submit = seen.iter().find(|seen| seen.is_submit()).expect("submit");
+    // Session pins that do not change the encoding stay.
+    assert_eq!(submit.body_json()["parameters"]["TIMEZONE"], "UTC");
+}
+
 /// The discovery-to-query path over the wire: `catalog scan` runs its
 /// INFORMATION_SCHEMA statements (filters bound as parameters, never
 /// interpolated) and its relation pass (keys, the view's dependencies,

@@ -698,26 +698,11 @@ fn require_rows(
     }
 }
 
+/// The CLI's session pins. No DATE/TIME/TIMESTAMP output format: one set in
+/// the request replaces the documented jsonv2 encoding the decoders read.
 fn deterministic_session_parameters() -> BTreeMap<String, String> {
     BTreeMap::from([
         ("TIMEZONE".to_string(), "UTC".to_string()),
-        ("DATE_OUTPUT_FORMAT".to_string(), "YYYY-MM-DD".to_string()),
-        (
-            "TIME_OUTPUT_FORMAT".to_string(),
-            "HH24:MI:SS.FF9".to_string(),
-        ),
-        (
-            "TIMESTAMP_NTZ_OUTPUT_FORMAT".to_string(),
-            "YYYY-MM-DD HH24:MI:SS.FF9".to_string(),
-        ),
-        (
-            "TIMESTAMP_LTZ_OUTPUT_FORMAT".to_string(),
-            "YYYY-MM-DD HH24:MI:SS.FF9 TZHTZM".to_string(),
-        ),
-        (
-            "TIMESTAMP_TZ_OUTPUT_FORMAT".to_string(),
-            "YYYY-MM-DD HH24:MI:SS.FF9 TZHTZM".to_string(),
-        ),
         ("BINARY_OUTPUT_FORMAT".to_string(), "HEX".to_string()),
         ("USE_CACHED_RESULT".to_string(), "FALSE".to_string()),
     ])

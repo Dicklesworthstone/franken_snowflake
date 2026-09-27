@@ -98,30 +98,47 @@ export FRANKEN_SNOWFLAKE_DATA_DIR="${FRANKEN_SNOWFLAKE_DATA_DIR:-$ARTIFACTS/data
 mkdir -p "$FRANKEN_SNOWFLAKE_DATA_DIR"
 
 # --- the all-types capture statement ---------------------------------------
-# Known instants; one row; every documented wire type. CURRENT_SETTING keeps
-# the session timezone in the capture so TIMESTAMP_LTZ strings are interpretable.
-SQL="SELECT
+# Known instants; one row; every documented wire type. A quoted heredoc keeps
+# the SQL verbatim (inside a double-quoted string bash strips the JSON's
+# quotes). String casts rather than TIMESTAMP_NTZ'...' literals (only DATE,
+# TIME and TIMESTAMP literals are documented); DECFLOAT from a string (the
+# numeric-types page: numeric literals are cast through NUMBER/FLOAT first);
+# TO_BINARY for a BINARY column (HEX_ENCODE returns a string). The CLI pins
+# TIMEZONE=UTC in every request, so TIMESTAMP_LTZ cells are UTC instants, and
+# pins no DATE/TIME/TIMESTAMP output format, so cells keep the default
+# encoding. Docs consulted 2026-09-27: sql-reference/data-types-datetime,
+# data-types-numeric, functions/hex_encode, functions/to_binary.
+SQL=$(cat <<'SQL_EOF'
+SELECT
   12345::NUMBER(38,0) AS num_int,
+  99999999999999999999::NUMBER(38,0) AS num_beyond_i64,
   123.45::NUMBER(10,2) AS num_scale,
   -0.000001::NUMBER(38,9) AS num_negative_scale,
   1.5::FLOAT AS float_val,
-  1.5::DECFLOAT AS decfloat_val,
+  'NaN'::FLOAT AS float_nan,
+  '1.5'::DECFLOAT AS decfloat_val,
   TRUE AS bool_true,
   FALSE AS bool_false,
-  DATE'2026-09-04' AS date_val,
-  TIME'12:34:56.123456' AS time_val,
-  TIMESTAMP_NTZ'2026-09-04 12:34:56.123456789' AS ts_ntz,
-  TIMESTAMP_TZ'2026-09-04 12:34:56.123456789 +05:30' AS ts_tz,
-  TIMESTAMP_LTZ'2026-09-04 12:34:56.123456789' AS ts_ltz,
-  HEX_ENCODE('golden') AS binary_val,
+  '2026-09-04'::DATE AS date_val,
+  '1969-12-31'::DATE AS date_pre_epoch,
+  '12:34:56.123456'::TIME AS time_val,
+  '2026-09-04 12:34:56.123456789'::TIMESTAMP_NTZ AS ts_ntz,
+  '1969-12-31 23:59:59.5'::TIMESTAMP_NTZ AS ts_ntz_pre_epoch,
+  '2026-09-04 12:34:56.123456789 +05:30'::TIMESTAMP_TZ AS ts_tz,
+  '2026-09-04 12:34:56.123456789'::TIMESTAMP_LTZ AS ts_ltz,
+  TO_BINARY('676F6C64656E', 'HEX') AS binary_val,
   PARSE_JSON('{"k":[1,{"nested":true}],"s":"v"}') AS variant_val,
-  ARRAY_CONSTRUCT_COMPACT(1, NULL, 'two')::VARIANT AS array_val,
+  OBJECT_CONSTRUCT('k', 1) AS object_val,
+  ARRAY_CONSTRUCT(1, 'two') AS array_val,
   NULL AS null_val,
-  CURRENT_SETTING('TIMEZONE') AS session_tz,
-  'text'::VARCHAR AS varchar_val"
+  'text'::VARCHAR AS varchar_val
+SQL_EOF
+)
 
 echo "capturing the all-types wire encoding through the live binary..."
-if ! "$BIN" query run --profile "$PROFILE" --sql "$SQL" --json \
+# --raw-cells: rows default to typed.v1 (decoded by the codec under test);
+# the golden must hold the strings Snowflake sent.
+if ! "$BIN" query run --profile "$PROFILE" --sql "$SQL" --raw-cells --json \
     > "$ARTIFACTS/all-types-envelope.json" 2> "$ARTIFACTS/all-types-stderr.txt"; then
   emit fail ',"stage":"query_run"'
   echo "FAIL: query run exited nonzero - see $ARTIFACTS/all-types-envelope.json"
@@ -135,13 +152,15 @@ if not envelope.get("ok") or envelope.get("data_source") != "live":
     print("FAIL: envelope is not a live success:", envelope.get("error"))
     sys.exit(1)
 data = envelope["data"]
-tz_index = next((i for i, c in enumerate(data["columns"]) if c["name"] == "SESSION_TZ"), None)
+if data.get("row_encoding") != "jsonv2.wire":
+    print("FAIL: rows are not wire strings (row_encoding=%r)" % data.get("row_encoding"))
+    sys.exit(1)
 golden = {
     "schema": "franken_snowflake.jsonv2_wire_golden.v1",
     "captured_via": "cli query run (cells are literal wire strings)",
     "columns": data["columns"],
     "rows": data["rows"],
-    "session_tz": data["rows"][0][tz_index] if tz_index is not None and data["rows"] else None,
+    "session_tz": "UTC (pinned in the request by the CLI)",
 }
 with open(sys.argv[2] + "/jsonv2-wire-golden.json", "w") as f:
     json.dump(golden, f, indent=1)
@@ -157,4 +176,4 @@ emit pass ',"stage":"captured"'
 PINNED="crates/franken-snowflake-frame/tests/captured/jsonv2-wire-golden.json"
 mkdir -p "$(dirname "$PINNED")"
 cp "$ARTIFACTS/jsonv2-wire-golden.json" "$PINNED"
-echo "next: diff $ARTIFACTS/jsonv2-wire-golden.json against the kx6 fixtures, commit $PINNED, and run the frame jsonv2_golden test (bead w0i.13)." 
+echo "next: diff $ARTIFACTS/jsonv2-wire-golden.json against the kx6 fixtures, commit $PINNED, and run the frame jsonv2_golden test (--features frankenpandas) and the core typed test a_checked_in_live_capture_types_every_column (bead w0i.13)." 

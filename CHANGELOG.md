@@ -142,6 +142,15 @@ implementation first and the test/hardening pass follows in a later wave. The
   refused as non-canonical, and China-region accounts
   (`snowflakecomputing.cn`) were refused; both now connect, and a bare
   `<locator>.cn-northwest-1[.aws]` resolves to `snowflakecomputing.cn`.
+- Every live request set `DATE_OUTPUT_FORMAT`, `TIME_OUTPUT_FORMAT` and the
+  `TIMESTAMP_*_OUTPUT_FORMAT` parameters. The SQL API docs say a format set in
+  the request replaces the documented encoding (epoch days, epoch seconds) with
+  formatted text. `typed.v1` would have left every date, time and timestamp
+  column as wire strings with a warning. Frame materialization would have
+  failed, and Parquet export would have failed on TIME and TIMESTAMP. The
+  request no longer sets them; the SQL API ignores account and user settings for
+  them, so output stays deterministic. `scripts/capture-jsonv2-golden.sh` now
+  records wire strings (`--raw-cells`) with SQL that Snowflake compiles.
 
 ### Added
 

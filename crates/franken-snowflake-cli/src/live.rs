@@ -4696,28 +4696,17 @@ fn outcome_kind_for(code: SnowflakeErrorCode) -> &'static str {
     }
 }
 
-/// Deterministic session output formats so live results are stable across runs
-/// (UTC, fixed date/time/timestamp/binary formats, result cache disabled).
+/// Deterministic session parameters (UTC, hex binary, result cache disabled).
+///
+/// DATE/TIME/TIMESTAMP output formats are deliberately **not** set: the SQL
+/// API ignores account- and user-level settings for them, and a format set in
+/// the request replaces the documented encoding (epoch days, epoch seconds,
+/// `"<seconds> <offset+1440>"`) that `typed.v1`, frames and Parquet export
+/// decode ("Handling responses", consulted 2026-09-27:
+/// <https://docs.snowflake.com/en/developer-guide/sql-api/handling-responses>).
 fn deterministic_session_parameters() -> BTreeMap<String, String> {
     BTreeMap::from([
         ("TIMEZONE".to_string(), "UTC".to_string()),
-        ("DATE_OUTPUT_FORMAT".to_string(), "YYYY-MM-DD".to_string()),
-        (
-            "TIME_OUTPUT_FORMAT".to_string(),
-            "HH24:MI:SS.FF9".to_string(),
-        ),
-        (
-            "TIMESTAMP_NTZ_OUTPUT_FORMAT".to_string(),
-            "YYYY-MM-DD HH24:MI:SS.FF9".to_string(),
-        ),
-        (
-            "TIMESTAMP_LTZ_OUTPUT_FORMAT".to_string(),
-            "YYYY-MM-DD HH24:MI:SS.FF9 TZHTZM".to_string(),
-        ),
-        (
-            "TIMESTAMP_TZ_OUTPUT_FORMAT".to_string(),
-            "YYYY-MM-DD HH24:MI:SS.FF9 TZHTZM".to_string(),
-        ),
         ("BINARY_OUTPUT_FORMAT".to_string(), "HEX".to_string()),
         ("USE_CACHED_RESULT".to_string(), "FALSE".to_string()),
     ])
