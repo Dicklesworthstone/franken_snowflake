@@ -501,9 +501,12 @@ impl DtypeClass {
         !matches!(self, Self::Unknown | Self::Variant)
     }
 
-    /// Snowflake SQL API binding type used by the planner.
+    /// The class's SQL API type token (the upper-case form of the `rowType`
+    /// type name). Not a binding type: the planner derives each binding from
+    /// its value (`planner::sql_api_binding_type`), because the SQL API binds
+    /// DATE/TIME/TIMESTAMP* as epoch numbers, not date strings.
     #[must_use]
-    pub const fn default_binding_type(self) -> &'static str {
+    pub const fn sql_api_type_token(self) -> &'static str {
         match self {
             Self::String => "TEXT",
             Self::Number => "FIXED",
@@ -672,18 +675,15 @@ mod tests {
         assert!(!DtypeClass::Variant.is_known_scalar());
         assert!(!DtypeClass::Unknown.is_known_scalar());
 
-        assert_eq!(DtypeClass::String.default_binding_type(), "TEXT");
-        assert_eq!(DtypeClass::Number.default_binding_type(), "FIXED");
-        assert_eq!(DtypeClass::Boolean.default_binding_type(), "BOOLEAN");
-        assert_eq!(DtypeClass::Date.default_binding_type(), "DATE");
-        assert_eq!(DtypeClass::Time.default_binding_type(), "TIME");
-        assert_eq!(
-            DtypeClass::Timestamp.default_binding_type(),
-            "TIMESTAMP_NTZ"
-        );
-        assert_eq!(DtypeClass::Binary.default_binding_type(), "BINARY");
-        assert_eq!(DtypeClass::Variant.default_binding_type(), "VARIANT");
-        assert_eq!(DtypeClass::Unknown.default_binding_type(), "TEXT");
+        assert_eq!(DtypeClass::String.sql_api_type_token(), "TEXT");
+        assert_eq!(DtypeClass::Number.sql_api_type_token(), "FIXED");
+        assert_eq!(DtypeClass::Boolean.sql_api_type_token(), "BOOLEAN");
+        assert_eq!(DtypeClass::Date.sql_api_type_token(), "DATE");
+        assert_eq!(DtypeClass::Time.sql_api_type_token(), "TIME");
+        assert_eq!(DtypeClass::Timestamp.sql_api_type_token(), "TIMESTAMP_NTZ");
+        assert_eq!(DtypeClass::Binary.sql_api_type_token(), "BINARY");
+        assert_eq!(DtypeClass::Variant.sql_api_type_token(), "VARIANT");
+        assert_eq!(DtypeClass::Unknown.sql_api_type_token(), "TEXT");
     }
 
     #[test]

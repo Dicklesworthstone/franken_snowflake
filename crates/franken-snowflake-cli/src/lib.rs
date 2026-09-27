@@ -2801,7 +2801,7 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
                     "bindings_env",
                     "string",
                     false,
-                    "Env var holding a JSON object of positional typed bindings (--bindings-env)",
+                    "Env var holding a JSON object of positional typed bindings (--bindings-env), e.g. {\"1\":{\"type\":\"TEXT\",\"value\":\"2024-01-01\"}}; values are strings, DATE takes epoch milliseconds and TIME/TIMESTAMP_* epoch nanoseconds, so bind a date or time string as TEXT",
                 ),
                 input(
                     "query_tag",

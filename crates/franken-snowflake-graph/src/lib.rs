@@ -1393,7 +1393,7 @@ mod tests {
                 object: dataset.object.clone(),
                 column: field.column.clone(),
                 ordinal: (index + 1) as u32,
-                snowflake_type: field.dtype.default_binding_type().to_owned(),
+                snowflake_type: field.dtype.sql_api_type_token().to_owned(),
                 dtype_class: field.dtype,
                 nullable: !field.required,
                 precision: None,

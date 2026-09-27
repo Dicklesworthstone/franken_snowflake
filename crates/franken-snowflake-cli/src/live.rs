@@ -4289,14 +4289,13 @@ fn validate_bindings(bindings: &BTreeMap<String, Binding>) -> Result<(), Snowfla
             "binding keys must be contiguous 1-based positions",
         ));
     }
-    if bindings
-        .values()
-        .any(|binding| !is_safe_binding_type(&binding.value_type))
-    {
-        return Err(SnowflakeError::new(
-            SnowflakeErrorCode::UsageError,
-            "binding type names must be uppercase Snowflake type tokens",
-        ));
+    for (position, binding) in bindings {
+        if let Err(reason) = check_binding(&binding.value_type, &binding.value) {
+            return Err(SnowflakeError::new(
+                SnowflakeErrorCode::UsageError,
+                format!("binding {position}: {reason}"),
+            ));
+        }
     }
     Ok(())
 }
@@ -4326,14 +4325,53 @@ fn is_safe_env_name(value: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-fn is_safe_binding_type(value: &str) -> bool {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return false;
+/// Check one caller-supplied binding against the SQL API's binding rules
+/// ("Using bind variables in a statement", consulted 2026-09-26:
+/// <https://docs.snowflake.com/en/developer-guide/sql-api/submitting-requests>),
+/// so a value Snowflake would refuse with 100037 is a local usage error that
+/// names the fix instead.
+fn check_binding(binding_type: &str, value: &str) -> Result<(), String> {
+    let integer = |text: &str| {
+        let digits = text.strip_prefix('-').unwrap_or(text);
+        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
     };
-    value.len() <= 64
-        && first.is_ascii_uppercase()
-        && chars.all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+    let ok = match binding_type {
+        "TEXT" => true,
+        "FIXED" => integer(value),
+        "REAL" | "DECFLOAT" => value.trim().parse::<f64>().is_ok_and(f64::is_finite),
+        "BOOLEAN" => ["true", "false", "0", "1"]
+            .iter()
+            .any(|literal| value.eq_ignore_ascii_case(literal)),
+        "DATE" | "TIME" | "TIMESTAMP_NTZ" | "TIMESTAMP_LTZ" => integer(value),
+        "TIMESTAMP_TZ" => value
+            .split_once(' ')
+            .is_some_and(|(nanos, offset)| integer(nanos) && integer(offset)),
+        "BINARY" => value.len().is_multiple_of(2) && value.bytes().all(|b| b.is_ascii_hexdigit()),
+        _ => {
+            return Err(format!(
+                "`{binding_type}` is not a SQL API binding type (FIXED, REAL, DECFLOAT, TEXT, \
+                 BINARY, BOOLEAN, DATE, TIME, TIMESTAMP_TZ, TIMESTAMP_LTZ, TIMESTAMP_NTZ)"
+            ));
+        }
+    };
+    if ok {
+        return Ok(());
+    }
+    Err(match binding_type {
+        "FIXED" => "FIXED takes an integer; bind a decimal as REAL or TEXT".to_owned(),
+        "REAL" | "DECFLOAT" => format!("{binding_type} takes a number"),
+        "BOOLEAN" => "BOOLEAN takes true, false, 0 or 1".to_owned(),
+        "DATE" => "DATE takes epoch milliseconds (e.g. 1704067200000); bind a date string \
+                   like 2024-01-01 as TEXT"
+            .to_owned(),
+        "TIMESTAMP_TZ" => "TIMESTAMP_TZ takes epoch nanoseconds, a space and an offset in \
+                           minutes; bind a timestamp string as TEXT"
+            .to_owned(),
+        "BINARY" => "BINARY takes hex digits".to_owned(),
+        other => {
+            format!("{other} takes epoch nanoseconds; bind a time or timestamp string as TEXT")
+        }
+    })
 }
 
 fn authorization_descriptor(
@@ -5022,6 +5060,48 @@ mod tests {
             Binding::new("TEXT; DROP TABLE", "must-not-run"),
         )]);
         assert!(validate_bindings(&unsafe_type).is_err());
+    }
+
+    /// Bindings follow the SQL API's documented rules, so a value Snowflake
+    /// would refuse (100037) is refused locally with the fix named.
+    #[test]
+    fn bindings_are_checked_against_the_sql_api_binding_rules() {
+        let one = |binding_type: &str, value: &str| {
+            validate_bindings(&BTreeMap::from([(
+                "1".to_owned(),
+                Binding::new(binding_type, value),
+            )]))
+        };
+        for (binding_type, value) in [
+            ("TEXT", "2024-01-01"),
+            ("FIXED", "-42"),
+            ("REAL", "1.5"),
+            ("DECFLOAT", "1.23e-40"),
+            ("BOOLEAN", "TRUE"),
+            ("DATE", "1704067200000"),
+            ("TIME", "45000000000000"),
+            ("TIMESTAMP_NTZ", "1704067200000000000"),
+            ("TIMESTAMP_TZ", "1616173619000000000 960"),
+            ("BINARY", "DEADBEEF"),
+        ] {
+            assert!(one(binding_type, value).is_ok(), "{binding_type} {value}");
+        }
+        for (binding_type, value, hint) in [
+            ("DATE", "2024-01-01", "as TEXT"),
+            ("TIMESTAMP_NTZ", "2024-01-01T00:00:00", "as TEXT"),
+            ("TIMESTAMP_TZ", "1616173619000000000", "offset"),
+            ("FIXED", "1.5", "REAL or TEXT"),
+            ("BOOLEAN", "yes", "true, false"),
+            ("BINARY", "zz", "hex"),
+            ("VARIANT", "{}", "not a SQL API binding type"),
+        ] {
+            let error = one(binding_type, value).expect_err(binding_type);
+            assert!(
+                error.message.contains(hint),
+                "{binding_type}: {}",
+                error.message
+            );
+        }
     }
 
     #[test]

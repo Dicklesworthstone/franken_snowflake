@@ -127,6 +127,16 @@ implementation first and the test/hardening pass follows in a later wave. The
 - Every request now carries `User-Agent: franken-snowflake/<version>`, which
   the SQL API reference lists as required; with a CA bundle
   (`<PREFIX>_CA_BUNDLE`), requests carried none (`176d7ce`).
+- Dataset mode bound date, time and timestamp filters with the SQL API's
+  `DATE`/`TIME`/`TIMESTAMP_*` binding types, which take epoch numbers, so
+  `--from 2024-01-01` would have been refused (100037) on a live account; a
+  decimal on a number column went out as `FIXED`, which takes integers only.
+  The planner now binds date, time and timestamp strings (and decimals, binary
+  hex and variants) as `TEXT`, which the docs name for strings, integers as
+  `FIXED` and `true`/`false` as `BOOLEAN`. Bindings passed with
+  `--bindings-env` are checked against the documented rules before any request,
+  with the fix named (e.g. "DATE takes epoch milliseconds; bind a date string
+  as TEXT").
 - Accounts whose names contain underscores (`acme-marketing_test_account`,
   and the `..._aws_us_east_2` URLs Snowflake gives converted accounts) were
   refused as non-canonical, and China-region accounts
