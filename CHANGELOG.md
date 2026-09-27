@@ -151,6 +151,9 @@ implementation first and the test/hardening pass follows in a later wave. The
   request no longer sets them; the SQL API ignores account and user settings for
   them, so output stays deterministic. `scripts/capture-jsonv2-golden.sh` now
   records wire strings (`--raw-cells`) with SQL that Snowflake compiles.
+- A result that Snowflake marks too large (code `391908`: "the response does
+  not include the entire result set") is a typed error naming the fix, never
+  returned as a complete result.
 
 ### Added
 

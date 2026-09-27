@@ -252,6 +252,9 @@ pub enum Progress {
     Failed(QueryFailureStatus),
 }
 
+/// The `code` of a `200` result set that does not include the whole result.
+const RESULT_SET_TOO_LARGE: &str = "391908";
+
 /// A lifecycle-orchestration error (distinct from a *protocol* timeout/failure,
 /// which are [`Progress::TimedOut`] / [`Progress::Failed`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -273,6 +276,9 @@ pub enum LifecycleErrorCode {
     PollQuotaExhausted,
     /// Assembled row count did not match `resultSetMetaData.numRows`.
     PartitionRowMismatch,
+    /// Snowflake marked the result set too large (code `391908`): the
+    /// response does not include all of it.
+    ResultTooLarge,
 }
 
 impl LifecycleError {
@@ -289,7 +295,8 @@ impl LifecycleError {
         let code = match self.code {
             LifecycleErrorCode::DecodeFailed
             | LifecycleErrorCode::UnexpectedStatus
-            | LifecycleErrorCode::PartitionRowMismatch => SnowflakeErrorCode::UpstreamError,
+            | LifecycleErrorCode::PartitionRowMismatch
+            | LifecycleErrorCode::ResultTooLarge => SnowflakeErrorCode::UpstreamError,
             LifecycleErrorCode::PollQuotaExhausted => SnowflakeErrorCode::RetryBudgetExhausted,
         };
         SnowflakeError::new(code, self.message)
@@ -605,6 +612,19 @@ impl StatementMachine {
 
     /// Enter partition assembly (or finish immediately for a single partition).
     fn enter_terminal_result(&mut self, result_set: ResultSet) -> Result<Progress, LifecycleError> {
+        // "If the `code` field in the response is set to `391908`, the result
+        // set is too large, and the response does not include the entire
+        // result set" (SQL API reference, POST /api/v2/statements, 200;
+        // consulted 2026-09-27). Its counts may still agree with its rows, so
+        // refuse it by code rather than pass part of a result as the whole.
+        if result_set.code == RESULT_SET_TOO_LARGE {
+            return Err(LifecycleError::new(
+                LifecycleErrorCode::ResultTooLarge,
+                "Snowflake returned code 391908: the result set is too large and the response \
+                 does not include all of it; narrow the query (filters or LIMIT) or export it \
+                 server-side with COPY INTO",
+            ));
+        }
         let handle = result_set.statement_handle.clone();
         // A multi-statement parent's rows are only a status message ("Multiple
         // statements executed successfully."); the results are its children's,
@@ -1070,6 +1090,55 @@ mod tests {
             }
             other => Err(format!("expected Complete, got {other:?}")),
         }
+    }
+
+    /// A result Snowflake marks too large (code 391908) is refused even when
+    /// its counts agree with its rows; the same body with a success code is not.
+    #[test]
+    fn a_result_set_snowflake_marks_too_large_is_refused() {
+        let body = |code: &str| {
+            format!(
+                r#"{{"resultSetMetaData":{{"numRows":1,"format":"jsonv2",
+                "rowType":[{{"name":"A","type":"TEXT","nullable":false}}],
+                "partitionInfo":[{{"rowCount":1,"uncompressedSize":1}}]}},
+                "data":[["x"]],"code":"{code}","statementHandle":"hl"}}"#
+            )
+        };
+        let complete = StatementMachine::new(PollPlan::default())
+            .on_submit(ResponseClass::Completed, body("090001").as_bytes());
+        assert!(
+            matches!(complete, Ok(Progress::Complete(_))),
+            "{complete:?}"
+        );
+        let refused = StatementMachine::new(PollPlan::default())
+            .on_submit(ResponseClass::Completed, body("391908").as_bytes());
+        assert!(
+            matches!(
+                &refused,
+                Err(LifecycleError {
+                    code: LifecycleErrorCode::ResultTooLarge,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        // The same refusal when the result arrives on a poll.
+        let mut machine = StatementMachine::new(PollPlan::default());
+        let _ = machine.on_submit(
+            ResponseClass::Running,
+            br#"{"code":"333334","statementHandle":"hl"}"#,
+        );
+        let polled = machine.on_poll(ResponseClass::Completed, body("391908").as_bytes());
+        assert!(
+            matches!(
+                &polled,
+                Err(LifecycleError {
+                    code: LifecycleErrorCode::ResultTooLarge,
+                    ..
+                })
+            ),
+            "{polled:?}"
+        );
     }
 
     #[test]
