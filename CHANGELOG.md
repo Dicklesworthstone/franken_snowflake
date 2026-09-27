@@ -23,7 +23,8 @@ immediately after that window, then 17 more non-merge commits through the
 - [`v0.0.1`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.1)
   is a **published GitHub Release** (2026-06-30, tag
   [`fae8bed`](https://github.com/Dicklesworthstone/franken_snowflake/commit/fae8bed20bda3353edf1beb46ea3cedb86885cf4)).
-  It is the only GitHub Release in this repo.
+  It was the only GitHub Release when this synthesis was written; v0.0.2
+  through v0.0.5 followed (see "Version state").
 
 The record is organized by landed capability wave rather than raw commit order,
 with representative commit links so another agent can navigate from a theme to
@@ -43,15 +44,19 @@ implementation first and the test/hardening pass follows in a later wave. The
 
 ## Version state
 
-- Package version: `0.0.4` across the workspace; crates configured for
-  crates.io publishing.
+- Package version: `0.0.5` across the workspace; all 14 crates published on
+  crates.io.
 - Tags/releases: `v0.0.0` (tag only, 2026-06-29), `v0.0.1` (GitHub Release,
   2026-06-30), `v0.0.2` (GitHub Release, 2026-08-24), `v0.0.3`
-  (GitHub Release, 2026-09-04), and `v0.0.4` (GitHub Release, 2026-09-11).
+  (GitHub Release, 2026-09-04), `v0.0.4` (GitHub Release, 2026-09-11), and
+  `v0.0.5` (GitHub Release, 2026-09-25).
 - Live Snowflake transport is enabled with the `live` feature (default-off) and
   is gated at runtime by credential availability. Reads (`query run`,
   `catalog scan`, `profile doctor --online`) and writes (`query write`) both run
-  through it. The release binaries are built with `--features live,mcp`.
+  through it. The release binaries are built with `--features live,mcp`. The
+  CLI has not yet run against a live account: its proof is the no-account
+  suites (socket-level e2e over real TLS against a mock SQL API, and DPOR over
+  the production driver).
 
 ## Version Timeline
 
@@ -109,7 +114,38 @@ implementation first and the test/hardening pass follows in a later wave. The
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- A cancel that landed while the submit request was in flight (Ctrl-C,
+  SIGTERM, a deadline, the credit cap, an MCP cancel) could leave the statement
+  running on Snowflake until its server-side timeout: the driver dropped the
+  answer that named the statement, so no cancel was sent. The submit now
+  completes under the cancellation mask and the statement it names is
+  cancelled; a first Ctrl-C can therefore wait for Snowflake's answer (a
+  synchronous submit is answered within 45 s), and a second one exits at once.
+  Found by the new DPOR suite over the production driver (`35a58bf`).
+- Every request now carries `User-Agent: franken-snowflake/<version>`, which
+  the SQL API reference lists as required; with a CA bundle
+  (`<PREFIX>_CA_BUNDLE`), requests carried none (`176d7ce`).
+- Accounts whose names contain underscores (`acme-marketing_test_account`,
+  and the `..._aws_us_east_2` URLs Snowflake gives converted accounts) were
+  refused as non-canonical, and China-region accounts
+  (`snowflakecomputing.cn`) were refused; both now connect, and a bare
+  `<locator>.cn-northwest-1[.aws]` resolves to `snowflakecomputing.cn`.
+
+### Added
+
+- A first SIGINT/SIGTERM during a statement prints one stderr line saying the
+  cancel is under way and that a second signal exits at once (`1e703fc`).
+- Each running statement is an Asupersync `Lease` obligation held by the task
+  that drives it, checked by the lab runtime's obligation-leak oracle
+  (`fcd6679`).
+- Release proof: README capability claims checked against their evidence
+  (`scripts/check-claims.py`, `docs/claims.toml`), a per-crate coverage floor
+  (`scripts/check-coverage-floor.py`), and the release gates in
+  `docs/RELEASE.md` (`467ff03`, `5f5fa5a`, `8969ca7`).
+- The installers say when a signature was not verified (no release is signed
+  yet) instead of staying silent (`8969ca7`).
 
 ---
 

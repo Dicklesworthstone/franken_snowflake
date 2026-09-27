@@ -773,7 +773,7 @@ normalized to `_`, then prefixed with `FRANKEN_SNOWFLAKE_`. The profile
 
 | Handle | Purpose |
 |---|---|
-| `<PREFIX>_ACCOUNT` | Snowflake account locator or full `https://...snowflakecomputing.com` URL |
+| `<PREFIX>_ACCOUNT` | Snowflake account identifier (`orgname-account_name`, underscores allowed, or a locator such as `xy12345.us-east-2.aws`) or the full account URL; China-region locators (`xy12345.cn-northwest-1.aws`) resolve to `snowflakecomputing.cn` |
 | `<PREFIX>_USER` | Snowflake user |
 | `<PREFIX>_AUTH` | Auth lane: `pat`, `oauth_bearer`, or `key_pair_jwt` |
 | `<PREFIX>_WAREHOUSE` | Warehouse for submitted statements |

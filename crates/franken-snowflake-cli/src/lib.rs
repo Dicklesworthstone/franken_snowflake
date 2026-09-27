@@ -3393,7 +3393,7 @@ fn profile_validate_outcome(format: OutputFormat, request_id: String, profile: S
     let mut unusable = Vec::new();
     if let Some(reason) = presence.account_error {
         unusable.push(format!(
-            "{}_ACCOUNT does not form a canonical https://<account>.snowflakecomputing.com endpoint ({reason})",
+            "{}_ACCOUNT does not form a canonical https://<account>.snowflakecomputing.com (or .cn) endpoint ({reason})",
             profile_env_prefix(&profile)
         ));
     }
@@ -3685,7 +3685,7 @@ fn account_endpoint_check(presence: &health::HandlePresence) -> Json {
             "account_endpoint",
             "fail",
             format!(
-                "_ACCOUNT does not form a canonical https://<account>.snowflakecomputing.com endpoint ({reason}); every live command would refuse it"
+                "_ACCOUNT does not form a canonical https://<account>.snowflakecomputing.com (or .cn) endpoint ({reason}); every live command would refuse it"
             ),
         ),
         (true, None) => check_json(
