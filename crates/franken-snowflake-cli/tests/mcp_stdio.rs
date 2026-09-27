@@ -121,7 +121,7 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(tools.len(), 26, "{names:?}");
+    assert_eq!(tools.len(), 28, "{names:?}");
     for expected in [
         "capabilities",
         "onboard",
@@ -143,6 +143,8 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
         "export_run",
         "dataset_profile",
         "profile_doctor",
+        "text_index",
+        "text_search",
     ] {
         assert!(names.contains(&expected), "missing tool {expected}");
     }
@@ -159,6 +161,8 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
     assert_eq!(hint("query_run", "openWorldHint"), Some(true.into()));
     assert_eq!(hint("query_run", "readOnlyHint"), Some(true.into()));
     assert_eq!(hint("export_run", "destructiveHint"), Some(true.into()));
+    assert_eq!(hint("text_index", "destructiveHint"), Some(true.into()));
+    assert_eq!(hint("text_search", "readOnlyHint"), Some(true.into()));
 
     // Parity: the tool result IS the CLI envelope for the same verb.
     let text = responses[&3]["result"]["content"][0]["text"]

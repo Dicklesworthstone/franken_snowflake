@@ -399,6 +399,49 @@ fn every_operator_has_a_schema_and_typos_get_suggestions() {
     assert_eq!(value["did_you_mean"][0], "between");
 }
 
+/// Bead acl8: without `frankensearch` both text verbs are a typed refusal that
+/// names the rebuild; with it, searching an index that was never built is
+/// FSNOW-7002 naming `text index`. An unknown `text` verb is a usage error with
+/// a suggestion, and a name that is not one path component is refused.
+#[test]
+fn text_verbs_refuse_or_explain_offline() {
+    let h = Harness::new("text");
+    let search = h.run(&["text", "search", "notes", "refund", "--json"]);
+    let index = h.run(&[
+        "text",
+        "index",
+        "--profile",
+        "e2e",
+        "--sql",
+        "select 1",
+        "--column",
+        "BODY",
+        "--name",
+        "notes",
+        "--json",
+    ]);
+    if cfg!(feature = "frankensearch") {
+        assert_eq!(search.exit, 7, "{}", search.stdout);
+        assert_eq!(search.code(), "FSNOW-7002");
+        assert!(search.stdout.contains("text index"), "{}", search.stdout);
+        let traversal = h.run(&["text", "search", "../x", "refund", "--json"]);
+        assert_eq!(traversal.exit, 64, "{}", traversal.stdout);
+    } else {
+        for (run, command) in [(&search, "text.search"), (&index, "text.index")] {
+            assert_eq!(run.exit, 64, "{}", run.stdout);
+            let value = assert_envelope(run, command);
+            assert_eq!(value["outcome_kind"], "refusal", "{value}");
+            assert!(
+                value.to_string().contains("--features frankensearch"),
+                "{value}"
+            );
+        }
+    }
+    let typo = h.run(&["text", "serch", "--json"]);
+    assert_eq!(typo.exit, 64, "{}", typo.stdout);
+    assert_eq!(typo.json()["did_you_mean"][0], "search");
+}
+
 /// Reality-check bead oj0.36: `catalog search` with no snapshot is a typed
 /// FSNOW-7002 naming the scan to run; a query with no words is a usage error.
 #[test]

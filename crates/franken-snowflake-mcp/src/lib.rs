@@ -273,6 +273,8 @@ mod fastmcp_surface {
         ReceiptRefetch,
         ExportPlan,
         ExportRun,
+        TextIndex,
+        TextSearch,
     }
 
     const READ_VERBS: &[ReadVerb] = &[
@@ -302,6 +304,8 @@ mod fastmcp_surface {
         ReadVerb::ReceiptRefetch,
         ReadVerb::ExportPlan,
         ReadVerb::ExportRun,
+        ReadVerb::TextIndex,
+        ReadVerb::TextSearch,
     ];
 
     #[derive(Clone, Copy)]
@@ -713,6 +717,57 @@ mod fastmcp_surface {
                     params: export_params(false),
                     tags: &["export", "snowflake"],
                 },
+                Self::TextIndex => ToolSpec {
+                    name: "text_index",
+                    description: "Run a read-only query live and index the text of the named columns locally (Frankensearch hash + lexical), each document tied to the statement's receipt and row; `text_search` then ranks them offline. Needs a build with the frankensearch and live features.",
+                    open_world_hint: true,
+                    read_only: false,
+                    params: vec![
+                        ParamSpec::string("profile", "Profile id.", true),
+                        ParamSpec::string("sql", "The read statement whose rows to index.", true),
+                        ParamSpec::string(
+                            "columns",
+                            "Comma-separated result columns whose text to index (e.g. \"BODY,TITLE\").",
+                            true,
+                        ),
+                        ParamSpec::string(
+                            "id_column",
+                            "A result column whose value each hit reports as its id.",
+                            false,
+                        ),
+                        ParamSpec::string(
+                            "name",
+                            "Index name: 1-64 letters, digits, `_` or `-`.",
+                            true,
+                        ),
+                        ParamSpec::string(
+                            "max_rows",
+                            "Refuse a result with more rows than this (default 1000000).",
+                            false,
+                        ),
+                    ],
+                    tags: &["text", "search", "snowflake"],
+                },
+                Self::TextSearch => ToolSpec {
+                    name: "text_search",
+                    description: "Rank the documents of a local text index (built by `text_index`) by the query's words, offline; each hit names its row, column, id, a snippet, and the index's receipt.",
+                    open_world_hint: false,
+                    read_only: true,
+                    params: vec![
+                        ParamSpec::string("index", "Index name.", true),
+                        ParamSpec::string(
+                            "query",
+                            "Words to rank by (e.g. \"refund policy\").",
+                            true,
+                        ),
+                        ParamSpec::string(
+                            "limit",
+                            "Most hits to return, 1-100 (default 10).",
+                            false,
+                        ),
+                    ],
+                    tags: &["text", "search", "offline"],
+                },
             }
         }
 
@@ -933,6 +988,47 @@ mod fastmcp_surface {
                 }
                 Self::ExportPlan => export_args("plan", arguments),
                 Self::ExportRun => export_args("run", arguments),
+                Self::TextIndex => {
+                    let mut args = vec![
+                        "text".to_string(),
+                        "index".to_string(),
+                        "--profile".to_string(),
+                        required_string(arguments, "profile")?,
+                        "--sql".to_string(),
+                        required_string(arguments, "sql")?,
+                        "--name".to_string(),
+                        required_string(arguments, "name")?,
+                    ];
+                    for column in required_string(arguments, "columns")?.split(',') {
+                        let column = column.trim();
+                        if !column.is_empty() {
+                            args.push("--column".to_string());
+                            args.push(column.to_string());
+                        }
+                    }
+                    for (key, flag) in [("id_column", "--id-column"), ("max_rows", "--max-rows")] {
+                        if let Some(value) = optional_string(arguments, key)? {
+                            args.push(flag.to_string());
+                            args.push(value);
+                        }
+                    }
+                    args.push("--json".to_string());
+                    Ok(args)
+                }
+                Self::TextSearch => {
+                    let mut args = vec![
+                        "text".to_string(),
+                        "search".to_string(),
+                        required_string(arguments, "index")?,
+                        required_string(arguments, "query")?,
+                    ];
+                    if let Some(limit) = optional_string(arguments, "limit")? {
+                        args.push("--limit".to_string());
+                        args.push(limit);
+                    }
+                    args.push("--json".to_string());
+                    Ok(args)
+                }
             }
         }
     }
@@ -1700,7 +1796,10 @@ mod fastmcp_surface {
                     .annotations
                     .as_ref()
                     .and_then(|annotations| annotations.read_only);
-                if tool.name == "query_cancel" || tool.name == "export_run" {
+                if matches!(
+                    tool.name.as_str(),
+                    "query_cancel" | "export_run" | "text_index"
+                ) {
                     assert_eq!(read_only, Some(false), "{} has side effects", tool.name);
                 } else {
                     assert_eq!(

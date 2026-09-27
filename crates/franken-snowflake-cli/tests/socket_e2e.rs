@@ -2701,6 +2701,209 @@ fn catalog_scan_then_dataset_inspect_then_dataset_query() {
     );
 }
 
+/// Bead acl8: `text index` runs a read statement over the wire and indexes the
+/// named column with Frankensearch; `text search` ranks offline and maps each
+/// hit back to its row, id and receipt. A rebuild replaces what search reads; a
+/// mutation is refused before any request; an unknown column names the ones
+/// the result has; a missing index is FSNOW-7002.
+#[cfg(feature = "frankensearch")]
+#[test]
+fn text_index_then_text_search() {
+    const NOTES: &str = "01b2c3d4-0000-0000-0000-00000000f1a0";
+    const ARCHIVE: &str = "01b2c3d4-0000-0000-0000-00000000f1a1";
+    let cert = TestCert::mint();
+    let server = MockServer::start(&cert, |request, _| {
+        if !request.is_submit() {
+            return not_found();
+        }
+        let statement = request.body_json()["statement"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let columns = [("ID", "TEXT", None, None), ("BODY", "TEXT", None, None)];
+        if statement.contains("archive") {
+            return result_set(
+                ARCHIVE,
+                &columns,
+                &[vec![
+                    Some("Z9"),
+                    Some("invoice correction for the march batch"),
+                ]],
+            );
+        }
+        result_set(
+            NOTES,
+            &columns,
+            &[
+                vec![
+                    Some("N1"),
+                    Some("warehouse sizing memo for the platform team"),
+                ],
+                vec![
+                    Some("N2"),
+                    Some("customer asked about the refund policy twice"),
+                ],
+                vec![Some("N3"), None],
+            ],
+        )
+    });
+    let h = Harness::new("text-index", &cert);
+    let index = |sql: &str, column: &str| {
+        h.run(
+            server.port,
+            &[
+                "text",
+                "index",
+                "--profile",
+                "sock",
+                "--sql",
+                sql,
+                "--column",
+                column,
+                "--id-column",
+                "ID",
+                "--name",
+                "notes",
+                "--json",
+            ],
+        )
+    };
+    let built = index("select id, body from notes", "body");
+    assert_eq!(built.exit, 0, "{}", built.context());
+    assert_eq!(built.envelope["data_source"], "live", "{}", built.context());
+    let receipt = built.envelope["receipt_hash"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(receipt.len(), 64, "{}", built.context());
+    let source = &built.envelope["data"]["source"];
+    assert_eq!(
+        source["documents"],
+        2,
+        "the NULL cell is skipped: {}",
+        built.context()
+    );
+    assert_eq!(source["rows"], 3, "{}", built.context());
+    assert_eq!(
+        source["columns"],
+        serde_json::json!(["BODY"]),
+        "{}",
+        built.context()
+    );
+    assert_eq!(
+        source["receipt_hash"],
+        receipt.as_str(),
+        "{}",
+        built.context()
+    );
+    let first_version = source["version"].as_str().unwrap_or_default().to_owned();
+
+    let search = |query: &str| h.run(server.port, &["text", "search", "notes", query, "--json"]);
+    let refund = search("refund");
+    assert_eq!(refund.exit, 0, "{}", refund.context());
+    let top = &refund.envelope["data"]["hits"][0];
+    assert_eq!(top["id"], "N2", "{}", refund.context());
+    assert_eq!(top["row"], 1, "{}", refund.context());
+    assert_eq!(top["column"], "BODY", "{}", refund.context());
+    assert!(
+        top["snippet"]
+            .as_str()
+            .is_some_and(|text| text.contains("refund policy")),
+        "{}",
+        refund.context()
+    );
+    assert_eq!(
+        refund.envelope["data"]["source"]["receipt_hash"],
+        receipt.as_str(),
+        "{}",
+        refund.context()
+    );
+    let nothing = search("zeppelin");
+    assert_eq!(nothing.exit, 0, "{}", nothing.context());
+    assert_eq!(
+        nothing.envelope["data"]["count"],
+        0,
+        "{}",
+        nothing.context()
+    );
+
+    // A rebuild of the same name replaces what search reads.
+    let rebuilt = index("select id, body from archive", "BODY");
+    assert_eq!(rebuilt.exit, 0, "{}", rebuilt.context());
+    assert_eq!(
+        rebuilt.envelope["data"]["replaced_version"],
+        first_version.as_str(),
+        "{}",
+        rebuilt.context()
+    );
+    let stale = search("refund");
+    assert_eq!(
+        stale.envelope["data"]["count"],
+        0,
+        "a superseded version answered: {}",
+        stale.context()
+    );
+    let invoice = search("invoice");
+    assert_eq!(
+        invoice.envelope["data"]["hits"][0]["id"],
+        "Z9",
+        "{}",
+        invoice.context()
+    );
+
+    // Refusals: a mutation never reaches the server; an unknown column names
+    // the result's columns and points at the receipt; a missing index is 7002.
+    let requests = server.seen().len();
+    let mutation = index("delete from notes", "BODY");
+    assert_eq!(mutation.exit, 2, "{}", mutation.context());
+    assert_eq!(
+        mutation.envelope["error"]["code"],
+        "FSNOW-3001",
+        "{}",
+        mutation.context()
+    );
+    assert_eq!(
+        server.seen().len(),
+        requests,
+        "a refused mutation sent a request"
+    );
+    let unknown = index("select id, body from notes", "TITLE");
+    assert_eq!(unknown.exit, 64, "{}", unknown.context());
+    let message = unknown.envelope["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains("`TITLE`") && message.contains("ID, BODY"),
+        "{}",
+        unknown.context()
+    );
+    assert!(
+        unknown.envelope["safe_next_commands"]
+            .to_string()
+            .contains("receipt refetch"),
+        "{}",
+        unknown.context()
+    );
+    let missing = h.run(
+        server.port,
+        &["text", "search", "nosuch", "refund", "--json"],
+    );
+    assert_eq!(missing.exit, 7, "{}", missing.context());
+    assert_eq!(
+        missing.envelope["error"]["code"],
+        "FSNOW-7002",
+        "{}",
+        missing.context()
+    );
+    assert!(
+        missing.envelope["safe_next_commands"]
+            .to_string()
+            .contains("text index"),
+        "{}",
+        missing.context()
+    );
+}
+
 /// Reality-check bead oj0.42: text Snowflake controls (a table name, a comment,
 /// a cell) carrying terminal escapes never reaches stdout or stderr raw, in any
 /// output mode, with `NO_COLOR` and `CI` set and stdout piped; JSON keeps the

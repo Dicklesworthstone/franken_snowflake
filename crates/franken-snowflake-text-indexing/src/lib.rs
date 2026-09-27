@@ -279,6 +279,43 @@ impl TextChunk {
     }
 }
 
+/// The chunks of a query result's text columns: one per non-null, non-blank
+/// cell of each `(index, name)` column, in row order. The chunk ordinal is the
+/// zero-based row, so a handle names its cell; the `id_column` cell, when
+/// given, is the chunk's title (the row's own key, for display).
+#[must_use]
+pub fn chunks_from_rows(
+    source: &TextSourceRef,
+    columns: &[(usize, String)],
+    id_column: Option<usize>,
+    rows: &[Vec<Option<String>>],
+    rights_class: RightsClass,
+) -> Vec<TextChunk> {
+    let mut chunks = Vec::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        let Ok(ordinal) = u32::try_from(row_index) else {
+            break;
+        };
+        let title = id_column
+            .and_then(|index| row.get(index).cloned().flatten())
+            .filter(|id| !id.trim().is_empty());
+        for (index, name) in columns {
+            let Some(text) = row.get(*index).cloned().flatten() else {
+                continue;
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            let chunk = TextChunk::new(source.clone(), name.as_str(), ordinal, text, rights_class);
+            chunks.push(match &title {
+                Some(title) => chunk.with_title(title.as_str()),
+                None => chunk,
+            });
+        }
+    }
+    chunks
+}
+
 /// Text-indexing feature surface for capabilities/doctor output.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TextIndexingFeatureReport {
@@ -658,6 +695,56 @@ mod tests {
                 max: DEFAULT_RERANK_MAX_TOP_K
             })
         ));
+    }
+
+    /// One chunk per non-null, non-blank cell of the chosen columns; the
+    /// ordinal is the row (so row 2's handle names row 2 even when row 1 held
+    /// nothing), and the id column is the title only where it has a value.
+    #[test]
+    fn result_rows_become_one_chunk_per_text_cell() {
+        let cell = |value: &str| Some(value.to_owned());
+        let rows = vec![
+            vec![cell("A1"), cell("refund policy memo"), cell("ops")],
+            vec![cell("A2"), None, cell("  ")],
+            vec![cell(" "), cell("billing dispute notes"), None],
+        ];
+        let columns = vec![(1, "BODY".to_owned()), (2, "TAGS".to_owned())];
+        let chunks = chunks_from_rows(
+            &query_source(),
+            &columns,
+            Some(0),
+            &rows,
+            RightsClass::Restricted,
+        );
+        let summary: Vec<(u32, &str, Option<&str>, &str)> = chunks
+            .iter()
+            .map(|chunk| {
+                (
+                    chunk.chunk_ordinal,
+                    chunk.column_or_path.as_str(),
+                    chunk.title.as_deref(),
+                    chunk.text.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (0, "BODY", Some("A1"), "refund policy memo"),
+                (0, "TAGS", Some("A1"), "ops"),
+                (2, "BODY", None, "billing dispute notes"),
+            ]
+        );
+        assert_eq!(
+            chunks[2].handle,
+            TextDocumentHandle::from_source(&query_source(), "BODY", 2)
+        );
+        assert!(chunks.iter().all(|chunk| chunk.validate().is_ok()));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.rights_class == RightsClass::Restricted)
+        );
     }
 
     #[test]

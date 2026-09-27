@@ -114,8 +114,23 @@ same stable handle.
 5. Map `doc_id` values back to `TextDocumentHandle` and then to receipt/source
    metadata maintained by the caller.
 
-The crate does not store the caller's source map. That belongs in the cache
-repository once the index location is durable.
+The crate does not store the caller's source map; the CLI does, next to each
+index.
+
+## CLI Surface
+
+`text index` runs one read statement (the `export run` guard, receipt and
+`--max-rows` bound), turns every non-null, non-blank cell of the `--column`s into
+a chunk (`chunks_from_rows`: ordinal = row, title = the `--id-column` value,
+rights class `restricted`), and writes a version under
+`<data dir>/text-indexes/<name>/<version>/`: `manifest.json` (receipt hash,
+statement handle, redacted SQL preview, columns, counts), `documents.jsonl` (the
+chunks, which map a `doc_id` back to its cell), and `index/` (Frankensearch).
+`current.json`, replaced by write-then-rename, names the version `text search`
+reads; a rebuild never deletes the older version and never answers from it.
+`text search` is offline and returns each hit's row, column, id, a snippet of at
+most 240 characters, and the manifest as provenance. Both are MCP tools
+(`text_index`, `text_search`).
 
 ## Reranker Seam
 
