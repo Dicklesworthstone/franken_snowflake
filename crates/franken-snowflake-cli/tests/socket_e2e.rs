@@ -2220,7 +2220,7 @@ fn catalog_scan_then_dataset_inspect_then_dataset_query() {
     const QUERY: &str = "01b2c3d4-0000-0000-0000-00000000f122";
     const RELATION: &str = "01b2c3d4-0000-0000-0000-00000000f123";
     let cert = TestCert::mint();
-    let server = MockServer::start(&cert, |request, _| {
+    let server = MockServer::start(&cert, |request, before| {
         if !request.is_submit() {
             return not_found();
         }
@@ -2230,6 +2230,18 @@ fn catalog_scan_then_dataset_inspect_then_dataset_query() {
             .to_owned();
         let text = |name| (name, "TEXT", None, None);
         if statement.contains("INFORMATION_SCHEMA.TABLES") {
+            // A rescan sees EVENTS' comment changed.
+            let rescan = before.iter().any(|seen| {
+                seen.is_submit()
+                    && seen.body_json()["statement"]
+                        .as_str()
+                        .is_some_and(|sql| sql.contains("INFORMATION_SCHEMA.TABLES"))
+            });
+            let comment = if rescan {
+                "daily events archive"
+            } else {
+                "daily events ledger"
+            };
             return result_set(
                 TABLES,
                 &[
@@ -2247,7 +2259,7 @@ fn catalog_scan_then_dataset_inspect_then_dataset_query() {
                         Some("PUBLIC"),
                         Some("EVENTS"),
                         Some("BASE TABLE"),
-                        Some("daily events"),
+                        Some(comment),
                         Some("3"),
                         Some("4096"),
                     ],
@@ -2621,6 +2633,11 @@ fn catalog_scan_then_dataset_inspect_then_dataset_query() {
         "{}",
         nothing.context()
     );
+    let ledger = h.run(
+        server.port,
+        &["catalog", "search", "sock", "ledger", "--json"],
+    );
+    assert_eq!(ledger.envelope["data"]["count"], 1, "{}", ledger.context());
     assert_eq!(server.seen().len(), 9, "graph verbs and search are offline");
 
     // Tags the role cannot read: the scan still lands, as partial_success
@@ -2659,6 +2676,28 @@ fn catalog_scan_then_dataset_inspect_then_dataset_query() {
         1,
         "{}",
         tagged.context()
+    );
+    // The rescan changed EVENTS' comment ("ledger" -> "archive"). Search reads
+    // only the newest snapshot, so the superseded comment no longer matches.
+    let archive = h.run(
+        server.port,
+        &["catalog", "search", "sock", "archive", "--json"],
+    );
+    assert_eq!(
+        archive.envelope["data"]["hits"][0]["qualified_name"],
+        "DB.PUBLIC.EVENTS",
+        "{}",
+        archive.context()
+    );
+    let superseded = h.run(
+        server.port,
+        &["catalog", "search", "sock", "ledger", "--json"],
+    );
+    assert_eq!(
+        superseded.envelope["data"]["count"],
+        0,
+        "a superseded snapshot answered: {}",
+        superseded.context()
     );
 }
 
