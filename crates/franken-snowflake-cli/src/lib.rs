@@ -180,6 +180,14 @@ enum Command {
         /// `None` = stdio; `Some` = the secured HTTP transport.
         http: Option<McpHttpArgs>,
     },
+    TextIndex {
+        spec: text_surface::TextIndexSpec,
+    },
+    TextSearch {
+        name: String,
+        query: String,
+        limit: Option<String>,
+    },
 }
 
 /// `mcp serve --http` options, parsed without the `mcp` feature so the default
@@ -639,6 +647,26 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         mutates_local_state: false,
         sensitive_output: false,
     },
+    CommandSpec {
+        id: "text.index",
+        invocation: "franken-snowflake text index --profile <profile> --sql <select> --column <COL> [--column <COL>]... [--id-column <COL>] --name <index> [--max-rows <n>] --json",
+        output_contract_id: "fsnow.text.index.v1",
+        description: "Run a read statement live and index the text of the named columns with Frankensearch (hash + lexical, local, no model), every document tied to the statement's receipt and its row (features frankensearch + live). A rebuild of the same name replaces what `text search` reads.",
+        read_only: true,
+        provider_network: true,
+        mutates_local_state: true,
+        sensitive_output: true,
+    },
+    CommandSpec {
+        id: "text.search",
+        invocation: "franken-snowflake text search <index> <query> [--limit <n>] --json",
+        output_contract_id: "fsnow.text.search.v1",
+        description: "Rank the documents of a local text index by the query, offline: each hit names its row, column, id-column value, a snippet, and the index's receipt (feature frankensearch).",
+        read_only: true,
+        provider_network: false,
+        mutates_local_state: false,
+        sensitive_output: true,
+    },
 ];
 
 fn execute(raw_args: Vec<String>) -> Outcome {
@@ -710,6 +738,7 @@ fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
             profile: value_after(&args, "--profile"),
         },
         "mcp" => parse_mcp(&args, output)?,
+        "text" => parse_text(&args, output)?,
         other => {
             let suggestions = did_you_mean(other, &top_level_commands());
             return Err(error_outcome(
@@ -1522,6 +1551,65 @@ fn parse_mcp(args: &[String], output: OutputFormat) -> Result<Command, Outcome> 
     Ok(Command::McpServe { http })
 }
 
+fn parse_text(args: &[String], output: OutputFormat) -> Result<Command, Outcome> {
+    match args.get(1).map(String::as_str) {
+        Some("index") => Ok(Command::TextIndex {
+            spec: text_surface::TextIndexSpec {
+                profile: resolve_profile(value_after(args, "--profile")),
+                sql: raw_value_after(args, "--sql"),
+                columns: values_after(args, "--column"),
+                id_column: value_after(args, "--id-column"),
+                name: value_after(args, "--name"),
+                max_rows: value_after(args, "--max-rows"),
+            },
+        }),
+        Some("search") => {
+            let usage = |message: &str| {
+                usage_error(
+                    output,
+                    "text.search",
+                    "fsnow.text.search.v1",
+                    message,
+                    vec!["franken-snowflake text search <index> \"refund policy\" --json".to_string()],
+                    vec![],
+                )
+            };
+            let positional = |index: usize| {
+                args.get(index)
+                    .filter(|value| !value.starts_with('-'))
+                    .cloned()
+            };
+            let Some(name) = positional(2) else {
+                return Err(usage("Missing <index> for `text search`."));
+            };
+            let Some(query) = positional(3) else {
+                return Err(usage(
+                    "Missing <query> for `text search` (quote several words as one argument).",
+                ));
+            };
+            Ok(Command::TextSearch {
+                name,
+                query,
+                limit: value_after(args, "--limit"),
+            })
+        }
+        other => Err(usage_error(
+            output,
+            "help",
+            "fsnow.help.v1",
+            &format!(
+                "Unknown `text` subcommand `{}`; use `text index` or `text search`.",
+                other.unwrap_or("")
+            ),
+            vec![
+                "franken-snowflake text index --profile <profile> --sql <select> --column <COL> --name <index> --json".to_string(),
+                "franken-snowflake text search <index> <query> --json".to_string(),
+            ],
+            did_you_mean(other.unwrap_or(""), &["index", "search"]),
+        )),
+    }
+}
+
 /// Every value following a repeatable flag (`--allow-tool a --allow-tool b`).
 fn values_after(args: &[String], flag: &str) -> Vec<String> {
     args.windows(2)
@@ -1749,6 +1837,10 @@ fn dispatch(invocation: Invocation) -> Outcome {
             sandbox_out,
         } => export_run_dispatch(invocation.output, request_id, spec, out, sandbox_out),
         Command::Tui { profile } => tui_dispatch(invocation.output, request_id, profile),
+        Command::TextIndex { spec } => text_index_dispatch(invocation.output, request_id, spec),
+        Command::TextSearch { name, query, limit } => {
+            text_search_dispatch(invocation.output, request_id, name, query, limit)
+        }
         Command::McpServe { http } => {
             #[cfg(feature = "mcp")]
             {
@@ -1967,6 +2059,84 @@ fn live_transport_required_with_data(
         status: SnowflakeErrorCode::RequireLiveRefused.exit_code(),
         body: Body::Envelope { envelope, format },
     }
+}
+
+#[cfg(all(feature = "frankensearch", feature = "live"))]
+fn text_index_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    spec: text_surface::TextIndexSpec,
+) -> Outcome {
+    live::text_index_outcome(format, request_id, spec)
+}
+
+#[cfg(all(feature = "frankensearch", not(feature = "live")))]
+fn text_index_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    spec: text_surface::TextIndexSpec,
+) -> Outcome {
+    live_transport_required_with_data(
+        format,
+        "text.index",
+        "fsnow.text.index.v1",
+        request_id,
+        spec.profile,
+        json_object(vec![
+            ("index", option_json(spec.name)),
+            (
+                "requires",
+                json_array(vec![
+                    json_string("live SQL API transport (build with --features live)"),
+                    json_string("profile credential handles"),
+                ]),
+            ),
+        ]),
+        vec!["franken-snowflake text search <index> <query> --json".to_string()],
+    )
+}
+
+#[cfg(not(feature = "frankensearch"))]
+fn text_index_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    spec: text_surface::TextIndexSpec,
+) -> Outcome {
+    text_surface::feature_off_outcome(
+        format,
+        request_id,
+        "text.index",
+        "fsnow.text.index.v1",
+        spec.name,
+    )
+}
+
+#[cfg(feature = "frankensearch")]
+fn text_search_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    name: String,
+    query: String,
+    limit: Option<String>,
+) -> Outcome {
+    text_surface::text_search_outcome(format, request_id, name, query, limit)
+}
+
+#[cfg(not(feature = "frankensearch"))]
+fn text_search_dispatch(
+    format: OutputFormat,
+    request_id: String,
+    name: String,
+    _query: String,
+    _limit: Option<String>,
+) -> Outcome {
+    text_surface::feature_off_outcome(
+        format,
+        request_id,
+        "text.search",
+        "fsnow.text.search.v1",
+        Some(name),
+    )
 }
 
 #[cfg(feature = "tui")]
@@ -3097,6 +3267,56 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
             OUTPUT_INPUT,
         ],
         "tui" => vec![PROFILE_INPUT],
+        "text.index" => vec![
+            PROFILE_INPUT,
+            input(
+                "sql",
+                "string",
+                true,
+                "The read statement whose rows to index (--sql)",
+            ),
+            input(
+                "column",
+                "string",
+                true,
+                "A result column whose text to index (--column; repeat it for several)",
+            ),
+            input(
+                "id_column",
+                "string",
+                false,
+                "A result column whose value each hit reports as its id (--id-column)",
+            ),
+            input(
+                "name",
+                "string",
+                true,
+                "Index name: 1-64 letters, digits, `_` or `-` (--name); stored under <data dir>/text-indexes",
+            ),
+            input(
+                "max_rows",
+                "integer",
+                false,
+                "Refuse (FSNOW-3004) a result with more rows than this (--max-rows; default <PREFIX>_EXPORT_MAX_ROWS or 1000000)",
+            ),
+            OUTPUT_INPUT,
+        ],
+        "text.search" => vec![
+            input("index", "string", true, "positional: index name"),
+            input(
+                "query",
+                "string",
+                true,
+                "positional: words to rank documents by (quote several as one argument)",
+            ),
+            input(
+                "limit",
+                "integer",
+                false,
+                "Most hits to return, 1-100 (--limit; default 10)",
+            ),
+            OUTPUT_INPUT,
+        ],
         "mcp.serve" => vec![
             input("stdio", "boolean", false, "Serve over stdio (--stdio)"),
             input(
@@ -5674,6 +5894,8 @@ fn command_id(command: &Command) -> Option<&'static str> {
         Command::ExportRun { .. } => "export.run",
         Command::Tui { .. } => "tui",
         Command::McpServe { .. } => "mcp.serve",
+        Command::TextIndex { .. } => "text.index",
+        Command::TextSearch { .. } => "text.search",
     })
 }
 
@@ -5778,6 +6000,7 @@ fn flag_requires_value(flag: &str) -> bool {
             | "--allow-tool"
             | "--as-of"
             | "--bindings-env"
+            | "--column"
             | "--compression"
             | "--confirm"
             | "--database"
@@ -5787,9 +6010,11 @@ fn flag_requires_value(flag: &str) -> bool {
             | "--format"
             | "--from"
             | "--header"
+            | "--id-column"
             | "--limit"
             | "--location"
             | "--max-file-size"
+            | "--name"
             | "--out"
             | "--profile"
             | "--query-id"
@@ -5971,6 +6196,7 @@ fn top_level_commands() -> Vec<&'static str> {
         "export",
         "tui",
         "mcp",
+        "text",
     ]
 }
 
@@ -6210,6 +6436,7 @@ pub fn execute_cli_contract(args: Vec<String>) -> CliContractOutput {
 
 #[cfg(feature = "mcp")]
 mod mcp_surface;
+mod text_surface;
 #[cfg(feature = "tui")]
 mod tui_surface;
 

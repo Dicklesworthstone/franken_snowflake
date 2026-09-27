@@ -54,6 +54,9 @@ sqlite-store = ["franken-snowflake-cache/frankensqlite"]
 frankensearch = [
     "dep:franken-snowflake-text-indexing",
     "franken-snowflake-text-indexing/frankensearch",
+    # `text index`/`text search` drive Frankensearch on an Asupersync runtime
+    # (the same asupersync Frankensearch itself depends on).
+    "dep:asupersync",
 ]
 # Opt-in live SQL API transport for `query run` / `catalog scan` / `profile
 # doctor --online`. Default-off so the agent CLI stays a no-account slice (no

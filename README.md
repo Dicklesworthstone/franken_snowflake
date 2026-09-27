@@ -732,6 +732,23 @@ append-only JSONL store under the platform data directory
 or `%APPDATA%\franken-snowflake`); `FRANKEN_SNOWFLAKE_DATA_DIR` overrides it.
 `doctor` reports the resolved directory.
 
+### Text search
+
+With `--features frankensearch` (and `live` for `text index`), the text of a
+query result can be indexed locally and searched offline: filings, transcripts,
+notes, support tickets, any column of prose. Retrieval is Frankensearch's hash
+and lexical (Tantivy BM25) tiers only; nothing downloads a model. <!-- claim:text-search -->
+
+| Command | What it does |
+|---|---|
+| `fsnow text index --profile <p> --sql <select> --column <COL> [--column <COL>]... [--id-column <COL>] --name <index> [--max-rows <n>] --json` | Run one read statement live (the same guard, receipt and `--max-rows` bound as `export run`) and index every non-null, non-blank cell of the named columns. Each document keeps its row, column, `--id-column` value, and the statement's receipt hash. An unknown column is a usage error that lists the result's columns and points at `receipt refetch`, so the rows need not be read again. A rebuild of the same name replaces what `text search` reads; the older version stays on disk under `<data dir>/text-indexes/<name>/` and is never read again. Query text carries no rights label, so documents are `restricted` |
+| `fsnow text search <index> "<words>" [--limit <n>] --json` | Rank the index's documents by the query, offline. Each hit has its row, column, id, a snippet of at most 240 characters around the first query word, and a rights class; `data.source` names the receipt, statement handle and SQL preview the text came from. Nothing matching is an empty success; a missing index is `FSNOW-7002` naming `text index` |
+
+```bash
+fsnow text index --profile demo-prod --sql "select ticket_id, body from support.tickets where opened_at > dateadd(day, -30, current_date)" --column BODY --id-column TICKET_ID --name tickets --json
+fsnow text search tickets "refund policy" --limit 5 --json
+```
+
 ### MCP and TUI
 
 | Command | What it does |
@@ -909,7 +926,7 @@ statement handle.
     catalog (info-schema discovery · manifests · operator catalog · dataset planner · predicate AST)
     graph (containment + dataset edges · Mermaid/SVG) · export (COPY INTO plans + local CSV/JSONL/Parquet/frame writers)
     cache (local store: append-only JSONL by default; FrankenSQLite backend opt-in)
-    frame (fp-columnar/fp-types via --features frankenpandas) · text-indexing (frankensearch via --features frankensearch)
+    frame (fp-columnar/fp-types via --features frankenpandas) · text-indexing (text index/search: frankensearch via --features frankensearch)
     interactive surface: tui (FrankenTUI via --features tui)
               |
               v
@@ -935,7 +952,7 @@ SQL mode is the expert path. Both modes share one planner.
 ## MCP surface
 
 With the `mcp` feature compiled in, `fsnow mcp serve` exposes the connector's
-read verbs, plus `query_cancel` and `export_run`, as MCP tools backed by the same
+read verbs, plus `query_cancel`, `export_run` and `text_index`, as MCP tools backed by the same
 CLI handlers and the same JSON envelope, so the CLI and the MCP server cannot
 diverge into two contracts. The server runs over stdio or HTTP and is
 stdio-first by design; data writes go through the CLI `query write` ladder. A
@@ -949,14 +966,20 @@ The exposed tools mirror the CLI read and discovery verbs:
 capabilities          onboard               doctor
 agent_handbook        robot_docs_guide      selftest
 profile_validate      profile_doctor        catalog_scan
-catalog_graph         catalog_diff          dataset_inspect
-dataset_profile       query_plan            query_run
-query_cancel          receipt_show          export_plan
-export_run            dataset_describe_operator
+catalog_graph         catalog_diff          catalog_search
+catalog_relates       catalog_lineage       catalog_cycles
+dataset_inspect       dataset_profile       dataset_validate_manifest
+dataset_describe_operator                   query_plan
+query_run             query_cancel          receipt_show
+receipt_refetch       export_plan           export_run
+text_index            text_search
 ```
 
-`query_cancel` and `export_run` are not read-only (the first cancels a remote
-statement, the second writes a local file), and their MCP annotations say so.
+`query_cancel`, `export_run` and `text_index` are not read-only (the first
+cancels a remote statement, the others write local files), and their MCP
+annotations say so. `text_index` takes its columns comma-separated
+(`columns: "BODY,TITLE"`); `text_search` and `text_index` answer with a typed
+refusal in a build without `frankensearch`.
 `export_run` from MCP is confined to the `exports/` directory under the data
 directory: its `out` must be a relative path without `..` or symlinked
 components, and an existing file is replaced only with `overwrite: true`.

@@ -2209,6 +2209,238 @@ fn max_rows_error(max_rows: usize) -> SnowflakeError {
     )
 }
 
+/// `text index` (bead acl8): run one read statement and index the text of the
+/// named columns with Frankensearch (hash + lexical), each document tied to
+/// the statement's receipt, cell by cell. Bounded by `--max-rows` like `export
+/// run`.
+#[cfg(feature = "frankensearch")]
+pub fn text_index_outcome(
+    format: OutputFormat,
+    request_id: String,
+    spec: crate::text_surface::TextIndexSpec,
+) -> crate::Outcome {
+    use crate::text_surface::{
+        TEXT_INDEX_ENGINE, TEXT_INDEX_SCHEMA, TextIndexManifest, build_index, manifest_json,
+        validate_index_name,
+    };
+    use franken_snowflake_core::guardrails::RightsClass;
+    use franken_snowflake_core::ids::{QueryId, ReceiptHash};
+    use franken_snowflake_text_indexing::{TextSourceRef, chunks_from_rows};
+
+    const COMMAND: &str = "text.index";
+    const CONTRACT: &str = "fsnow.text.index.v1";
+    let profile = spec.profile.clone().unwrap_or_default();
+    let fail = |error: &SnowflakeError| {
+        failure_outcome(
+            format,
+            COMMAND,
+            CONTRACT,
+            request_id.clone(),
+            profile.clone(),
+            error,
+        )
+    };
+    let usage = |message: String| SnowflakeError::new(SnowflakeErrorCode::UsageError, message);
+    if profile.is_empty() {
+        return fail(&usage(
+            "Missing --profile for `text index`. Pass --profile <profile> or set FRANKEN_SNOWFLAKE_DEFAULT_PROFILE.".to_owned(),
+        ));
+    }
+    let Some(name) = spec.name.clone() else {
+        return fail(&usage(
+            "Missing --name <index> for `text index`.".to_owned(),
+        ));
+    };
+    if let Err(message) = validate_index_name(&name) {
+        return fail(&usage(message));
+    }
+    if spec.columns.is_empty() {
+        return fail(&usage(
+            "Name the text to index with --column <COL> (repeat it for several columns)."
+                .to_owned(),
+        ));
+    }
+    let Some(sql) = spec.sql.clone() else {
+        return fail(&usage(
+            "Missing --sql <select> for `text index`.".to_owned(),
+        ));
+    };
+    if !crate::is_select_like(&sql) || crate::has_multiple_statements(&sql) {
+        return fail(&SnowflakeError::new(
+            SnowflakeErrorCode::MutationRefused,
+            "text index only indexes a single read statement (SELECT/WITH/SHOW/DESCRIBE/EXPLAIN)",
+        ));
+    }
+    let conn = match LiveConn::resolve(&profile, &SessionOverrides::default()) {
+        Ok(conn) => conn.tagged(COMMAND, &request_id),
+        Err(error) => return fail(&error),
+    };
+    let max_rows = match export_max_rows(spec.max_rows.as_deref(), &profile) {
+        Ok(max_rows) => max_rows,
+        Err(error) => return fail(&error),
+    };
+    let request_options = QueryRequestOptions {
+        row_cap: Some(max_rows.saturating_add(1)),
+        ..QueryRequestOptions::default()
+    };
+    let rows = match execute(&conn, &sql, request_options) {
+        Ok(rows) => rows,
+        Err(error) => {
+            return with_terminal_receipt(fail(&error), COMMAND, &conn, &request_id, &sql, &error);
+        }
+    };
+    if rows.rows.len() > max_rows {
+        return fail(&max_rows_error(max_rows));
+    }
+    let find = |wanted: &str| {
+        rows.columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case(wanted))
+    };
+    let mut unknown = Vec::new();
+    let mut text_columns: Vec<(usize, String)> = Vec::new();
+    for wanted in &spec.columns {
+        match find(wanted) {
+            Some(index) if !text_columns.iter().any(|(seen, _)| *seen == index) => {
+                text_columns.push((index, rows.columns[index].name.clone()));
+            }
+            Some(_) => {}
+            None => unknown.push(wanted.clone()),
+        }
+    }
+    let id_column = match spec.id_column.as_deref() {
+        None => None,
+        Some(wanted) => match find(wanted) {
+            Some(index) => Some(index),
+            None => {
+                unknown.push(wanted.to_owned());
+                None
+            }
+        },
+    };
+    let (receipt_hash, mut warnings) = record_receipt(
+        COMMAND,
+        &conn,
+        &request_id,
+        &sql,
+        &rows,
+        if unknown.is_empty() {
+            "text_indexed"
+        } else {
+            "text_index_refused"
+        },
+        serde_json::json!({ "index": name, "columns": spec.columns }),
+    );
+    if !unknown.is_empty() {
+        let available: Vec<&str> = rows
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect();
+        let mut outcome = fail(&usage(format!(
+            "the result has no column {}; it has {}",
+            unknown
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            available.join(", ")
+        )));
+        if let (crate::Body::Envelope { envelope, .. }, Some(hash)) =
+            (&mut outcome.body, receipt_hash.as_deref())
+        {
+            // The rows are in Snowflake's result cache: re-read, don't re-run.
+            envelope.safe_next_commands = vec![format!(
+                "franken-snowflake receipt refetch {hash} --profile {profile} --json"
+            )];
+            envelope.receipt_hash = Some(hash.to_owned());
+        }
+        return outcome;
+    }
+    let Some(receipt) = receipt_hash.clone() else {
+        return fail(&SnowflakeError::new(
+            SnowflakeErrorCode::CacheError,
+            "the receipt was not recorded, and every indexed document must name one",
+        ));
+    };
+    let source = TextSourceRef::QueryResult {
+        receipt_hash: ReceiptHash::new(receipt.clone()),
+        statement_handle: Some(StatementHandle::new(rows.statement_handle.clone())),
+        query_id: Some(QueryId::new(rows.statement_handle.clone())),
+        dataset_id: None,
+        object_ref_redacted: None,
+    };
+    // Query text carries no rights label of its own: fail closed.
+    let chunks = chunks_from_rows(
+        &source,
+        &text_columns,
+        id_column,
+        &rows.rows,
+        RightsClass::Restricted,
+    );
+    let manifest = TextIndexManifest {
+        schema: TEXT_INDEX_SCHEMA.to_owned(),
+        name: name.clone(),
+        version: String::new(),
+        profile_id: profile.clone(),
+        receipt_hash: receipt.clone(),
+        statement_handle: rows.statement_handle.clone(),
+        sql_preview_redacted: crate::compact_sql(&redact(&sql)),
+        columns: text_columns.iter().map(|(_, name)| name.clone()).collect(),
+        id_column: id_column.map(|index| rows.columns[index].name.clone()),
+        rows: rows.rows.len() as u64,
+        documents: 0,
+        created_at_ms: local_store::now_unix_ms(),
+        engine: TEXT_INDEX_ENGINE.to_owned(),
+    };
+    let built = match build_index(manifest.clone(), &chunks) {
+        Ok(built) => built,
+        Err(message) => {
+            return fail(&SnowflakeError::new(
+                SnowflakeErrorCode::CacheError,
+                format!("text index `{name}` was not written: {message}"),
+            ));
+        }
+    };
+    if chunks.is_empty() {
+        warnings.push(json_string(format!(
+            "no cell of {} held text; the index is empty",
+            manifest.columns.join(", ")
+        )));
+    }
+    let published = TextIndexManifest {
+        version: built.version.clone(),
+        documents: chunks.len() as u64,
+        ..manifest
+    };
+    let mut envelope = base_envelope(
+        true,
+        "success",
+        COMMAND,
+        CONTRACT,
+        request_id,
+        json_object(vec![
+            ("index", json_string(name.clone())),
+            ("replaced_version", option_json(built.replaced_version)),
+            (
+                "directory",
+                json_string(redact(&built.directory.to_string_lossy()).into_owned()),
+            ),
+            ("source", manifest_json(&published)),
+        ]),
+    );
+    stamp_live(&mut envelope, &profile, &rows, receipt_hash.clone());
+    envelope.warnings = warnings;
+    envelope.safe_next_commands = vec![
+        format!("franken-snowflake text search {name} \"<words>\" --json"),
+        receipt_show_command(receipt_hash.as_deref()),
+    ];
+    crate::Outcome {
+        status: CoreExitCode::Success,
+        body: Body::Envelope { envelope, format },
+    }
+}
+
 /// Writes a streaming CSV/JSONL export as rows arrive; refuses once the
 /// export would pass `--max-rows` (the driver then cancels the statement).
 struct ExportSink {

@@ -148,6 +148,15 @@ text = "The testkit explores cancel and retry interleavings with DPOR, over a mo
 evidence = ["test:franken-snowflake-testkit::race::tests::default_race_suite_proves_cancel_retry_invariants"]
 
 [[claim]]
+id = "text-search"
+heading = "Text search"
+text = "the text of a query result can be indexed locally and searched offline"
+evidence = [
+  "test:franken-snowflake-cli::text_index_then_text_search",
+  "test:franken-snowflake-cli::text_surface::tests::search_reads_only_the_current_version",
+]
+
+[[claim]]
 id = "empty-exit-zero"
 heading = "Design Philosophy"
 text = "a documented exit-code scheme where an empty-but-valid result is exit 0"

@@ -157,6 +157,13 @@ implementation first and the test/hardening pass follows in a later wave. The
 
 ### Added
 
+- `text index` and `text search` (with `--features frankensearch`; `text
+  index` also needs `live`), plus the MCP tools `text_index` and `text_search`.
+  They index the text columns of a query result locally with Frankensearch's
+  hash and lexical tiers, and rank them offline. Each hit names its row,
+  column, id value, snippet, and the receipt of the statement the text came
+  from. The text-indexing crate was linked before but reachable only from a
+  doctor check.
 - A first SIGINT/SIGTERM during a statement prints one stderr line saying the
   cancel is under way and that a second signal exits at once (`1e703fc`).
 - Each running statement is an Asupersync `Lease` obligation held by the task
