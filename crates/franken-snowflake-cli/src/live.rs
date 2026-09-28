@@ -67,6 +67,7 @@ use franken_snowflake_export::{
 use franken_snowflake_http::{
     AuthorizationDescriptor, CancelHttpRequest, SnowflakeAuthTokenType, SnowflakeEndpoint,
     SnowflakeHttpClient, StatusClass, TlsRootPolicy, TransportConfig, TransportError,
+    capture::{CAPTURE_DIR_ENV, TranscriptRecorder},
 };
 use franken_snowflake_sqlapi::driver::{
     AuthProvider, DriverEvent, DriverObserver, DriverStats, RowSink, StatementHooks,
@@ -3463,6 +3464,10 @@ where
                 format!("the profile's CA bundle was refused: {}", error.message),
             )
         })?;
+        let client = match transcript_recorder(conn) {
+            Some(recorder) => client.capturing(recorder),
+            None => client,
+        };
         let mut mechanism = conn
             .auth_profile
             .resolve(&ProcessSecretResolver, &conn.account, &conn.user)
@@ -4328,6 +4333,37 @@ fn receipt_show_command(receipt_hash: Option<&str>) -> String {
     match receipt_hash {
         Some(hash) => format!("franken-snowflake receipt show {hash} --json"),
         None => "franken-snowflake receipt show <receipt-hash> --json".to_string(),
+    }
+}
+
+/// With `FRANKEN_SNOWFLAKE_CAPTURE_DIR` set, a recorder that writes each
+/// exchange as a redacted transcript (bead oj0.21), refusing any transcript
+/// that still holds one of this profile's secret values.
+fn transcript_recorder(conn: &LiveConn) -> Option<Arc<TranscriptRecorder>> {
+    let dir = env_value(CAPTURE_DIR_ENV)?;
+    let prefix = crate::profile_env_prefix(&conn.profile);
+    let mut secrets: Vec<String> = [
+        "PAT",
+        "OAUTH_BEARER",
+        "PRIVATE_KEY_PASSPHRASE",
+        "OIDC_TOKEN",
+    ]
+    .iter()
+    .filter_map(|key| env_value(&name(&prefix, key)))
+    .collect();
+    if let Some(pem) = env_value(&name(&prefix, "PRIVATE_KEY_PEM")) {
+        secrets.extend(
+            pem.lines()
+                .filter(|line| !line.contains("-----"))
+                .map(str::to_owned),
+        );
+    }
+    match TranscriptRecorder::new(&dir, conn.endpoint.host()) {
+        Ok(recorder) => Some(Arc::new(recorder.with_secrets(secrets))),
+        Err(error) => {
+            eprintln!("{CAPTURE_DIR_ENV}: capture is off, `{dir}` could not be created: {error}");
+            None
+        }
     }
 }
 

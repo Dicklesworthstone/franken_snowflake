@@ -135,6 +135,32 @@ Missing credentials are not a pass-by-omission: the test writes a structured
 `franken_snowflake.live_gate.v1` skip event with the missing env handle names.
 Secrets are never written to the events or summaries.
 
+## Wire Transcripts
+
+Every `scripts/live-proof-cli.sh` step runs with
+`FRANKEN_SNOWFLAKE_CAPTURE_DIR=<run dir>/transcripts/<step>`, so each live HTTP
+exchange is written as `<seq>-<route>.json`, where route is `submit`, `poll`,
+`partition` or `cancel` (bead oj0.21). The recorder
+(`franken_snowflake_http::capture`) makes these changes before writing:
+
+- it keeps only the path and query, never the host;
+- it replaces the account host and name wherever else they appear;
+- it writes `Authorization`, cookie and token header values as `[REDACTED]`;
+- it maps statement handles and request ids to stable placeholders;
+- it decodes gzip bodies and marks them.
+
+A transcript that still holds one of the profile's secret env values, or a
+bearer-token shape, is not written. A `refused-<seq>.txt` with the reason is
+left in its place, and the battery's secret scan covers the transcripts as well.
+
+`franken_snowflake_http::capture::ReplayHttp` serves a transcript directory
+back as the transport, so the production driver can run against what
+Snowflake actually sent. The socket e2e
+`a_captured_run_replays_through_the_production_driver` proves the full loop
+over TLS against the mock. To turn a live run into regression fixtures, review
+the transcripts and commit the steps under
+`crates/franken-snowflake-testkit/fixtures/replay/<step>/`.
+
 ## Spawned CLI Safety
 
 Any helper that spawns the CLI from the live proof harness must build a sanitized

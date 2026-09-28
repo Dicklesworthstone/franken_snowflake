@@ -200,7 +200,9 @@ run_step() {
   local out="$RUN_DIR/$step.json" err="$RUN_DIR/$step.stderr"
   local started rc ms
   started=$(now_ms)
-  "$BIN" "$@" >"$out" 2>"$err"
+  # Every live exchange of the step is written as a redacted transcript
+  # (bead oj0.21): the regression fixtures a credentialed run leaves behind.
+  FRANKEN_SNOWFLAKE_CAPTURE_DIR="$RUN_DIR/transcripts/$step" "$BIN" "$@" >"$out" 2>"$err"
   rc=$?
   ms=$(( $(now_ms) - started ))
   if jq -e "$assertion" "$out" >/dev/null 2>&1; then

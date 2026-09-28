@@ -33,6 +33,8 @@ use franken_snowflake_core::ids::{RequestId, StatementHandle};
 use franken_snowflake_core::redact::{REDACTION_PLACEHOLDER, redact};
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
+pub mod capture;
+
 /// Crate version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -254,6 +256,9 @@ pub enum LiveHttp {
     NativeRoots(AsupersyncHttpClient),
     /// Fresh connections verified against a caller-provided PEM bundle.
     PemBundle(PemBundleHttp),
+    /// Either of the above, with every exchange written as a redacted
+    /// transcript ([`SnowflakeHttpClient::capturing`], bead oj0.21).
+    Capturing(Box<LiveHttp>, std::sync::Arc<capture::TranscriptRecorder>),
 }
 
 impl RawHttp for LiveHttp {
@@ -269,6 +274,19 @@ impl RawHttp for LiveHttp {
         match self {
             Self::NativeRoots(client) => client.send(cx, method, url, headers, body, timeout).await,
             Self::PemBundle(client) => client.send(cx, method, url, headers, body, timeout).await,
+            Self::Capturing(inner, recorder) => {
+                let request = (
+                    method.as_str().to_owned(),
+                    url.clone(),
+                    headers.clone(),
+                    body.clone(),
+                );
+                let result = Box::pin(inner.send(cx, method, url, headers, body, timeout)).await;
+                if let Ok(response) = &result {
+                    recorder.record(&request.0, &request.1, &request.2, &request.3, response);
+                }
+                result
+            }
         }
     }
 }
@@ -305,6 +323,16 @@ impl SnowflakeHttpClient {
             }
         };
         Ok(Self { config, client })
+    }
+
+    /// Write every exchange this client makes as a redacted transcript
+    /// (see [`capture`]); the requests themselves are unchanged.
+    #[must_use]
+    pub fn capturing(self, recorder: std::sync::Arc<capture::TranscriptRecorder>) -> Self {
+        Self {
+            config: self.config,
+            client: LiveHttp::Capturing(Box::new(self.client), recorder),
+        }
     }
 }
 

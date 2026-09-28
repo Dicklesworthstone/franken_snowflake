@@ -645,6 +645,133 @@ fn query_run_polls_and_streams_gzip_partitions_over_tls() {
     );
 }
 
+/// Bead oj0.21: with FRANKEN_SNOWFLAKE_CAPTURE_DIR set, a real run over TLS
+/// leaves one redacted transcript per exchange (no host, no credential, no
+/// real statement handle), and replaying them drives the production driver to
+/// the rows the CLI returned, taking every transcript. This is the path a
+/// credentialed run takes to become a no-account regression fixture.
+#[test]
+fn a_captured_run_replays_through_the_production_driver() {
+    use franken_snowflake_http::capture::ReplayHttp;
+    use franken_snowflake_http::{
+        AuthorizationDescriptor, SnowflakeAuthTokenType, SnowflakeEndpoint, SnowflakeHttpClient,
+        TransportConfig,
+    };
+    use franken_snowflake_sqlapi::driver::run_statement;
+    use franken_snowflake_sqlapi::lifecycle::PollPlan;
+    use franken_snowflake_sqlapi::request::{SubmitQueryParams, SubmitStatementRequest};
+
+    const HANDLE: &str = "01b2c3d4-0000-0000-0000-00000000f1b0";
+    let cert = TestCert::mint();
+    let server = MockServer::start(&cert, |request, before| {
+        if request.is_submit() {
+            return running(HANDLE);
+        }
+        if request.is_poll_of(HANDLE) {
+            let polls = before.iter().filter(|seen| seen.is_poll_of(HANDLE)).count();
+            return if polls == 0 {
+                running(HANDLE)
+            } else {
+                completed_multi(HANDLE)
+            };
+        }
+        match (
+            request.path() == format!("{SUBMIT_PATH}/{HANDLE}"),
+            request.query("partition"),
+        ) {
+            (true, Some("1")) => scenarios::gzip_partition(),
+            (true, Some("2")) => {
+                MockHttpResponse::json(200, br#"{"data":[["5","epsilon"]]}"#.to_vec())
+            }
+            _ => not_found(),
+        }
+    });
+    let h = Harness::new("capture", &cert);
+    let transcripts = h.dir.join("transcripts");
+    let args = [
+        "query",
+        "run",
+        "--profile",
+        "sock",
+        "--sql",
+        "select event_date, entity_id from events",
+        "--raw-cells",
+        "--json",
+    ];
+    let output = h
+        .command(server.port, &args)
+        .env("FRANKEN_SNOWFLAKE_CAPTURE_DIR", &transcripts)
+        .output()
+        .expect("spawn");
+    let run = h.finish(&args, output);
+    assert_eq!(run.exit, 0, "{}", run.context());
+
+    let mut routes = Vec::new();
+    for entry in fs::read_dir(&transcripts).expect("transcripts") {
+        let path = entry.expect("entry").path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let text = fs::read_to_string(&path).expect("read transcript");
+        assert!(!name.starts_with("refused"), "{name}: {text}");
+        for forbidden in [CANARY_PAT, "127.0.0.1", HANDLE] {
+            assert!(
+                !text.contains(forbidden),
+                "{name} holds {forbidden}: {text}"
+            );
+        }
+        routes.push(
+            name.split_once('-')
+                .unwrap()
+                .1
+                .trim_end_matches(".json")
+                .to_owned(),
+        );
+    }
+    routes.sort();
+    assert_eq!(
+        routes,
+        ["partition", "partition", "poll", "poll", "submit"],
+        "one transcript per exchange"
+    );
+
+    let replay = ReplayHttp::from_dir(&transcripts).expect("load transcripts");
+    let endpoint =
+        SnowflakeEndpoint::parse("https://acme-replay.snowflakecomputing.com").expect("endpoint");
+    let client = SnowflakeHttpClient::new(TransportConfig::new(endpoint), replay);
+    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+    let replayed = runtime.block_on(async {
+        let cx = asupersync::Cx::current().expect("cx");
+        run_statement(
+            &cx,
+            &client,
+            AuthorizationDescriptor::bearer(
+                SnowflakeAuthTokenType::ProgrammaticAccessToken,
+                "replay-token-not-a-secret",
+                "replay",
+            ),
+            SubmitStatementRequest::new("select event_date, entity_id from events"),
+            SubmitQueryParams {
+                request_id: Some("replay-request".to_owned()),
+                retry: true,
+                asynchronous: false,
+                nullable: None,
+            },
+            PollPlan::with_max_polls(5),
+        )
+        .await
+    });
+    let done = match replayed {
+        asupersync::Outcome::Ok(done) => done,
+        other => panic!("replay did not complete: {other:?}"),
+    };
+    let rows: Vec<Vec<Option<String>>> =
+        serde_json::from_value(run.envelope["data"]["rows"].clone()).expect("cli rows");
+    assert_eq!(
+        done.rows, rows,
+        "the replayed driver returns what the live run returned"
+    );
+    assert_eq!(done.rows.len(), 5);
+}
+
 /// A 429 without Retry-After is resubmitted with the SAME requestId and
 /// `retry=true`, so Snowflake can deduplicate it.
 #[test]
