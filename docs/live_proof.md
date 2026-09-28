@@ -161,6 +161,27 @@ over TLS against the mock. To turn a live run into regression fixtures, review
 the transcripts and commit the steps under
 `crates/franken-snowflake-testkit/fixtures/replay/<step>/`.
 
+## Questions the First Credentialed Run Answers
+
+Besides the lanes above, `scripts/live-proof-cli.sh` answers three open questions
+in the same run:
+
+- **Statement counts (bead oj0.23):** ten SELECT-only `sql_guard_*` shapes run
+  (semicolons in strings, in `--`/`//`/block comments, in `$$` and quoted
+  identifiers; a trailing `;` with and without a comment; two statements). Every
+  request pins `MULTI_STATEMENT_COUNT` to the lexer's count, so Snowflake refuses,
+  without executing, any request whose count differs. A failing probe is a
+  finding that names the shape. Nested block comments are not probed, because
+  the lexer refuses them locally.
+- **Correctness against the incumbent (bead oj0.22):** when `uv` is available,
+  `scripts/differential-python-connector.py` runs one type-matrix SELECT through
+  fsnow and through `snowflake-connector-python==4.7.5`, then compares the cells
+  in `differential.json`. Times and timestamps are compared to the microsecond,
+  because Python's datetime stops there. `--self-test` checks the normalization
+  and the documented `connect()` arguments offline.
+- **Result encoding (bead w0i.13):** `scripts/capture-jsonv2-golden.sh` is run
+  separately.
+
 ## Spawned CLI Safety
 
 Any helper that spawns the CLI from the live proof harness must build a sanitized

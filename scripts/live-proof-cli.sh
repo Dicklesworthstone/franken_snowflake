@@ -336,6 +336,28 @@ fi
 run_step query_run_partitioned hard '.ok == true and .data.returned_rows == 10 and .data.truncated == true' -- query run --profile "$PROFILE" --sql "$PARTITION_SQL" --limit 10 --json
 run_step partition_early_stop soft '.data.partition_count > 1 and .data.partitions_fetched < .data.partition_count' -- query run --profile "$PROFILE" --sql "$PARTITION_SQL" --limit 10 --json
 
+# Statement-count truth (bead oj0.23). Every request pins MULTI_STATEMENT_COUNT
+# to the count the CLI's lexer found, and Snowflake rejects a request whose
+# count differs without executing anything. So each shape below, all
+# SELECT-only, checks the lexer against the server: a failure is a finding
+# naming the shape (error.code FSNOW-3xxx = the lexer refused it locally;
+# otherwise the server disagreed). Nested block comments are not probed: the
+# lexer refuses them locally (fails closed), so they never reach the server.
+guard_probe() { # guard_probe <step> <sql> [--allow-multiple-statements]
+  local step="$1" sql="$2"; shift 2
+  run_step "$step" soft '.ok == true' -- query run --profile "$PROFILE" --sql "$sql" --limit 1 "$@" --json
+}
+guard_probe sql_guard_semicolon_in_string "SELECT 'a;b' AS S"
+guard_probe sql_guard_semicolon_in_block_comment "SELECT 1 /* ; */ AS X"
+guard_probe sql_guard_semicolon_in_dash_comment "$(printf 'SELECT 1 -- ;\nAS X')"
+guard_probe sql_guard_semicolon_in_slash_comment "$(printf 'SELECT 1 // ;\nAS X')"
+guard_probe sql_guard_dollar_quote 'SELECT $$a;b$$ AS D'
+guard_probe sql_guard_backslash_escape "SELECT 'don\\'t; stop' AS E"
+guard_probe sql_guard_quoted_identifier 'SELECT "w;c" FROM (SELECT 1 AS "w;c")'
+guard_probe sql_guard_trailing_semicolon "SELECT 1 AS X;"
+guard_probe sql_guard_trailing_semicolon_comment "SELECT 1 AS X; -- trailing comment"
+guard_probe sql_guard_two_statements "SELECT 1 AS X; SELECT 2 AS Y" --allow-multiple-statements
+
 if [ -n "$HANDLE" ] && [ "$HANDLE" != "null" ]; then
   # The statement is already complete; Snowflake answers the cancel endpoint
   # with a typed result either way. The assertion is "well-formed typed
@@ -384,6 +406,30 @@ if [ -s "$RUN_DIR/export.csv" ]; then
 else
   HARD_FAILURES=$((HARD_FAILURES + 1))
   event export_file fail 0 0 "export.csv missing or empty"
+fi
+
+# Correctness against the incumbent (bead oj0.22): the same type-matrix SELECT
+# through the official Snowflake Python connector, live in this run, compared
+# cell by cell with fsnow's typed rows. A mismatch is a finding to file (see
+# differential.json), not a harness failure.
+if command -v uv >/dev/null 2>&1; then
+  started=$(now_ms)
+  uv run --quiet --python 3.12 --with "snowflake-connector-python==4.7.5" \
+    python3 "$REPO_ROOT/scripts/differential-python-connector.py" \
+    --bin "$BIN" --profile "$PROFILE" --out "$RUN_DIR/differential.json" \
+    >"$RUN_DIR/differential.stdout" 2>"$RUN_DIR/differential.stderr"
+  rc=$?
+  ms=$(( $(now_ms) - started ))
+  if [ "$rc" -eq 0 ]; then
+    event python_connector_differential pass "$rc" "$ms" "$(tail -1 "$RUN_DIR/differential.stdout")"
+    log "PASS python_connector_differential (${ms}ms)"
+  else
+    SOFT_FINDINGS=$((SOFT_FINDINGS + 1))
+    event python_connector_differential finding "$rc" "$ms" "see differential.json / differential.stderr"
+    log "FINDING python_connector_differential: exit=$rc"
+  fi
+else
+  event python_connector_differential skip 0 0 "uv is not installed; the Python connector arm was not run"
 fi
 
 secret_scan "$PREFIX" || true
