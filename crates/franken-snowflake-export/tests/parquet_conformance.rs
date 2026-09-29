@@ -243,13 +243,225 @@ fn test_parquet_large_dataset_and_edge_cases() {
     assert_eq!(re_read.partitions[0].rows[1999][0], Some("1999".to_owned()));
 }
 
+/// The live SQL API reports the bare type name (`"fixed"`, `"timestamp_ntz"`)
+/// with precision/scale in separate `rowType` fields. Before 2026-09-24 the
+/// writer read scale only from a `NUMBER(p,s)` string, so every live NUMBER was
+/// written as INT64 and `1.50` came back as `1` (reproduced with pyarrow/duckdb).
+fn live_shaped_columns() -> Vec<ExportColumn> {
+    vec![
+        ExportColumn::new("amount", "fixed").precision_scale(Some(10), Some(2)),
+        ExportColumn::new("big", "fixed").precision_scale(Some(38), Some(0)),
+        ExportColumn::new("tiny_frac", "fixed").precision_scale(Some(38), Some(10)),
+        ExportColumn::new("small_int", "fixed").precision_scale(Some(5), Some(0)),
+        ExportColumn::new("ts_ntz", "timestamp_ntz").precision_scale(None, Some(9)),
+        ExportColumn::new("ts_ltz", "timestamp_ltz").precision_scale(None, Some(3)),
+        ExportColumn::new("ts_tz", "timestamp_tz").precision_scale(None, Some(9)),
+        ExportColumn::new("t", "time").precision_scale(None, Some(9)),
+        ExportColumn::new("d", "date"),
+        ExportColumn::new("bin", "binary"),
+        ExportColumn::new("v", "variant"),
+        ExportColumn::new("flag", "boolean"),
+    ]
+}
+
+fn cells(values: &[Option<&str>]) -> Vec<Option<String>> {
+    values.iter().map(|v| v.map(str::to_owned)).collect()
+}
+
+fn live_shaped_rows() -> Vec<Vec<Option<String>>> {
+    vec![
+        cells(&[
+            Some("1.50"),
+            Some("12345678901234567890123456789012345678"),
+            Some("0.0000000001"),
+            Some("42"),
+            Some("1700000000.123456789"),
+            Some("1700000000.123"),
+            Some("1700000000.500000000 1770"),
+            Some("82919.123456789"),
+            Some("18262"),
+            Some("DEADBEEF"),
+            Some("{\"a\":1}"),
+            Some("true"),
+        ]),
+        cells(&[
+            Some("-7.99"),
+            Some("-99999999999999999999999999999999999999"),
+            Some("-12345.6789012345"),
+            Some("-5"),
+            Some("-1.500000000"),
+            Some("0.000"),
+            Some("-3600.000000000 1440"),
+            Some("0.000000000"),
+            Some("-1"),
+            Some("00"),
+            Some("[1,2]"),
+            Some("false"),
+        ]),
+        vec![None; 12],
+    ]
+}
+
+#[test]
+fn test_live_shaped_schema_round_trips_exactly() {
+    let input = LocalExportInput::new(
+        live_shaped_columns(),
+        vec![ResultPartition::new(0, live_shaped_rows())],
+    );
+    let artifact = export_parquet(
+        &input,
+        "@tests/live_shaped.parquet",
+        1_700_000_000_000,
+        None,
+    )
+    .expect("export_parquet failed");
+    let re_read = read_parquet_records(&artifact.bytes).expect("read_parquet_records failed");
+
+    // TIMESTAMP_TZ becomes the UTC instant plus a sibling offset column.
+    let names: Vec<&str> = re_read.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "amount",
+            "big",
+            "tiny_frac",
+            "small_int",
+            "ts_ntz",
+            "ts_ltz",
+            "ts_tz",
+            "ts_tz__tz_offset_minutes",
+            "t",
+            "d",
+            "bin",
+            "v",
+            "flag",
+        ]
+    );
+    // Canonical renderings: decimals keep their scale, time units follow the
+    // declared scale (TIMESTAMP_LTZ(3) is stored in micros), dates render ISO.
+    let expected = vec![
+        cells(&[
+            Some("1.50"),
+            Some("12345678901234567890123456789012345678"),
+            Some("0.0000000001"),
+            Some("42"),
+            Some("1700000000.123456789"),
+            Some("1700000000.123000"),
+            Some("1700000000.500000000"),
+            Some("330"),
+            Some("82919.123456789"),
+            Some("2020-01-01"),
+            Some("DEADBEEF"),
+            Some("{\"a\":1}"),
+            Some("true"),
+        ]),
+        cells(&[
+            Some("-7.99"),
+            Some("-99999999999999999999999999999999999999"),
+            Some("-12345.6789012345"),
+            Some("-5"),
+            Some("-1.500000000"),
+            Some("0.000000"),
+            Some("-3600.000000000"),
+            Some("0"),
+            Some("0.000000000"),
+            Some("1969-12-31"),
+            Some("00"),
+            Some("[1,2]"),
+            Some("false"),
+        ]),
+        vec![None; 13],
+    ];
+    assert_eq!(re_read.partitions[0].rows, expected);
+
+    // The schema carries the Snowflake shape back.
+    let amount = &re_read.columns[0];
+    assert_eq!(
+        (
+            amount.snowflake_type.as_str(),
+            amount.precision,
+            amount.scale
+        ),
+        ("NUMBER", Some(10), Some(2))
+    );
+    assert_eq!(re_read.columns[4].snowflake_type, "TIMESTAMP_NTZ");
+    assert_eq!(re_read.columns[5].snowflake_type, "TIMESTAMP_LTZ");
+    assert_eq!(re_read.columns[10].snowflake_type, "BINARY");
+    assert_eq!(re_read.columns[11].snowflake_type, "VARIANT");
+}
+
+#[test]
+fn test_lossy_values_are_refused_not_rounded() {
+    let refuse = |column: ExportColumn, value: &str| {
+        let input = LocalExportInput::new(
+            vec![column],
+            vec![ResultPartition::new(0, vec![vec![Some(value.to_owned())]])],
+        );
+        let error = export_parquet(&input, "@tests/lossy.parquet", 1, None)
+            .expect_err("a lossy value must be refused");
+        assert!(
+            error.to_string().contains("without loss"),
+            "{value}: {error}"
+        );
+    };
+    let amount = || ExportColumn::new("amount", "fixed").precision_scale(Some(10), Some(2));
+    refuse(amount(), "1.505"); // needs rounding
+    refuse(amount(), "123456789.01"); // 11 digits > precision 10
+    refuse(
+        ExportColumn::new("big", "fixed").precision_scale(Some(38), Some(0)),
+        "123456789012345678901234567890123456789", // 39 digits
+    );
+    refuse(
+        ExportColumn::new("ts", "timestamp_ltz").precision_scale(None, Some(3)),
+        "1.1234567", // 7 digits in a micros column
+    );
+    refuse(
+        ExportColumn::new("n", "fixed").precision_scale(Some(10), Some(2)),
+        "1e5",
+    );
+    refuse(ExportColumn::new("flag", "boolean"), "maybe");
+    refuse(ExportColumn::new("bin", "binary"), "XYZ");
+    // Extra zero digits are exact and accepted.
+    let input = LocalExportInput::new(
+        vec![amount()],
+        vec![ResultPartition::new(
+            0,
+            vec![vec![Some("1.5000".to_owned())]],
+        )],
+    );
+    let artifact = export_parquet(&input, "@tests/zeros.parquet", 1, None).expect("exact value");
+    let re_read = read_parquet_records(&artifact.bytes).expect("read back");
+    assert_eq!(re_read.partitions[0].rows[0][0].as_deref(), Some("1.50"));
+}
+
+/// Locate `uv` on PATH (then `$HOME/.local/bin`). `None` when absent.
+fn find_uv() -> Option<std::path::PathBuf> {
+    let on_path = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("uv"))
+            .find(|candidate| candidate.is_file())
+    });
+    on_path.or_else(|| {
+        std::env::var_os("HOME")
+            .map(|home| std::path::Path::new(&home).join(".local/bin/uv"))
+            .filter(|candidate| candidate.is_file())
+    })
+}
+
 #[test]
 fn test_parquet_external_pyarrow_and_duckdb_validation() {
-    let uv_bin = "/home/ubuntu/.local/bin/uv";
-    if !std::path::Path::new(uv_bin).exists() {
-        eprintln!("uv not available; skipping external consumer validation");
+    // In the release lane (FSNOW_REQUIRE_EXTERNAL_PARQUET=1) a missing tool is a
+    // failure; elsewhere the test says plainly that it did not run.
+    let Some(uv_bin) = find_uv() else {
+        assert!(
+            std::env::var("FSNOW_REQUIRE_EXTERNAL_PARQUET").as_deref() != Ok("1"),
+            "FSNOW_REQUIRE_EXTERNAL_PARQUET=1 but `uv` was not found; external Parquet conformance did not run"
+        );
+        eprintln!(
+            "SKIPPED (not a pass): uv not found; external PyArrow/DuckDB validation did not run"
+        );
         return;
-    }
+    };
 
     let columns = vec![
         ExportColumn::new("id", "INTEGER").nullable(false),
@@ -289,13 +501,55 @@ fn test_parquet_external_pyarrow_and_duckdb_validation() {
         .expect("export failed");
     std::fs::write(&test_file, &artifact.bytes).expect("write file failed");
 
+    // The live-shaped schema (bare type names + rowType precision/scale).
+    let live_file = temp_dir.path().join("live_shaped.parquet");
+    let live_input = LocalExportInput::new(
+        live_shaped_columns(),
+        vec![ResultPartition::new(0, live_shaped_rows())],
+    );
+    let live_artifact = export_parquet(&live_input, live_file.to_string_lossy(), 1, None)
+        .expect("live-shaped export failed");
+    std::fs::write(&live_file, &live_artifact.bytes).expect("write live file failed");
+
     // Execute Python script to validate with PyArrow and DuckDB
     let python_code = format!(
         r#"
 import pyarrow.parquet as pq
 import duckdb
+from decimal import Decimal
+import datetime
 
 path = r"{}"
+live = r"{}"
+
+# 0. Live-shaped types: exact decimals, time units, TZ offsets, raw binary.
+t2 = pq.read_table(live)
+sch = t2.schema
+assert str(sch.field("amount").type) == "decimal128(10, 2)", sch.field("amount").type
+assert t2["amount"].to_pylist() == [Decimal("1.50"), Decimal("-7.99"), None], t2["amount"].to_pylist()
+assert str(sch.field("big").type) == "decimal128(38, 0)", sch.field("big").type
+assert t2["big"].to_pylist() == [Decimal("12345678901234567890123456789012345678"), Decimal("-99999999999999999999999999999999999999"), None]
+assert t2["tiny_frac"].to_pylist() == [Decimal("0.0000000001"), Decimal("-12345.6789012345"), None]
+assert t2["small_int"].to_pylist() == [42, -5, None]
+assert str(sch.field("ts_ntz").type) == "timestamp[ns]", sch.field("ts_ntz").type
+assert t2["ts_ntz"].cast("int64").to_pylist() == [1700000000123456789, -1500000000, None]
+assert str(sch.field("ts_ltz").type) == "timestamp[us, tz=UTC]", sch.field("ts_ltz").type
+assert t2["ts_ltz"].cast("int64").to_pylist() == [1700000000123000, 0, None]
+assert str(sch.field("ts_tz").type) == "timestamp[ns, tz=UTC]", sch.field("ts_tz").type
+assert t2["ts_tz"].cast("int64").to_pylist() == [1700000000500000000, -3600000000000, None]
+assert t2["ts_tz__tz_offset_minutes"].to_pylist() == [330, 0, None]
+assert str(sch.field("t").type) == "time64[ns]", sch.field("t").type
+assert t2["t"].cast("int64").to_pylist() == [82919123456789, 0, None]
+assert t2["d"].to_pylist() == [datetime.date(2020, 1, 1), datetime.date(1969, 12, 31), None]
+assert t2["bin"].to_pylist() == [b"\xde\xad\xbe\xef", b"\x00", None], t2["bin"].to_pylist()
+assert [str(v) if v is not None else None for v in t2["v"].to_pylist()] == ['{{"a":1}}', "[1,2]", None]
+assert t2["flag"].to_pylist() == [True, False, None]
+print("PyArrow live-shaped validation PASSED")
+con0 = duckdb.connect()
+s = con0.execute(f"SELECT CAST(sum(amount) AS VARCHAR), CAST(max(big) AS VARCHAR) FROM read_parquet('{{live}}')").fetchone()
+assert s[0] == "-6.49", s
+assert s[1] == "12345678901234567890123456789012345678", s
+print("DuckDB live-shaped validation PASSED")
 
 # 1. Validate with PyArrow
 table = pq.read_table(path)
@@ -315,10 +569,11 @@ assert sum_id == 410, f"duckdb sum(id): {{sum_id}}"
 assert abs(max_cost - 99.95) < 1e-4, f"duckdb max_cost: {{max_cost}}"
 print("DuckDB validation PASSED")
 "#,
-        test_file.display()
+        test_file.display(),
+        live_file.display()
     );
 
-    let output = std::process::Command::new(uv_bin)
+    let output = std::process::Command::new(&uv_bin)
         .args([
             "run",
             "--with",
@@ -330,11 +585,25 @@ print("DuckDB validation PASSED")
         .output()
         .expect("failed to execute uv command");
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
         panic!(
             "external validation failed!\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
+            stdout,
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    // Exit 0 alone is not proof: every validation block must have run.
+    for marker in [
+        "PyArrow live-shaped validation PASSED",
+        "DuckDB live-shaped validation PASSED",
+        "PyArrow validation PASSED",
+        "DuckDB validation PASSED",
+    ] {
+        assert!(
+            stdout.contains(marker),
+            "missing `{marker}` in external validation output:\n{stdout}"
+        );
+    }
+    eprintln!("{stdout}");
 }

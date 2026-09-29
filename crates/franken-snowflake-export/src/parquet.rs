@@ -4,11 +4,25 @@
 //! Apache Parquet file format encoder and reader.
 //!
 //! # Specification Conformance
-//! Implements Apache Parquet format specification v2.0 using the standard Thrift
-//! Compact Protocol for `FileMetaData`, `ColumnMetaData`, and `PageHeader`.
+//! Writes Parquet files with `FileMetaData` version 1 and `DATA_PAGE` (V1) pages,
+//! serialized with the Thrift Compact Protocol, carrying both `LogicalType` and
+//! (where the legacy semantics match exactly) `ConvertedType` annotations.
 //! Supports PLAIN value encoding, RLE/Bit-Packing hybrid definition levels for
 //! nullable columns, optional statistics (null count, min/max values), and
-//! compression modes (Uncompressed, Snappy, Gzip).
+//! compression modes (Uncompressed, Snappy, Gzip). No dictionary encoding.
+//!
+//! # Type mapping (exact or refused)
+//! Columns are typed from the SQL API `rowType` (type + precision + scale):
+//! `FIXED`/`NUMBER` with scale 0 and precision ≤ 18 → `INT64`; any other
+//! `NUMBER(p,s)` → `DECIMAL(p,s)` on `INT32`/`INT64`/`FIXED_LEN_BYTE_ARRAY` by
+//! precision; `REAL` → `DOUBLE`; `DATE` → `DATE`; `TIME` → `TIME` (local);
+//! `TIMESTAMP_NTZ` → `TIMESTAMP` (not UTC-adjusted); `TIMESTAMP_LTZ` →
+//! `TIMESTAMP` (UTC-adjusted); `TIMESTAMP_TZ` → the UTC instant plus a sibling
+//! `<name>__tz_offset_minutes` `INT32` column; time units are micros for scale
+//! ≤ 6 and nanos above; `BINARY` → raw bytes; `VARIANT`/`OBJECT`/`ARRAY` →
+//! `JSON`; everything else (incl. `DECFLOAT`, `GEOGRAPHY`) → UTF-8 `STRING`.
+//! A value that cannot be represented exactly (extra fractional digits, more
+//! digits than the precision, out of range) is a typed error, never rounded.
 
 use serde::{Deserialize, Serialize};
 
@@ -694,14 +708,138 @@ pub enum ParquetType {
     Int64 = 2,
     Double = 5,
     ByteArray = 6,
+    FixedLenByteArray = 7,
 }
 
-/// Logical / Converted types for Parquet metadata.
+impl ParquetType {
+    const fn from_thrift(id: i32) -> Option<Self> {
+        match id {
+            0 => Some(Self::Boolean),
+            1 => Some(Self::Int32),
+            2 => Some(Self::Int64),
+            5 => Some(Self::Double),
+            6 => Some(Self::ByteArray),
+            7 => Some(Self::FixedLenByteArray),
+            _ => None,
+        }
+    }
+}
+
+/// Legacy converted types written for older readers (the logical type below is
+/// authoritative). Only annotations whose legacy semantics match exactly are
+/// written: `TIMESTAMP_MICROS` implies UTC-adjusted, so local (`_NTZ`) and
+/// nanosecond timestamps carry the logical type alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ParquetConvertedType {
     Utf8 = 0,
+    Decimal = 5,
     Date = 6,
     TimestampMicros = 10,
+    Json = 19,
+}
+
+impl ParquetConvertedType {
+    const fn from_thrift(id: i32) -> Option<Self> {
+        match id {
+            0 => Some(Self::Utf8),
+            5 => Some(Self::Decimal),
+            6 => Some(Self::Date),
+            10 => Some(Self::TimestampMicros),
+            19 => Some(Self::Json),
+            _ => None,
+        }
+    }
+}
+
+/// Unit of a `TIME` / `TIMESTAMP` logical type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TimeUnit {
+    Micros,
+    Nanos,
+}
+
+impl TimeUnit {
+    /// Fractional-second digits the unit represents exactly.
+    #[must_use]
+    pub const fn digits(self) -> u32 {
+        match self {
+            Self::Micros => 6,
+            Self::Nanos => 9,
+        }
+    }
+
+    /// Choose the unit that represents a column's declared fractional-second
+    /// scale exactly: micros up to scale 6 (wide range), nanos above.
+    #[must_use]
+    pub const fn for_scale(scale: Option<u32>) -> Self {
+        match scale {
+            Some(scale) if scale > 6 => Self::Nanos,
+            _ => Self::Micros,
+        }
+    }
+
+    /// Field id of the unit inside the Thrift `TimeUnit` union.
+    const fn thrift_field(self) -> i16 {
+        match self {
+            Self::Micros => 2,
+            Self::Nanos => 3,
+        }
+    }
+}
+
+/// Parquet logical type annotation (the Thrift `LogicalType` union).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ParquetLogicalType {
+    String,
+    Decimal {
+        precision: u32,
+        scale: u32,
+    },
+    Date,
+    Time {
+        unit: TimeUnit,
+    },
+    Timestamp {
+        adjusted_to_utc: bool,
+        unit: TimeUnit,
+    },
+    Json,
+}
+
+/// How one Snowflake `jsonv2` cell string becomes a Parquet value. Every codec
+/// is exact: a value that cannot be represented without loss is a typed error,
+/// never a rounded or truncated value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CellCodec {
+    /// UTF-8 text stored verbatim (TEXT, VARIANT JSON, DECFLOAT, GEOGRAPHY, ...).
+    Text,
+    /// BINARY: the hex wire string decoded to raw bytes.
+    HexBytes,
+    Boolean,
+    /// An exact integer that must fit `i64`.
+    Integer,
+    Float,
+    /// An exact decimal stored as its unscaled integer.
+    Decimal {
+        precision: u32,
+        scale: u32,
+    },
+    /// Days since the epoch (or an ISO `YYYY-MM-DD` date).
+    Date,
+    /// `TIME`: seconds since midnight, stored in `unit`.
+    TimeOfDay {
+        unit: TimeUnit,
+    },
+    /// `TIMESTAMP_NTZ` / `_LTZ`: epoch seconds, stored in `unit`.
+    Epoch {
+        unit: TimeUnit,
+    },
+    /// `TIMESTAMP_TZ` `"<epoch seconds> <offset minutes + 1440>"`: the UTC instant.
+    TzInstant {
+        unit: TimeUnit,
+    },
+    /// `TIMESTAMP_TZ`: the offset in minutes (`raw - 1440`).
+    TzOffsetMinutes,
 }
 
 /// Parquet field repetition type.
@@ -716,74 +854,201 @@ pub enum FieldRepetitionType {
 pub struct ParquetColumnDescriptor {
     pub physical: ParquetType,
     pub converted: Option<ParquetConvertedType>,
+    pub logical: Option<ParquetLogicalType>,
+    /// Byte width of a `FIXED_LEN_BYTE_ARRAY` column.
+    pub type_length: Option<i32>,
     pub nullable: bool,
+    pub codec: CellCodec,
+}
+
+/// One physical Parquet column and the result column its cells come from. A
+/// `TIMESTAMP_TZ` result column becomes two physical columns: the UTC instant
+/// under its own name and `<name>__tz_offset_minutes`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParquetColumnPlan {
+    pub name: String,
+    pub source: usize,
+    pub desc: ParquetColumnDescriptor,
+}
+
+/// Suffix of the sibling column that carries a `TIMESTAMP_TZ` column's offset.
+pub const TZ_OFFSET_SUFFIX: &str = "__tz_offset_minutes";
+
+/// Smallest byte width whose signed range holds every decimal of `precision`
+/// digits (the Parquet `FIXED_LEN_BYTE_ARRAY` rule; 16 bytes for 38 digits).
+#[must_use]
+pub fn decimal_byte_width(precision: u32) -> i32 {
+    let max_unscaled = 10_i128.saturating_pow(precision.min(38)) - 1;
+    (1_i32..=16)
+        .find(|width| (1_i128 << (8 * width - 1)) > max_unscaled)
+        .unwrap_or(16)
 }
 
 impl ParquetColumnDescriptor {
-    /// Resolve physical and converted type from Snowflake logical type string.
+    /// Resolve the Parquet column for a Snowflake result column from its type
+    /// name plus the result metadata's precision and scale. `NUMBER(p,s)` type
+    /// strings (used by callers that only have a type label) are honored when the
+    /// metadata fields are absent.
     #[must_use]
-    pub fn resolve(snowflake_type: &str, nullable: bool) -> Self {
-        let base = snowflake_type
+    pub fn resolve(column: &ExportColumn) -> Self {
+        let type_name = column.snowflake_type.as_str();
+        let base = type_name
             .split('(')
             .next()
-            .unwrap_or(snowflake_type)
+            .unwrap_or(type_name)
             .trim()
             .to_ascii_uppercase();
+        let (declared_precision, declared_scale) = parse_declared_precision_scale(type_name);
+        let precision = column.precision.or(declared_precision);
+        let scale = column.scale.or(declared_scale);
+        let nullable = column.nullable;
+        let plain = |physical, codec| Self {
+            physical,
+            converted: None,
+            logical: None,
+            type_length: None,
+            nullable,
+            codec,
+        };
 
         match base.as_str() {
-            "BOOLEAN" | "BOOL" => Self {
-                physical: ParquetType::Boolean,
-                converted: None,
-                nullable,
-            },
+            "BOOLEAN" | "BOOL" => plain(ParquetType::Boolean, CellCodec::Boolean),
             "DATE" => Self {
-                physical: ParquetType::Int32,
                 converted: Some(ParquetConvertedType::Date),
-                nullable,
+                logical: Some(ParquetLogicalType::Date),
+                ..plain(ParquetType::Int32, CellCodec::Date)
             },
-            "TIMESTAMP" | "TIMESTAMP_NTZ" | "TIMESTAMP_LTZ" | "TIMESTAMP_TZ" => Self {
-                physical: ParquetType::Int64,
-                converted: Some(ParquetConvertedType::TimestampMicros),
-                nullable,
-            },
-            "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "REAL" => Self {
-                physical: ParquetType::Double,
-                converted: None,
-                nullable,
-            },
-            "NUMBER" | "FIXED" | "DECIMAL" | "NUMERIC" => {
-                // If scale is specified and non-zero, map to Double; otherwise Int64.
-                if let Some(scale_str) = snowflake_type.split(',').nth(1) {
-                    let scale = scale_str
-                        .trim()
-                        .trim_end_matches(')')
-                        .parse::<i32>()
-                        .unwrap_or(0);
-                    if scale > 0 {
-                        return Self {
-                            physical: ParquetType::Double,
-                            converted: None,
-                            nullable,
-                        };
-                    }
-                }
+            "TIME" => {
+                let unit = TimeUnit::for_scale(scale);
                 Self {
-                    physical: ParquetType::Int64,
-                    converted: None,
-                    nullable,
+                    logical: Some(ParquetLogicalType::Time { unit }),
+                    ..plain(ParquetType::Int64, CellCodec::TimeOfDay { unit })
                 }
             }
-            "INT" | "INTEGER" | "BIGINT" | "SMALLINT" | "TINYINT" | "BYTEINT" => Self {
-                physical: ParquetType::Int64,
-                converted: None,
-                nullable,
+            "TIMESTAMP" | "TIMESTAMP_NTZ" | "DATETIME" => {
+                let unit = TimeUnit::for_scale(scale);
+                Self {
+                    logical: Some(ParquetLogicalType::Timestamp {
+                        adjusted_to_utc: false,
+                        unit,
+                    }),
+                    ..plain(ParquetType::Int64, CellCodec::Epoch { unit })
+                }
+            }
+            "TIMESTAMP_LTZ" | "TIMESTAMP_TZ" => {
+                let unit = TimeUnit::for_scale(scale);
+                let codec = if base == "TIMESTAMP_TZ" {
+                    CellCodec::TzInstant { unit }
+                } else {
+                    CellCodec::Epoch { unit }
+                };
+                Self {
+                    converted: (unit == TimeUnit::Micros)
+                        .then_some(ParquetConvertedType::TimestampMicros),
+                    logical: Some(ParquetLogicalType::Timestamp {
+                        adjusted_to_utc: true,
+                        unit,
+                    }),
+                    ..plain(ParquetType::Int64, codec)
+                }
+            }
+            "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "REAL" => {
+                plain(ParquetType::Double, CellCodec::Float)
+            }
+            "INT" | "INTEGER" | "BIGINT" | "SMALLINT" | "TINYINT" | "BYTEINT" => {
+                plain(ParquetType::Int64, CellCodec::Integer)
+            }
+            "NUMBER" | "FIXED" | "DECIMAL" | "NUMERIC" => {
+                let scale = scale.unwrap_or(0).min(37);
+                let precision = precision.unwrap_or(38).clamp(1, 38).max(scale);
+                if scale == 0 && precision <= 18 {
+                    return plain(ParquetType::Int64, CellCodec::Integer);
+                }
+                let (physical, type_length) = match precision {
+                    0..=9 => (ParquetType::Int32, None),
+                    10..=18 => (ParquetType::Int64, None),
+                    _ => (
+                        ParquetType::FixedLenByteArray,
+                        Some(decimal_byte_width(precision)),
+                    ),
+                };
+                Self {
+                    converted: Some(ParquetConvertedType::Decimal),
+                    logical: Some(ParquetLogicalType::Decimal { precision, scale }),
+                    type_length,
+                    ..plain(physical, CellCodec::Decimal { precision, scale })
+                }
+            }
+            "BINARY" | "VARBINARY" => plain(ParquetType::ByteArray, CellCodec::HexBytes),
+            "VARIANT" | "OBJECT" | "ARRAY" => Self {
+                converted: Some(ParquetConvertedType::Json),
+                logical: Some(ParquetLogicalType::Json),
+                ..plain(ParquetType::ByteArray, CellCodec::Text)
             },
+            // TEXT/VARCHAR/STRING/CHAR, DECFLOAT (up to 38 significant digits with
+            // an exponent: kept exact as text), GEOGRAPHY/GEOMETRY and anything
+            // unknown are written as UTF-8 text.
             _ => Self {
-                physical: ParquetType::ByteArray,
                 converted: Some(ParquetConvertedType::Utf8),
-                nullable,
+                logical: Some(ParquetLogicalType::String),
+                ..plain(ParquetType::ByteArray, CellCodec::Text)
             },
         }
+    }
+}
+
+/// Plan the physical Parquet columns for a result schema (expands each
+/// `TIMESTAMP_TZ` column into its instant and offset columns).
+#[must_use]
+pub fn plan_parquet_columns(columns: &[ExportColumn]) -> Vec<ParquetColumnPlan> {
+    let mut plans = Vec::with_capacity(columns.len());
+    for (source, column) in columns.iter().enumerate() {
+        let desc = ParquetColumnDescriptor::resolve(column);
+        let is_tz = matches!(desc.codec, CellCodec::TzInstant { .. });
+        plans.push(ParquetColumnPlan {
+            name: column.name.clone(),
+            source,
+            desc,
+        });
+        if is_tz {
+            plans.push(ParquetColumnPlan {
+                name: format!("{}{TZ_OFFSET_SUFFIX}", column.name),
+                source,
+                desc: ParquetColumnDescriptor {
+                    physical: ParquetType::Int32,
+                    converted: None,
+                    logical: None,
+                    type_length: None,
+                    nullable: column.nullable,
+                    codec: CellCodec::TzOffsetMinutes,
+                },
+            });
+        }
+    }
+    plans
+}
+
+/// `(p, s)` from a `NUMBER(p,s)` / `TIMESTAMP_NTZ(s)`-style type label.
+fn parse_declared_precision_scale(type_name: &str) -> (Option<u32>, Option<u32>) {
+    let Some(args) = type_name
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(args, _)| args)
+    else {
+        return (None, None);
+    };
+    let mut parts = args.split(',').map(|part| part.trim().parse::<u32>().ok());
+    let first = parts.next().flatten();
+    let second = parts.next().flatten();
+    let upper = type_name.trim_start().to_ascii_uppercase();
+    let numeric = ["NUMBER", "DECIMAL", "NUMERIC", "FIXED"]
+        .iter()
+        .any(|prefix| upper.starts_with(prefix));
+    if numeric {
+        (first, second)
+    } else {
+        // TIMESTAMP_NTZ(3) / TIME(9): the single argument is the scale.
+        (None, first)
     }
 }
 
@@ -942,34 +1207,31 @@ pub fn encode_column_plain(
             }
             Some(s) => {
                 defs.push(1_u8);
-                match desc.physical {
-                    ParquetType::Int64 => {
-                        let val = parse_i64_cell(s, desc.converted)?;
+                match encode_cell(desc, s)? {
+                    PlainValue::I64(val) => {
                         stats.update_i64(val);
                         values.extend_from_slice(&val.to_le_bytes());
                     }
-                    ParquetType::Int32 => {
-                        let val = parse_i32_cell(s, desc.converted)?;
+                    PlainValue::I32(val) => {
                         stats.update_i32(val);
                         values.extend_from_slice(&val.to_le_bytes());
                     }
-                    ParquetType::Double => {
-                        let val = parse_f64_cell(s)?;
+                    PlainValue::F64(val) => {
                         stats.update_f64(val);
                         values.extend_from_slice(&val.to_bits().to_le_bytes());
                     }
-                    ParquetType::Boolean => {
-                        let val =
-                            matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "t");
-                        bool_bits.push(val);
-                    }
-                    ParquetType::ByteArray => {
-                        stats.update_str(s);
-                        let bytes = s.as_bytes();
-                        let len_u32 = bytes.len() as u32;
+                    PlainValue::Bool(val) => bool_bits.push(val),
+                    PlainValue::Bytes(bytes) => {
+                        if desc.codec == CellCodec::Text {
+                            stats.update_str(s);
+                        }
+                        let len_u32 = u32::try_from(bytes.len()).map_err(|_| {
+                            cell_error(s, "a Parquet BYTE_ARRAY", "longer than 4 GiB")
+                        })?;
                         values.extend_from_slice(&len_u32.to_le_bytes());
-                        values.extend_from_slice(bytes);
+                        values.extend_from_slice(&bytes);
                     }
+                    PlainValue::Fixed(bytes) => values.extend_from_slice(&bytes),
                 }
             }
         }
@@ -999,83 +1261,183 @@ pub fn encode_column_plain(
     Ok((page_data, stats))
 }
 
-fn parse_i64_cell(s: &str, converted: Option<ParquetConvertedType>) -> ExportResult<i64> {
+/// One encoded PLAIN value.
+enum PlainValue {
+    Bool(bool),
+    I32(i32),
+    I64(i64),
+    F64(f64),
+    /// A length-prefixed `BYTE_ARRAY` value.
+    Bytes(Vec<u8>),
+    /// A `FIXED_LEN_BYTE_ARRAY` value (exactly `type_length` bytes).
+    Fixed(Vec<u8>),
+}
+
+fn cell_error(cell: &str, target: &str, detail: impl std::fmt::Display) -> ExportError {
+    let shown: String = cell.chars().take(64).collect();
+    ExportError::Sink {
+        message: format!("cannot encode `{shown}` as {target} without loss: {detail}"),
+    }
+}
+
+/// Encode one `jsonv2` cell for `desc`. Exact or a typed error: no rounding, no
+/// truncation, no saturation.
+fn encode_cell(desc: &ParquetColumnDescriptor, s: &str) -> ExportResult<PlainValue> {
     let trimmed = s.trim();
-    if converted == Some(ParquetConvertedType::TimestampMicros) {
-        if trimmed.contains('.') {
-            let mut parts = trimmed.split('.');
-            if let (Some(sec_str), Some(frac_str)) = (parts.next(), parts.next()) {
-                let sec = sec_str.parse::<i64>().map_err(|e| ExportError::Sink {
-                    message: format!("cannot parse timestamp seconds `{sec_str}`: {e}"),
-                })?;
-                let frac_micros = parse_fractional_micros(frac_str);
-                let total = if sec >= 0 && !sec_str.starts_with('-') {
-                    sec.saturating_mul(1_000_000).saturating_add(frac_micros)
-                } else {
-                    sec.saturating_mul(1_000_000).saturating_sub(frac_micros)
-                };
-                return Ok(total);
+    match desc.codec {
+        CellCodec::Text => Ok(PlainValue::Bytes(s.as_bytes().to_vec())),
+        CellCodec::HexBytes => decode_hex(trimmed)
+            .map(PlainValue::Bytes)
+            .ok_or_else(|| cell_error(s, "BINARY", "not an even-length hex string")),
+        CellCodec::Boolean => match trimmed.to_ascii_lowercase().as_str() {
+            "true" | "t" | "1" => Ok(PlainValue::Bool(true)),
+            "false" | "f" | "0" => Ok(PlainValue::Bool(false)),
+            _ => Err(cell_error(s, "BOOLEAN", "not true/false")),
+        },
+        CellCodec::Integer => {
+            let value = parse_scaled_decimal(trimmed, 0).map_err(|e| cell_error(s, "INT64", e))?;
+            i64::try_from(value)
+                .map(PlainValue::I64)
+                .map_err(|_| cell_error(s, "INT64", "outside the 64-bit range"))
+        }
+        CellCodec::Float => trimmed
+            .parse::<f64>()
+            .map(PlainValue::F64)
+            .map_err(|e| cell_error(s, "DOUBLE", e)),
+        CellCodec::Decimal { precision, scale } => {
+            let target = || format!("DECIMAL({precision},{scale})");
+            let unscaled =
+                parse_scaled_decimal(trimmed, scale).map_err(|e| cell_error(s, &target(), e))?;
+            let limit = 10_i128.pow(precision.min(38));
+            if unscaled.abs() >= limit {
+                return Err(cell_error(
+                    s,
+                    &target(),
+                    "more digits than the declared precision",
+                ));
+            }
+            match desc.physical {
+                ParquetType::Int32 => i32::try_from(unscaled)
+                    .map(PlainValue::I32)
+                    .map_err(|_| cell_error(s, &target(), "outside INT32")),
+                ParquetType::Int64 => i64::try_from(unscaled)
+                    .map(PlainValue::I64)
+                    .map_err(|_| cell_error(s, &target(), "outside INT64")),
+                _ => {
+                    let width = desc.type_length.unwrap_or(16).clamp(1, 16) as usize;
+                    let be = unscaled.to_be_bytes();
+                    Ok(PlainValue::Fixed(be[16 - width..].to_vec()))
+                }
             }
         }
-        if let Ok(v) = trimmed.parse::<i64>() {
-            return Ok(if v.abs() >= 100_000_000_000 {
-                v
-            } else {
-                v.saturating_mul(1_000_000)
-            });
+        CellCodec::Date => {
+            let days = trimmed
+                .parse::<i32>()
+                .ok()
+                .or_else(|| parse_iso_date_to_days(trimmed))
+                .ok_or_else(|| cell_error(s, "DATE", "not days-since-epoch or YYYY-MM-DD"))?;
+            Ok(PlainValue::I32(days))
+        }
+        CellCodec::TimeOfDay { unit } | CellCodec::Epoch { unit } => {
+            scaled_seconds_i64(trimmed, unit)
+                .map(PlainValue::I64)
+                .map_err(|e| cell_error(s, "TIME/TIMESTAMP", e))
+        }
+        CellCodec::TzInstant { unit } => {
+            let instant = trimmed.split_whitespace().next().unwrap_or_default();
+            scaled_seconds_i64(instant, unit)
+                .map(PlainValue::I64)
+                .map_err(|e| cell_error(s, "TIMESTAMP_TZ", e))
+        }
+        CellCodec::TzOffsetMinutes => {
+            let raw = trimmed
+                .split_whitespace()
+                .nth(1)
+                .and_then(|offset| offset.parse::<i32>().ok())
+                .ok_or_else(|| cell_error(s, "TIMESTAMP_TZ offset", "missing `<offset+1440>`"))?;
+            let minutes = raw - 1440;
+            if !(-1440..=1440).contains(&minutes) {
+                return Err(cell_error(s, "TIMESTAMP_TZ offset", "outside ±24h"));
+            }
+            Ok(PlainValue::I32(minutes))
         }
     }
-    if let Ok(v) = trimmed.parse::<i64>() {
-        return Ok(v);
-    }
-    // Handle floating decimal integer representation e.g. "123.0"
-    if let Ok(f) = trimmed.parse::<f64>() {
-        return Ok(f as i64);
-    }
-    // Handle timestamp microseconds with decimal fractional seconds e.g. "1704067200.123456"
-    if let Some((sec_str, frac_str)) = trimmed.split_once('.') {
-        let frac_micros = parse_fractional_micros(frac_str);
-        if let Ok(sec) = sec_str.parse::<i64>() {
-            return Ok(sec.saturating_mul(1_000_000).saturating_add(frac_micros));
-        }
-    }
-    Err(ExportError::Sink {
-        message: format!("cannot parse i64 Parquet cell from `{s}`"),
-    })
 }
 
-fn parse_i32_cell(s: &str, converted: Option<ParquetConvertedType>) -> ExportResult<i32> {
-    let trimmed = s.trim();
-    if let Ok(v) = trimmed.parse::<i32>() {
-        return Ok(v);
-    }
-    if converted == Some(ParquetConvertedType::Date) {
-        // Parse ISO date "YYYY-MM-DD"
-        if let Some(days) = parse_iso_date_to_days(trimmed) {
-            return Ok(days);
-        }
-    }
-    Err(ExportError::Sink {
-        message: format!("cannot parse i32 Parquet cell from `{s}`"),
-    })
+fn scaled_seconds_i64(seconds: &str, unit: TimeUnit) -> Result<i64, String> {
+    let value = parse_scaled_decimal(seconds, unit.digits())?;
+    i64::try_from(value).map_err(|_| format!("outside the INT64 range for {unit:?}"))
 }
 
-fn parse_f64_cell(s: &str) -> ExportResult<f64> {
-    s.trim().parse::<f64>().map_err(|e| ExportError::Sink {
-        message: format!("cannot parse f64 Parquet cell from `{s}`: {e}"),
-    })
+/// Parse a plain decimal string (`-12.3400`) into its unscaled integer at
+/// `scale` digits. Fractional digits beyond `scale` are accepted only when they
+/// are zeros; anything else would need rounding and is refused.
+fn parse_scaled_decimal(text: &str, scale: u32) -> Result<i128, String> {
+    let (negative, body) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
+    if int_part.is_empty() && frac_part.is_empty() {
+        return Err("empty number".to_owned());
+    }
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err("not a plain decimal".to_owned());
+    }
+    let keep = (scale as usize).min(frac_part.len());
+    if frac_part[keep..].bytes().any(|b| b != b'0') {
+        return Err(format!(
+            "more than {scale} fractional digits (refusing to round)"
+        ));
+    }
+    let overflow = || "outside the 128-bit range".to_owned();
+    let mut value: i128 = 0;
+    for digit in int_part.bytes().chain(frac_part[..keep].bytes()) {
+        value = value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(i128::from(digit - b'0')))
+            .ok_or_else(overflow)?;
+    }
+    for _ in keep..scale as usize {
+        value = value.checked_mul(10).ok_or_else(overflow)?;
+    }
+    Ok(if negative { -value } else { value })
 }
 
-fn parse_fractional_micros(frac: &str) -> i64 {
-    let digits = frac.as_bytes();
-    let mut val = 0_i64;
-    for i in 0..6 {
-        val = val.saturating_mul(10);
-        if i < digits.len() && digits[i].is_ascii_digit() {
-            val = val.saturating_add((digits[i] - b'0') as i64);
-        }
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
     }
-    val
+    text.as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let hi = (pair[0] as char).to_digit(16)?;
+            let lo = (pair[1] as char).to_digit(16)?;
+            u8::try_from(hi * 16 + lo).ok()
+        })
+        .collect()
+}
+
+/// Render an unscaled integer at `scale` as a plain decimal string.
+fn format_scaled(unscaled: i128, scale: u32) -> String {
+    let negative = unscaled < 0;
+    let digits = unscaled.unsigned_abs().to_string();
+    let scale = scale as usize;
+    let body = if scale == 0 {
+        digits
+    } else if digits.len() > scale {
+        format!(
+            "{}.{}",
+            &digits[..digits.len() - scale],
+            &digits[digits.len() - scale..]
+        )
+    } else {
+        format!("0.{}{digits}", "0".repeat(scale - digits.len()))
+    };
+    if negative { format!("-{body}") } else { body }
 }
 
 /// Howard Hinnant's algorithm for converting civil date to days since 1970-01-01.
@@ -1174,7 +1536,8 @@ fn serialize_page_header(
                 writer.write_binary_field(6, min.as_bytes());
             }
         }
-        ParquetType::Boolean => {}
+        // Optional min/max are omitted for booleans and fixed-length decimals.
+        ParquetType::Boolean | ParquetType::FixedLenByteArray => {}
     }
     writer.pop_struct(); // end statistics
     writer.pop_struct(); // end data_page_header
@@ -1197,7 +1560,6 @@ pub struct WrittenColumnChunk {
 }
 
 fn serialize_file_metadata(
-    columns: &[ExportColumn],
     chunks: &[WrittenColumnChunk],
     total_rows: i64,
     options: &ParquetWriterOptions,
@@ -1207,61 +1569,50 @@ fn serialize_file_metadata(
     writer.write_i32_field(1, 1);
 
     // 2: required list<SchemaElement> schema
-    writer.write_list_field_begin(2, thrift_type::STRUCT, columns.len().saturating_add(1));
+    writer.write_list_field_begin(2, thrift_type::STRUCT, chunks.len().saturating_add(1));
 
-    // Root SchemaElement (name = "schema", num_children = columns.len())
+    // Root SchemaElement (name = "schema", num_children = chunks.len())
     writer.push_struct();
     writer.write_string_field(4, "schema");
-    writer.write_i32_field(5, columns.len() as i32);
+    writer.write_i32_field(5, chunks.len() as i32);
     writer.pop_struct();
 
-    // Leaf SchemaElements
-    for (col, chunk) in columns.iter().zip(chunks.iter()) {
+    // Leaf SchemaElements (field ids written in ascending order)
+    for chunk in chunks {
+        let desc = &chunk.desc;
         writer.push_struct();
         // 1: optional Type type
-        writer.write_i32_field(1, chunk.desc.physical as i32);
+        writer.write_i32_field(1, desc.physical as i32);
+        // 2: optional i32 type_length (FIXED_LEN_BYTE_ARRAY only)
+        if let Some(type_length) = desc.type_length {
+            writer.write_i32_field(2, type_length);
+        }
         // 3: optional FieldRepetitionType repetition_type (REQUIRED = 0, OPTIONAL = 1)
         writer.write_i32_field(
             3,
-            if chunk.desc.nullable {
+            if desc.nullable {
                 FieldRepetitionType::Optional as i32
             } else {
                 FieldRepetitionType::Required as i32
             },
         );
         // 4: required string name
-        writer.write_string_field(4, &col.name);
+        writer.write_string_field(4, &chunk.name);
 
         // 6: optional ConvertedType converted_type
-        if let Some(converted) = chunk.desc.converted {
+        if let Some(converted) = desc.converted {
             writer.write_i32_field(6, converted as i32);
+        }
+        // 7/8: optional i32 scale / precision (DECIMAL)
+        if let Some(ParquetLogicalType::Decimal { precision, scale }) = desc.logical {
+            writer.write_i32_field(7, scale as i32);
+            writer.write_i32_field(8, precision as i32);
         }
 
         // 10: optional LogicalType logicalType
-        if let Some(converted) = chunk.desc.converted {
+        if let Some(logical) = desc.logical {
             writer.write_struct_field_begin(10);
-            match converted {
-                ParquetConvertedType::Utf8 => {
-                    // 1: StringType STRING
-                    writer.write_struct_field_begin(1);
-                    writer.pop_struct();
-                }
-                ParquetConvertedType::Date => {
-                    // 6: DateType DATE
-                    writer.write_struct_field_begin(6);
-                    writer.pop_struct();
-                }
-                ParquetConvertedType::TimestampMicros => {
-                    // 8: TimestampType TIMESTAMP
-                    writer.write_struct_field_begin(8);
-                    writer.write_bool_field(1, true); // isAdjustedToUTC
-                    writer.write_struct_field_begin(2); // unit
-                    writer.write_struct_field_begin(2); // MicroSeconds
-                    writer.pop_struct();
-                    writer.pop_struct();
-                    writer.pop_struct();
-                }
-            }
+            write_logical_type(&mut writer, logical);
             writer.pop_struct(); // end logicalType
         }
 
@@ -1332,7 +1683,7 @@ fn serialize_file_metadata(
                     writer.write_binary_field(6, min.as_bytes());
                 }
             }
-            ParquetType::Boolean => {}
+            ParquetType::Boolean | ParquetType::FixedLenByteArray => {}
         }
         writer.pop_struct(); // end statistics
 
@@ -1359,6 +1710,52 @@ fn serialize_file_metadata(
     writer.into_bytes()
 }
 
+/// Write one member of the Thrift `LogicalType` union (the caller has opened the
+/// union struct).
+fn write_logical_type(writer: &mut ThriftCompactWriter, logical: ParquetLogicalType) {
+    let write_unit = |writer: &mut ThriftCompactWriter, unit: TimeUnit| {
+        writer.write_struct_field_begin(2); // unit: TimeUnit union
+        writer.write_struct_field_begin(unit.thrift_field()); // MICROS=2 / NANOS=3
+        writer.pop_struct();
+        writer.pop_struct();
+    };
+    match logical {
+        ParquetLogicalType::String => {
+            writer.write_struct_field_begin(1); // STRING
+            writer.pop_struct();
+        }
+        ParquetLogicalType::Decimal { precision, scale } => {
+            writer.write_struct_field_begin(5); // DECIMAL
+            writer.write_i32_field(1, scale as i32);
+            writer.write_i32_field(2, precision as i32);
+            writer.pop_struct();
+        }
+        ParquetLogicalType::Date => {
+            writer.write_struct_field_begin(6); // DATE
+            writer.pop_struct();
+        }
+        ParquetLogicalType::Time { unit } => {
+            writer.write_struct_field_begin(7); // TIME
+            writer.write_bool_field(1, false); // isAdjustedToUTC: Snowflake TIME is local
+            write_unit(writer, unit);
+            writer.pop_struct();
+        }
+        ParquetLogicalType::Timestamp {
+            adjusted_to_utc,
+            unit,
+        } => {
+            writer.write_struct_field_begin(8); // TIMESTAMP
+            writer.write_bool_field(1, adjusted_to_utc);
+            write_unit(writer, unit);
+            writer.pop_struct();
+        }
+        ParquetLogicalType::Json => {
+            writer.write_struct_field_begin(12); // JSON
+            writer.pop_struct();
+        }
+    }
+}
+
 // ─── Public Streaming and In-Memory Exporters ────────────────────────────────
 
 /// Stream Parquet file bytes to a caller-provided byte sink.
@@ -1376,21 +1773,17 @@ where
         return Err(ExportError::EmptySchema);
     }
 
-    // Validate column name uniqueness
+    // Plan the physical columns (TIMESTAMP_TZ adds an offset column) and
+    // validate name uniqueness over the physical schema.
+    let plans = plan_parquet_columns(columns);
     let mut seen = std::collections::BTreeSet::new();
-    for col in columns {
-        if !seen.insert(col.name.as_str()) {
+    for plan in &plans {
+        if !seen.insert(plan.name.as_str()) {
             return Err(ExportError::DuplicateColumn {
-                name: col.name.clone(),
+                name: plan.name.clone(),
             });
         }
     }
-
-    // Gather and flatten rows preserving column order
-    let descriptors: Vec<ParquetColumnDescriptor> = columns
-        .iter()
-        .map(|col| ParquetColumnDescriptor::resolve(&col.snowflake_type, col.nullable))
-        .collect();
 
     let mut column_cells: Vec<Vec<Option<String>>> = vec![Vec::new(); columns.len()];
     let mut total_rows = 0_u64;
@@ -1425,11 +1818,12 @@ where
     sink.write_chunk(PARQUET_MAGIC)?;
     let mut current_offset = 4_i64;
 
-    let mut written_chunks = Vec::with_capacity(columns.len());
+    let mut written_chunks = Vec::with_capacity(plans.len());
 
     // 2. Encode and write ColumnChunks
-    for (col_idx, desc) in descriptors.iter().enumerate() {
-        let (page_uncompressed, stats) = encode_column_plain(desc, &column_cells[col_idx])?;
+    for plan in &plans {
+        let desc = &plan.desc;
+        let (page_uncompressed, stats) = encode_column_plain(desc, &column_cells[plan.source])?;
 
         let page_compressed = match options.compression {
             ParquetCompression::Uncompressed => page_uncompressed.clone(),
@@ -1454,7 +1848,7 @@ where
         current_offset = current_offset.saturating_add(chunk_compressed_size);
 
         written_chunks.push(WrittenColumnChunk {
-            name: columns[col_idx].name.clone(),
+            name: plan.name.clone(),
             desc: *desc,
             codec: options.compression,
             num_values: total_rows as i64,
@@ -1466,8 +1860,7 @@ where
     }
 
     // 3. Serialize and write FileMetaData footer
-    let file_meta_bytes =
-        serialize_file_metadata(columns, &written_chunks, total_rows as i64, options);
+    let file_meta_bytes = serialize_file_metadata(&written_chunks, total_rows as i64, options);
     sink.write_chunk(&file_meta_bytes)?;
 
     // 4. Write 4-byte LE FileMetaData length
@@ -1633,6 +2026,249 @@ pub fn validate_parquet(bytes: &[u8]) -> ExportResult<ParquetInspection> {
     })
 }
 
+/// Read one member of the Thrift `LogicalType` union after its field header
+/// (field 10 of a `SchemaElement`). Unknown members and units yield `None`.
+fn read_logical_type(
+    reader: &mut ThriftCompactReader<'_>,
+) -> ExportResult<Option<ParquetLogicalType>> {
+    reader.push_struct(); // the union
+    let (member, member_type) = reader.read_field_header()?;
+    let Some(member) = member else {
+        return Ok(None);
+    };
+    let mut logical = None;
+    if member_type == thrift_type::STRUCT {
+        reader.push_struct(); // the member struct
+        let mut ints = (None, None);
+        let mut adjusted_to_utc = false;
+        let mut unit = None;
+        loop {
+            let (field, field_type) = reader.read_field_header()?;
+            match field {
+                None => break,
+                Some(1) if field_type == thrift_type::BOOLEAN_TRUE => adjusted_to_utc = true,
+                Some(1) if field_type == thrift_type::BOOLEAN_FALSE => adjusted_to_utc = false,
+                Some(1) if field_type == thrift_type::I32 => {
+                    ints.0 = Some(reader.read_zigzag_i32()?)
+                }
+                Some(2) if field_type == thrift_type::I32 => {
+                    ints.1 = Some(reader.read_zigzag_i32()?)
+                }
+                Some(2) if field_type == thrift_type::STRUCT => {
+                    reader.push_struct(); // the TimeUnit union
+                    let (unit_member, unit_type) = reader.read_field_header()?;
+                    unit = match unit_member {
+                        Some(2) => Some(TimeUnit::Micros),
+                        Some(3) => Some(TimeUnit::Nanos),
+                        _ => None,
+                    };
+                    if unit_member.is_some() {
+                        reader.skip_field(unit_type)?;
+                        // Consume the union's STOP.
+                        let _ = reader.read_field_header()?;
+                    }
+                }
+                Some(_) => reader.skip_field(field_type)?,
+            }
+        }
+        let as_u32 = |value: Option<i32>| value.and_then(|v| u32::try_from(v).ok());
+        logical = match member {
+            1 => Some(ParquetLogicalType::String),
+            5 => match (as_u32(ints.0), as_u32(ints.1)) {
+                (Some(scale), Some(precision)) => {
+                    Some(ParquetLogicalType::Decimal { precision, scale })
+                }
+                _ => None,
+            },
+            6 => Some(ParquetLogicalType::Date),
+            7 => unit.map(|unit| ParquetLogicalType::Time { unit }),
+            8 => unit.map(|unit| ParquetLogicalType::Timestamp {
+                adjusted_to_utc,
+                unit,
+            }),
+            12 => Some(ParquetLogicalType::Json),
+            _ => None,
+        };
+    } else {
+        reader.skip_field(member_type)?;
+    }
+    // Consume the union's STOP.
+    let _ = reader.read_field_header()?;
+    Ok(logical)
+}
+
+/// Rebuild a column descriptor (including the decode codec) from the schema
+/// annotations a Parquet file carries.
+fn descriptor_from_schema(
+    physical: ParquetType,
+    type_length: Option<i32>,
+    converted: Option<ParquetConvertedType>,
+    logical: Option<ParquetLogicalType>,
+    (precision, scale): (Option<u32>, Option<u32>),
+    nullable: bool,
+) -> ParquetColumnDescriptor {
+    let logical = logical.or(match converted {
+        Some(ParquetConvertedType::Utf8) => Some(ParquetLogicalType::String),
+        Some(ParquetConvertedType::Date) => Some(ParquetLogicalType::Date),
+        Some(ParquetConvertedType::Json) => Some(ParquetLogicalType::Json),
+        Some(ParquetConvertedType::TimestampMicros) => Some(ParquetLogicalType::Timestamp {
+            adjusted_to_utc: true,
+            unit: TimeUnit::Micros,
+        }),
+        Some(ParquetConvertedType::Decimal) => Some(ParquetLogicalType::Decimal {
+            precision: precision.unwrap_or(38),
+            scale: scale.unwrap_or(0),
+        }),
+        None => None,
+    });
+    let codec = match (logical, physical) {
+        (Some(ParquetLogicalType::Decimal { precision, scale }), _) => {
+            CellCodec::Decimal { precision, scale }
+        }
+        (Some(ParquetLogicalType::Date), _) => CellCodec::Date,
+        (Some(ParquetLogicalType::Time { unit }), _) => CellCodec::TimeOfDay { unit },
+        (Some(ParquetLogicalType::Timestamp { unit, .. }), _) => CellCodec::Epoch { unit },
+        (Some(ParquetLogicalType::String | ParquetLogicalType::Json), _) => CellCodec::Text,
+        (None, ParquetType::Boolean) => CellCodec::Boolean,
+        (None, ParquetType::Double) => CellCodec::Float,
+        (None, ParquetType::Int32 | ParquetType::Int64) => CellCodec::Integer,
+        (None, ParquetType::ByteArray | ParquetType::FixedLenByteArray) => CellCodec::HexBytes,
+    };
+    ParquetColumnDescriptor {
+        physical,
+        converted,
+        logical,
+        type_length,
+        nullable,
+        codec,
+    }
+}
+
+/// The Snowflake type label (plus precision/scale) a descriptor corresponds to.
+fn snowflake_type_of(desc: &ParquetColumnDescriptor) -> (Option<u32>, Option<u32>, &'static str) {
+    match desc.logical {
+        Some(ParquetLogicalType::Decimal { precision, scale }) => {
+            (Some(precision), Some(scale), "NUMBER")
+        }
+        Some(ParquetLogicalType::Date) => (None, None, "DATE"),
+        Some(ParquetLogicalType::Time { unit }) => (None, Some(unit.digits()), "TIME"),
+        Some(ParquetLogicalType::Timestamp {
+            adjusted_to_utc,
+            unit,
+        }) => (
+            None,
+            Some(unit.digits()),
+            if adjusted_to_utc {
+                "TIMESTAMP_LTZ"
+            } else {
+                "TIMESTAMP_NTZ"
+            },
+        ),
+        Some(ParquetLogicalType::Json) => (None, None, "VARIANT"),
+        Some(ParquetLogicalType::String) => (None, None, "TEXT"),
+        None => match desc.physical {
+            ParquetType::Boolean => (None, None, "BOOLEAN"),
+            ParquetType::Double => (None, None, "FLOAT"),
+            ParquetType::Int32 | ParquetType::Int64 => (None, None, "NUMBER"),
+            ParquetType::ByteArray | ParquetType::FixedLenByteArray => (None, None, "BINARY"),
+        },
+    }
+}
+
+/// A bounds-checked cursor over PLAIN-encoded values that renders each value
+/// back into the canonical `jsonv2`-style text the writer accepts.
+struct PlainCursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    bool_idx: usize,
+}
+
+impl PlainCursor<'_> {
+    fn take(&mut self, len: usize) -> ExportResult<&[u8]> {
+        let end = self.pos.saturating_add(len);
+        let slice = self
+            .bytes
+            .get(self.pos..end)
+            .ok_or_else(|| ExportError::Sink {
+                message: "Parquet page ends before its values".to_owned(),
+            })?;
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn array<const N: usize>(&mut self) -> ExportResult<[u8; N]> {
+        let slice = self.take(N)?;
+        let mut out = [0_u8; N];
+        out.copy_from_slice(slice);
+        Ok(out)
+    }
+
+    fn decode(&mut self, desc: &ParquetColumnDescriptor) -> ExportResult<String> {
+        let integer: i128 = match desc.physical {
+            ParquetType::Boolean => {
+                let byte = *self
+                    .bytes
+                    .get(self.bool_idx / 8)
+                    .ok_or_else(|| ExportError::Sink {
+                        message: "Parquet page ends before its booleans".to_owned(),
+                    })?;
+                let bit = (byte >> (self.bool_idx % 8)) & 1;
+                self.bool_idx = self.bool_idx.saturating_add(1);
+                return Ok(if bit == 1 { "true" } else { "false" }.to_owned());
+            }
+            ParquetType::Double => {
+                let value = f64::from_bits(u64::from_le_bytes(self.array::<8>()?));
+                return Ok(value.to_string());
+            }
+            ParquetType::ByteArray => {
+                let len = u32::from_le_bytes(self.array::<4>()?) as usize;
+                let raw = self.take(len)?;
+                return if desc.codec == CellCodec::Text {
+                    std::str::from_utf8(raw)
+                        .map(str::to_owned)
+                        .map_err(|e| ExportError::Sink {
+                            message: format!("invalid UTF-8 in Parquet string: {e}"),
+                        })
+                } else {
+                    Ok(raw.iter().map(|b| format!("{b:02X}")).collect())
+                };
+            }
+            ParquetType::FixedLenByteArray => {
+                let width = desc.type_length.unwrap_or(16).clamp(1, 16) as usize;
+                let raw = self.take(width)?;
+                if desc.codec == CellCodec::HexBytes {
+                    return Ok(raw.iter().map(|b| format!("{b:02X}")).collect());
+                }
+                // Sign-extend the big-endian two's complement value.
+                let fill = if raw.first().is_some_and(|b| b & 0x80 != 0) {
+                    0xFF
+                } else {
+                    0x00
+                };
+                let mut be = [fill; 16];
+                be[16 - width..].copy_from_slice(raw);
+                i128::from_be_bytes(be)
+            }
+            ParquetType::Int32 => i128::from(i32::from_le_bytes(self.array::<4>()?)),
+            ParquetType::Int64 => i128::from(i64::from_le_bytes(self.array::<8>()?)),
+        };
+        Ok(match desc.codec {
+            CellCodec::Decimal { scale, .. } => format_scaled(integer, scale),
+            CellCodec::Date => {
+                let days = i32::try_from(integer).map_err(|_| ExportError::Sink {
+                    message: "DATE value outside the INT32 range".to_owned(),
+                })?;
+                let (y, m, d) = civil_from_days(days);
+                format!("{y:04}-{m:02}-{d:02}")
+            }
+            CellCodec::TimeOfDay { unit }
+            | CellCodec::Epoch { unit }
+            | CellCodec::TzInstant { unit } => format_scaled(integer, unit.digits()),
+            _ => integer.to_string(),
+        })
+    }
+}
+
 /// Fully deserialize a Parquet file back into `LocalExportInput` for bitwise scalar verification.
 pub fn read_parquet_records(bytes: &[u8]) -> ExportResult<LocalExportInput> {
     let inspection = validate_parquet(bytes)?;
@@ -1651,8 +2287,8 @@ pub fn read_parquet_records(bytes: &[u8]) -> ExportResult<LocalExportInput> {
 
     let mut reader = ThriftCompactReader::new(footer_slice);
     let mut columns = Vec::new();
-    let mut chunk_offsets: Vec<(i64, i32, ParquetType, Option<ParquetConvertedType>, bool)> =
-        Vec::new();
+    let mut descriptors: Vec<ParquetColumnDescriptor> = Vec::new();
+    let mut chunk_offsets: Vec<(i64, i32)> = Vec::new();
 
     loop {
         let (field_opt, type_code) = reader.read_field_header()?;
@@ -1665,7 +2301,10 @@ pub fn read_parquet_records(bytes: &[u8]) -> ExportResult<LocalExportInput> {
                     reader.push_struct();
                     let mut name = String::new();
                     let mut ptype = ParquetType::ByteArray;
+                    let mut type_length = None;
                     let mut converted = None;
+                    let mut logical = None;
+                    let mut decimal = (None, None);
                     let mut nullable = true;
 
                     loop {
@@ -1674,14 +2313,15 @@ pub fn read_parquet_records(bytes: &[u8]) -> ExportResult<LocalExportInput> {
                             None => break,
                             Some(1) => {
                                 let t_id = reader.read_zigzag_i32()?;
-                                ptype = match t_id {
-                                    0 => ParquetType::Boolean,
-                                    1 => ParquetType::Int32,
-                                    2 => ParquetType::Int64,
-                                    5 => ParquetType::Double,
-                                    _ => ParquetType::ByteArray,
-                                };
+                                ptype = ParquetType::from_thrift(t_id).ok_or_else(|| {
+                                    ExportError::Sink {
+                                        message: format!(
+                                            "unsupported Parquet physical type {t_id}"
+                                        ),
+                                    }
+                                })?;
                             }
+                            Some(2) => type_length = Some(reader.read_zigzag_i32()?),
                             Some(3) => {
                                 let rep = reader.read_zigzag_i32()?;
                                 nullable = rep == 1; // OPTIONAL
@@ -1690,13 +2330,13 @@ pub fn read_parquet_records(bytes: &[u8]) -> ExportResult<LocalExportInput> {
                                 name = reader.read_string()?;
                             }
                             Some(6) => {
-                                let conv = reader.read_zigzag_i32()?;
-                                converted = match conv {
-                                    0 => Some(ParquetConvertedType::Utf8),
-                                    6 => Some(ParquetConvertedType::Date),
-                                    10 => Some(ParquetConvertedType::TimestampMicros),
-                                    _ => None,
-                                };
+                                converted =
+                                    ParquetConvertedType::from_thrift(reader.read_zigzag_i32()?);
+                            }
+                            Some(7) => decimal.1 = u32::try_from(reader.read_zigzag_i32()?).ok(),
+                            Some(8) => decimal.0 = u32::try_from(reader.read_zigzag_i32()?).ok(),
+                            Some(10) if child_type == thrift_type::STRUCT => {
+                                logical = read_logical_type(&mut reader)?;
                             }
                             Some(_) => {
                                 reader.skip_field(child_type)?;
@@ -1705,26 +2345,21 @@ pub fn read_parquet_records(bytes: &[u8]) -> ExportResult<LocalExportInput> {
                     }
 
                     if idx > 0 {
-                        let sf_type = match ptype {
-                            ParquetType::Int64 => {
-                                if converted == Some(ParquetConvertedType::TimestampMicros) {
-                                    "TIMESTAMP_NTZ"
-                                } else {
-                                    "NUMBER"
-                                }
-                            }
-                            ParquetType::Int32 => {
-                                if converted == Some(ParquetConvertedType::Date) {
-                                    "DATE"
-                                } else {
-                                    "NUMBER"
-                                }
-                            }
-                            ParquetType::Double => "FLOAT",
-                            ParquetType::Boolean => "BOOLEAN",
-                            ParquetType::ByteArray => "TEXT",
-                        };
-                        columns.push(ExportColumn::new(name, sf_type).nullable(nullable));
+                        let desc = descriptor_from_schema(
+                            ptype,
+                            type_length,
+                            converted,
+                            logical,
+                            decimal,
+                            nullable,
+                        );
+                        let (precision, scale, sf_type) = snowflake_type_of(&desc);
+                        columns.push(
+                            ExportColumn::new(name, sf_type)
+                                .nullable(nullable)
+                                .precision_scale(precision, scale),
+                        );
+                        descriptors.push(desc);
                     }
                 }
             }
@@ -1740,7 +2375,7 @@ pub fn read_parquet_records(bytes: &[u8]) -> ExportResult<LocalExportInput> {
                             Some(1) => {
                                 // columns
                                 let (_, col_len) = reader.read_list_header()?;
-                                for col_idx in 0..col_len {
+                                for _ in 0..col_len {
                                     reader.push_struct();
                                     let mut data_page_offset = 0_i64;
                                     let mut codec = 0_i32;
@@ -1776,35 +2411,7 @@ pub fn read_parquet_records(bytes: &[u8]) -> ExportResult<LocalExportInput> {
                                             }
                                         }
                                     }
-                                    let ptype = match columns
-                                        .get(col_idx)
-                                        .map(|c| c.snowflake_type.as_str())
-                                    {
-                                        Some("BOOLEAN") => ParquetType::Boolean,
-                                        Some("DATE") => ParquetType::Int32,
-                                        Some("FLOAT") => ParquetType::Double,
-                                        Some("TEXT") => ParquetType::ByteArray,
-                                        _ => ParquetType::Int64,
-                                    };
-                                    let conv = match columns
-                                        .get(col_idx)
-                                        .map(|c| c.snowflake_type.as_str())
-                                    {
-                                        Some("DATE") => Some(ParquetConvertedType::Date),
-                                        Some("TIMESTAMP_NTZ") => {
-                                            Some(ParquetConvertedType::TimestampMicros)
-                                        }
-                                        Some("TEXT") => Some(ParquetConvertedType::Utf8),
-                                        _ => None,
-                                    };
-                                    let nullable = columns.get(col_idx).is_none_or(|c| c.nullable);
-                                    chunk_offsets.push((
-                                        data_page_offset,
-                                        codec,
-                                        ptype,
-                                        conv,
-                                        nullable,
-                                    ));
+                                    chunk_offsets.push((data_page_offset, codec));
                                 }
                             }
                             Some(_) => {
@@ -1823,8 +2430,18 @@ pub fn read_parquet_records(bytes: &[u8]) -> ExportResult<LocalExportInput> {
     // Now decode each column chunk
     let mut reconstructed_cols: Vec<Vec<Option<String>>> = vec![Vec::new(); columns.len()];
 
-    for (col_idx, (offset, codec_id, ptype, conv, nullable)) in chunk_offsets.iter().enumerate() {
-        let chunk_slice = &bytes[*offset as usize..];
+    for (col_idx, (offset, codec_id)) in chunk_offsets.iter().enumerate() {
+        let desc = descriptors
+            .get(col_idx)
+            .copied()
+            .ok_or_else(|| ExportError::Sink {
+                message: "Parquet row group has more column chunks than the schema".to_owned(),
+            })?;
+        let chunk_slice = bytes
+            .get(*offset as usize..)
+            .ok_or_else(|| ExportError::Sink {
+                message: "column chunk offset exceeds the file".to_owned(),
+            })?;
         let mut page_reader = ThriftCompactReader::new(chunk_slice);
         let mut comp_size = 0_i32;
 
@@ -1842,7 +2459,11 @@ pub fn read_parquet_records(bytes: &[u8]) -> ExportResult<LocalExportInput> {
         }
 
         let header_len = page_reader.position();
-        let payload_slice = &chunk_slice[header_len..header_len + comp_size as usize];
+        let payload_slice = chunk_slice
+            .get(header_len..header_len.saturating_add(comp_size.max(0) as usize))
+            .ok_or_else(|| ExportError::Sink {
+                message: "page payload exceeds the file".to_owned(),
+            })?;
 
         let decompressed = match ParquetCompression::from_thrift_codec_id(*codec_id)? {
             ParquetCompression::Uncompressed => payload_slice.to_vec(),
@@ -1850,106 +2471,24 @@ pub fn read_parquet_records(bytes: &[u8]) -> ExportResult<LocalExportInput> {
             ParquetCompression::Gzip => gzip_decompress(payload_slice)?,
         };
 
-        let (defs, data_start) = if *nullable {
+        let (defs, data_start) = if desc.nullable {
             decode_definition_levels(&decompressed, inspection.row_count as usize)?
         } else {
             (vec![1_u8; inspection.row_count as usize], 0)
         };
 
-        let values_slice = &decompressed[data_start..];
-        let mut val_pos = 0_usize;
-        let mut bool_idx = 0_usize;
-
+        let mut values = PlainCursor {
+            bytes: decompressed.get(data_start..).unwrap_or_default(),
+            pos: 0,
+            bool_idx: 0,
+        };
         for def in defs {
-            if def == 0 {
-                reconstructed_cols[col_idx].push(None);
+            let cell = if def == 0 {
+                None
             } else {
-                match ptype {
-                    ParquetType::Int64 => {
-                        let b: [u8; 8] = match values_slice[val_pos..val_pos + 8].try_into() {
-                            Ok(x) => x,
-                            Err(_) => {
-                                return Err(ExportError::Sink {
-                                    message: "slice conversion error".to_owned(),
-                                });
-                            }
-                        };
-                        val_pos = val_pos.saturating_add(8);
-                        let val = i64::from_le_bytes(b);
-                        let str_val = if *conv == Some(ParquetConvertedType::TimestampMicros) {
-                            let sec = val / 1_000_000;
-                            let frac = (val % 1_000_000).abs();
-                            if val < 0 && sec == 0 {
-                                format!("-0.{frac:06}")
-                            } else {
-                                format!("{sec}.{frac:06}")
-                            }
-                        } else {
-                            val.to_string()
-                        };
-                        reconstructed_cols[col_idx].push(Some(str_val));
-                    }
-                    ParquetType::Int32 => {
-                        let b: [u8; 4] = match values_slice[val_pos..val_pos + 4].try_into() {
-                            Ok(x) => x,
-                            Err(_) => {
-                                return Err(ExportError::Sink {
-                                    message: "slice conversion error".to_owned(),
-                                });
-                            }
-                        };
-                        val_pos = val_pos.saturating_add(4);
-                        let val = i32::from_le_bytes(b);
-                        if *conv == Some(ParquetConvertedType::Date) {
-                            let (y, m, d) = civil_from_days(val);
-                            reconstructed_cols[col_idx].push(Some(format!("{y:04}-{m:02}-{d:02}")));
-                        } else {
-                            reconstructed_cols[col_idx].push(Some(val.to_string()));
-                        }
-                    }
-                    ParquetType::Double => {
-                        let b: [u8; 8] = match values_slice[val_pos..val_pos + 8].try_into() {
-                            Ok(x) => x,
-                            Err(_) => {
-                                return Err(ExportError::Sink {
-                                    message: "slice conversion error".to_owned(),
-                                });
-                            }
-                        };
-                        val_pos = val_pos.saturating_add(8);
-                        let val = f64::from_bits(u64::from_le_bytes(b));
-                        reconstructed_cols[col_idx].push(Some(val.to_string()));
-                    }
-                    ParquetType::Boolean => {
-                        let byte = values_slice[bool_idx / 8];
-                        let bit = (byte >> (bool_idx % 8)) & 1;
-                        bool_idx = bool_idx.saturating_add(1);
-                        reconstructed_cols[col_idx].push(Some(if bit == 1 {
-                            "true".to_owned()
-                        } else {
-                            "false".to_owned()
-                        }));
-                    }
-                    ParquetType::ByteArray => {
-                        let b: [u8; 4] = match values_slice[val_pos..val_pos + 4].try_into() {
-                            Ok(x) => x,
-                            Err(_) => {
-                                return Err(ExportError::Sink {
-                                    message: "slice conversion error".to_owned(),
-                                });
-                            }
-                        };
-                        val_pos = val_pos.saturating_add(4);
-                        let str_len = u32::from_le_bytes(b) as usize;
-                        let s = std::str::from_utf8(&values_slice[val_pos..val_pos + str_len])
-                            .map_err(|e| ExportError::Sink {
-                                message: format!("invalid UTF-8 in Parquet string: {e}"),
-                            })?;
-                        val_pos = val_pos.saturating_add(str_len);
-                        reconstructed_cols[col_idx].push(Some(s.to_owned()));
-                    }
-                }
-            }
+                Some(values.decode(&desc)?)
+            };
+            reconstructed_cols[col_idx].push(cell);
         }
     }
 
