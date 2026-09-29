@@ -25,6 +25,8 @@
 //! - [`write_intent`] — non-executing deferred write ladder types, dry-run
 //!   planning receipts, exact confirmation tokens, and append-only audit gates.
 //! - [`envelope`] — the deterministic, versioned JSON envelope metadata.
+//! - [`typed`] — the `typed.v1` decoder for SQL API `jsonv2` result cells, one
+//!   JSON representation per column chosen from its `rowType`.
 //! - [`adapter`] — public downstream extension points and optional
 //!   `adapter-fixtures` contract tests.
 //!
@@ -47,6 +49,7 @@ pub mod adapter;
 pub mod budget;
 pub mod cancel;
 pub mod capabilities;
+pub mod endpoint;
 pub mod envelope;
 pub mod error;
 pub mod exit;
@@ -54,6 +57,8 @@ pub mod guardrails;
 pub mod ids;
 pub mod outcome;
 pub mod redact;
+pub mod sql_lexer;
+pub mod typed;
 pub mod write_intent;
 
 /// Crate version string, surfaced in the `capabilities` / `agent-handbook`

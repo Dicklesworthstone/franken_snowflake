@@ -81,7 +81,9 @@ pub trait SnowflakeOutcomeExt {
 /// Project a registry-backed error into the envelope outcome vocabulary.
 #[must_use]
 pub fn error_outcome_kind(error: &SnowflakeError) -> OutcomeKind {
-    if error.policy_boundary() {
+    if let Some(kind) = error.cancel_kind {
+        cancel_outcome_kind(kind)
+    } else if error.policy_boundary() {
         OutcomeKind::Refusal
     } else if error.code == SnowflakeErrorCode::StatementTimeout {
         OutcomeKind::Timeout
@@ -163,6 +165,17 @@ mod tests {
         assert_eq!(outcome.outcome_kind(), OutcomeKind::Timeout);
         assert_eq!(outcome.exit_code(), ExitCode::UpstreamError);
         assert!(!outcome.is_success());
+    }
+
+    #[test]
+    fn cancelled_error_projects_like_the_cancel_it_carries() {
+        let user = SnowflakeError::cancelled(CancelKind::User, "stopped");
+        assert_eq!(error_outcome_kind(&user), OutcomeKind::Cancelled);
+        let deadline = SnowflakeError::cancelled(CancelKind::Deadline, "late");
+        assert_eq!(error_outcome_kind(&deadline), OutcomeKind::Timeout);
+        // The same code without a kind is an ordinary error.
+        let bare = SnowflakeError::new(SnowflakeErrorCode::Cancelled, "x");
+        assert_eq!(error_outcome_kind(&bare), OutcomeKind::Error);
     }
 
     #[test]

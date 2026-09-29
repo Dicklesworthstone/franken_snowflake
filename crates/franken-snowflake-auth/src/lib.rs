@@ -1424,10 +1424,12 @@ impl OAuthBearerAuth {
         issued_at_unix_seconds: Option<i64>,
         expires_at_unix_seconds: Option<i64>,
     ) -> Result<Self, AuthError> {
+        let credential = SecretValue::new(token)?;
+        let expires_at = expires_at_unix_seconds.or_else(|| jwt_exp(credential.expose_secret()));
         Ok(Self {
-            credential: SecretValue::new(token)?,
+            credential,
             credential_handle: None,
-            lifetime: oauth_lifetime(issued_at_unix_seconds, expires_at_unix_seconds),
+            lifetime: oauth_lifetime(issued_at_unix_seconds, expires_at),
         })
     }
 
@@ -1437,10 +1439,12 @@ impl OAuthBearerAuth {
         issued_at_unix_seconds: Option<i64>,
         expires_at_unix_seconds: Option<i64>,
     ) -> Result<Self, AuthError> {
+        let credential = source.resolve(resolver)?;
+        let expires_at = expires_at_unix_seconds.or_else(|| jwt_exp(credential.expose_secret()));
         Ok(Self {
-            credential: source.resolve(resolver)?,
+            credential,
             credential_handle: Some(source.credential_handle()),
-            lifetime: oauth_lifetime(issued_at_unix_seconds, expires_at_unix_seconds),
+            lifetime: oauth_lifetime(issued_at_unix_seconds, expires_at),
         })
     }
 }
@@ -1673,6 +1677,26 @@ fn pat_lifetime(
         max_validity_seconds: Some(PAT_MAX_VALIDITY_SECONDS),
         refresh_before_expiry_seconds: None,
     }
+}
+
+/// The `exp` claim of a JWT-shaped bearer token (External OAuth access tokens
+/// usually are; Snowflake OAuth tokens are opaque and yield `None`). Read
+/// locally to report the remaining lifetime; the token is never logged and
+/// the signature is not checked, since Snowflake validates the token.
+fn jwt_exp(token: &str) -> Option<i64> {
+    use base64::Engine as _;
+    let mut parts = token.split('.');
+    let (_header, payload, _signature) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()?
+        .get("exp")?
+        .as_i64()
 }
 
 fn oauth_lifetime(
@@ -2041,6 +2065,38 @@ mod tests {
         assert!(!format!("{headers:?}").contains("pat-secret-value"));
         assert!(!serde_json::to_string(&headers)?.contains("pat-secret-value"));
         Ok(())
+    }
+
+    /// Reality-check bead C5: a JWT-shaped OAuth bearer's `exp` becomes the
+    /// credential lifetime; an opaque or malformed token has none.
+    #[test]
+    fn oauth_bearer_jwt_exp_is_read_locally() {
+        use base64::Engine as _;
+        let b64 = |json: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+        let jwt = format!(
+            "{}.{}.sig",
+            b64(r#"{"alg":"RS256"}"#),
+            b64(r#"{"sub":"svc","exp":1800000300}"#)
+        );
+        let auth = OAuthBearerAuth::from_bearer_token(jwt, None, None).unwrap();
+        assert_eq!(auth.lifetime().expires_at_unix_seconds, Some(1_800_000_300));
+        assert_eq!(
+            auth.lifetime().seconds_until_expiry(1_800_000_000),
+            Some(300)
+        );
+        let opaque =
+            OAuthBearerAuth::from_bearer_token("ver:1-hint:abc-opaque", None, None).unwrap();
+        assert_eq!(opaque.lifetime().expires_at_unix_seconds, None);
+        let malformed = OAuthBearerAuth::from_bearer_token("a.!!!.c", None, None).unwrap();
+        assert_eq!(malformed.lifetime().expires_at_unix_seconds, None);
+        // An explicit expiry wins over the claim.
+        let explicit = OAuthBearerAuth::from_bearer_token(
+            format!("{}.{}.s", b64("{}"), b64(r#"{"exp":1}"#)),
+            None,
+            Some(42),
+        )
+        .unwrap();
+        assert_eq!(explicit.lifetime().expires_at_unix_seconds, Some(42));
     }
 
     #[test]

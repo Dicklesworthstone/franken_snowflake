@@ -131,19 +131,140 @@ pub fn longest_secret_prefix(input: &str) -> Option<&'static str> {
         .max_by_key(|prefix| prefix.len())
 }
 
-/// Whether `input` contains a secret-shaped token.
-#[must_use]
-pub fn contains_secret(input: &str) -> bool {
-    !secret_spans(input).is_empty()
+/// Parameter-name fragments whose string value is a secret in Snowflake SQL
+/// (upper-cased match). The families, with the reference pages consulted
+/// 2026-09-24 (see `docs/security_model.md`):
+/// `PASSWORD` (CREATE/ALTER USER, CREATE SECRET), `CREDENTIALS = (AWS_KEY_ID,
+/// AWS_SECRET_KEY, AWS_TOKEN | AZURE_SAS_TOKEN)` and `ENCRYPTION = (MASTER_KEY,
+/// KMS_KEY_ID)` (CREATE STAGE, COPY INTO), `OAUTH_CLIENT_SECRET`,
+/// `OAUTH_REFRESH_TOKEN` and `SECRET_STRING` (CREATE SECRET, security
+/// integrations), `API_KEY` (CREATE API INTEGRATION). Matching by fragment
+/// covers new members of the same families; over-redacting a public value such
+/// as `RSA_PUBLIC_KEY` is the safe direction.
+pub const SECRET_SQL_PARAMETER_FRAGMENTS: &[&str] = &[
+    "PASSWORD",
+    "PASSPHRASE",
+    "SECRET",
+    "TOKEN",
+    "CREDENTIAL",
+    "_KEY",
+];
+
+fn is_secret_sql_parameter(word: &str) -> bool {
+    let upper = word.to_ascii_uppercase();
+    SECRET_SQL_PARAMETER_FRAGMENTS
+        .iter()
+        .any(|fragment| upper.contains(fragment))
 }
 
-/// Replace every secret-shaped token in `input` with [`REDACTION_PLACEHOLDER`].
+/// Byte spans of string values assigned to secret-bearing SQL parameters:
+/// the content of `'...'` or `$$...$$` after `<param>`, `<param> =`, or
+/// `<param> =>`. Context-free on purpose, so it also finds the literal when
+/// the SQL is embedded in a shell command, a message, or a comment. An
+/// unterminated value runs to the end of the input (fail closed). A value that
+/// is already exactly [`REDACTION_PLACEHOLDER`] is not a span, so redacted
+/// output does not read as a leak.
+#[must_use]
+pub fn secret_sql_literal_spans(input: &str) -> Vec<(usize, usize)> {
+    let bytes = input.as_bytes();
+    let is_word_start = |b: u8| b.is_ascii_alphabetic() || b == b'_';
+    let is_word_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    let skip_space = |mut i: usize| {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let starts_word = is_word_start(bytes[i]) && (i == 0 || !is_word_byte(bytes[i - 1]));
+        if !starts_word {
+            i += 1;
+            continue;
+        }
+        let word_start = i;
+        while i < bytes.len() && is_word_byte(bytes[i]) {
+            i += 1;
+        }
+        if !is_secret_sql_parameter(&input[word_start..i]) {
+            continue;
+        }
+        let mut j = skip_space(i);
+        if bytes.get(j) == Some(&b'=') {
+            j += 1;
+            if bytes.get(j) == Some(&b'>') {
+                j += 1;
+            }
+            j = skip_space(j);
+        }
+        let span = if bytes.get(j) == Some(&b'\'') {
+            let start = j + 1;
+            let mut k = start;
+            let mut end = bytes.len();
+            while k < bytes.len() {
+                match bytes[k] {
+                    b'\\' => k += 2,
+                    b'\'' if bytes.get(k + 1) == Some(&b'\'') => k += 2,
+                    b'\'' => {
+                        end = k;
+                        break;
+                    }
+                    _ => k += 1,
+                }
+            }
+            Some((start, end.min(bytes.len())))
+        } else if input[j..].starts_with("$$") {
+            let start = j + 2;
+            let end = input[start..]
+                .find("$$")
+                .map_or(input.len(), |off| start + off);
+            Some((start, end))
+        } else {
+            None
+        };
+        if let Some((start, end)) = span {
+            if start < end && input.get(start..end) != Some(REDACTION_PLACEHOLDER) {
+                spans.push((start, end));
+            }
+            i = end;
+        }
+    }
+    spans
+}
+
+/// Shape spans ([`secret_spans`]) and secret SQL literal spans
+/// ([`secret_sql_literal_spans`]), sorted and merged.
+fn all_secret_spans(input: &str) -> Vec<(usize, usize)> {
+    let mut spans = secret_spans(input);
+    spans.extend(secret_sql_literal_spans(input));
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+/// Whether `input` contains a secret-shaped token or a secret-bearing SQL
+/// literal.
+#[must_use]
+pub fn contains_secret(input: &str) -> bool {
+    !all_secret_spans(input).is_empty()
+}
+
+/// Replace every secret-shaped token and every secret-bearing SQL literal value
+/// (`PASSWORD = '...'`, `AWS_SECRET_KEY = '...'`, ...) in `input` with
+/// [`REDACTION_PLACEHOLDER`]; SQL literals keep their quotes.
 ///
 /// Returns the input borrowed unchanged when nothing matched, so the common
 /// no-secret path allocates nothing.
 #[must_use]
 pub fn redact(input: &str) -> Cow<'_, str> {
-    let spans = secret_spans(input);
+    let spans = all_secret_spans(input);
     if spans.is_empty() {
         return Cow::Borrowed(input);
     }
@@ -212,6 +333,90 @@ pub fn is_credential_field(field_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reality-check bead B5: one statement per secret-bearing parameter family.
+    #[test]
+    fn secret_sql_literal_values_are_redacted_in_every_family() {
+        for (sql, canary) in [
+            (
+                "alter user u1 set password = 'cnry_pw_7f3a'",
+                "cnry_pw_7f3a",
+            ),
+            (
+                "CREATE USER u2 PASSWORD='cnry_pw_b2' LOGIN_NAME='u2'",
+                "cnry_pw_b2",
+            ),
+            (
+                "create stage s url='s3://b/p' credentials=(aws_key_id='cnry_akid' aws_secret_key='cnry_sk' aws_token='cnry_tok')",
+                "cnry_sk",
+            ),
+            (
+                "copy into @s from t credentials = (azure_sas_token = 'cnry_sas')",
+                "cnry_sas",
+            ),
+            (
+                "create stage s2 encryption = (type = 'AWS_CSE' master_key = 'cnry_mk')",
+                "cnry_mk",
+            ),
+            (
+                "create secret s3 type = generic_string secret_string = 'cnry_ss'",
+                "cnry_ss",
+            ),
+            (
+                "create secret s4 type = oauth2 oauth_refresh_token = $$cnry_rt$$",
+                "cnry_rt",
+            ),
+            (
+                "create security integration i type = api_authentication oauth_client_secret = 'cnry_cs'",
+                "cnry_cs",
+            ),
+            ("create api integration a api_key = 'cnry_ak'", "cnry_ak"),
+            ("call p(password => 'cnry_named')", "cnry_named"),
+        ] {
+            let out = redact(sql);
+            assert!(!out.contains(canary), "{sql} -> {out}");
+            assert!(out.contains("[REDACTED]"), "{sql} -> {out}");
+            assert!(contains_secret(sql), "{sql}");
+        }
+        // Every value in a multi-value clause, not only the first.
+        let out =
+            redact("credentials=(aws_key_id='cnry_a' aws_secret_key='cnry_b' aws_token='cnry_c')");
+        for canary in ["cnry_a", "cnry_b", "cnry_c"] {
+            assert!(!out.contains(canary), "{out}");
+        }
+    }
+
+    #[test]
+    fn secret_sql_literal_edge_cases() {
+        // Quotes are kept; non-secret values are untouched.
+        assert_eq!(
+            redact("create stage s url = 's3://b/p' password = 'x'"),
+            "create stage s url = 's3://b/p' password = '[REDACTED]'"
+        );
+        // A doubled or backslash-escaped quote does not end the value early.
+        let out = redact("alter user u set password = 'ab''cd\\'ef'");
+        assert!(!out.contains("cd") && !out.contains("ef"), "{out}");
+        // Unterminated: redact through the end (fail closed).
+        assert_eq!(redact("password = 'never closed"), "password = '[REDACTED]");
+        // Already-redacted output is not a secret, so a last-mile scan of
+        // redacted text stays clean.
+        assert!(!contains_secret("alter user u set password = '[REDACTED]'"));
+        // Word boundaries: `url` / `comment` values are not secrets.
+        assert_eq!(
+            redact("comment = 'token rotation'"),
+            "comment = 'token rotation'"
+        );
+    }
+
+    /// The negative case a lexer-based redactor fails: SQL embedded in a shell
+    /// command, where `--profile` would lex as a comment hiding the literal.
+    #[test]
+    fn secret_sql_literal_inside_a_shell_command_is_redacted() {
+        let command = "franken-snowflake query write --profile p --sql \"alter user u set password = 'cnry_shell'\" --json";
+        let out = redact(command);
+        assert!(!out.contains("cnry_shell"), "{out}");
+        assert!(out.contains("--profile p"), "{out}");
+    }
 
     #[test]
     fn needle_list_has_expected_prefixes() {

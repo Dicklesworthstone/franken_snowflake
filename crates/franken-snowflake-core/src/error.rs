@@ -13,6 +13,7 @@
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::cancel::{CancelKind, cancel_exit_code};
 use crate::exit::ExitCode;
 
 /// A stable, enumerable connector error code.
@@ -49,6 +50,11 @@ pub enum SnowflakeErrorCode {
     WriteConfirmationRequired,
     /// A DDL statement was refused; DDL stays behind an explicit opt-in.
     WriteDdlRefused,
+    /// The SQL API does not run this statement kind as a single statement
+    /// (`PUT`/`GET`, `USE`, `ALTER SESSION`, transactions, `SET`).
+    StatementUnsupported,
+    /// A procedure or external unload needs its own per-profile opt-in.
+    WriteOptInRequired,
     /// An upstream Snowflake SQL API error.
     UpstreamError,
     /// A statement failed upstream (422 / SQL error).
@@ -61,6 +67,11 @@ pub enum SnowflakeErrorCode {
     RetryBudgetExhausted,
     /// Rate limited upstream (429).
     RateLimited,
+    /// Cancelled locally before completion (deadline, poll quota, cost budget,
+    /// shutdown, or a user request). The envelope's `outcome_kind` and the
+    /// exit code follow the cancel kind carried in
+    /// [`SnowflakeError::cancel_kind`], not this row's default.
+    Cancelled,
     /// An async query is still running (handle returned, not complete).
     QueryStillRunning,
     /// A local cache error.
@@ -113,12 +124,15 @@ impl SnowflakeErrorCode {
         Self::WriteDisabled,
         Self::WriteConfirmationRequired,
         Self::WriteDdlRefused,
+        Self::StatementUnsupported,
+        Self::WriteOptInRequired,
         Self::UpstreamError,
         Self::StatementFailed,
         Self::StatementTimeout,
         Self::NetworkError,
         Self::RetryBudgetExhausted,
         Self::RateLimited,
+        Self::Cancelled,
         Self::QueryStillRunning,
         Self::CacheError,
         Self::MetadataError,
@@ -298,6 +312,33 @@ impl SnowflakeErrorCode {
                 ],
                 repair_commands: &["export FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ALLOW_DDL=true"],
             },
+            Self::StatementUnsupported => ErrorEntry {
+                code: self,
+                stable_code: "FSNOW-3010",
+                exit_code: ExitCode::SafetyRefusal,
+                retryable: false,
+                policy_boundary: true,
+                summary: "The Snowflake SQL API does not run this statement as a single statement (PUT/GET, USE, ALTER SESSION, transactions, SET).",
+                safe_next_commands: &["franken-snowflake capabilities --json"],
+                repair_commands: &[
+                    "franken-snowflake query write --profile <profile> --sql <one DML statement> --json",
+                ],
+            },
+            Self::WriteOptInRequired => ErrorEntry {
+                code: self,
+                stable_code: "FSNOW-3011",
+                exit_code: ExitCode::SafetyRefusal,
+                retryable: false,
+                policy_boundary: true,
+                summary: "Procedures and external unloads need their own per-profile opt-in.",
+                safe_next_commands: &[
+                    "franken-snowflake query write --profile <profile> --sql <sql> --dry-run --json",
+                ],
+                repair_commands: &[
+                    "export FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ALLOW_PROCEDURES=true",
+                    "export FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ALLOW_EXTERNAL=true",
+                ],
+            },
             Self::UpstreamError => ErrorEntry {
                 code: self,
                 stable_code: "FSNOW-4001",
@@ -366,6 +407,20 @@ impl SnowflakeErrorCode {
                 safe_next_commands: &["franken-snowflake doctor --json"],
                 repair_commands: &[
                     "franken-snowflake query run --profile <profile> --sql <sql> --json",
+                ],
+            },
+            Self::Cancelled => ErrorEntry {
+                code: self,
+                stable_code: "FSNOW-5004",
+                exit_code: ExitCode::NetworkBudgetExhausted,
+                retryable: true,
+                policy_boundary: false,
+                summary: "Cancelled before completion; a submitted statement was sent a best-effort remote cancel.",
+                safe_next_commands: &[
+                    "franken-snowflake query run --profile <profile> --sql <sql> --json",
+                ],
+                repair_commands: &[
+                    "franken-snowflake query cancel <statement-handle> --profile <profile> --json",
                 ],
             },
             Self::QueryStillRunning => ErrorEntry {
@@ -479,6 +534,11 @@ pub struct SnowflakeError {
     /// Repair commands (defaulted from the registry).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repair_commands: Vec<String>,
+    /// The Asupersync cancel kind when this error stands for an
+    /// `Outcome::Cancelled` carried to the CLI edge; it decides the exit code
+    /// and `outcome_kind` (see [`crate::cancel`]). Edge metadata, not wire data.
+    #[serde(skip)]
+    pub cancel_kind: Option<CancelKind>,
 }
 
 impl SnowflakeError {
@@ -501,6 +561,17 @@ impl SnowflakeError {
                 .iter()
                 .map(|s| (*s).to_owned())
                 .collect(),
+            cancel_kind: None,
+        }
+    }
+
+    /// An `Outcome::Cancelled` carried to the edge as an error value, keeping
+    /// the cancel kind so the projection stays cancel-aware.
+    #[must_use]
+    pub fn cancelled(kind: CancelKind, message: impl Into<String>) -> Self {
+        Self {
+            cancel_kind: Some(kind),
+            ..Self::new(SnowflakeErrorCode::Cancelled, message)
         }
     }
 
@@ -516,10 +587,12 @@ impl SnowflakeError {
         self.code.policy_boundary()
     }
 
-    /// The process exit code for this error.
+    /// The process exit code for this error: the cancel policy's code for a
+    /// cancellation, the registry row's otherwise.
     #[must_use]
     pub fn exit_code(&self) -> ExitCode {
-        self.code.exit_code()
+        self.cancel_kind
+            .map_or_else(|| self.code.exit_code(), cancel_exit_code)
     }
 
     /// The stable wire code string.
@@ -592,6 +665,21 @@ mod tests {
         assert_eq!(err.exit_code(), ExitCode::CredentialError);
         assert_eq!(err.stable_code(), "FSNOW-2001");
         assert!(!err.retryable());
+    }
+
+    #[test]
+    fn cancelled_error_exits_by_cancel_kind() {
+        let deadline = SnowflakeError::cancelled(CancelKind::Deadline, "deadline");
+        assert_eq!(deadline.stable_code(), "FSNOW-5004");
+        assert_eq!(deadline.exit_code(), ExitCode::NetworkBudgetExhausted);
+        let cost = SnowflakeError::cancelled(CancelKind::CostBudget, "cost");
+        assert_eq!(cost.exit_code(), ExitCode::SafetyRefusal);
+        // A plain FSNOW-5004 without a kind uses the registry row.
+        let bare = SnowflakeError::new(SnowflakeErrorCode::Cancelled, "x");
+        assert_eq!(bare.exit_code(), ExitCode::NetworkBudgetExhausted);
+        // The kind is edge metadata: it never reaches the wire.
+        let json = serde_json::to_string(&cost).unwrap_or_default();
+        assert!(!json.contains("cancel_kind"), "{json}");
     }
 
     #[test]
