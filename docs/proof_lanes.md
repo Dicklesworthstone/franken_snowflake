@@ -40,6 +40,14 @@ credentials emits a typed skip/refusal, never a silent pass.
 
 ## Lane 2 — Deterministic Cancel/Retry Races (DPOR)
 
+Status (2026-09-24): the lane runs in `franken-snowflake-testkit` (`race.rs`)
+against a model of the statement driver, whose obligation ledger the model keeps
+itself; it does not drive the production `franken-snowflake-sqlapi` driver
+(bead `fsnow-agent-ergonomic-cli-gap-transport-injection-seam-dpor-o2o`). A
+failed run builds a crashpack manifest string; receipts do not carry crashpack
+pointers. The production driver's cancel paths are covered by scripted-transport
+tests in `franken-snowflake-sqlapi`.
+
 `Http1Client::request<IO>` codec driven over a `VirtualTcpStream` pair under
 `LabRuntime`, with DPOR exploration of cancellation/retry interleavings:
 

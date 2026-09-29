@@ -17,6 +17,14 @@
 #
 #   scripts/live-proof-cli.sh --selftest   # proves the harness itself offline
 #
+# The binary must have been built from this tree: its self-reported
+# `capabilities.build.source_digest` (a git-independent digest of the crate
+# sources, manifests and Cargo.lock) must equal the digest of the working tree,
+# and its self-reported `exe_sha256` the file on disk; a binary without a
+# source digest falls back to `build.git_sha` == `git rev-parse HEAD`.
+# summary.json records all of them. FSNOW_ALLOW_STALE_BIN=1 runs a mismatched
+# binary anyway (summary: stale=true).
+#
 # Optional: FSNOW_BIN=<path to a live+mcp binary> (else it is built),
 #           FRANKEN_SNOWFLAKE_LIVE_ARTIFACTS_DIR=<dir>,
 #           <PREFIX>_SMALL_SQL, <PREFIX>_PARTITION_SQL (see docs/live_proof.md).
@@ -80,11 +88,99 @@ resolve_bin() {
     return 0
   fi
   log "building franken-snowflake with --features live,mcp"
-  if ! (cd "$REPO_ROOT" && cargo build --locked --release -p franken-snowflake-cli --features live,mcp >"$RUN_DIR/build.log" 2>&1); then
+  # Pass the identity explicitly: a remote build worker may have no .git.
+  if ! (cd "$REPO_ROOT" && FSNOW_BUILD_SHA="$(head_sha)" FSNOW_BUILD_DIRTY="$(tree_dirty)" \
+      cargo build --locked --release -p franken-snowflake-cli --features live,mcp >"$RUN_DIR/build.log" 2>&1); then
     log "build failed; see $RUN_DIR/build.log"
     return 1
   fi
   printf '%s' "$CARGO_TARGET_DIR/release/franken-snowflake"
+}
+
+# ---------------------------------------------------------------- binary identity
+head_sha() { git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown'; }
+tree_dirty() {
+  if [ -n "$(git -C "$REPO_ROOT" --no-optional-locks status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+    printf 'true'
+  else
+    printf 'false'
+  fi
+}
+sum256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$@"
+  else
+    shasum -a 256 "$@"
+  fi
+}
+sha256_of() { sum256 "$1" | cut -d' ' -f1; }
+# Must match build.rs: sha256sum lines of every crates/**/*.rs and Cargo.toml
+# plus the root Cargo.toml and Cargo.lock, sorted by path, then hashed.
+source_digest() {
+  local hasher=sha256sum
+  command -v sha256sum >/dev/null 2>&1 || hasher="shasum -a 256"
+  # $hasher is split on purpose ("shasum -a 256").
+  (cd "$REPO_ROOT" && { find crates -type f \( -name '*.rs' -o -name Cargo.toml \) -not -path '*/target/*'; echo Cargo.toml; echo Cargo.lock; } \
+    | LC_ALL=C sort | xargs $hasher | $hasher | cut -d' ' -f1)
+}
+
+BIN_GIT_SHA=unknown
+BIN_DIRTY=unknown
+BIN_EXE_SHA=unknown
+BIN_SOURCE_DIGEST=unknown
+BIN_STALE=false
+
+# check_bin_identity <expected git sha> <expected source digest>: the binary
+# must self-report the SHA-256 of the file on disk (so this harness measures the
+# file it names) and have been built from these sources (source digest; git sha
+# for a binary without one), unless FSNOW_ALLOW_STALE_BIN=1.
+check_bin_identity() {
+  local expected="$1" expected_digest="$2" caps="$RUN_DIR/binary_identity.json" on_disk
+  "$BIN" capabilities --with-exe-hash --json >"$caps" 2>"$RUN_DIR/binary_identity.stderr"
+  BIN_GIT_SHA=$(jq -r '.data.build.git_sha // "unknown"' "$caps" 2>/dev/null || printf 'unknown')
+  BIN_DIRTY=$(jq -r '.data.build.dirty // "unknown"' "$caps" 2>/dev/null || printf 'unknown')
+  BIN_EXE_SHA=$(jq -r '.data.build.exe_sha256 // "missing"' "$caps" 2>/dev/null || printf 'missing')
+  BIN_SOURCE_DIGEST=$(jq -r '.data.build.source_digest // "unknown"' "$caps" 2>/dev/null || printf 'unknown')
+  on_disk=$(sha256_of "$BIN")
+  if [ "$BIN_EXE_SHA" != "$on_disk" ]; then
+    HARD_FAILURES=$((HARD_FAILURES + 1))
+    event binary_identity fail 0 0 "self-reported exe_sha256 $BIN_EXE_SHA differs from $BIN on disk ($on_disk)"
+    log "FAIL binary_identity: the process is not the file this harness names"
+    return 1
+  fi
+  local built_here=false
+  if [ "$BIN_SOURCE_DIGEST" != "unknown" ]; then
+    [ "$BIN_SOURCE_DIGEST" = "$expected_digest" ] && built_here=true
+  elif [ "$BIN_GIT_SHA" = "$expected" ] && [ "$expected" != "unknown" ]; then
+    built_here=true
+  fi
+  # "unknown" never matches: an unverifiable build is not a build of this tree.
+  if [ "$built_here" != true ]; then
+    if [ "${FSNOW_ALLOW_STALE_BIN:-0}" = "1" ]; then
+      BIN_STALE=true
+      SOFT_FINDINGS=$((SOFT_FINDINGS + 1))
+      event binary_identity finding 0 0 "binary sources $BIN_SOURCE_DIGEST (git $BIN_GIT_SHA), tree $expected_digest (git $expected); run anyway (FSNOW_ALLOW_STALE_BIN=1)"
+      log "FINDING binary_identity: stale binary allowed by FSNOW_ALLOW_STALE_BIN=1"
+      return 0
+    fi
+    HARD_FAILURES=$((HARD_FAILURES + 1))
+    event binary_identity fail 0 0 "binary sources $BIN_SOURCE_DIGEST (git $BIN_GIT_SHA) differ from the tree $expected_digest (git $expected); rebuild, or set FSNOW_ALLOW_STALE_BIN=1"
+    log "FAIL binary_identity: $BIN was not built from these sources (binary $BIN_SOURCE_DIGEST, tree $expected_digest)"
+    return 1
+  fi
+  event binary_identity pass 0 0 "built from these sources ($expected_digest; git $BIN_GIT_SHA, dirty=$BIN_DIRTY), exe_sha256=$BIN_EXE_SHA"
+  log "PASS binary_identity (sources $expected_digest)"
+}
+
+write_summary() {
+  jq -s '{schema:"franken_snowflake.live_proof_cli.summary.v1",profile:$profile,run_dir:$dir,
+          binary:{path:$bin,git_sha:$git_sha,dirty:$dirty,exe_sha256:$exe_sha,source_digest:$src,tree_digest:$tree,head_sha:$head,stale:($stale=="true")},
+          passed:(map(select(.status=="pass"))|length),failed:(map(select(.status=="fail"))|length),
+          findings:(map(select(.status=="finding"))|length),skipped:(map(select(.status=="skip"))|length),
+          steps:map({step,status,exit,ms})}' --arg profile "${PROFILE:-selftest}" --arg dir "$RUN_DIR" \
+    --arg bin "${BIN:-}" --arg git_sha "$BIN_GIT_SHA" --arg dirty "$BIN_DIRTY" --arg exe_sha "$BIN_EXE_SHA" \
+    --arg head "$(head_sha)" --arg stale "$BIN_STALE" --arg src "$BIN_SOURCE_DIGEST" --arg tree "$(source_digest)" \
+    "$EVENTS" >"$RUN_DIR/summary.json"
 }
 
 # ---------------------------------------------------------------- runner
@@ -164,6 +260,16 @@ if [ "$SELFTEST" -eq 1 ]; then
   # Proves the harness offline: the gate, the runner, and the canary scanner.
   BIN=$(resolve_bin)
   export FRANKEN_SNOWFLAKE_DATA_DIR="$RUN_DIR/data"
+  # Planted mismatch: a binary checked against a commit it was not built from
+  # MUST be refused. The `fail` event is the planted negative, not a defect.
+  if (unset FSNOW_ALLOW_STALE_BIN; check_bin_identity 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000000000000000000000000000); then
+    log "selftest FAILED: a binary from another commit was not refused"
+    exit 1
+  fi
+  if ! check_bin_identity "$(head_sha)" "$(source_digest)"; then
+    log "selftest FAILED: $BIN was not built from these sources (rebuild it, or FSNOW_ALLOW_STALE_BIN=1)"
+    exit 1
+  fi
   run_step selftest_capabilities hard '.ok == true and .command_id == "capabilities"' -- capabilities --json
   run_step selftest_offline_refusal hard '.ok == false and (.error.code | startswith("FSNOW-"))' -- query run --profile no_such_profile_for_selftest --sql "select 1" --json
   # Planted canary: the scanner must catch a secret value written into the run
@@ -198,6 +304,10 @@ PARTITION_SQL=$(printenv "${PREFIX}_PARTITION_SQL" 2>/dev/null || true)
 BIN=$(resolve_bin)
 export FRANKEN_SNOWFLAKE_DATA_DIR="$RUN_DIR/data"
 log "profile=$PROFILE artifacts=$RUN_DIR bin=$BIN"
+if ! check_bin_identity "$(head_sha)" "$(source_digest)"; then
+  write_summary
+  exit 1
+fi
 event credential_gate pass 0 0 "opted in for profile $PROFILE (handle names only; values never logged)"
 
 run_step profile_validate hard '.ok == true' -- profile validate "$PROFILE" --json
@@ -253,10 +363,7 @@ fi
 secret_scan "$PREFIX" || true
 
 # ---------------------------------------------------------------- summary
-jq -s '{schema:"franken_snowflake.live_proof_cli.summary.v1",profile:$profile,run_dir:$dir,
-        passed:(map(select(.status=="pass"))|length),failed:(map(select(.status=="fail"))|length),
-        findings:(map(select(.status=="finding"))|length),skipped:(map(select(.status=="skip"))|length),
-        steps:map({step,status,exit,ms})}' --arg profile "$PROFILE" --arg dir "$RUN_DIR" "$EVENTS" >"$RUN_DIR/summary.json"
+write_summary
 log "summary: $(jq -c '{passed,failed,findings,skipped}' "$RUN_DIR/summary.json") -> $RUN_DIR/summary.json"
 if [ "$HARD_FAILURES" -gt 0 ]; then
   exit 1
