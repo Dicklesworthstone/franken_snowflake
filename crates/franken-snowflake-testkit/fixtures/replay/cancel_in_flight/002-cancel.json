@@ -1,0 +1,108 @@
+{
+  "schema": "fsnow.wire_transcript.v1",
+  "seq": 2,
+  "route": "cancel",
+  "request": {
+    "method": "POST",
+    "path": "/api/v2/statements/00000000-0000-4000-8000-000000000002/cancel",
+    "query": [],
+    "headers": [
+      [
+        "Authorization",
+        "[REDACTED]"
+      ],
+      [
+        "X-Snowflake-Authorization-Token-Type",
+        "KEYPAIR_JWT"
+      ],
+      [
+        "Accept",
+        "application/json"
+      ],
+      [
+        "User-Agent",
+        "franken-snowflake/0.0.5"
+      ],
+      [
+        "Content-Type",
+        "application/json"
+      ]
+    ],
+    "body": {
+      "kind": "empty"
+    }
+  },
+  "response": {
+    "status": 200,
+    "reason": "OK",
+    "headers": [
+      [
+        "date",
+        "Tue, 29 Sep 2026 00:18:36 GMT"
+      ],
+      [
+        "content-type",
+        "application/json"
+      ],
+      [
+        "vary",
+        "Accept-Encoding, User-Agent"
+      ],
+      [
+        "content-length",
+        "230"
+      ],
+      [
+        "server",
+        "SF-LB-T1"
+      ],
+      [
+        "x-envoy-upstream-service-time",
+        "102"
+      ],
+      [
+        "x-snowflake-fe-instance",
+        "-"
+      ],
+      [
+        "x-snowflake-fe-config",
+        "v20260925.0.0.1790327919.va4.1790640961008"
+      ],
+      [
+        "x-frame-options",
+        "deny"
+      ],
+      [
+        "x-envoy-attempt-count",
+        "1"
+      ],
+      [
+        "x-content-type-options",
+        "nosniff"
+      ],
+      [
+        "x-xss-protection",
+        "1; mode=block"
+      ],
+      [
+        "expect-ct",
+        "enforce, max-age=3600"
+      ],
+      [
+        "strict-transport-security",
+        "max-age=31536000; includeSubDomains"
+      ]
+    ],
+    "content_encoding": null,
+    "body": {
+      "kind": "json",
+      "value": {
+        "code": "000604",
+        "sqlState": "57014",
+        "message": "SQL execution canceled",
+        "statementHandle": "00000000-0000-4000-8000-000000000002",
+        "statementStatusUrl": "/api/statements/00000000-0000-4000-8000-000000000002"
+      }
+    }
+  }
+}

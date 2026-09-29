@@ -1,0 +1,167 @@
+{
+  "schema": "fsnow.wire_transcript.v1",
+  "seq": 1,
+  "route": "submit",
+  "request": {
+    "method": "POST",
+    "path": "/api/v2/statements",
+    "query": [
+      [
+        "requestId",
+        "00000000-0000-4000-8000-000000000001"
+      ],
+      [
+        "retry",
+        "true"
+      ]
+    ],
+    "headers": [
+      [
+        "Authorization",
+        "[REDACTED]"
+      ],
+      [
+        "X-Snowflake-Authorization-Token-Type",
+        "KEYPAIR_JWT"
+      ],
+      [
+        "Accept",
+        "application/json"
+      ],
+      [
+        "User-Agent",
+        "franken-snowflake/0.0.5"
+      ],
+      [
+        "Content-Type",
+        "application/json"
+      ]
+    ],
+    "body": {
+      "kind": "json",
+      "value": {
+        "statement": "SELECT 1 AS FSNOW_LIVE_PROOF",
+        "timeout": 60,
+        "database": "<user>",
+        "schema": "PUBLIC",
+        "warehouse": "<warehouse>",
+        "parameters": {
+          "BINARY_OUTPUT_FORMAT": "HEX",
+          "MULTI_STATEMENT_COUNT": "1",
+          "QUERY_TAG": "fsnow:query.run:8d2ea010-000f-42da-8018-a28ff5aecde3",
+          "TIMEZONE": "UTC",
+          "USE_CACHED_RESULT": "FALSE"
+        }
+      }
+    }
+  },
+  "response": {
+    "status": 200,
+    "reason": "OK",
+    "headers": [
+      [
+        "date",
+        "Tue, 29 Sep 2026 00:17:46 GMT"
+      ],
+      [
+        "content-type",
+        "application/json"
+      ],
+      [
+        "link",
+        "</api/v2/statements/00000000-0000-4000-8000-000000000002?requestId=f52e3e11-8e90-49d5-a7e0-58a76e5cdee5&partition=0>; rel=\"first\",</api/v2/statements/00000000-0000-4000-8000-000000000002?requestId=a45f8ec1-cde8-4e08-9980-ae95b991e06e&partition=0>; rel=\"last\""
+      ],
+      [
+        "vary",
+        "Accept-Encoding, User-Agent"
+      ],
+      [
+        "server",
+        "SF-LB-T1"
+      ],
+      [
+        "x-envoy-upstream-service-time",
+        "350"
+      ],
+      [
+        "x-snowflake-fe-instance",
+        "-"
+      ],
+      [
+        "x-snowflake-fe-config",
+        "v20260925.0.0.1790327919.va4.1790640961008"
+      ],
+      [
+        "x-frame-options",
+        "deny"
+      ],
+      [
+        "x-envoy-attempt-count",
+        "1"
+      ],
+      [
+        "x-content-type-options",
+        "nosniff"
+      ],
+      [
+        "x-xss-protection",
+        "1; mode=block"
+      ],
+      [
+        "expect-ct",
+        "enforce, max-age=3600"
+      ],
+      [
+        "strict-transport-security",
+        "max-age=31536000; includeSubDomains"
+      ],
+      [
+        "transfer-encoding",
+        "chunked"
+      ]
+    ],
+    "content_encoding": null,
+    "body": {
+      "kind": "json",
+      "value": {
+        "resultSetMetaData": {
+          "numRows": 1,
+          "format": "jsonv2",
+          "partitionInfo": [
+            {
+              "rowCount": 1,
+              "uncompressedSize": 5
+            }
+          ],
+          "rowType": [
+            {
+              "name": "FSNOW_LIVE_PROOF",
+              "database": "",
+              "schema": "",
+              "table": "",
+              "collation": null,
+              "nullable": false,
+              "scale": 0,
+              "byteLength": null,
+              "precision": 1,
+              "length": null,
+              "type": "fixed"
+            }
+          ]
+        },
+        "data": [
+          [
+            "1"
+          ]
+        ],
+        "code": "090001",
+        "statementStatusUrl": "/api/v2/statements/00000000-0000-4000-8000-000000000002?requestId=00000000-0000-4000-8000-000000000001",
+        "requestId": "00000000-0000-4000-8000-000000000001",
+        "sqlState": "00000",
+        "statementHandle": "00000000-0000-4000-8000-000000000002",
+        "message": "Statement executed successfully.",
+        "createdOn": 1790641066212
+      }
+    }
+  }
+}
