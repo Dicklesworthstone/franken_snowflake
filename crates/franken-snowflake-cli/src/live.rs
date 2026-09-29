@@ -22,14 +22,17 @@
 //!   secret-leak redactor over the whole envelope before output.
 
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
 use franken_snowflake_auth::{
-    AuthMechanism, AuthProfile, KEYPAIR_JWT_TOKEN_TYPE, OAUTH_TOKEN_TYPE, OidcTokenSource,
-    PROGRAMMATIC_ACCESS_TOKEN_TYPE, ProcessSecretResolver, ReauthDecision, SecretSource,
-    SnowflakeAuth,
+    AuthLane, AuthMechanism, AuthProfile, CredentialLifetime, KEYPAIR_JWT_TOKEN_TYPE,
+    OAUTH_TOKEN_TYPE, OidcTokenSource, PROGRAMMATIC_ACCESS_TOKEN_TYPE, ProcessSecretResolver,
+    ReauthDecision, SecretSource, SnowflakeAuth,
 };
 use franken_snowflake_cache::{
     CacheBackend, CatalogSnapshotRecord, ContentAddress as CacheAddress, ExportKind, ExportRecord,
@@ -40,21 +43,24 @@ use franken_snowflake_catalog::discovery::{
     build_information_schema_requests, build_snapshot_from_information_schema, persist_snapshot,
 };
 use franken_snowflake_catalog::model::{CatalogSnapshot, DataSourceClass};
-use franken_snowflake_core::cancel::CancelKind;
+use franken_snowflake_core::cancel::{
+    CancelKind, attempts_remote_cancel, cancel_outcome_kind, cancel_policy,
+};
 use franken_snowflake_core::error::{SnowflakeError, SnowflakeErrorCode};
 use franken_snowflake_core::exit::ExitCode as CoreExitCode;
 use franken_snowflake_core::guardrails::enforce_require_live;
 use franken_snowflake_core::ids::{
     DatabaseName, RoleName, SchemaName, StatementHandle, WarehouseName,
 };
-use franken_snowflake_core::outcome::DataSource;
+use franken_snowflake_core::outcome::{DataSource, OutcomeKind};
 use franken_snowflake_core::redact::redact;
+use franken_snowflake_core::typed::{ColumnCodec, JsonRepr, TYPED_ROW_ENCODING, WIRE_ROW_ENCODING};
 use franken_snowflake_export::{
     CopySource, ExportColumn, LocalExportInput, ResultPartition, export_csv, export_jsonl,
 };
 use franken_snowflake_http::{
     AuthorizationDescriptor, CancelHttpRequest, SnowflakeAuthTokenType, SnowflakeEndpoint,
-    SnowflakeHttpClient, StatusClass, TransportConfig,
+    SnowflakeHttpClient, StatusClass, TlsRootPolicy, TransportConfig, TransportError,
 };
 use franken_snowflake_sqlapi::driver::{AuthProvider, DriverStats, run_statement_with_auth};
 use franken_snowflake_sqlapi::lifecycle::{
@@ -94,6 +100,8 @@ const CANCEL_BODY_PREVIEW_BYTES: usize = 512;
 
 #[derive(Default)]
 struct QueryRequestOptions {
+    /// A fixed SQL API `requestId` (confirmed writes); a fresh one otherwise.
+    sql_api_request_id: Option<String>,
     bindings: Option<BTreeMap<String, Binding>>,
     query_tag: Option<String>,
     /// Stop fetching partitions once this many rows are assembled (the
@@ -112,11 +120,15 @@ struct SessionOverrides {
     statement_timeout: Option<u32>,
 }
 
-/// A column's name/type/nullability, projected from the result-set metadata.
+/// A column's name/type/nullability/precision/scale, projected from the
+/// result-set metadata. `type_name` is the bare SQL API type (`"fixed"`); the
+/// numeric shape lives in `precision`/`scale`, which typed writers must use.
 struct LiveColumn {
     name: String,
     type_name: String,
     nullable: bool,
+    precision: Option<u32>,
+    scale: Option<u32>,
 }
 
 /// The assembled rows plus the metadata an agent needs to interpret them.
@@ -135,6 +147,8 @@ struct LiveRows {
     /// The full completed statement (metadata + rows) for consumers that read
     /// the SQL API shape directly (the catalog crate's row normalizer).
     completed: CompletedStatement,
+    /// The QUERY_TAG the statement ran with, for the receipt.
+    query_tag: Option<String>,
 }
 
 impl LiveRows {
@@ -164,7 +178,7 @@ pub fn run_query_outcome(
         failure_outcome(
             format,
             "query.run",
-            "fsnow.query.run.v1",
+            "fsnow.query.run.v2",
             request_id.clone(),
             profile,
             error,
@@ -189,7 +203,9 @@ pub fn run_query_outcome(
         Err(error) => return fail(&error, profile),
     };
     let conn = match LiveConn::resolve(&profile, &overrides) {
-        Ok(conn) => conn,
+        Ok(conn) => conn
+            .tagged("query.run", &request_id)
+            .with_statement_tag(request_options.query_tag.as_deref()),
         Err(error) => return fail(&error, profile),
     };
     match execute(&conn, sql, request_options) {
@@ -211,10 +227,11 @@ pub fn run_query_outcome(
                 request_id,
                 profile.clone(),
                 "query.run",
-                "fsnow.query.run.v1",
+                "fsnow.query.run.v2",
                 Vec::new(),
                 &rows,
                 emit_cap,
+                RowEncoding::from_raw_cells(options.raw_cells),
                 receipt_hash.clone(),
                 warnings,
                 vec![
@@ -223,7 +240,14 @@ pub fn run_query_outcome(
                 ],
             )
         }
-        Err(error) => fail(&error, profile),
+        Err(error) => with_terminal_receipt(
+            fail(&error, profile),
+            "query.run",
+            &conn,
+            &request_id,
+            sql,
+            &error,
+        ),
     }
 }
 
@@ -243,7 +267,7 @@ pub fn run_dataset_query_outcome(
     let planned = match crate::dataset_mode::plan_dataset(
         format,
         "query.run",
-        "fsnow.query.run.v1",
+        "fsnow.query.run.v2",
         &request_id,
         &spec,
     ) {
@@ -255,7 +279,7 @@ pub fn run_dataset_query_outcome(
         failure_outcome(
             format,
             "query.run",
-            "fsnow.query.run.v1",
+            "fsnow.query.run.v2",
             request_id.clone(),
             profile.clone(),
             error,
@@ -271,7 +295,9 @@ pub fn run_dataset_query_outcome(
         overrides.statement_timeout = Some(planned.plan.guardrails.statement_timeout_seconds);
     }
     let conn = match LiveConn::resolve(&profile, &overrides) {
-        Ok(conn) => conn,
+        Ok(conn) => conn
+            .tagged("query.run", &request_id)
+            .with_statement_tag(Some(&planned.plan.guardrails.query_tag)),
         Err(error) => return fail(&error),
     };
     // Every planner binding becomes a positional SQL API binding; values never
@@ -291,6 +317,7 @@ pub fn run_dataset_query_outcome(
         row_cap: None,
         bindings: (!bindings.is_empty()).then_some(bindings),
         query_tag: Some(planned.plan.guardrails.query_tag.clone()),
+        sql_api_request_id: None,
     };
     let rows = match execute(&conn, &planned.plan.sql, request_options) {
         Ok(rows) => {
@@ -299,7 +326,16 @@ pub fn run_dataset_query_outcome(
             }
             rows
         }
-        Err(error) => return fail(&error),
+        Err(error) => {
+            return with_terminal_receipt(
+                fail(&error),
+                "query.run",
+                &conn,
+                &request_id,
+                &planned.plan.sql,
+                &error,
+            );
+        }
     };
     let (receipt_hash, warnings) = record_receipt(
         "query.run",
@@ -323,10 +359,11 @@ pub fn run_dataset_query_outcome(
         request_id,
         profile,
         "query.run",
-        "fsnow.query.run.v1",
+        "fsnow.query.run.v2",
         crate::dataset_mode::plan_json(&planned),
         &rows,
         emit_cap,
+        RowEncoding::from_raw_cells(options.raw_cells),
         receipt_hash.clone(),
         warnings,
         vec![
@@ -354,6 +391,9 @@ pub struct AuthorizedWrite<'a> {
     pub safety_class: &'a str,
     /// The write-intent ladder receipt / idempotency id (non-secret).
     pub idempotency_request_id: String,
+    /// For a confirmed write: the dry run's id, submitted as the SQL API
+    /// `requestId` with `retry=true` so a replay cannot write twice.
+    pub confirmed_request_id: Option<String>,
     /// Optional session database/schema overrides (else the profile env applies).
     pub database: Option<String>,
     /// Optional session schema override.
@@ -378,8 +418,25 @@ pub fn run_write_outcome(
         ..SessionOverrides::default()
     };
     let conn = match LiveConn::resolve(&profile, &overrides) {
-        Ok(conn) => conn,
+        Ok(conn) => conn.tagged("query.write", &request_id),
         Err(error) => {
+            // An authorized write that never reached Snowflake is still an
+            // attempt on the ledger (bead B4: audit every attempt).
+            if let Ok(store) = local_store::open_store() {
+                let _ = local_store::append_audit(
+                    &store,
+                    "query.write",
+                    &request_id,
+                    "write_not_submitted",
+                    &serde_json::json!({
+                        "profile_id": profile,
+                        "statement_kind": write.statement_kind,
+                        "idempotency_request_id": write.idempotency_request_id,
+                        "error_code": error.stable_code(),
+                    }),
+                    None,
+                );
+            }
             return failure_outcome(
                 format,
                 "query.write",
@@ -390,9 +447,31 @@ pub fn run_write_outcome(
             );
         }
     };
-    match execute(&conn, write.sql, QueryRequestOptions::default()) {
+    // Audit every attempt before it leaves the process, so an indeterminate
+    // outcome (a killed process, a lost response) still leaves a record.
+    if let Ok(store) = local_store::open_store() {
+        let _ = local_store::append_audit(
+            &store,
+            "query.write",
+            &request_id,
+            "write_submitted",
+            &serde_json::json!({
+                "profile_id": profile,
+                "statement_kind": write.statement_kind,
+                "idempotency_request_id": write.idempotency_request_id,
+                "sql_api_request_id": write.confirmed_request_id,
+                "sql_preview_redacted": crate::compact_sql(&redact(write.sql)),
+            }),
+            None,
+        );
+    }
+    let options = QueryRequestOptions {
+        sql_api_request_id: write.confirmed_request_id.clone(),
+        ..QueryRequestOptions::default()
+    };
+    match execute(&conn, write.sql, options) {
         Ok(rows) => {
-            let (receipt_hash, warnings) = record_receipt(
+            let (receipt_hash, mut warnings) = record_receipt(
                 "query.write",
                 &conn,
                 &request_id,
@@ -406,6 +485,25 @@ pub fn run_write_outcome(
                     "rows_affected": dml_rows_affected(&rows),
                 }),
             );
+            // The confirmation is single-use once its write completed.
+            if let Some(confirm_id) = &write.confirmed_request_id {
+                let consumed = local_store::open_store()
+                    .map_err(|error| error.message())
+                    .and_then(|store| {
+                        local_store::record_confirmation_consumed(
+                            &store,
+                            &request_id,
+                            confirm_id,
+                            receipt_hash.as_deref(),
+                        )
+                        .map_err(|error| error.to_string())
+                    });
+                if let Err(message) = consumed {
+                    warnings.push(json_string(format!(
+                        "the confirmation could not be marked used: {message}"
+                    )));
+                }
+            }
             write_success(
                 format,
                 request_id,
@@ -416,12 +514,19 @@ pub fn run_write_outcome(
                 warnings,
             )
         }
-        Err(error) => failure_outcome(
-            format,
+        Err(error) => with_terminal_receipt(
+            failure_outcome(
+                format,
+                "query.write",
+                "fsnow.query.write.v1",
+                request_id.clone(),
+                profile,
+                &error,
+            ),
             "query.write",
-            "fsnow.query.write.v1",
-            request_id,
-            profile,
+            &conn,
+            &request_id,
+            write.sql,
             &error,
         ),
     }
@@ -456,6 +561,8 @@ fn write_success(
     let returned = rows.rows.len().min(ROW_EMIT_CAP);
     let truncated = rows.rows.len() > ROW_EMIT_CAP;
     let rows_affected = dml_rows_affected(rows);
+    let projected = project_rows(rows, returned, RowEncoding::Typed);
+    warnings.extend(projected.warnings);
 
     let mut envelope = base_envelope(
         true,
@@ -483,8 +590,9 @@ fn write_success(
                 "rows_affected",
                 rows_affected.map_or(Json::Null, Json::Number),
             ),
-            ("columns", columns_json(rows)),
-            ("rows", rows_json(rows, returned)),
+            ("row_encoding", json_string(RowEncoding::Typed.token())),
+            ("columns", projected.columns),
+            ("rows", projected.rows),
             ("result_row_count", Json::Number(rows.total_rows)),
             ("returned_rows", Json::Number(returned as i64)),
             ("partition_count", Json::Number(rows.partition_count as i64)),
@@ -573,7 +681,7 @@ fn scan_catalog(
         }
         let mut request = discovery.request;
         apply_session(conn, &mut request);
-        let (completed, stats, sql_api_request_id) = execute_request(conn, request, None)?;
+        let (completed, stats, sql_api_request_id) = execute_request(conn, request, None, None)?;
         let rows = into_rows(completed, stats, sql_api_request_id);
         match discovery.kind {
             DiscoveryStatementKind::Tables => tables = Some(rows),
@@ -692,7 +800,7 @@ pub fn run_catalog_scan_outcome(
         ..SessionOverrides::default()
     };
     let conn = match LiveConn::resolve(&profile, &overrides) {
-        Ok(conn) => conn,
+        Ok(conn) => conn.tagged("catalog.scan", &request_id),
         Err(error) => return fail(&error),
     };
     let scan = match scan_catalog(&conn, &profile, &database, Some(&schema), &request_id) {
@@ -883,7 +991,7 @@ pub fn run_catalog_graph_outcome(
         ..SessionOverrides::default()
     };
     let conn = match LiveConn::resolve(&profile, &overrides) {
-        Ok(conn) => conn,
+        Ok(conn) => conn.tagged("catalog.graph", &request_id),
         Err(error) => return fail(&error),
     };
     let scan = match scan_catalog(&conn, &profile, &database, schema.as_deref(), &request_id) {
@@ -953,14 +1061,14 @@ pub fn run_query_cancel_outcome(
         ));
     }
     let conn = match LiveConn::resolve(&profile, &SessionOverrides::default()) {
-        Ok(conn) => conn,
+        Ok(conn) => conn.tagged("query.cancel", &request_id),
         Err(error) => return fail(&error),
     };
     let handle = StatementHandle::new(statement_handle.clone());
     let response = match with_runtime(&conn, |cx, client, auth| {
         Box::pin(async move {
             let auth = auth.descriptor()?;
-            match client
+            let outcome = client
                 .cancel_statement(
                     cx,
                     CancelHttpRequest {
@@ -969,19 +1077,8 @@ pub fn run_query_cancel_outcome(
                         reason_kind: CancelKind::User,
                     },
                 )
-                .await
-            {
-                Outcome::Ok(response) => Ok(response),
-                Outcome::Err(error) => Err(error),
-                Outcome::Cancelled(reason) => Err(SnowflakeError::new(
-                    SnowflakeErrorCode::Internal,
-                    format!("cancel request was cancelled locally: {:?}", reason.kind),
-                )),
-                Outcome::Panicked(_) => Err(SnowflakeError::new(
-                    SnowflakeErrorCode::Internal,
-                    "cancel task panicked",
-                )),
-            }
+                .await;
+            outcome_into_result(outcome, "the cancel request", false)
         })
     }) {
         Ok(response) => response,
@@ -1095,12 +1192,21 @@ pub fn dataset_profile_execute_outcome(
         ..SessionOverrides::default()
     };
     let conn = match LiveConn::resolve(&plan.profile, &overrides) {
-        Ok(conn) => conn,
+        Ok(conn) => conn.tagged("dataset.profile", &request_id),
         Err(error) => return fail(&error),
     };
     let rows = match execute(&conn, &plan.sql, QueryRequestOptions::default()) {
         Ok(rows) => rows,
-        Err(error) => return fail(&error),
+        Err(error) => {
+            return with_terminal_receipt(
+                fail(&error),
+                "dataset.profile",
+                &conn,
+                &request_id,
+                &plan.sql,
+                &error,
+            );
+        }
     };
     let (receipt_hash, warnings) = record_receipt(
         "dataset.profile",
@@ -1161,6 +1267,7 @@ pub fn export_run_outcome(
     request_id: String,
     spec: ExportPlanSpec,
     out: Option<String>,
+    sandbox_out: bool,
 ) -> crate::Outcome {
     let profile = spec.profile.clone().unwrap_or_default();
     let fail = |error: &SnowflakeError| {
@@ -1182,6 +1289,25 @@ pub fn export_run_outcome(
     let Some(out_path) = out else {
         return fail(&usage("Missing --out <path> for `export run`."));
     };
+    // Validate the destination before running anything (no warehouse cost for
+    // a refused path). Sandbox mode confines it under <data_dir>/exports.
+    let sandbox_root = if sandbox_out {
+        match local_store::data_dir() {
+            Some(dir) => Some(dir.join("exports")),
+            None => {
+                return fail(&usage(
+                    "export run --sandbox-out needs a data directory; set FRANKEN_SNOWFLAKE_DATA_DIR",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let target =
+        match crate::export_path::resolve_out(&out_path, sandbox_root.as_deref(), spec.overwrite) {
+            Ok(target) => target,
+            Err(message) => return fail(&usage(&format!("export run refused: {message}"))),
+        };
     let sql = match (spec.sql.clone(), spec.query_id.clone()) {
         (Some(sql), None) => sql,
         (None, Some(query_id)) => match (CopySource::ResultScan { query_id }).to_sql() {
@@ -1220,12 +1346,21 @@ pub fn export_run_outcome(
         ));
     }
     let conn = match LiveConn::resolve(&profile, &SessionOverrides::default()) {
-        Ok(conn) => conn,
+        Ok(conn) => conn.tagged("export.run", &request_id),
         Err(error) => return fail(&error),
     };
     let rows = match execute(&conn, &sql, QueryRequestOptions::default()) {
         Ok(rows) => rows,
-        Err(error) => return fail(&error),
+        Err(error) => {
+            return with_terminal_receipt(
+                fail(&error),
+                "export.run",
+                &conn,
+                &request_id,
+                &sql,
+                &error,
+            );
+        }
     };
     let input = LocalExportInput::new(
         rows.columns
@@ -1233,6 +1368,7 @@ pub fn export_run_outcome(
             .map(|column| {
                 ExportColumn::new(column.name.clone(), column.type_name.clone())
                     .nullable(column.nullable)
+                    .precision_scale(column.precision, column.scale)
             })
             .collect(),
         vec![ResultPartition::new(0, rows.rows.clone())],
@@ -1335,7 +1471,7 @@ pub fn export_run_outcome(
             ));
         }
     };
-    if let Err(error) = std::fs::write(&out_path, &artifact.bytes) {
+    if let Err(error) = crate::export_path::write_artifact(&target, &artifact.bytes) {
         return fail(&SnowflakeError::new(
             SnowflakeErrorCode::Internal,
             format!("could not write {target_label}: {error}"),
@@ -1392,6 +1528,11 @@ pub fn export_run_outcome(
             ("format", json_string(export_format)),
             ("out", json_string(target_label)),
             (
+                "resolved_path",
+                json_string(redact(&target.path.to_string_lossy()).into_owned()),
+            ),
+            ("overwrote", Json::Bool(target.overwrite)),
+            (
                 "bytes_written",
                 Json::Number(i64::try_from(artifact.bytes.len()).unwrap_or(i64::MAX)),
             ),
@@ -1427,7 +1568,7 @@ pub fn profile_doctor_online_outcome(
 ) -> crate::Outcome {
     const PROBE_SQL: &str = "SELECT CURRENT_VERSION() AS SNOWFLAKE_VERSION";
     let conn = match LiveConn::resolve(&profile, &SessionOverrides::default()) {
-        Ok(conn) => conn,
+        Ok(conn) => conn.tagged("profile.doctor", &request_id),
         Err(error) => {
             return failure_outcome(
                 format,
@@ -1446,7 +1587,7 @@ pub fn profile_doctor_online_outcome(
                 .first()
                 .and_then(|row| row.first())
                 .and_then(Clone::clone);
-            let (receipt_hash, warnings) = record_receipt(
+            let (receipt_hash, mut warnings) = record_receipt(
                 "profile.doctor",
                 &conn,
                 &request_id,
@@ -1455,6 +1596,8 @@ pub fn profile_doctor_online_outcome(
                 "profile_probed",
                 serde_json::json!({ "snowflake_version": version }),
             );
+            let (credential, mut lifetime_warnings) = online_credential_lifetime(&conn);
+            warnings.append(&mut lifetime_warnings);
             probe_success(
                 format,
                 request_id,
@@ -1463,19 +1606,156 @@ pub fn profile_doctor_online_outcome(
                 &rows,
                 receipt_hash,
                 warnings,
+                credential,
             )
         }
-        Err(error) => failure_outcome(
-            format,
+        Err(error) => with_terminal_receipt(
+            failure_outcome(
+                format,
+                "profile.doctor",
+                "fsnow.profile.doctor.v1",
+                request_id.clone(),
+                profile,
+                &error,
+            ),
             "profile.doctor",
-            "fsnow.profile.doctor.v1",
-            request_id,
-            profile,
+            &conn,
+            &request_id,
+            PROBE_SQL,
             &error,
         ),
     }
 }
 
+/// The credential's remaining lifetime as far as it can be known online
+/// (reality-check bead C5): the resolved credential's own lifetime (a JWT
+/// OAuth bearer's `exp`, the key-pair validity cap) and, for the PAT lane, the
+/// user's tokens from `SHOW USER PROGRAMMATIC ACCESS TOKENS`
+/// (docs.snowflake.com/en/sql-reference/sql/show-user-programmatic-access-tokens,
+/// consulted 2026-09-24; the secret is never returned, so the one this profile
+/// uses cannot be singled out and the soonest active expiry is reported).
+fn online_credential_lifetime(conn: &LiveConn) -> (Json, Vec<Json>) {
+    let now = now_unix_seconds();
+    let mut fields = Vec::new();
+    let mut warnings = Vec::new();
+    if let Ok(mechanism) =
+        conn.auth_profile
+            .resolve(&ProcessSecretResolver, &conn.account, &conn.user)
+    {
+        let (lifetime, mut found) = lifetime_findings(&mechanism.lifetime(), now);
+        fields.push(("credential", lifetime));
+        warnings.append(&mut found);
+    }
+    if matches!(conn.auth_profile, AuthProfile::Pat { .. }) {
+        match execute(
+            conn,
+            "SHOW USER PROGRAMMATIC ACCESS TOKENS",
+            QueryRequestOptions::default(),
+        ) {
+            Ok(rows) => {
+                let (tokens, mut found) = pat_token_findings(&rows, now);
+                fields.push(("programmatic_access_tokens", tokens));
+                warnings.append(&mut found);
+            }
+            Err(error) => fields.push((
+                "programmatic_access_tokens",
+                json_string(format!(
+                    "not listed ({}): the role may not run SHOW USER PROGRAMMATIC ACCESS TOKENS",
+                    error.stable_code()
+                )),
+            )),
+        }
+    }
+    (json_object(fields), warnings)
+}
+
+/// Remaining lifetime of a resolved credential, with a warning when it is
+/// short: OAuth under 10 minutes, a PAT within 2 days, or a key-pair JWT
+/// validity above Snowflake's cap.
+fn lifetime_findings(lifetime: &CredentialLifetime, now: i64) -> (Json, Vec<Json>) {
+    let remaining = lifetime.seconds_until_expiry(now);
+    let mut warnings = Vec::new();
+    match (lifetime.lane, remaining) {
+        (AuthLane::OAuthBearer, Some(seconds)) if seconds <= 600 => {
+            warnings.push(json_string(format!(
+                "the OAuth access token expires in {} minute(s); this connector cannot refresh it",
+                (seconds.max(0) + 59) / 60
+            )));
+        }
+        _ => {
+            if let Some(warning) = lifetime.doctor_warning_at(now) {
+                warnings.push(json_string(warning.message));
+            }
+        }
+    }
+    let data = json_object(vec![
+        ("lane", json_string(lifetime.lane.to_string())),
+        (
+            "expires_in_seconds",
+            remaining.map_or(Json::Null, Json::Number),
+        ),
+    ]);
+    (data, warnings)
+}
+
+/// Active tokens and the soonest expiry from `SHOW USER PROGRAMMATIC ACCESS
+/// TOKENS`; a warning when an active token expires within 7 days. `expires_at`
+/// is a jsonv2 timestamp (fractional epoch seconds).
+fn pat_token_findings(rows: &LiveRows, now: i64) -> (Json, Vec<Json>) {
+    let column = |name: &str| {
+        rows.columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case(name))
+    };
+    let (Some(name_at), Some(expires_at), Some(status_at)) =
+        (column("name"), column("expires_at"), column("status"))
+    else {
+        return (
+            json_string("unrecognized SHOW USER PROGRAMMATIC ACCESS TOKENS columns"),
+            Vec::new(),
+        );
+    };
+    let cell = |row: &Vec<Option<String>>, at: usize| row.get(at).cloned().flatten();
+    let mut active: Vec<(String, i64)> = rows
+        .rows
+        .iter()
+        .filter(|row| {
+            cell(row, status_at).is_some_and(|status| status.eq_ignore_ascii_case("ACTIVE"))
+        })
+        .filter_map(|row| {
+            let seconds = cell(row, expires_at)?.trim().parse::<f64>().ok()?;
+            Some((
+                cell(row, name_at).unwrap_or_default(),
+                seconds.floor() as i64,
+            ))
+        })
+        .collect();
+    active.sort_by_key(|(_, expires)| *expires);
+    let mut warnings = Vec::new();
+    if let Some((name, expires)) = active.first()
+        && expires - now <= 7 * 24 * 60 * 60
+    {
+        warnings.push(json_string(format!(
+            "programmatic access token `{name}` expires in {} day(s); rotate the profile's PAT if it is this one",
+            ((expires - now).max(0) + 86_399) / 86_400
+        )));
+    }
+    let data = json_object(vec![
+        (
+            "active",
+            Json::Number(i64::try_from(active.len()).unwrap_or(i64::MAX)),
+        ),
+        (
+            "soonest_expiry_unix_seconds",
+            active
+                .first()
+                .map_or(Json::Null, |(_, expires)| Json::Number(*expires)),
+        ),
+    ]);
+    (data, warnings)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn probe_success(
     format: OutputFormat,
     request_id: String,
@@ -1484,13 +1764,16 @@ fn probe_success(
     rows: &LiveRows,
     receipt_hash: Option<String>,
     warnings: Vec<Json>,
+    credential_lifetime: Json,
 ) -> crate::Outcome {
     let data = json_object(vec![
         ("profile_id", json_string(profile.clone())),
         ("live_probe_requested", Json::Bool(true)),
         ("live_probe_attempted", Json::Bool(true)),
         ("live_probe_ok", Json::Bool(true)),
-        ("secret_values_read", Json::Bool(false)),
+        // The probe authenticates, so the credential was read (never emitted).
+        ("secret_values_read", Json::Bool(true)),
+        ("credential_lifetime", credential_lifetime),
         (
             "snowflake_version",
             match version {
@@ -1541,10 +1824,19 @@ struct LiveConn {
     role: Option<String>,
     statement_timeout_seconds: u32,
     endpoint: SnowflakeEndpoint,
+    /// `<PREFIX>_CA_BUNDLE`: verify the server against this PEM bundle instead
+    /// of the OS trust store (a TLS-intercepting proxy's CA).
+    tls_roots: TlsRootPolicy,
     auth_profile: AuthProfile,
     max_polls: u32,
     /// Partition fetch window (`<PREFIX>_PARTITION_CONCURRENCY`, default 4).
     partition_concurrency: usize,
+    /// `<PREFIX>_QUERY_TAG`: generated per invocation (unset), fixed, or off.
+    query_tag_policy: QueryTagPolicy,
+    /// The QUERY_TAG every statement of this invocation carries unless the
+    /// request sets its own (`--query-tag`, the dataset planner); set by
+    /// [`LiveConn::tagged`].
+    query_tag: Option<String>,
     /// Test-only: answers every `execute_request` from a script instead of the
     /// SQL API (see `test_support`). Always `None` in production builds.
     #[cfg(test)]
@@ -1588,6 +1880,13 @@ impl LiveConn {
         }
 
         let lane = auth_lane.clone().unwrap_or_default();
+        // Refused before any credential is read or any socket opens.
+        if crate::classify_auth_lane(&lane) == crate::AuthLaneStatus::Quarantined {
+            return Err(SnowflakeError::new(
+                SnowflakeErrorCode::ProfileInvalid,
+                crate::WORKLOAD_IDENTITY_QUARANTINE,
+            ));
+        }
         let secret_env = secret_env_for_lane(&prefix, &lane);
         if let Some(secret_env) = &secret_env
             && env_value(secret_env).is_none()
@@ -1613,9 +1912,13 @@ impl LiveConn {
         }
 
         let account = account.unwrap_or_default();
-        let endpoint = SnowflakeEndpoint::parse(endpoint_url(&account)).map_err(|error| {
+        let endpoint = live_endpoint(&account).map_err(|error| {
             SnowflakeError::new(SnowflakeErrorCode::ProfileInvalid, error.message)
         })?;
+        let tls_roots = env_value(&name(&prefix, "CA_BUNDLE"))
+            .map_or(TlsRootPolicy::NativeRoots, |path| {
+                TlsRootPolicy::ExplicitPemBundle(PathBuf::from(path))
+            });
         let auth_profile = build_auth_profile(&prefix, &lane)?;
         let statement_timeout_seconds = overrides
             .statement_timeout
@@ -1642,15 +1945,67 @@ impl LiveConn {
                 .or_else(|| env_value(&name(&prefix, "ROLE"))),
             statement_timeout_seconds,
             endpoint,
+            tls_roots,
             auth_profile,
             max_polls: env_u32(&name(&prefix, "MAX_POLLS")).unwrap_or(DEFAULT_MAX_POLLS),
             partition_concurrency: env_u32(&name(&prefix, "PARTITION_CONCURRENCY"))
                 .and_then(|value| usize::try_from(value).ok())
                 .unwrap_or(DEFAULT_PARTITION_CONCURRENCY)
                 .clamp(1, MAX_PARTITION_CONCURRENCY),
+            query_tag_policy: query_tag_policy(env_value(&name(&prefix, "QUERY_TAG")).as_deref())?,
+            query_tag: None,
             #[cfg(test)]
             script: None,
         })
+    }
+
+    /// Bind the invocation's default QUERY_TAG (reality-check bead L5), so
+    /// Snowflake's query history ties each statement back to its envelope:
+    /// `fsnow:<command_id>:<request_id>` unless the profile fixes or disables it.
+    fn tagged(mut self, command_id: &str, request_id: &str) -> Self {
+        self.query_tag = match &self.query_tag_policy {
+            QueryTagPolicy::Generated => Some(format!("fsnow:{command_id}:{request_id}")),
+            QueryTagPolicy::Fixed(tag) => Some(tag.clone()),
+            QueryTagPolicy::Off => None,
+        };
+        self
+    }
+
+    /// An explicit tag (`--query-tag`, the dataset planner's) replaces the
+    /// default, so a failure receipt records the tag the statement ran with.
+    fn with_statement_tag(mut self, tag: Option<&str>) -> Self {
+        if let Some(tag) = tag {
+            self.query_tag = Some(tag.to_owned());
+        }
+        self
+    }
+}
+
+/// How a profile's statements are tagged (`<PREFIX>_QUERY_TAG`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum QueryTagPolicy {
+    /// Unset: `fsnow:<command_id>:<request_id>`.
+    Generated,
+    /// A fixed tag for every statement.
+    Fixed(String),
+    /// `off`: no default tag.
+    Off,
+}
+
+fn query_tag_policy(raw: Option<&str>) -> Result<QueryTagPolicy, SnowflakeError> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(QueryTagPolicy::Generated),
+        Some(value) if value.eq_ignore_ascii_case("off") => Ok(QueryTagPolicy::Off),
+        Some(value) => validate_query_tag(value)
+            .map(QueryTagPolicy::Fixed)
+            .map_err(|_| {
+                SnowflakeError::new(
+                    SnowflakeErrorCode::ProfileInvalid,
+                    format!(
+                        "_QUERY_TAG must be `off` or 1..={MAX_QUERY_TAG_BYTES} bytes without control characters"
+                    ),
+                )
+            }),
     }
 }
 
@@ -1758,10 +2113,14 @@ where
                 "async runtime did not install an ambient context",
             )
         })?;
-        let client = SnowflakeHttpClient::default_for_runtime(
-            TransportConfig::new(conn.endpoint.clone()),
-            &cx,
-        );
+        let mut config = TransportConfig::new(conn.endpoint.clone());
+        config.tls_roots = conn.tls_roots.clone();
+        let client = SnowflakeHttpClient::for_runtime(config).map_err(|error| {
+            SnowflakeError::new(
+                SnowflakeErrorCode::ProfileInvalid,
+                format!("the profile's CA bundle was refused: {}", error.message),
+            )
+        })?;
         let mut mechanism = conn
             .auth_profile
             .resolve(&ProcessSecretResolver, &conn.account, &conn.user)
@@ -1793,8 +2152,149 @@ where
         // Resolve once up front so a missing/invalid credential fails before
         // any request is built, with the same typed error as before.
         auth.descriptor()?;
-        body(&cx, &client, &mut auth).await
+        let _in_flight = InFlight::enter();
+        cancel_on_signal(&cx, body(&cx, &client, &mut auth)).await
     })
+}
+
+/// The SQL API endpoint for a profile's account. Production builds accept only
+/// a Snowflake host. A `testkit-endpoint` build (never a release) also accepts
+/// a loopback `https://127.0.0.1:<port>`, and only when the run opts in with
+/// `FRANKEN_SNOWFLAKE_TESTKIT_ENDPOINT=1`, so the socket e2e reaches its mock
+/// while every other test keeps the production refusal.
+fn live_endpoint(account: &str) -> Result<SnowflakeEndpoint, TransportError> {
+    #[cfg(feature = "testkit-endpoint")]
+    if SnowflakeEndpoint::parse(endpoint_url(account)).is_err()
+        && env_value("FRANKEN_SNOWFLAKE_TESTKIT_ENDPOINT").as_deref() == Some("1")
+        && let Ok(loopback) = SnowflakeEndpoint::parse_testkit_loopback(account)
+    {
+        return Ok(loopback);
+    }
+    SnowflakeEndpoint::parse(endpoint_url(account))
+}
+
+// ---------------------------------------------------------------------------
+// Signals (reality-check bead E1)
+// ---------------------------------------------------------------------------
+
+/// How often an in-flight statement checks for a pending signal.
+const SIGNAL_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Process-wide signal state, installed on first use through signal-hook's
+/// flag API (Asupersync's dispatcher is not used: it would keep SIGINT/SIGTERM
+/// away from the default action for the rest of the process, so a long-lived
+/// `mcp serve` could not be stopped with Ctrl-C).
+///
+/// - No statement in flight (`idle`): SIGINT/SIGTERM keep their default
+///   action; the process ends as it always did.
+/// - A statement in flight: the first signal only sets its pending flag, which
+///   [`cancel_on_signal`] turns into a cancellation of the statement's `Cx`
+///   (`User` for SIGINT, `Shutdown` for SIGTERM), so the driver fires the
+///   SQL API remote cancel and the envelope says `cancelled`.
+/// - A second signal while the first is pending exits at once (130 / 143).
+struct SignalFlags {
+    idle: Arc<AtomicBool>,
+    interrupt: Arc<AtomicBool>,
+    terminate: Arc<AtomicBool>,
+    /// Statements in flight (`mcp serve --http` can run several at once).
+    in_flight: AtomicUsize,
+}
+
+fn signal_flags() -> Option<&'static SignalFlags> {
+    static FLAGS: OnceLock<Option<SignalFlags>> = OnceLock::new();
+    FLAGS
+        .get_or_init(|| {
+            use signal_hook::consts::{SIGINT, SIGTERM};
+            use signal_hook::flag;
+            let flags = SignalFlags {
+                idle: Arc::new(AtomicBool::new(true)),
+                interrupt: Arc::new(AtomicBool::new(false)),
+                terminate: Arc::new(AtomicBool::new(false)),
+                in_flight: AtomicUsize::new(0),
+            };
+            // Registration order matters: signal-hook runs the actions in order.
+            for (signal, pending, status) in [
+                (SIGINT, &flags.interrupt, 130),
+                (SIGTERM, &flags.terminate, 143),
+            ] {
+                flag::register_conditional_default(signal, Arc::clone(&flags.idle)).ok()?;
+                flag::register_conditional_shutdown(signal, status, Arc::clone(pending)).ok()?;
+                flag::register(signal, Arc::clone(pending)).ok()?;
+            }
+            Some(flags)
+        })
+        .as_ref()
+}
+
+/// Marks a statement in flight for the signal handlers; restores the default
+/// action when dropped (a panic unwinding through the runtime included).
+struct InFlight(&'static SignalFlags);
+
+impl InFlight {
+    fn enter() -> Option<Self> {
+        let flags = signal_flags()?;
+        if flags.in_flight.fetch_add(1, Ordering::SeqCst) == 0 {
+            // First statement in flight: forget signals from an idle period.
+            flags.interrupt.store(false, Ordering::SeqCst);
+            flags.terminate.store(false, Ordering::SeqCst);
+        }
+        flags.idle.store(false, Ordering::SeqCst);
+        Some(Self(flags))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if self.0.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.idle.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Drive `work` to completion; a pending SIGINT/SIGTERM cancels `cx` once.
+async fn cancel_on_signal<T>(cx: &Cx, work: impl std::future::Future<Output = T>) -> T {
+    let Some(flags) = signal_flags() else {
+        return work.await;
+    };
+    cancel_on_flags(cx, work, &flags.interrupt, &flags.terminate).await
+}
+
+/// The signal-independent core of [`cancel_on_signal`] (unit-testable).
+async fn cancel_on_flags<T>(
+    cx: &Cx,
+    work: impl std::future::Future<Output = T>,
+    interrupt: &AtomicBool,
+    terminate: &AtomicBool,
+) -> T {
+    use std::task::Poll;
+    let mut work = std::pin::pin!(work);
+    let mut raised = false;
+    loop {
+        let tick = asupersync::time::sleep(cx.now_for_observability(), SIGNAL_CHECK_INTERVAL);
+        let mut tick = std::pin::pin!(tick);
+        let finished = std::future::poll_fn(|task| {
+            if let Poll::Ready(value) = work.as_mut().poll(task) {
+                return Poll::Ready(Some(value));
+            }
+            if tick.as_mut().poll(task).is_ready() {
+                return Poll::Ready(None);
+            }
+            Poll::Pending
+        })
+        .await;
+        if let Some(value) = finished {
+            return value;
+        }
+        if !raised {
+            if interrupt.load(Ordering::SeqCst) {
+                cx.cancel_with(CancelKind::User, Some("interrupted (SIGINT)"));
+                raised = true;
+            } else if terminate.load(Ordering::SeqCst) {
+                cx.cancel_with(CancelKind::Shutdown, Some("terminated (SIGTERM)"));
+                raised = true;
+            }
+        }
+    }
 }
 
 /// Submit one prepared request and drive it to completion. Returns the completed
@@ -1803,12 +2303,13 @@ fn execute_request(
     conn: &LiveConn,
     request: SubmitStatementRequest,
     row_cap: Option<usize>,
+    fixed_request_id: Option<String>,
 ) -> Result<(CompletedStatement, DriverStats, String), SnowflakeError> {
+    let sql_api_request_id = fixed_request_id.unwrap_or_else(unique_request_id);
     #[cfg(test)]
     if let Some(script) = &conn.script {
-        return script.execute(request, row_cap);
+        return script.execute(request, row_cap, &sql_api_request_id);
     }
-    let sql_api_request_id = unique_request_id();
     let params = SubmitQueryParams {
         request_id: Some(sql_api_request_id.clone()),
         retry: true,
@@ -1824,19 +2325,41 @@ fn execute_request(
             Ok(run_statement_with_auth(cx, client, auth, request, params, poll_plan).await)
         })
     })?;
+    outcome_into_result(outcome, "the statement", true)
+        .map(|done| (done, stats, sql_api_request_id))
+}
+
+/// Carry the driver's four-valued outcome onto the CLI error channel without
+/// flattening it (reality-check bead C6): a cancellation keeps its kind, so
+/// the envelope reads `cancelled`/`timeout` and the exit code follows the
+/// core cancel policy, and a panic keeps its redacted payload summary.
+fn outcome_into_result<T>(
+    outcome: Outcome<T, SnowflakeError>,
+    what: &str,
+    submitted_statement: bool,
+) -> Result<T, SnowflakeError> {
     match outcome {
-        Outcome::Ok(done) => Ok((done, stats, sql_api_request_id)),
+        Outcome::Ok(value) => Ok(value),
         Outcome::Err(error) => Err(error),
-        Outcome::Cancelled(reason) => Err(SnowflakeError::new(
+        Outcome::Cancelled(reason) => {
+            let remote = if !submitted_statement {
+                ""
+            } else if attempts_remote_cancel(cancel_policy(reason.kind)) {
+                "; a best-effort remote cancel was sent for the submitted statement, if any"
+            } else {
+                "; no remote cancel (the statement drains quietly)"
+            };
+            Err(SnowflakeError::cancelled(
+                reason.kind,
+                format!(
+                    "{what} was cancelled before completion (cancel kind {:?}){remote}",
+                    reason.kind
+                ),
+            ))
+        }
+        Outcome::Panicked(payload) => Err(SnowflakeError::new(
             SnowflakeErrorCode::Internal,
-            format!(
-                "statement was cancelled before completion: {:?}",
-                reason.kind
-            ),
-        )),
-        Outcome::Panicked(_) => Err(SnowflakeError::new(
-            SnowflakeErrorCode::Internal,
-            "statement task panicked before completion",
+            format!("{what} panicked: {}", redact(payload.message())),
         )),
     }
 }
@@ -1848,9 +2371,18 @@ fn execute(
     options: QueryRequestOptions,
 ) -> Result<LiveRows, SnowflakeError> {
     let row_cap = options.row_cap;
+    let fixed_request_id = options.sql_api_request_id.clone();
     let request = build_request(conn, sql, options);
-    let (done, stats, sql_api_request_id) = execute_request(conn, request, row_cap)?;
-    Ok(into_rows(done, stats, sql_api_request_id))
+    let query_tag = request
+        .parameters
+        .as_ref()
+        .and_then(|parameters| parameters.get("QUERY_TAG"))
+        .cloned();
+    let (done, stats, sql_api_request_id) =
+        execute_request(conn, request, row_cap, fixed_request_id)?;
+    let mut rows = into_rows(done, stats, sql_api_request_id);
+    rows.query_tag = query_tag;
+    Ok(rows)
 }
 
 /// Stamp session context from the connection onto a prepared request (used for
@@ -1866,9 +2398,18 @@ fn apply_session(conn: &LiveConn, request: &mut SubmitStatementRequest) {
     }
     request.role = conn.role.clone().map(RoleName::new);
     let mut parameters = deterministic_session_parameters();
+    if let Some(tag) = &conn.query_tag {
+        parameters.insert("QUERY_TAG".to_owned(), tag.clone());
+    }
     if let Some(existing) = request.parameters.take() {
         parameters.extend(existing);
     }
+    // Server-side backstop for the client's one-statement guard: with an
+    // explicit count of 1, Snowflake rejects a request whose statement count
+    // differs instead of running it, whatever the account/user default is (the
+    // documented request default is 1, but a MULTI_STATEMENT_COUNT parameter can
+    // be set at account level). Inserted last so nothing can override it.
+    parameters.insert("MULTI_STATEMENT_COUNT".to_owned(), "1".to_owned());
     request.parameters = Some(parameters);
 }
 
@@ -1902,8 +2443,9 @@ fn record_receipt(
         profile: &conn.profile,
         trace_id,
         sql_preview_redacted: &preview,
-        statement_handle: &rows.statement_handle,
+        statement_handle: Some(&rows.statement_handle),
         sql_api_request_id: Some(&rows.sql_api_request_id),
+        query_tag: rows.query_tag.as_deref(),
         row_count: u64::try_from(rows.total_rows).unwrap_or(0),
         partitions: &rows.partitions,
         columns: &columns,
@@ -1915,6 +2457,7 @@ fn record_receipt(
         polls: u64::from(rows.stats.polls),
         event_kind,
         extra,
+        terminal_failure: None,
     };
     match local_store::record_execution(&store, &facts) {
         Ok(hash) => (Some(hash), Vec::new()),
@@ -1923,6 +2466,73 @@ fn record_receipt(
             vec![json_string(format!("receipt not recorded: {error}"))],
         ),
     }
+}
+
+/// A live statement ended without rows (failed, cancelled, or timed out):
+/// record a receipt that says how, and point the failure envelope at it, so
+/// `receipt show` can explain the attempt later (reality-check bead C6).
+fn with_terminal_receipt(
+    mut outcome: crate::Outcome,
+    command_id: &str,
+    conn: &LiveConn,
+    trace_id: &str,
+    sql: &str,
+    error: &SnowflakeError,
+) -> crate::Outcome {
+    let outcome_kind = match error.cancel_kind.map(cancel_outcome_kind) {
+        Some(OutcomeKind::Timeout) => "timeout",
+        Some(_) => "cancelled",
+        None if error.code == SnowflakeErrorCode::StatementTimeout => "timeout",
+        None => "error",
+    };
+    let cancel_kind = error.cancel_kind.map(|kind| format!("{kind:?}"));
+    let message = redact(&error.message);
+    let preview = crate::compact_sql(&redact(sql));
+    let facts = ExecutionFacts {
+        command_id,
+        profile: &conn.profile,
+        trace_id,
+        sql_preview_redacted: &preview,
+        statement_handle: None,
+        sql_api_request_id: None,
+        query_tag: conn.query_tag.as_deref(),
+        row_count: 0,
+        partitions: &[],
+        columns: &[],
+        warehouse: Some(&conn.warehouse),
+        database: conn.database.as_deref(),
+        schema: conn.schema.as_deref(),
+        role: conn.role.as_deref(),
+        statement_timeout_seconds: conn.statement_timeout_seconds,
+        polls: 0,
+        event_kind: "statement_terminal",
+        extra: serde_json::json!({}),
+        terminal_failure: Some(local_store::TerminalFailure {
+            outcome_kind,
+            error_code: error.stable_code(),
+            message: &message,
+            cancel_kind: cancel_kind.as_deref(),
+        }),
+    };
+    let recorded = local_store::open_store()
+        .map_err(|error| error.message())
+        .and_then(|store| {
+            local_store::record_execution(&store, &facts).map_err(|error| error.to_string())
+        });
+    if let crate::Body::Envelope { envelope, .. } = &mut outcome.body {
+        match recorded {
+            Ok(hash) => {
+                envelope
+                    .safe_next_commands
+                    .insert(0, receipt_show_command(Some(&hash)));
+                envelope.receipt_hash = Some(hash);
+            }
+            Err(message) => envelope
+                .warnings
+                .push(json_string(format!("receipt not recorded: {message}"))),
+        }
+    }
+    outcome
 }
 
 /// Stamp the live provenance fields shared by every successful live envelope.
@@ -2064,6 +2674,7 @@ fn query_request_options(
         row_cap: None,
         bindings,
         query_tag,
+        sql_api_request_id: None,
     })
 }
 
@@ -2241,6 +2852,8 @@ fn into_rows(done: CompletedStatement, stats: DriverStats, sql_api_request_id: S
             name: column.name.clone(),
             type_name: column.column_type.clone(),
             nullable: column.nullable,
+            precision: column.precision.and_then(|p| u32::try_from(p).ok()),
+            scale: column.scale.and_then(|s| u32::try_from(s).ok()),
         })
         .collect();
     let total_rows = done.result_set.total_rows();
@@ -2272,41 +2885,115 @@ fn into_rows(done: CompletedStatement, stats: DriverStats, sql_api_request_id: S
         stats,
         rows: done.rows.clone(),
         completed: done,
+        query_tag: None,
     }
 }
 
-fn columns_json(rows: &LiveRows) -> Json {
-    json_array(
-        rows.columns
-            .iter()
-            .map(|column| {
-                json_object(vec![
-                    ("name", json_string(column.name.clone())),
-                    ("type", json_string(column.type_name.clone())),
-                    ("nullable", Json::Bool(column.nullable)),
-                ])
-            })
-            .collect(),
-    )
+/// How result cells are rendered (reality-check bead C1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowEncoding {
+    /// `typed.v1`: one JSON representation per column, chosen from its rowType.
+    Typed,
+    /// `jsonv2.wire`: the SQL API strings as received (`--raw-cells`).
+    Wire,
 }
 
-fn rows_json(rows: &LiveRows, returned: usize) -> Json {
-    json_array(
-        rows.rows
-            .iter()
-            .take(returned)
-            .map(|row| {
-                json_array(
-                    row.iter()
-                        .map(|cell| match cell {
-                            Some(value) => json_string(value.clone()),
-                            None => Json::Null,
-                        })
-                        .collect(),
-                )
-            })
-            .collect(),
-    )
+impl RowEncoding {
+    fn from_raw_cells(raw_cells: bool) -> Self {
+        if raw_cells { Self::Wire } else { Self::Typed }
+    }
+
+    fn token(self) -> &'static str {
+        match self {
+            Self::Typed => TYPED_ROW_ENCODING,
+            Self::Wire => WIRE_ROW_ENCODING,
+        }
+    }
+}
+
+/// An envelope's `columns` and `rows`, plus a warning per column that could not
+/// be typed.
+struct ProjectedRows {
+    columns: Json,
+    rows: Json,
+    warnings: Vec<Json>,
+}
+
+/// Render the first `returned` rows. In `typed.v1` every column gets one
+/// representation from its rowType (`columns[].json_repr`); a column holding a
+/// cell that does not match its wire convention keeps the wire strings for all
+/// of its cells (`json_repr: "wire"`) and is named in a warning. Cell values
+/// never appear in a warning.
+fn project_rows(rows: &LiveRows, returned: usize, encoding: RowEncoding) -> ProjectedRows {
+    let shown = rows.rows.get(..returned).unwrap_or(rows.rows.as_slice());
+    let mut cells: Vec<Vec<Json>> = shown
+        .iter()
+        .map(|_| Vec::with_capacity(rows.columns.len()))
+        .collect();
+    let mut columns = Vec::with_capacity(rows.columns.len());
+    let mut warnings = Vec::new();
+    for (index, column) in rows.columns.iter().enumerate() {
+        let codec = ColumnCodec::new(
+            &column.type_name,
+            column.precision.map(i64::from),
+            column.scale.map(i64::from),
+        );
+        let wire = |row: &Vec<Option<String>>| row.get(index).cloned().flatten();
+        let typed = match encoding {
+            RowEncoding::Wire => None,
+            RowEncoding::Typed => match shown
+                .iter()
+                .map(|row| codec.decode(wire(row).as_deref()).map(Json::from_serde))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(typed) => Some(typed),
+                Err(error) => {
+                    warnings.push(json_string(format!(
+                        "column `{}` ({}): a cell {error}; the column keeps the jsonv2 wire strings",
+                        column.name, column.type_name
+                    )));
+                    None
+                }
+            },
+        };
+        let json_repr = if typed.is_some() {
+            codec.json_repr()
+        } else {
+            JsonRepr::Wire
+        };
+        let values = typed.unwrap_or_else(|| {
+            shown
+                .iter()
+                .map(|row| wire(row).map_or(Json::Null, json_string))
+                .collect()
+        });
+        for (row_cells, value) in cells.iter_mut().zip(values) {
+            row_cells.push(value);
+        }
+        columns.push(json_object(vec![
+            ("name", json_string(column.name.clone())),
+            ("type", json_string(column.type_name.clone())),
+            ("nullable", Json::Bool(column.nullable)),
+            (
+                "precision",
+                column
+                    .precision
+                    .map_or(Json::Null, |precision| Json::Number(i64::from(precision))),
+            ),
+            (
+                "scale",
+                column
+                    .scale
+                    .map_or(Json::Null, |scale| Json::Number(i64::from(scale))),
+            ),
+            ("json_repr", json_string(json_repr.as_str())),
+        ]));
+    }
+    ProjectedRows {
+        columns: json_array(columns),
+        rows: json_array(cells.into_iter().map(json_array).collect()),
+        warnings,
+    }
 }
 
 /// Build a `data_source = "live"` success envelope carrying assembled rows. The
@@ -2322,15 +3009,19 @@ fn rows_success(
     mut leading: Vec<(&'static str, Json)>,
     rows: &LiveRows,
     emit_cap: usize,
+    encoding: RowEncoding,
     receipt_hash: Option<String>,
     mut warnings: Vec<Json>,
     safe_next_commands: Vec<String>,
 ) -> crate::Outcome {
     let returned = rows.rows.len().min(emit_cap);
     let truncated = rows.rows.len() > emit_cap;
+    let projected = project_rows(rows, returned, encoding);
+    warnings.extend(projected.warnings);
     leading.extend(vec![
-        ("columns", columns_json(rows)),
-        ("rows", rows_json(rows, returned)),
+        ("row_encoding", json_string(encoding.token())),
+        ("columns", projected.columns),
+        ("rows", projected.rows),
         ("row_count", Json::Number(rows.total_rows)),
         ("returned_rows", Json::Number(returned as i64)),
         ("partition_count", Json::Number(rows.partition_count as i64)),
@@ -2386,20 +3077,25 @@ fn failure_outcome(
     profile: String,
     error: &SnowflakeError,
 ) -> crate::Outcome {
+    let outcome_kind = match error.cancel_kind.map(cancel_outcome_kind) {
+        Some(OutcomeKind::Timeout) => "timeout",
+        Some(_) => "cancelled",
+        None => outcome_kind_for(error.code),
+    };
+    let mut evidence = vec![json_string("live SQL API transport")];
+    if let Some(kind) = error.cancel_kind {
+        evidence.push(json_string(format!("cancel_kind={kind:?}")));
+    }
     let mut envelope = base_envelope(
         false,
-        outcome_kind_for(error.code),
+        outcome_kind,
         command_id,
         output_contract_id,
         request_id,
         json_object(vec![]),
     );
     envelope.profile_id = Some(profile);
-    envelope.error = Some(error_info(
-        error.code,
-        error.message.clone(),
-        vec![json_string("live SQL API transport")],
-    ));
+    envelope.error = Some(error_info(error.code, error.message.clone(), evidence));
     envelope.safe_next_commands = error.safe_next_commands.clone();
     envelope.repair_commands = error.repair_commands.clone();
     crate::Outcome {
@@ -2485,39 +3181,10 @@ fn env_u64(key: &str) -> Option<u64> {
     env_value(key).and_then(|value| value.parse().ok())
 }
 
-fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
-    } else {
-        None
-    }
-}
-
+/// The SQL API base URL for an account handle (shared with offline
+/// `profile validate` through `franken_snowflake_core::endpoint`).
 fn endpoint_url(account: &str) -> String {
-    let mut s = account.trim().trim_end_matches('/');
-    let has_scheme = strip_prefix_ignore_ascii_case(s, "https://").is_some()
-        || strip_prefix_ignore_ascii_case(s, "http://").is_some();
-    if let Some(rest) = strip_prefix_ignore_ascii_case(s, "https://") {
-        s = rest;
-    } else if let Some(rest) = strip_prefix_ignore_ascii_case(s, "http://") {
-        s = rest;
-    }
-    let host_with_port = s.split('/').next().unwrap_or(s);
-    let host_only = host_with_port.split(':').next().unwrap_or(host_with_port);
-
-    let is_ip_or_loopback = host_only.parse::<std::net::IpAddr>().is_ok()
-        || host_only.eq_ignore_ascii_case("localhost")
-        || host_with_port.contains(':');
-
-    let lower = host_only.to_ascii_lowercase();
-    if lower.ends_with(".snowflakecomputing.com") {
-        let account_part = &lower[..lower.len() - ".snowflakecomputing.com".len()];
-        format!("https://{account_part}.snowflakecomputing.com")
-    } else if has_scheme || is_ip_or_loopback {
-        format!("https://{host_with_port}")
-    } else {
-        format!("https://{lower}.snowflakecomputing.com")
-    }
+    franken_snowflake_core::endpoint::endpoint_url(account)
 }
 
 fn now_unix_seconds() -> i64 {
@@ -2567,6 +3234,8 @@ mod test_support {
         responses: VecDeque<Result<CompletedStatement, SnowflakeError>>,
         submitted: Vec<SubmitStatementRequest>,
         row_caps: Vec<Option<usize>>,
+        /// The SQL API `requestId` each statement was submitted with.
+        request_ids: Vec<String>,
     }
 
     /// Shared handle to the script: the test keeps one to inspect what was
@@ -2579,10 +3248,12 @@ mod test_support {
             &self,
             request: SubmitStatementRequest,
             row_cap: Option<usize>,
+            sql_api_request_id: &str,
         ) -> Result<(CompletedStatement, DriverStats, String), SnowflakeError> {
             let mut state = self.0.borrow_mut();
             state.submitted.push(request);
             state.row_caps.push(row_cap);
+            state.request_ids.push(sql_api_request_id.to_owned());
             let ordinal = state.submitted.len();
             match state.responses.pop_front() {
                 Some(Ok(done)) => Ok((
@@ -2613,6 +3284,11 @@ mod test_support {
         pub(super) fn row_caps(&self) -> Vec<Option<usize>> {
             self.0.borrow().row_caps.clone()
         }
+
+        /// The SQL API `requestId` each submitted statement carried.
+        pub(super) fn request_ids(&self) -> Vec<String> {
+            self.0.borrow().request_ids.clone()
+        }
     }
 
     struct ScriptedProfile {
@@ -2639,6 +3315,7 @@ mod test_support {
             responses: responses.into(),
             submitted: Vec::new(),
             row_caps: Vec::new(),
+            request_ids: Vec::new(),
         })));
         SCRIPTED.with(|slot| {
             *slot.borrow_mut() = Some(ScriptedProfile {
@@ -2674,9 +3351,12 @@ mod test_support {
                     .statement_timeout
                     .unwrap_or(DEFAULT_STATEMENT_TIMEOUT_SECONDS),
                 endpoint: SnowflakeEndpoint::parse(endpoint_url(account)).ok()?,
+                tls_roots: TlsRootPolicy::NativeRoots,
                 auth_profile: build_auth_profile("FSNOW_SCRIPTED", "pat").ok()?,
                 max_polls: 10,
                 partition_concurrency: DEFAULT_PARTITION_CONCURRENCY,
+                query_tag_policy: QueryTagPolicy::Generated,
+                query_tag: None,
                 script: Some(scripted.script.clone()),
             })
         })
@@ -2766,7 +3446,8 @@ mod tests {
             QueryRequestOptions {
                 row_cap: None,
                 bindings: Some(bindings.clone()),
-                query_tag: Some("hfdt.trace.123".to_owned()),
+                query_tag: Some("acme.trace.123".to_owned()),
+                sql_api_request_id: None,
             },
         );
 
@@ -2777,7 +3458,7 @@ mod tests {
                 .as_ref()
                 .and_then(|parameters| parameters.get("QUERY_TAG"))
                 .map(String::as_str),
-            Some("hfdt.trace.123")
+            Some("acme.trace.123")
         );
     }
 
@@ -2798,10 +3479,10 @@ mod tests {
 
     #[test]
     fn query_tag_and_binding_env_names_are_bounded() {
-        assert!(validate_query_tag("hfdt.trace.123").is_ok());
-        assert!(validate_query_tag("hfdt\ntrace").is_err());
-        assert!(is_safe_env_name("HFDT_TYPED_BINDINGS_JSON"));
-        assert!(!is_safe_env_name("HFDT-TYPED-BINDINGS"));
+        assert!(validate_query_tag("acme.trace.123").is_ok());
+        assert!(validate_query_tag("acme\ntrace").is_err());
+        assert!(is_safe_env_name("ACME_TYPED_BINDINGS_JSON"));
+        assert!(!is_safe_env_name("ACME-TYPED-BINDINGS"));
     }
 
     #[test]
@@ -3035,6 +3716,10 @@ mod tests {
             request["parameters"]["QUERY_TAG"], "fsnow.test.1",
             "{request}"
         );
+        assert_eq!(
+            request["parameters"]["MULTI_STATEMENT_COUNT"], "1",
+            "every live submit pins the one-statement backstop: {request}"
+        );
         assert_eq!(script.remaining(), 0);
         assert_eq!(
             script.row_caps(),
@@ -3060,7 +3745,7 @@ mod tests {
     }
 
     #[test]
-    fn scripted_query_failure_is_a_typed_error_envelope_without_a_receipt() {
+    fn scripted_query_failure_is_a_typed_error_envelope_with_a_failed_receipt() {
         install(
             "demo",
             None,
@@ -3092,7 +3777,20 @@ mod tests {
                 .contains("compilation error"),
             "{env}"
         );
-        assert!(env["receipt_hash"].is_null(), "{env}");
+        // The attempt still leaves a receipt that says it failed (reality-check
+        // bead C6); before, a failed statement left no trace in the store.
+        let hash = env["receipt_hash"].as_str().unwrap_or_default().to_owned();
+        assert_eq!(hash.len(), 64, "{env}");
+        let shown = envelope(crate::execute(
+            ["receipt", "show", hash.as_str(), "--json"]
+                .map(str::to_owned)
+                .to_vec(),
+        ));
+        assert_eq!(shown["data"]["receipt_state"], "failed", "{shown}");
+        assert_eq!(
+            shown["data"]["receipt"]["error"]["code"], "FSNOW-4002",
+            "{shown}"
+        );
     }
 
     #[test]
@@ -3319,7 +4017,7 @@ mod tests {
             std::process::id(),
             local_store::now_unix_ms()
         ));
-        let spec = ExportPlanSpec {
+        let spec = || ExportPlanSpec {
             profile: Some("demo".to_owned()),
             sql: Some("select id, name from events".to_owned()),
             format: Some("csv".to_owned()),
@@ -3328,10 +4026,23 @@ mod tests {
         let env = envelope(export_run_outcome(
             OutputFormat::Json,
             "req-export-1".to_owned(),
-            spec,
+            spec(),
             Some(out.display().to_string()),
+            false,
         ));
         assert_eq!(env["ok"], true, "{env}");
+        assert_eq!(env["data"]["overwrote"], false, "{env}");
+        // A second run to the same path is refused before any statement runs
+        // (reality-check bead B2): no silent overwrite.
+        let again = envelope(export_run_outcome(
+            OutputFormat::Json,
+            "req-export-2".to_owned(),
+            spec(),
+            Some(out.display().to_string()),
+            false,
+        ));
+        assert_eq!(again["ok"], false, "{again}");
+        assert!(again.to_string().contains("--overwrite"), "{again}");
         assert_eq!(env["data_source"], "live");
         let written = std::fs::read_to_string(&out).map_err(|e| e.to_string())?;
         let _ = std::fs::remove_file(&out);
@@ -3371,6 +4082,419 @@ mod tests {
             Some(64),
             "{env}"
         );
+    }
+
+    /// Reality-check bead C6: all four driver outcomes survive to the edge.
+    #[test]
+    fn outcome_into_result_keeps_cancel_kind_and_panic_summary() {
+        use asupersync::{CancelReason, PanicPayload};
+        let ok: Outcome<u8, SnowflakeError> = Outcome::ok(7);
+        assert_eq!(outcome_into_result(ok, "the statement", true).ok(), Some(7));
+        let err: Outcome<u8, SnowflakeError> = Outcome::err(SnowflakeError::new(
+            SnowflakeErrorCode::StatementFailed,
+            "bad sql",
+        ));
+        assert_eq!(
+            outcome_into_result(err, "the statement", true).map_err(|e| e.code),
+            Err(SnowflakeErrorCode::StatementFailed)
+        );
+        let cancelled: Outcome<u8, SnowflakeError> = Outcome::cancelled(CancelReason::deadline());
+        let error = outcome_into_result(cancelled, "the statement", true).err();
+        assert_eq!(
+            error.as_ref().map(|e| e.code),
+            Some(SnowflakeErrorCode::Cancelled)
+        );
+        assert_eq!(
+            error.as_ref().and_then(|e| e.cancel_kind),
+            Some(CancelKind::Deadline)
+        );
+        assert!(
+            error
+                .as_ref()
+                .is_some_and(|e| e.message.contains("remote cancel was sent")),
+            "{error:?}"
+        );
+        let panicked: Outcome<u8, SnowflakeError> =
+            Outcome::panicked(PanicPayload::new("index out of bounds"));
+        let error = outcome_into_result(panicked, "the statement", true).err();
+        assert_eq!(
+            error.as_ref().map(|e| e.code),
+            Some(SnowflakeErrorCode::Internal)
+        );
+        assert!(
+            error
+                .as_ref()
+                .is_some_and(|e| e.message.contains("panicked: index out of bounds")),
+            "{error:?}"
+        );
+    }
+
+    /// Reality-check bead C6: a cancelled statement is not an internal error at
+    /// the edge. Deadline reads `timeout` (exit 5), cost budget `cancelled`
+    /// (exit 2), both FSNOW-5004 with the kind in the evidence.
+    #[test]
+    fn scripted_cancellations_reach_the_envelope_by_kind() {
+        for (kind, outcome_kind, exit) in [
+            (CancelKind::Deadline, "timeout", 5),
+            (CancelKind::PollQuota, "cancelled", 5),
+            (CancelKind::CostBudget, "cancelled", 2),
+        ] {
+            install(
+                "demo",
+                None,
+                None,
+                vec![Err(SnowflakeError::cancelled(kind, "scripted cancel"))],
+            );
+            let outcome = run_query_outcome(
+                OutputFormat::Json,
+                "req-cancel".to_owned(),
+                "demo".to_owned(),
+                "select 1",
+                &crate::QueryRunOptions::default(),
+            );
+            assert_eq!(outcome.status.code(), exit, "{kind:?}");
+            let env = envelope(outcome);
+            assert_eq!(env["ok"], false, "{env}");
+            assert_eq!(env["outcome_kind"], outcome_kind, "{kind:?}: {env}");
+            assert_eq!(env["error"]["code"], "FSNOW-5004", "{env}");
+            assert!(
+                env.to_string().contains(&format!("cancel_kind={kind:?}")),
+                "{env}"
+            );
+            // The attempt still leaves a receipt that says how it ended.
+            let hash = env["receipt_hash"].as_str().unwrap_or_default().to_owned();
+            assert_eq!(hash.len(), 64, "{env}");
+            let shown = envelope(crate::execute(
+                ["receipt", "show", hash.as_str(), "--json"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            ))
+            .to_string();
+            let state = if outcome_kind == "timeout" {
+                "timed_out"
+            } else {
+                "cancelled"
+            };
+            assert!(
+                shown.contains(&format!("\"receipt_state\":\"{state}\"")),
+                "{shown}"
+            );
+        }
+    }
+
+    /// Reality-check bead L5: every live statement carries a QUERY_TAG that
+    /// ties it back to the envelope, unless the request brings its own or the
+    /// profile turns the default off.
+    #[test]
+    fn statements_carry_the_invocation_query_tag() {
+        assert_eq!(query_tag_policy(None).ok(), Some(QueryTagPolicy::Generated));
+        assert_eq!(
+            query_tag_policy(Some(" OFF ")).ok(),
+            Some(QueryTagPolicy::Off)
+        );
+        assert_eq!(
+            query_tag_policy(Some("team.etl")).ok(),
+            Some(QueryTagPolicy::Fixed("team.etl".to_owned()))
+        );
+        assert!(query_tag_policy(Some("bad\ntag")).is_err());
+
+        let script = install(
+            "demo",
+            None,
+            None,
+            vec![Ok(completed(
+                "01b2-tag",
+                &[("N", "FIXED")],
+                &[vec![Some("1")]],
+            ))],
+        );
+        let env = envelope(run_query_outcome(
+            OutputFormat::Json,
+            "req-tag-1".to_owned(),
+            "demo".to_owned(),
+            "select 1",
+            &crate::QueryRunOptions::default(),
+        ));
+        assert_eq!(env["ok"], true, "{env}");
+        let submitted = request_json(&script.submitted()[0]);
+        assert_eq!(
+            submitted["parameters"]["QUERY_TAG"], "fsnow:query.run:req-tag-1",
+            "{submitted}"
+        );
+        let hash = env["receipt_hash"].as_str().unwrap_or_default().to_owned();
+        let shown = envelope(crate::execute(
+            ["receipt", "show", hash.as_str(), "--json"]
+                .map(str::to_owned)
+                .to_vec(),
+        ))
+        .to_string();
+        assert!(shown.contains("fsnow:query.run:req-tag-1"), "{shown}");
+    }
+
+    /// Reality-check bead B4: a confirmed write submits its dry run's id as the
+    /// SQL API requestId (with retry=true a replay returns the first result
+    /// instead of writing twice) and marks the confirmation used once it
+    /// completes; a bare write gets a fresh id and consumes nothing.
+    #[test]
+    fn confirmed_write_submits_its_dry_run_id_and_consumes_it() {
+        let rows_inserted = || {
+            Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000aa71",
+                &[("number of rows inserted", "FIXED")],
+                &[vec![Some("1")]],
+            ))
+        };
+        let script = install("demo", None, None, vec![rows_inserted(), rows_inserted()]);
+        let confirm_id = local_store::random_id().unwrap();
+        let write = |confirmed: Option<String>| AuthorizedWrite {
+            sql: "insert into t values (1)",
+            statement_kind: "insert",
+            safety_class: "dml",
+            idempotency_request_id: confirm_id.clone(),
+            confirmed_request_id: confirmed,
+            database: None,
+            schema: None,
+        };
+        let confirmed = envelope(run_write_outcome(
+            OutputFormat::Json,
+            "req-write-1".to_owned(),
+            "demo".to_owned(),
+            &write(Some(confirm_id.clone())),
+        ));
+        assert_eq!(confirmed["ok"], true, "{confirmed}");
+        let bare = envelope(run_write_outcome(
+            OutputFormat::Json,
+            "req-write-2".to_owned(),
+            "demo".to_owned(),
+            &write(None),
+        ));
+        assert_eq!(bare["ok"], true, "{bare}");
+        let ids = script.request_ids();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(
+            ids[0], confirm_id,
+            "the confirmed write reuses its dry run's id"
+        );
+        assert_ne!(ids[1], confirm_id, "a bare write gets a fresh id");
+        let store = local_store::open_store().unwrap();
+        assert_eq!(
+            local_store::confirmation_consumed_by(&store, &confirm_id).as_deref(),
+            confirmed["receipt_hash"].as_str(),
+            "the completed confirmed write is recorded against its receipt"
+        );
+    }
+
+    /// Reality-check bead E1: a pending interrupt cancels the statement's
+    /// context with `User` (terminate: `Shutdown`), which is what makes the
+    /// driver fire the remote cancel; with nothing pending the work finishes
+    /// untouched.
+    #[test]
+    fn a_pending_signal_cancels_the_statement_context() {
+        let run = |interrupt: bool, terminate: bool| {
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            let interrupt = AtomicBool::new(interrupt);
+            let terminate = AtomicBool::new(terminate);
+            runtime.block_on(async move {
+                let cx = Cx::current().unwrap();
+                // Stands in for the driver's poll wait: runs until its context
+                // is cancelled, or finishes on its own after ~0.5 s.
+                let work = async {
+                    for _ in 0..50 {
+                        if cx.checkpoint().is_err() {
+                            return cx.cancel_reason().map(|reason| reason.kind);
+                        }
+                        asupersync::time::sleep(
+                            cx.now_for_observability(),
+                            Duration::from_millis(10),
+                        )
+                        .await;
+                    }
+                    None
+                };
+                cancel_on_flags(&cx, work, &interrupt, &terminate).await
+            })
+        };
+        assert_eq!(run(true, false), Some(CancelKind::User));
+        assert_eq!(run(false, true), Some(CancelKind::Shutdown));
+        assert_eq!(
+            run(false, false),
+            None,
+            "nothing pending: the work is not cancelled"
+        );
+    }
+
+    /// Reality-check bead C5: `profile doctor --online` on the PAT lane lists
+    /// the user's tokens and warns about the soonest active expiry.
+    #[test]
+    fn scripted_doctor_online_reports_pat_expiry() {
+        let now = now_unix_seconds();
+        let soon = format!("{}.000000000", now + 2 * 86_400);
+        let later = format!("{}.000000000", now + 90 * 86_400);
+        let expired = format!("{}.000000000", now - 86_400);
+        install(
+            "demo",
+            None,
+            None,
+            vec![
+                Ok(completed(
+                    "01b2c3d4-0000-0000-0000-00000000ab21",
+                    &[("SNOWFLAKE_VERSION", "TEXT")],
+                    &[vec![Some("9.30.0")]],
+                )),
+                Ok(completed(
+                    "01b2c3d4-0000-0000-0000-00000000ab22",
+                    &[
+                        ("name", "TEXT"),
+                        ("expires_at", "TIMESTAMP_LTZ"),
+                        ("status", "TEXT"),
+                    ],
+                    &[
+                        vec![Some("ci_token"), Some(later.as_str()), Some("ACTIVE")],
+                        vec![Some("laptop_token"), Some(soon.as_str()), Some("ACTIVE")],
+                        vec![Some("old_token"), Some(expired.as_str()), Some("EXPIRED")],
+                    ],
+                )),
+            ],
+        );
+        let env = envelope(profile_doctor_online_outcome(
+            OutputFormat::Json,
+            "req-doctor-pat".to_owned(),
+            "demo".to_owned(),
+        ));
+        assert_eq!(env["ok"], true, "{env}");
+        let tokens = &env["data"]["credential_lifetime"]["programmatic_access_tokens"];
+        assert_eq!(tokens["active"], 2, "{env}");
+        assert_eq!(
+            tokens["soonest_expiry_unix_seconds"],
+            now + 2 * 86_400,
+            "{env}"
+        );
+        assert!(
+            env["warnings"]
+                .to_string()
+                .contains("`laptop_token` expires in 2 day(s)"),
+            "{env}"
+        );
+    }
+
+    #[test]
+    fn lifetime_findings_warn_by_lane() {
+        let lifetime = |lane, expires_at| CredentialLifetime {
+            lane,
+            issued_at_unix_seconds: None,
+            expires_at_unix_seconds: expires_at,
+            expected_validity_seconds: None,
+            max_validity_seconds: None,
+            refresh_before_expiry_seconds: None,
+        };
+        let (data, warnings) =
+            lifetime_findings(&lifetime(AuthLane::OAuthBearer, Some(1_300)), 1_000);
+        assert!(crate::render_json(&data).contains(r#""expires_in_seconds":300"#));
+        assert_eq!(warnings.len(), 1);
+        assert!(crate::render_json(&warnings[0]).contains("expires in 5 minute(s)"));
+        let (_, none) = lifetime_findings(&lifetime(AuthLane::OAuthBearer, Some(10_000)), 1_000);
+        assert!(none.is_empty(), "an hour left is not a warning: {none:?}");
+        let (data, none) = lifetime_findings(&lifetime(AuthLane::OAuthBearer, None), 1_000);
+        assert!(none.is_empty());
+        assert!(
+            crate::render_json(&data).contains(r#""expires_in_seconds":null"#),
+            "opaque token: lifetime unknown"
+        );
+    }
+
+    /// Reality-check bead C1: the documented jsonv2 conventions become typed
+    /// cells with one representation per column; `--raw-cells` keeps the wire
+    /// strings; a column holding a cell that breaks its convention keeps the
+    /// wire strings for every cell, with a warning that never echoes the value.
+    #[test]
+    fn rows_are_typed_per_column_or_kept_on_the_wire() {
+        use franken_snowflake_sqlapi::lifecycle::{Progress, StatementMachine};
+        use franken_snowflake_sqlapi::status::ResponseClass;
+        let fixture = include_bytes!(
+            "../../franken-snowflake-testkit/fixtures/sqlapi/jsonv2_codec_cells.json"
+        );
+        let mut machine = StatementMachine::new(PollPlan::default());
+        let Ok(Progress::Complete(done)) = machine.on_submit(ResponseClass::Completed, fixture)
+        else {
+            panic!("the codec fixture is a completed statement");
+        };
+        let mut rows = into_rows(done, DriverStats::default(), "req".to_owned());
+        let parse = |json: &Json| -> serde_json::Value {
+            serde_json::from_str(&crate::render_json(json)).unwrap_or_default()
+        };
+
+        let typed = project_rows(&rows, 1, RowEncoding::Typed);
+        assert!(typed.warnings.is_empty(), "{:?}", typed.warnings);
+        assert_eq!(
+            parse(&typed.rows),
+            serde_json::json!([[
+                "12345678901234567.89",
+                "99999999999999999999",
+                1.25,
+                "1.2345678901234567890123456789012345678E+39",
+                true,
+                "2020-01-01",
+                "23:01:59.000000000",
+                "2021-01-28T22:09:37.123456789",
+                "2021-01-28T22:09:37.123456789Z",
+                "2021-03-19T18:06:59.000000000+01:00",
+                "DEADBEEF",
+                {"k": [1, 2]},
+                {"nested": {"ok": true}},
+                [1, "two", null],
+                null
+            ]])
+        );
+        let reprs = |columns: &Json| -> Vec<String> {
+            parse(columns)
+                .as_array()
+                .map(|columns| {
+                    columns
+                        .iter()
+                        .map(|column| column["json_repr"].as_str().unwrap_or("").to_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            reprs(&typed.columns),
+            [
+                "decimal_string",
+                "decimal_string",
+                "float",
+                "decimal_string",
+                "bool",
+                "date",
+                "time",
+                "timestamp_ntz",
+                "timestamp_utc",
+                "timestamp_offset",
+                "hex",
+                "json",
+                "json",
+                "json",
+                "string"
+            ]
+        );
+        assert_eq!(parse(&typed.columns)[0]["scale"], 2);
+
+        let wire = project_rows(&rows, 1, RowEncoding::Wire);
+        assert_eq!(parse(&wire.rows)[0][5], "18262");
+        assert_eq!(parse(&wire.rows)[0][11], r#"{"k":[1,2]}"#);
+        assert!(reprs(&wire.columns).iter().all(|repr| repr == "wire"));
+
+        // One malformed DATE cell: that column falls back, the others stay typed.
+        if let Some(cell) = rows.rows.get_mut(0).and_then(|row| row.get_mut(5)) {
+            *cell = Some("not-a-day-count".to_owned());
+        }
+        let degraded = project_rows(&rows, 1, RowEncoding::Typed);
+        assert_eq!(reprs(&degraded.columns)[5], "wire");
+        assert_eq!(parse(&degraded.rows)[0][5], "not-a-day-count");
+        assert_eq!(parse(&degraded.rows)[0][4], true);
+        assert_eq!(degraded.warnings.len(), 1);
+        let warning = crate::render_json(&degraded.warnings[0]);
+        assert!(warning.contains("EVENT_DATE"), "{warning}");
+        assert!(!warning.contains("not-a-day-count"), "{warning}");
     }
 
     #[test]

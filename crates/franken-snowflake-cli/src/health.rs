@@ -357,18 +357,22 @@ fn redaction_fixture() -> Json {
 }
 
 fn read_only_guard_fixture() -> Json {
-    let cases: [(&str, bool); 8] = [
+    let cases: [(&str, bool); 11] = [
         ("select 1", true),
         ("WITH x AS (SELECT 1) SELECT * FROM x", true),
         ("SELECT /* delete from t */ 1", true),
         ("-- delete from t\nselect 1", true),
+        ("select $$ a;b $$, a$b, $1 from @s", true),
         ("delete from t", false),
         ("with x as (select 1) delete from t", false),
-        // Snowflake nests block comments: the outer comment swallows the inner
-        // one, so what remains is the mutation. A guard that stops at the first
-        // `*/` would classify this as a read.
+        // If Snowflake nests block comments, the outer comment swallows the
+        // inner one and what remains is the mutation; nesting is undocumented,
+        // so any nested comment is refused.
         ("/* /* nested */ select 1 */ delete from t", false),
         ("select 1; select 2", false),
+        // An apostrophe inside a `$$` string must not hide the separator.
+        ("select $$ it's $$; delete from t", false),
+        ("select system$cancel_all_queries(1)", false),
     ];
     let mut wrong = Vec::new();
     for (sql, expected_read) in cases {
@@ -548,9 +552,35 @@ fn export_plan_fixture() -> Json {
 fn frame_codec_mapping_fixture() -> Json {
     #[cfg(feature = "frankenpandas")]
     {
-        use franken_snowflake_frame::{
-            FrameStorageKind, ResultPartition, SnowflakeColumn, materialize_partitions,
-        };
+        use franken_snowflake_frame::FrameStorageKind;
+        frame_codec_check(&[
+            ("ID", FrameStorageKind::Int64),
+            ("AMOUNT", FrameStorageKind::DecimalString),
+            ("FLAG", FrameStorageKind::Bool),
+            ("VAL", FrameStorageKind::Float64),
+            ("NOTE", FrameStorageKind::Utf8),
+        ])
+    }
+    #[cfg(not(feature = "frankenpandas"))]
+    {
+        // Nothing to execute: the frame codec is not linked into this binary.
+        // Reporting `pass` here (as before 2026-09-24) certified code that
+        // was never run.
+        check_json(
+            "frame_codec_mapping",
+            "skipped",
+            "frame codec not compiled into this binary (build with --features frankenpandas to run this check)",
+        )
+    }
+}
+
+/// Decode a fixed five-column row through the frame codec and compare each
+/// column's storage kind with `expected` (a test feeds a wrong expectation to
+/// prove the check can fail).
+#[cfg(feature = "frankenpandas")]
+fn frame_codec_check(expected: &[(&str, franken_snowflake_frame::FrameStorageKind)]) -> Json {
+    use franken_snowflake_frame::{ResultPartition, SnowflakeColumn, materialize_partitions};
+    {
         let columns = vec![
             SnowflakeColumn::new("ID", "FIXED")
                 .with_scale(0)
@@ -574,22 +604,26 @@ fn frame_codec_mapping_fixture() -> Json {
         )];
         match materialize_partitions(&columns, partitions) {
             Ok(frame) => {
-                let id_col = frame.column("ID");
-                let ok = id_col.is_some_and(|c| c.metadata.storage_kind == FrameStorageKind::Int64);
-                if ok && frame.row_count == 1 {
+                let kind = |name: &str| frame.column(name).map(|c| c.metadata.storage_kind);
+                let wrong: Vec<String> = expected
+                    .iter()
+                    .filter(|(name, want)| kind(name) != Some(*want))
+                    .map(|(name, want)| format!("{name}: expected {want:?}, got {:?}", kind(name)))
+                    .collect();
+                if wrong.is_empty() && frame.row_count == 1 {
                     check_json_owned(
                         "frame_codec_mapping",
                         "pass",
                         format!(
-                            "materialized {} columns across 1 partition with full type mappings",
+                            "decoded {} typed columns (FIXED/FIXED(10,2)/BOOLEAN/REAL/TEXT) through the frame codec with the expected storage kinds",
                             frame.columns.len()
                         ),
                     )
                 } else {
-                    check_json(
+                    check_json_owned(
                         "frame_codec_mapping",
                         "fail",
-                        "unexpected column storage kind or row count",
+                        format!("rows={} mismatches: {}", frame.row_count, wrong.join("; ")),
                     )
                 }
             }
@@ -600,34 +634,31 @@ fn frame_codec_mapping_fixture() -> Json {
             ),
         }
     }
-    #[cfg(not(feature = "frankenpandas"))]
-    {
-        let contract_mappings = [
-            ("FIXED(scale=0, prec<=18)", "Int64"),
-            ("FIXED(scale>0 | prec>18)", "DecimalString"),
-            ("REAL / FLOAT", "Float64"),
-            ("BOOLEAN", "Bool"),
-            ("DATE", "Datetime64[ns]"),
-            ("TIME", "Datetime64[ns]"),
-            ("TIMESTAMP_NTZ", "Datetime64[ns]"),
-            ("TIMESTAMP_LTZ", "Datetime64[ns]"),
-            ("TIMESTAMP_TZ", "Datetime64[ns] + minute offset sidecar"),
-            ("VARIANT / OBJECT / ARRAY", "StructuredJson"),
-            ("BINARY", "BinaryHex"),
-        ];
-        let count = contract_mappings.len();
-        check_json_owned(
-            "frame_codec_mapping",
-            "pass",
-            format!(
-                "{count} Snowflake SQL API type mappings verified against canonical columnar contract (offline contract check)"
-            ),
-        )
-    }
 }
 
 fn text_indexing_provenance_fixture() -> Json {
     #[cfg(feature = "frankensearch")]
+    {
+        text_provenance_check("receipt-123")
+    }
+    #[cfg(not(feature = "frankensearch"))]
+    {
+        // Nothing to execute: text indexing is not linked into this binary.
+        // (Before 2026-09-24 this branch formatted a string and then "verified"
+        // its own prefix, reporting `pass`.)
+        check_json(
+            "text_indexing_provenance",
+            "skipped",
+            "text indexing not compiled into this binary (build with --features frankensearch to run this check)",
+        )
+    }
+}
+
+/// Derive a document handle and chunk for a query-result source with this
+/// receipt hash and verify provenance (a test feeds an empty hash to prove the
+/// check can fail).
+#[cfg(feature = "frankensearch")]
+fn text_provenance_check(receipt_hash: &str) -> Json {
     {
         use franken_snowflake_core::guardrails::RightsClass;
         use franken_snowflake_core::ids::ReceiptHash;
@@ -635,7 +666,7 @@ fn text_indexing_provenance_fixture() -> Json {
             TEXT_INDEX_SCHEMA_VERSION, TextChunk, TextDocumentHandle, TextSourceRef,
         };
         let source = TextSourceRef::QueryResult {
-            receipt_hash: ReceiptHash::new("receipt-123"),
+            receipt_hash: ReceiptHash::new(receipt_hash),
             statement_handle: None,
             query_id: None,
             dataset_id: None,
@@ -669,28 +700,6 @@ fn text_indexing_provenance_fixture() -> Json {
             )
         }
     }
-    #[cfg(not(feature = "frankensearch"))]
-    {
-        let schema_version = 1;
-        let kind = "query";
-        let source_id = "receipt%3Areceipt-123";
-        let col = "body";
-        let ordinal = 0;
-        let synthetic_handle =
-            format!("fsnow-text:v{schema_version}:{kind}:{source_id}:{col}:{ordinal}");
-        let valid_prefix = synthetic_handle.starts_with("fsnow-text:v1:query:");
-        if valid_prefix {
-            check_json_owned(
-                "text_indexing_provenance",
-                "pass",
-                format!(
-                    "verified stable document handle format `{synthetic_handle}` (offline contract check)"
-                ),
-            )
-        } else {
-            check_json("text_indexing_provenance", "fail", "invalid handle format")
-        }
-    }
 }
 
 /// Env-handle presence (names only, never values) for a profile.
@@ -698,6 +707,9 @@ pub struct HandlePresence {
     pub auth_lane: Option<String>,
     pub required_missing: Vec<String>,
     pub handles: Vec<Json>,
+    /// Why `<PREFIX>_ACCOUNT` does not form a usable SQL API endpoint, if set
+    /// and unusable (the live path would refuse it with FSNOW-2002).
+    pub account_error: Option<&'static str>,
 }
 
 /// Inspect which env handles a profile has set. Reads only the `_AUTH` lane
@@ -750,6 +762,9 @@ pub fn profile_handle_presence(profile: &str) -> HandlePresence {
         "ROLE",
         "MAX_POLLS",
         "STATEMENT_TIMEOUT_SECONDS",
+        "PARTITION_CONCURRENCY",
+        "QUERY_TAG",
+        "CA_BUNDLE",
     ] {
         push(key, false, false);
     }
@@ -786,19 +801,60 @@ pub fn profile_handle_presence(profile: &str) -> HandlePresence {
             }
         }
     }
+    // The account identifier is not a secret; validate the endpoint it forms
+    // with the same rule the live transport applies (no socket).
+    let account_error = std::env::var(format!("{prefix}_ACCOUNT"))
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|account| franken_snowflake_core::endpoint::validate_account(&account).err());
     HandlePresence {
         auth_lane,
         required_missing,
         handles,
+        account_error,
     }
 }
 
 /// Lane names the `_AUTH` handle accepts, for diagnostics.
 pub fn supported_auth_lanes() -> Json {
+    // workload_identity is implemented but quarantined (not Snowflake's
+    // documented SQL API protocol); it is refused on the live path.
     string_array(vec![
         "pat".to_string(),
         "key_pair_jwt".to_string(),
         "oauth_bearer".to_string(),
-        "workload_identity".to_string(),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    /// Reality-check bead C4: the frame fixture can fail. A wrong expected
+    /// storage kind (scaled NUMBER as a float) must report `fail`.
+    #[cfg(feature = "frankenpandas")]
+    #[test]
+    fn frame_codec_check_fails_on_a_wrong_expectation() {
+        use franken_snowflake_frame::FrameStorageKind;
+        let wrong = crate::render_json(&super::frame_codec_check(&[(
+            "AMOUNT",
+            FrameStorageKind::Float64,
+        )]));
+        assert!(wrong.contains("\"status\":\"fail\""), "{wrong}");
+        assert!(wrong.contains("AMOUNT"), "{wrong}");
+        let right = crate::render_json(&super::frame_codec_check(&[(
+            "AMOUNT",
+            FrameStorageKind::DecimalString,
+        )]));
+        assert!(right.contains("\"status\":\"pass\""), "{right}");
+    }
+
+    /// Reality-check bead C4: the text-indexing fixture can fail. A source
+    /// without a receipt hash has no provenance and must report `fail`.
+    #[cfg(feature = "frankensearch")]
+    #[test]
+    fn text_provenance_check_fails_without_a_receipt_hash() {
+        let missing = crate::render_json(&super::text_provenance_check(""));
+        assert!(missing.contains("\"status\":\"fail\""), "{missing}");
+        let present = crate::render_json(&super::text_provenance_check("receipt-123"));
+        assert!(present.contains("\"status\":\"pass\""), "{present}");
+    }
 }

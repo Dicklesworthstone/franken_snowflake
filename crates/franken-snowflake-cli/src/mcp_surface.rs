@@ -1,9 +1,20 @@
 //! Feature-gated CLI shim for the `franken-snowflake-mcp` crate.
 
-use crate::execute_cli_contract;
+use crate::{McpHttpArgs, execute_cli_contract};
+use franken_snowflake_mcp::{HttpServeOptions, McpServeMode};
 
-/// Run `franken-snowflake mcp serve` on stdio or HTTP.
-pub fn run_mcp_serve_process(mode: Option<String>) -> ! {
+/// Run `franken-snowflake mcp serve` on stdio (`None`) or the secured HTTP
+/// transport (`Some`).
+pub fn run_mcp_serve_process(http: Option<McpHttpArgs>) -> ! {
+    let mode = match http {
+        None => McpServeMode::Stdio,
+        Some(args) => McpServeMode::Http(HttpServeOptions {
+            addr: args.addr,
+            allowed_origins: args.allowed_origins,
+            extra_tools: args.extra_tools,
+            allow_remote: args.allow_remote,
+        }),
+    };
     franken_snowflake_mcp::run_mcp_serve_process(mode, run_cli_contract)
 }
 

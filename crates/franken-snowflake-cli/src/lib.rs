@@ -22,11 +22,12 @@ use franken_snowflake_core::error::SnowflakeErrorCode;
 use franken_snowflake_core::exit::ExitCode as CoreExitCode;
 use franken_snowflake_core::ids::RequestId;
 use franken_snowflake_core::redact::redact;
+use franken_snowflake_core::sql_lexer::{self, SqlTokenKind};
 use franken_snowflake_core::write_intent::{
-    ConfirmationToken, StatementAllowlistEntry, WriteIntentDecision, WriteIntentMode,
-    WriteIntentPlan, WriteIntentPolicy, WriteIntentRefusal, WriteIntentRefusalCode,
-    WriteIntentRequest, WriteSafetyClass, WriteStatementKind, classify_write_statement,
-    evaluate_write_intent,
+    AppendOnlyAuditIntent, ConfirmationToken, StatementAllowlistEntry, WriteIntentDecision,
+    WriteIntentMode, WriteIntentPlan, WriteIntentPolicy, WriteIntentRefusal,
+    WriteIntentRefusalCode, WriteIntentRequest, WriteSafetyClass, WriteStatementKind,
+    classify_write_statement, evaluate_write_intent,
 };
 
 use std::env;
@@ -64,7 +65,10 @@ enum GraphOutput {
 enum Command {
     Help,
     Onboard,
-    Capabilities,
+    Capabilities {
+        /// Also report the SHA-256 of the running executable.
+        with_exe_hash: bool,
+    },
     RobotDocsGuide,
     AgentHandbook,
     Doctor,
@@ -137,13 +141,26 @@ enum Command {
     ExportRun {
         spec: catalog_surface::ExportPlanSpec,
         out: Option<String>,
+        /// Confine `--out` under `<data_dir>/exports` (the MCP tool always sets it).
+        sandbox_out: bool,
     },
     Tui {
         profile: Option<String>,
     },
     McpServe {
-        mode: Option<String>,
+        /// `None` = stdio; `Some` = the secured HTTP transport.
+        http: Option<McpHttpArgs>,
     },
+}
+
+/// `mcp serve --http` options, parsed without the `mcp` feature so the default
+/// build can still refuse them with a precise diagnostic.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct McpHttpArgs {
+    pub addr: String,
+    pub allowed_origins: Vec<String>,
+    pub extra_tools: Vec<String>,
+    pub allow_remote: bool,
 }
 
 #[derive(Debug)]
@@ -171,6 +188,9 @@ struct QueryRunOptions {
     /// (`--require-live`); success on the live paths always stamps
     /// `data_source = "live"`, so this only fires on non-live substitution.
     require_live: bool,
+    /// Emit the SQL API jsonv2 wire strings instead of `typed.v1` cells
+    /// (`--raw-cells`, reality-check bead C1).
+    raw_cells: bool,
     /// Inline typed bindings for embedded callers (the TUI executor): the
     /// same JSON shape `--bindings-env` carries, parsed with the same
     /// validation. `None` keeps the env-var path.
@@ -445,8 +465,8 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "query.run",
-        invocation: "franken-snowflake query [run] --profile <profile> (--sql <sql> | --dataset <id> [--entity <v>] [--from <t>] [--to <t>] [--as-of <t>] [--select a,b] [--filter <json>]) [--limit <rows>] [--role <role>] [--warehouse <wh>] [--statement-timeout <secs>] [--bindings-env <env-var>] [--query-tag <tag>] --json",
-        output_contract_id: "fsnow.query.run.v1",
+        invocation: "franken-snowflake query [run] --profile <profile> (--sql <sql> | --dataset <id> [--entity <v>] [--from <t>] [--to <t>] [--as-of <t>] [--select a,b] [--filter <json>]) [--limit <rows>] [--role <role>] [--warehouse <wh>] [--statement-timeout <secs>] [--bindings-env <env-var>] [--query-tag <tag>] [--raw-cells] --json",
+        output_contract_id: "fsnow.query.run.v2",
         description: "Submit a SQL API statement; `query --sql` shorthand maps to this surface.",
         read_only: true,
         provider_network: true,
@@ -515,9 +535,9 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "mcp.serve",
-        invocation: "franken-snowflake mcp serve [--stdio | --http <addr>]",
+        invocation: "franken-snowflake mcp serve [--stdio | --http <addr> [--allow-origin <origin>]... [--allow-tool <name>]... [--allow-remote]]",
         output_contract_id: "fsnow.mcp.serve.v1",
-        description: "Feature-gated MCP server using the same handlers and envelope contract.",
+        description: "Feature-gated MCP server using the same handlers and envelope contract. --http requires a bearer token (FRANKEN_SNOWFLAKE_MCP_TOKEN), refuses foreign Origin/Host headers, binds loopback unless --allow-remote, and exposes only read-only tools unless --allow-tool names a side-effecting one.",
         read_only: true,
         provider_network: false,
         mutates_local_state: false,
@@ -569,7 +589,9 @@ fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
 
     let command = match args[0].as_str() {
         "onboard" => Command::Onboard,
-        "capabilities" => Command::Capabilities,
+        "capabilities" => Command::Capabilities {
+            with_exe_hash: has_flag(&args, "--with-exe-hash"),
+        },
         "robot-docs" => parse_robot_docs(&args, output)?,
         "agent-handbook" => Command::AgentHandbook,
         "doctor" => Command::Doctor,
@@ -611,6 +633,7 @@ fn parse_invocation(raw_args: Vec<String>) -> Result<Invocation, Outcome> {
             ));
         }
     };
+    validate_command_flags(output, &command, &args)?;
 
     Ok(Invocation {
         request_id,
@@ -935,7 +958,7 @@ fn parse_query(args: &[String], output: OutputFormat) -> Result<Command, Outcome
                 && (raw_value_after(args, "--sql").is_some()
                     || value_after(args, "--dataset").is_some()) =>
         {
-            let dataset = dataset_spec(args, output, "query.run", "fsnow.query.run.v1")?;
+            let dataset = dataset_spec(args, output, "query.run", "fsnow.query.run.v2")?;
             Ok(Command::QueryRun {
                 profile: resolve_profile(value_after(args, "--profile")),
                 sql: raw_value_after(args, "--sql"),
@@ -952,7 +975,7 @@ fn parse_query(args: &[String], output: OutputFormat) -> Result<Command, Outcome
             })
         }
         Some("run") => {
-            let dataset = dataset_spec(args, output, "query.run", "fsnow.query.run.v1")?;
+            let dataset = dataset_spec(args, output, "query.run", "fsnow.query.run.v2")?;
             Ok(Command::QueryRun {
                 profile: resolve_profile(value_after(args, "--profile")),
                 sql: raw_value_after(args, "--sql"),
@@ -1114,6 +1137,7 @@ fn query_run_options(args: &[String]) -> QueryRunOptions {
         warehouse: value_after(args, "--warehouse"),
         statement_timeout: value_after(args, "--statement-timeout"),
         require_live: has_flag(args, "--require-live"),
+        raw_cells: has_flag(args, "--raw-cells"),
         bindings_json: None,
     }
 }
@@ -1141,6 +1165,7 @@ fn parse_export(args: &[String], output: OutputFormat) -> Result<Command, Outcom
         Some("run") => Ok(Command::ExportRun {
             spec: export_plan_spec(args),
             out: value_after(args, "--out"),
+            sandbox_out: has_flag(args, "--sandbox-out"),
         }),
         Some(other) => Err(usage_error(
             output,
@@ -1213,12 +1238,40 @@ fn parse_mcp(args: &[String], output: OutputFormat) -> Result<Command, Outcome> 
         ));
     }
 
-    let mode = if wants_stdio {
-        Some("stdio".to_string())
+    let allowed_origins = values_after(args, "--allow-origin");
+    let extra_tools = values_after(args, "--allow-tool");
+    let allow_remote = has_flag(args, "--allow-remote");
+    if http_addr.is_none()
+        && (!allowed_origins.is_empty() || !extra_tools.is_empty() || allow_remote)
+    {
+        return Err(usage_error(
+            output,
+            "mcp.serve",
+            "fsnow.mcp.serve.v1",
+            "--allow-origin, --allow-tool and --allow-remote apply only to `mcp serve --http <addr>`.",
+            vec!["franken-snowflake mcp serve --http 127.0.0.1:3000".to_string()],
+            vec![],
+        ));
+    }
+    let http = if wants_stdio {
+        None
     } else {
-        http_addr.map(|addr| format!("http:{addr}"))
+        http_addr.map(|addr| McpHttpArgs {
+            addr,
+            allowed_origins,
+            extra_tools,
+            allow_remote,
+        })
     };
-    Ok(Command::McpServe { mode })
+    Ok(Command::McpServe { http })
+}
+
+/// Every value following a repeatable flag (`--allow-tool a --allow-tool b`).
+fn values_after(args: &[String], flag: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|pair| pair[0] == flag)
+        .map(|pair| pair[1].clone())
+        .collect()
 }
 
 fn dispatch(invocation: Invocation) -> Outcome {
@@ -1246,12 +1299,12 @@ fn dispatch(invocation: Invocation) -> Outcome {
                 "franken-snowflake profile validate <profile> --json".to_string(),
             ],
         ),
-        Command::Capabilities => success(
+        Command::Capabilities { with_exe_hash } => success(
             invocation.output,
             "capabilities",
             "fsnow.capabilities.v1",
             request_id,
-            capabilities_data(),
+            capabilities_data(with_exe_hash),
             vec![],
             vec!["franken-snowflake agent-handbook --json".to_string()],
         ),
@@ -1388,14 +1441,16 @@ fn dispatch(invocation: Invocation) -> Outcome {
         Command::ExportPlan { spec } => {
             catalog_surface::export_plan_outcome(invocation.output, request_id, spec)
         }
-        Command::ExportRun { spec, out } => {
-            export_run_dispatch(invocation.output, request_id, spec, out)
-        }
+        Command::ExportRun {
+            spec,
+            out,
+            sandbox_out,
+        } => export_run_dispatch(invocation.output, request_id, spec, out, sandbox_out),
         Command::Tui { profile } => tui_dispatch(invocation.output, request_id, profile),
-        Command::McpServe { mode } => {
+        Command::McpServe { http } => {
             #[cfg(feature = "mcp")]
             {
-                run_mcp_serve_process(mode)
+                run_mcp_serve_process(http)
             }
             #[cfg(not(feature = "mcp"))]
             {
@@ -1404,7 +1459,10 @@ fn dispatch(invocation: Invocation) -> Outcome {
                     "mcp.serve",
                     "fsnow.mcp.serve.v1",
                     request_id,
-                    mode,
+                    Some(match http {
+                        Some(args) => format!("http:{}", args.addr),
+                        None => "stdio".to_owned(),
+                    }),
                     SnowflakeErrorCode::UsageError,
                     "The MCP server is feature-gated and not linked in this CLI slice.",
                     vec!["franken-snowflake capabilities --json".to_string()],
@@ -2032,6 +2090,7 @@ fn onboard_data() -> Json {
         ("tool_name", json_string("franken-snowflake")),
         ("binary_aliases", string_array(vec!["fsnow".to_string()])),
         ("version", json_string(env!("CARGO_PKG_VERSION"))),
+        ("build", build_identity_json(false)),
         ("contract_version", json_string(CLI_CONTRACT_VERSION)),
         ("schema_version", json_string(ENVELOPE_SCHEMA_VERSION)),
         ("default_output", json_string("json")),
@@ -2098,12 +2157,13 @@ fn environment_docs() -> Json {
     ])])
 }
 
-fn capabilities_data() -> Json {
+fn capabilities_data(with_exe_hash: bool) -> Json {
     json_object(vec![
         ("tool_name", json_string("franken-snowflake")),
         ("binary_aliases", string_array(vec!["fsnow".to_string()])),
         ("crate_name", json_string(env!("CARGO_PKG_NAME"))),
         ("version", json_string(env!("CARGO_PKG_VERSION"))),
+        ("build", build_identity_json(with_exe_hash)),
         ("contract_version", json_string(CLI_CONTRACT_VERSION)),
         ("schema_version", json_string(ENVELOPE_SCHEMA_VERSION)),
         ("default_output", json_string("json")),
@@ -2221,8 +2281,18 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
         "Snowflake schema identifier (--schema)",
     );
     match command_id {
-        "onboard" | "capabilities" | "robot-docs.guide" | "agent-handbook" | "doctor"
-        | "selftest" => vec![OUTPUT_INPUT],
+        "capabilities" => vec![
+            input(
+                "with_exe_hash",
+                "boolean",
+                false,
+                "Also report build.exe_sha256, the SHA-256 of the running executable (--with-exe-hash)",
+            ),
+            OUTPUT_INPUT,
+        ],
+        "onboard" | "robot-docs.guide" | "agent-handbook" | "doctor" | "selftest" => {
+            vec![OUTPUT_INPUT]
+        }
         "profile.validate" => vec![
             input(
                 "profile",
@@ -2398,6 +2468,12 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
                     false,
                     "Hard-refuse (FSNOW-3003) unless served by the live transport (--require-live)",
                 ),
+                input(
+                    "raw_cells",
+                    "boolean",
+                    false,
+                    "Emit the SQL API jsonv2 wire strings instead of typed.v1 cells (--raw-cells)",
+                ),
             ];
             inputs.extend(
                 dataset_mode_inputs()
@@ -2531,7 +2607,19 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
                 "out",
                 "string",
                 true,
-                "Local file path for the artifact (--out)",
+                "Local file path for the artifact (--out); an existing file is refused unless --overwrite, and a symlink or non-file target is always refused",
+            ),
+            input(
+                "overwrite",
+                "boolean",
+                false,
+                "Atomically replace an existing --out file (--overwrite)",
+            ),
+            input(
+                "sandbox_out",
+                "boolean",
+                false,
+                "Confine --out to a relative path, without `..` or symlinked components, under <data dir>/exports (--sandbox-out; the MCP export_run tool always sets it)",
             ),
             OUTPUT_INPUT,
         ],
@@ -2542,7 +2630,25 @@ fn command_inputs(command_id: &str) -> Vec<InputSpec> {
                 "http",
                 "string",
                 false,
-                "Serve over HTTP at host:port (--http <addr>)",
+                "Serve over HTTP at host:port (--http <addr>); requires a bearer token of 32+ characters in FRANKEN_SNOWFLAKE_MCP_TOKEN, sent by clients as `Authorization: Bearer <token>`",
+            ),
+            input(
+                "allow_origin",
+                "string",
+                false,
+                "Browser origin allowed to call the HTTP server (--allow-origin <origin>, repeatable; cross-origin requests are refused otherwise)",
+            ),
+            input(
+                "allow_tool",
+                "string",
+                false,
+                "Expose a side-effecting tool over HTTP (--allow-tool export_run|query_cancel, repeatable; only read-only tools are exposed by default)",
+            ),
+            input(
+                "allow_remote",
+                "boolean",
+                false,
+                "Permit a non-loopback HTTP bind address (--allow-remote)",
             ),
         ],
         _ => vec![OUTPUT_INPUT],
@@ -2761,6 +2867,34 @@ fn check_json_owned(name: &'static str, status: &'static str, detail: String) ->
     ])
 }
 
+/// How an `_AUTH` lane value is treated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthLaneStatus {
+    Supported,
+    /// Implemented but refused on the live path (see [`WORKLOAD_IDENTITY_QUARANTINE`]).
+    Quarantined,
+    Unknown,
+}
+
+fn classify_auth_lane(lane: &str) -> AuthLaneStatus {
+    match lane {
+        "pat"
+        | "programmatic_access_token"
+        | "oauth"
+        | "oauth_bearer"
+        | "oauth_bearer_token"
+        | "key_pair_jwt"
+        | "jwt" => AuthLaneStatus::Supported,
+        "workload_identity" | "workload_identity_federation" | "oidc" => {
+            AuthLaneStatus::Quarantined
+        }
+        _ => AuthLaneStatus::Unknown,
+    }
+}
+
+/// Why the workload-identity lane is refused (reality-check bead C7a).
+pub(crate) const WORKLOAD_IDENTITY_QUARANTINE: &str = "the workload_identity auth lane is quarantined: its implementation exchanges the OIDC token through an RFC 7523 grant to /oauth/token-request, which is not Snowflake's documented SQL API protocol (`Authorization: Bearer WIF.<provider>.<token>`, docs.snowflake.com/en/developer-guide/sql-api/authenticating), so it cannot authenticate and would send the token to an unvalidated URL; use pat, key_pair_jwt, or oauth_bearer";
+
 fn profile_validate_outcome(format: OutputFormat, request_id: String, profile: String) -> Outcome {
     let syntax_valid = is_valid_profile_id(&profile);
     let presence = health::profile_handle_presence(&profile);
@@ -2781,18 +2915,52 @@ fn profile_validate_outcome(format: OutputFormat, request_id: String, profile: S
             presence.required_missing.join(", ")
         )));
     }
-    let (outcome_kind, exit, status) = if warnings.is_empty() {
+    // A profile the live path would refuse is an error (exit 3), not a finding:
+    // "validated" must mean the live transport accepts the account and lane.
+    let mut unusable = Vec::new();
+    if let Some(reason) = presence.account_error {
+        unusable.push(format!(
+            "{}_ACCOUNT does not form a canonical https://<account>.snowflakecomputing.com endpoint ({reason})",
+            profile_env_prefix(&profile)
+        ));
+    }
+    match presence.auth_lane.as_deref().map(classify_auth_lane) {
+        Some(AuthLaneStatus::Quarantined) => unusable.push(WORKLOAD_IDENTITY_QUARANTINE.to_owned()),
+        Some(AuthLaneStatus::Unknown) => unusable.push(format!(
+            "auth lane `{}` is not supported; use pat, key_pair_jwt, or oauth_bearer",
+            presence.auth_lane.as_deref().unwrap_or("")
+        )),
+        Some(AuthLaneStatus::Supported) | None => {}
+    }
+    let (outcome_kind, exit, status) = if !unusable.is_empty() {
+        ("error", CoreExitCode::CredentialError, "invalid")
+    } else if warnings.is_empty() {
         ("success", CoreExitCode::Success, "validated")
     } else {
         ("partial_success", CoreExitCode::Findings, "findings")
     };
-    let repair_commands: Vec<String> = presence
+    let mut repair_commands: Vec<String> = presence
         .required_missing
         .iter()
         .map(|name| format!("export {name}=<value>"))
         .collect();
+    if presence.account_error.is_some() {
+        repair_commands.push(format!(
+            "export {}_ACCOUNT=<locator such as xy12345.us-east-1, or org-account such as myorg-prod2>",
+            profile_env_prefix(&profile)
+        ));
+    }
+    if matches!(
+        presence.auth_lane.as_deref().map(classify_auth_lane),
+        Some(AuthLaneStatus::Quarantined | AuthLaneStatus::Unknown)
+    ) {
+        repair_commands.push(format!(
+            "export {}_AUTH=pat   # or key_pair_jwt, oauth_bearer",
+            profile_env_prefix(&profile)
+        ));
+    }
     let mut envelope = base_envelope(
-        true,
+        unusable.is_empty(),
         outcome_kind,
         "profile.validate",
         "fsnow.profile.validate.v1",
@@ -2804,6 +2972,13 @@ fn profile_validate_outcome(format: OutputFormat, request_id: String, profile: S
         format!("franken-snowflake profile doctor {profile} --json"),
         format!("franken-snowflake query plan --profile {profile} --sql \"select 1\" --json"),
     ]);
+    if !unusable.is_empty() {
+        envelope.error = Some(error_info(
+            SnowflakeErrorCode::ProfileInvalid,
+            format!("profile `{profile}` is unusable: {}", unusable.join("; ")),
+            vec![json_string("offline profile validation (no socket)")],
+        ));
+    }
     envelope.repair_commands = repair_commands;
     envelope.profile_id = Some(profile);
     Outcome {
@@ -2937,24 +3112,13 @@ fn profile_diagnostics_data(
             format!("missing: {}", presence.required_missing.join(", ")),
         )
     };
-    let auth_check = match presence.auth_lane.as_deref() {
+    let auth_check = match presence.auth_lane.as_deref().map(classify_auth_lane) {
         None => check_json(
             "auth_lane",
             "not_checked",
-            "_AUTH handle is unset; expected pat, key_pair_jwt, oauth_bearer, or workload_identity",
+            "_AUTH handle is unset; expected pat, key_pair_jwt, or oauth_bearer",
         ),
-        Some(
-            "pat"
-            | "programmatic_access_token"
-            | "oauth"
-            | "oauth_bearer"
-            | "oauth_bearer_token"
-            | "key_pair_jwt"
-            | "jwt"
-            | "workload_identity"
-            | "workload_identity_federation"
-            | "oidc",
-        ) => check_json_owned(
+        Some(AuthLaneStatus::Supported) => check_json_owned(
             "auth_lane",
             "pass",
             format!(
@@ -2962,11 +3126,15 @@ fn profile_diagnostics_data(
                 presence.auth_lane.as_deref().unwrap_or("")
             ),
         ),
-        Some(other) => check_json_owned(
+        Some(AuthLaneStatus::Quarantined) => {
+            check_json("auth_lane", "fail", WORKLOAD_IDENTITY_QUARANTINE)
+        }
+        Some(AuthLaneStatus::Unknown) => check_json_owned(
             "auth_lane",
-            "warn",
+            "fail",
             format!(
-                "auth lane `{other}` is not supported; use pat, key_pair_jwt, oauth_bearer, or workload_identity"
+                "auth lane `{}` is not supported; use pat, key_pair_jwt, or oauth_bearer",
+                presence.auth_lane.as_deref().unwrap_or("")
             ),
         ),
     };
@@ -3000,7 +3168,12 @@ fn profile_diagnostics_data(
         ),
         (
             "credential_lifetime_warnings",
-            Json::Array(credential_lifetime_warnings()),
+            Json::Array(credential_lifetime_warnings(
+                presence.auth_lane.as_deref(),
+                std::env::var(format!("{env_prefix}_JWT_VALIDITY_SECONDS"))
+                    .ok()
+                    .as_deref(),
+            )),
         ),
         ("profile_env_prefix", json_string(env_prefix.clone())),
         ("supported_auth_lanes", health::supported_auth_lanes()),
@@ -3021,6 +3194,7 @@ fn profile_diagnostics_data(
                     syntax_detail.to_string(),
                 ),
                 required_check,
+                account_endpoint_check(presence),
                 auth_check,
                 live_probe_check,
             ]),
@@ -3028,53 +3202,112 @@ fn profile_diagnostics_data(
     ])
 }
 
-fn credential_lifetime_warnings() -> Vec<Json> {
-    vec![
+fn account_endpoint_check(presence: &health::HandlePresence) -> Json {
+    let account_set = !presence
+        .required_missing
+        .iter()
+        .any(|name| name.ends_with("_ACCOUNT"));
+    match (account_set, presence.account_error) {
+        (_, Some(reason)) => check_json_owned(
+            "account_endpoint",
+            "fail",
+            format!(
+                "_ACCOUNT does not form a canonical https://<account>.snowflakecomputing.com endpoint ({reason}); every live command would refuse it"
+            ),
+        ),
+        (true, None) => check_json(
+            "account_endpoint",
+            "pass",
+            "_ACCOUNT forms a canonical SQL API endpoint",
+        ),
+        (false, None) => check_json(
+            "account_endpoint",
+            "not_checked",
+            "_ACCOUNT handle is unset",
+        ),
+    }
+}
+
+/// Credential-lifetime guidance for the profile's configured lane, derived
+/// from non-secret configuration only: the lane name and the raw
+/// `_JWT_VALIDITY_SECONDS` value. Token and key values are never read. With no
+/// lane set, the guidance for every supported lane.
+fn credential_lifetime_warnings(
+    auth_lane: Option<&str>,
+    jwt_validity_seconds: Option<&str>,
+) -> Vec<Json> {
+    let entry = |lane: &str, severity: &str, message: String| {
         json_object(vec![
-            ("auth_lane", json_string("programmatic_access_token")),
-            ("severity", json_string("warning")),
-            (
-                "message",
-                json_string(
-                    "PAT profiles should track the administrator expiry window; warn before the default 15-day lifetime ends",
+            ("auth_lane", json_string(lane)),
+            ("severity", json_string(severity)),
+            ("message", json_string(message)),
+            ("secret_values_read", Json::Bool(false)),
+        ])
+    };
+    let pat = || {
+        entry(
+            "pat",
+            "info",
+            "programmatic access tokens expire on the date the administrator set (15 days by default, at most 365); the expiry is not visible offline and a live command after it fails with a credential error, so rotate before then".to_owned(),
+        )
+    };
+    let oauth = || {
+        entry(
+            "oauth_bearer",
+            "info",
+            "OAuth access tokens are short-lived (commonly about 10 minutes) and this connector cannot refresh them; supply a fresh token per session, because a token that expires mid-poll fails the statement with a credential error".to_owned(),
+        )
+    };
+    let jwt = || {
+        let requested = jwt_validity_seconds.map(str::trim);
+        match requested.map(str::parse::<u64>) {
+            None => entry(
+                "key_pair_jwt",
+                "info",
+                "each JWT is signed for 3600 s (Snowflake's cap) and re-signed before expiry during long polls; nothing to rotate except the key pair itself".to_owned(),
+            ),
+            Some(Ok(0)) => entry(
+                "key_pair_jwt",
+                "error",
+                "_JWT_VALIDITY_SECONDS is 0; the signer refuses a zero validity window, so every live command would fail".to_owned(),
+            ),
+            Some(Ok(seconds)) if seconds > 3_600 => entry(
+                "key_pair_jwt",
+                "warning",
+                format!(
+                    "_JWT_VALIDITY_SECONDS is {seconds}, above Snowflake's 3600 s cap; each JWT is signed for 3600 s instead"
                 ),
             ),
-            ("secret_values_read", Json::Bool(false)),
-        ]),
-        json_object(vec![
-            ("auth_lane", json_string("key_pair_jwt")),
-            ("severity", json_string("warning")),
-            (
-                "message",
-                json_string(
-                    "JWT exp values beyond the one-hour cap are refused or capped by the signer before submission",
+            Some(Ok(seconds)) => entry(
+                "key_pair_jwt",
+                "info",
+                format!(
+                    "each JWT is signed for {seconds} s and re-signed before expiry during long polls"
                 ),
             ),
-            ("secret_values_read", Json::Bool(false)),
-        ]),
-        json_object(vec![
-            ("auth_lane", json_string("oauth_bearer_token")),
-            ("severity", json_string("warning")),
-            (
-                "message",
-                json_string(
-                    "OAuth bearer profiles should refresh before short-lived access tokens approach their roughly 10-minute lifetime",
+            Some(Err(_)) => entry(
+                "key_pair_jwt",
+                "warning",
+                format!(
+                    "_JWT_VALIDITY_SECONDS `{}` is not a whole number of seconds; the live path ignores it and signs for 3600 s",
+                    requested.unwrap_or_default()
                 ),
             ),
-            ("secret_values_read", Json::Bool(false)),
-        ]),
-        json_object(vec![
-            ("auth_lane", json_string("workload_identity")),
-            ("severity", json_string("warning")),
-            (
-                "message",
-                json_string(
-                    "Workload identity federation tokens are refreshed automatically or re-read from OIDC_TOKEN_FILE before expiration",
-                ),
-            ),
-            ("secret_values_read", Json::Bool(false)),
-        ]),
-    ]
+        }
+    };
+    match auth_lane {
+        None => vec![pat(), jwt(), oauth()],
+        Some("pat" | "programmatic_access_token") => vec![pat()],
+        Some("key_pair_jwt" | "jwt") => vec![jwt()],
+        Some("oauth" | "oauth_bearer" | "oauth_bearer_token") => vec![oauth()],
+        Some("workload_identity" | "workload_identity_federation" | "oidc") => vec![entry(
+            "workload_identity",
+            "error",
+            WORKLOAD_IDENTITY_QUARANTINE.to_owned(),
+        )],
+        // The auth_lane check already fails an unknown lane.
+        Some(_) => Vec::new(),
+    }
 }
 
 fn profile_env_handle_sets(env_prefix: &str) -> Vec<Json> {
@@ -3121,6 +3354,8 @@ fn profile_env_handle_sets(env_prefix: &str) -> Vec<Json> {
                     vars
                 }),
             ),
+            ("status", json_string("quarantined")),
+            ("detail", json_string(WORKLOAD_IDENTITY_QUARANTINE)),
         ]),
     ]
 }
@@ -3177,6 +3412,19 @@ fn query_plan_outcome(
         );
     };
 
+    if let Some(reason) = ambiguous_sql_reason(&sql_text) {
+        return refusal(
+            format,
+            "query.plan",
+            "fsnow.query.plan.v1",
+            request_id,
+            profile.clone(),
+            SnowflakeErrorCode::MultiStatementRefused,
+            reason,
+            vec![plan_example(profile.as_deref())],
+        );
+    }
+
     if has_multiple_statements(&sql_text) {
         return refusal(
             format,
@@ -3186,6 +3434,19 @@ fn query_plan_outcome(
             profile.clone(),
             SnowflakeErrorCode::MultiStatementRefused,
             "Multiple SQL statements are refused by default.",
+            vec![plan_example(profile.as_deref())],
+        );
+    }
+
+    if let Some(function) = read_side_effect(&sql_text) {
+        return refusal(
+            format,
+            "query.plan",
+            "fsnow.query.plan.v1",
+            request_id,
+            profile.clone(),
+            SnowflakeErrorCode::MutationRefused,
+            side_effect_refusal_message(&function),
             vec![plan_example(profile.as_deref())],
         );
     }
@@ -3277,7 +3538,7 @@ fn query_run_outcome(
         return usage_error(
             format,
             "query.run",
-            "fsnow.query.run.v1",
+            "fsnow.query.run.v2",
             "Missing --profile for `query run`. Pass --profile <profile> or set FRANKEN_SNOWFLAKE_DEFAULT_PROFILE.",
             vec!["franken-snowflake query run --profile <profile> --sql <sql> --json".to_string()],
             vec![],
@@ -3288,21 +3549,34 @@ fn query_run_outcome(
         return usage_error(
             format,
             "query.run",
-            "fsnow.query.run.v1",
+            "fsnow.query.run.v2",
             "Missing --sql for `query run`.",
             vec!["franken-snowflake query run --profile <profile> --sql <sql> --json".to_string()],
             vec![],
         );
     };
 
-    // a3y: distinguish the two refusal reasons instead of one conflated message.
-    // A multi-statement request and an unrecognized/typo'd SELECT are different
-    // problems and an agent needs to know which one it hit.
+    // a3y: distinguish the refusal reasons instead of one conflated message.
+    // Ambiguous structure, a multi-statement request, a side-effecting call and
+    // an unrecognized/typo'd SELECT are different problems and an agent needs to
+    // know which one it hit.
+    if let Some(reason) = ambiguous_sql_reason(&sql_text) {
+        return refusal(
+            format,
+            "query.run",
+            "fsnow.query.run.v2",
+            request_id,
+            profile.clone(),
+            SnowflakeErrorCode::MultiStatementRefused,
+            reason,
+            vec![plan_hint(profile.as_deref(), &sql_text)],
+        );
+    }
     if has_multiple_statements(&sql_text) {
         return refusal(
             format,
             "query.run",
-            "fsnow.query.run.v1",
+            "fsnow.query.run.v2",
             request_id,
             profile.clone(),
             SnowflakeErrorCode::MultiStatementRefused,
@@ -3310,11 +3584,23 @@ fn query_run_outcome(
             vec![plan_hint(profile.as_deref(), &sql_text)],
         );
     }
+    if let Some(function) = read_side_effect(&sql_text) {
+        return refusal(
+            format,
+            "query.run",
+            "fsnow.query.run.v2",
+            request_id,
+            profile.clone(),
+            SnowflakeErrorCode::MutationRefused,
+            side_effect_refusal_message(&function),
+            vec![plan_hint(profile.as_deref(), &sql_text)],
+        );
+    }
     if !is_select_like(&sql_text) {
         return refusal(
             format,
             "query.run",
-            "fsnow.query.run.v1",
+            "fsnow.query.run.v2",
             request_id,
             profile.clone(),
             SnowflakeErrorCode::MutationRefused,
@@ -3365,7 +3651,7 @@ fn query_run_dispatch(
     live_transport_required_with_data(
         format,
         "query.run",
-        "fsnow.query.run.v1",
+        "fsnow.query.run.v2",
         request_id,
         profile,
         json_object(vec![
@@ -3439,6 +3725,18 @@ fn query_write_outcome(
         );
     };
 
+    if let Some(reason) = ambiguous_sql_reason(&sql_text) {
+        return refusal(
+            format,
+            "query.write",
+            "fsnow.query.write.v1",
+            request_id,
+            Some(profile.clone()),
+            SnowflakeErrorCode::MultiStatementRefused,
+            reason,
+            vec![write_hint(Some(&profile), &sql_text)],
+        );
+    }
     if has_multiple_statements(&sql_text) {
         return refusal(
             format,
@@ -3473,7 +3771,7 @@ fn query_write_outcome(
             format,
             "query.write",
             "fsnow.query.write.v1",
-            "`query write` expects a mutating statement (INSERT/UPDATE/DELETE/MERGE/COPY INTO/PUT/...). For reads use `query run`.",
+            "`query write` expects a mutating statement (INSERT/UPDATE/DELETE/MERGE/COPY INTO/...). For reads use `query run`.",
             vec![run_hint(Some(&profile), &sql_text)],
             vec![],
         );
@@ -3507,35 +3805,234 @@ fn query_write_outcome(
         WriteIntentMode::PrepareExecution
     };
 
-    let policy = write_policy_for_profile(&profile, statement_kind);
+    let mut policy = match write_policy_for_profile(&profile, statement_kind) {
+        Ok(policy) => policy,
+        Err(message) => {
+            return refusal(
+                format,
+                "query.write",
+                "fsnow.query.write.v1",
+                request_id,
+                Some(profile.clone()),
+                SnowflakeErrorCode::ProfileInvalid,
+                message,
+                vec![format!(
+                    "franken-snowflake profile validate {profile} --json"
+                )],
+            );
+        }
+    };
+    // A supplied token is always checked (reality-check bead B4): in the
+    // frictionless default a wrong or stale `--confirm` must not execute.
+    if confirm.is_some() {
+        policy.require_exact_confirmation = true;
+    }
     let allowlist_id = cli_allowlist_id(statement_kind);
+    let store = local_store::open_store().ok();
 
-    // Deterministic idempotency id bound to (profile, compacted SQL): the dry-run
-    // confirmation token only validates a re-run of the *same* statement.
-    let ladder_request_id = stable_request_id(&format!(
-        "write\u{1f}{profile}\u{1f}{}",
-        compact_sql(&sql_text)
-    ));
+    // The ladder's request id. A confirmed write reuses the random id its dry
+    // run issued, after the token is checked against the audit log (same
+    // profile and statement, unexpired, not yet used), so a replay submits the
+    // same SQL API requestId; a dry run or a bare write gets a fresh random id.
+    // Tokens are no longer derived from the SQL, so they reveal nothing about it.
+    let ladder_request_id = match &confirm {
+        Some(token) => {
+            match verify_confirmation(store.as_ref(), &profile, &sql_text, statement_kind, token) {
+                Ok(id) => id,
+                Err(reason) => {
+                    return confirmation_refusal(format, request_id, profile, &sql_text, &reason);
+                }
+            }
+        }
+        None => local_store::random_id().unwrap_or_else(|_| local_store::invocation_id(&sql_text)),
+    };
 
     let mut intent = WriteIntentRequest::new(mode, &sql_text);
     intent.dry_run = true;
     intent.allowlist_id = Some(allowlist_id);
-    intent.request_id = Some(RequestId::new(ladder_request_id));
+    intent.request_id = Some(RequestId::new(ladder_request_id.clone()));
     if let Some(token) = &confirm {
         intent.confirmation_token = Some(ConfirmationToken::new(token.clone()));
     }
+    // The append-only audit rung is real: every write attempt is recorded, so
+    // a write only proceeds when the local store can take the record.
+    if let Some(store) = &store {
+        intent.audit_intent = Some(AppendOnlyAuditIntent::append_only(
+            store.dir.join("audit").display().to_string(),
+        ));
+    }
 
-    match evaluate_write_intent(&intent, &policy) {
+    let inline_credentials = matches!(
+        statement_kind,
+        WriteStatementKind::CopyIntoTable
+            | WriteStatementKind::CopyIntoStage
+            | WriteStatementKind::CopyIntoExternal
+    ) && sql_lexer::lex(&sql_text)
+        .words()
+        .iter()
+        .any(|word| word == "credentials");
+    let mut outcome = match evaluate_write_intent(&intent, &policy) {
         WriteIntentDecision::Refused { refusal: detail } => {
             write_refusal_outcome(format, request_id, profile, &sql_text, &detail)
         }
         WriteIntentDecision::DryRunPlanned { plan } => {
-            write_plan_outcome(format, request_id, profile, &plan)
+            let recorded = match &store {
+                Some(store) => record_issued_confirmation(
+                    store,
+                    &request_id,
+                    &profile,
+                    &sql_text,
+                    statement_kind,
+                    &ladder_request_id,
+                ),
+                None => Err("the local store is unavailable".to_owned()),
+            };
+            let mut outcome = write_plan_outcome(format, request_id, profile, &sql_text, &plan);
+            if let (Err(reason), Body::Envelope { envelope, .. }) = (recorded, &mut outcome.body) {
+                envelope.warnings.push(json_string(format!(
+                    "the confirmation token was not recorded, so --confirm cannot use it: {reason}"
+                )));
+            }
+            outcome
         }
-        WriteIntentDecision::ExecutionAuthorized { plan } => {
-            query_write_execute_dispatch(format, request_id, profile, &sql_text, &plan)
+        WriteIntentDecision::ExecutionAuthorized { plan } => query_write_execute_dispatch(
+            format,
+            request_id,
+            profile,
+            &sql_text,
+            &plan,
+            confirm.is_some(),
+        ),
+    };
+    // Bead B4: keys written into a COPY statement pass through this process
+    // (redacted in every output, but present in the request).
+    if inline_credentials && let Body::Envelope { envelope, .. } = &mut outcome.body {
+        envelope.warnings.push(json_string(
+            "the statement carries inline CREDENTIALS; prefer a STORAGE INTEGRATION so cloud keys never pass through the connector",
+        ));
+    }
+    outcome
+}
+
+/// Default lifetime of a confirmation token (`<PREFIX>_WRITE_TOKEN_TTL_SECONDS`).
+const DEFAULT_WRITE_TOKEN_TTL_SECONDS: u64 = 900;
+
+fn record_issued_confirmation(
+    store: &local_store::Store,
+    trace_id: &str,
+    profile: &str,
+    sql: &str,
+    statement_kind: WriteStatementKind,
+    confirm_id: &str,
+) -> Result<(), String> {
+    let issued = local_store::IssuedConfirmation {
+        confirm_id: confirm_id.to_owned(),
+        profile: profile.to_owned(),
+        sql_digest: local_store::keyed_sql_digest(store, profile, &compact_sql(sql))?,
+        statement_kind: statement_kind.as_token().to_owned(),
+        issued_at_ms: local_store::now_unix_ms(),
+    };
+    local_store::record_dry_run(store, trace_id, &issued)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Check a supplied `--confirm` against the dry run it names (reality-check
+/// bead B4): issued by this data directory, for this profile and exactly this
+/// statement and kind, within its lifetime, and not already used by a
+/// completed write. Returns the confirmation id.
+fn verify_confirmation(
+    store: Option<&local_store::Store>,
+    profile: &str,
+    sql: &str,
+    statement_kind: WriteStatementKind,
+    token: &str,
+) -> Result<String, String> {
+    let Some(store) = store else {
+        return Err("the local store is unavailable, so the token cannot be verified".to_owned());
+    };
+    let kind = statement_kind.as_token();
+    let Some(id) = token.strip_prefix(&format!("confirm:{kind}:")) else {
+        return Err(format!(
+            "the token is not a `{kind}` confirmation (expected confirm:{kind}:<id> from a dry run of this statement)"
+        ));
+    };
+    let Some(issued) = local_store::find_dry_run(store, id) else {
+        return Err(
+            "the token names no dry run recorded in this data directory; run `query write --dry-run` first"
+                .to_owned(),
+        );
+    };
+    let digest = local_store::keyed_sql_digest(store, profile, &compact_sql(sql))?;
+    if issued.profile != profile || issued.sql_digest != digest || issued.statement_kind != kind {
+        return Err("the token was issued for a different statement or profile".to_owned());
+    }
+    let ttl_seconds = profile_env_u64(profile, "WRITE_TOKEN_TTL_SECONDS")
+        .unwrap_or(DEFAULT_WRITE_TOKEN_TTL_SECONDS);
+    let age_ms = local_store::now_unix_ms().saturating_sub(issued.issued_at_ms);
+    if age_ms >= ttl_seconds.saturating_mul(1000) {
+        return Err(format!(
+            "the token expired: issued {} s ago, lifetime {ttl_seconds} s; dry-run again",
+            age_ms / 1000
+        ));
+    }
+    if let Some(receipt) = local_store::confirmation_consumed_by(store, id) {
+        return Err(format!(
+            "the token was already used by a completed write (receipt {receipt}); dry-run again for a new one"
+        ));
+    }
+    Ok(id.to_owned())
+}
+
+/// A `--confirm` that fails verification: FSNOW-3008, recorded on the audit log.
+fn confirmation_refusal(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    sql: &str,
+    reason: &str,
+) -> Outcome {
+    let mut outcome = refusal(
+        format,
+        "query.write",
+        "fsnow.query.write.v1",
+        request_id.clone(),
+        Some(profile.clone()),
+        SnowflakeErrorCode::WriteConfirmationRequired,
+        format!("confirmation token refused: {reason}"),
+        vec![write_hint(Some(&profile), sql)],
+    );
+    if let Ok(store) = local_store::open_store() {
+        let event = serde_json::json!({
+            "profile_id": profile,
+            "refusal_code": SnowflakeErrorCode::WriteConfirmationRequired.stable_code(),
+            "stage": "ConfirmationMatched",
+            "reason": reason,
+            "sql_preview_redacted": compact_sql(&redact(sql)),
+        });
+        let recorded = local_store::append_audit(
+            &store,
+            "query.write",
+            &request_id,
+            "write_refused",
+            &event,
+            None,
+        );
+        if let (Err(error), Body::Envelope { envelope, .. }) = (recorded, &mut outcome.body) {
+            envelope
+                .warnings
+                .push(json_string(format!("audit log append failed: {error}")));
         }
     }
+    outcome
+}
+
+/// Read a numeric profile env handle (`<PREFIX>_<KEY>`).
+fn profile_env_u64(profile: &str, key: &str) -> Option<u64> {
+    let prefix = profile_env_prefix(profile);
+    env::var(format!("{prefix}_{key}"))
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
 }
 
 /// Build the per-profile write-intent policy from env handles. By default a
@@ -3548,13 +4045,58 @@ fn query_write_outcome(
 fn write_policy_for_profile(
     profile: &str,
     statement_kind: WriteStatementKind,
-) -> WriteIntentPolicy {
-    write_policy_from_flags(
+) -> Result<WriteIntentPolicy, String> {
+    let mut policy = write_policy_from_flags(
         profile_env_flag(profile, "WRITE_ENABLED"),
         profile_env_flag(profile, "WRITE_ALLOW_DDL"),
         profile_env_flag(profile, "WRITE_REQUIRE_CONFIRM"),
         statement_kind,
-    )
+    );
+    policy.allow_procedures = profile_env_flag(profile, "WRITE_ALLOW_PROCEDURES");
+    policy.allow_external_unload = profile_env_flag(profile, "WRITE_ALLOW_EXTERNAL");
+    let prefix = profile_env_prefix(profile);
+    if let Ok(kinds) = env::var(format!("{prefix}_WRITE_ALLOWED_KINDS")) {
+        policy.allowed_kinds = Some(parse_allowed_kinds(&kinds).map_err(|unknown| {
+            format!(
+                "{prefix}_WRITE_ALLOWED_KINDS names unknown statement kind `{unknown}`; use tokens such as insert, merge, update, delete, copy_into_table"
+            )
+        })?);
+    }
+    Ok(policy)
+}
+
+/// Parse `WRITE_ALLOWED_KINDS` (comma-separated kind tokens). An unknown token
+/// is an error, never silently ignored.
+fn parse_allowed_kinds(raw: &str) -> Result<Vec<WriteStatementKind>, String> {
+    const KINDS: &[WriteStatementKind] = &[
+        WriteStatementKind::Insert,
+        WriteStatementKind::Merge,
+        WriteStatementKind::Update,
+        WriteStatementKind::Delete,
+        WriteStatementKind::CopyIntoTable,
+        WriteStatementKind::CopyIntoStage,
+        WriteStatementKind::CopyIntoExternal,
+        WriteStatementKind::Create,
+        WriteStatementKind::Alter,
+        WriteStatementKind::Drop,
+        WriteStatementKind::Truncate,
+        WriteStatementKind::Grant,
+        WriteStatementKind::Revoke,
+        WriteStatementKind::Call,
+        WriteStatementKind::Execute,
+        WriteStatementKind::Remove,
+    ];
+    raw.split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            KINDS
+                .iter()
+                .copied()
+                .find(|kind| kind.as_token().eq_ignore_ascii_case(token))
+                .ok_or_else(|| token.to_owned())
+        })
+        .collect()
 }
 
 /// Pure write-intent policy assembly from the resolved boolean flags (env-free, so
@@ -3573,11 +4115,14 @@ fn write_policy_from_flags(
         require_dry_run: require_confirm,
         require_exact_confirmation: require_confirm,
         require_idempotency_request_id: true,
-        require_append_only_audit: false,
+        // Every attempt is recorded on the append-only local audit log; a write
+        // proceeds only when the store can take the record (bead B4).
+        require_append_only_audit: true,
         statement_allowlist: vec![StatementAllowlistEntry::new(
             cli_allowlist_id(statement_kind),
             statement_kind,
         )],
+        ..WriteIntentPolicy::default()
     }
 }
 
@@ -3602,12 +4147,13 @@ fn write_plan_outcome(
     format: OutputFormat,
     request_id: String,
     profile: String,
+    sql: &str,
     plan: &WriteIntentPlan,
 ) -> Outcome {
     let token = plan.required_confirmation_token.as_str().to_string();
     let confirm_command = format!(
-        "franken-snowflake query write --profile {profile} --sql \"{}\" --confirm {token} --json",
-        compact_sql(&plan.redacted_sql_preview)
+        "franken-snowflake query write --profile {profile} --sql {} --confirm {token} --json",
+        sql_for_command(sql)
     );
     let next_stages = string_array(
         plan.next_required_stages
@@ -3726,6 +4272,9 @@ fn write_refusal_code(code: WriteIntentRefusalCode) -> SnowflakeErrorCode {
         | WriteIntentRefusalCode::MissingIdempotencyRequestId
         | WriteIntentRefusalCode::MissingAppendOnlyAudit
         | WriteIntentRefusalCode::ExecutionUnavailable => SnowflakeErrorCode::MutationRefused,
+        WriteIntentRefusalCode::StatementUnsupported => SnowflakeErrorCode::StatementUnsupported,
+        WriteIntentRefusalCode::ProceduresRefused
+        | WriteIntentRefusalCode::ExternalUnloadRefused => SnowflakeErrorCode::WriteOptInRequired,
     }
 }
 
@@ -3739,6 +4288,20 @@ fn write_refusal_repair(code: WriteIntentRefusalCode, profile: &str) -> Vec<Stri
         WriteIntentRefusalCode::DdlRefused => {
             vec![format!("export {prefix}_WRITE_ALLOW_DDL=true")]
         }
+        WriteIntentRefusalCode::ProceduresRefused => {
+            vec![format!("export {prefix}_WRITE_ALLOW_PROCEDURES=true")]
+        }
+        WriteIntentRefusalCode::ExternalUnloadRefused => {
+            vec![format!("export {prefix}_WRITE_ALLOW_EXTERNAL=true")]
+        }
+        WriteIntentRefusalCode::StatementUnsupported => vec![],
+        WriteIntentRefusalCode::MissingAppendOnlyAudit => vec![
+            "franken-snowflake doctor --json".to_owned(),
+            format!(
+                "export {}=<writable directory>",
+                franken_snowflake_cache::DATA_DIR_ENV
+            ),
+        ],
         _ => vec![write_dry_run_example(Some(profile))],
     }
 }
@@ -3759,9 +4322,20 @@ fn safety_class_token(class: WriteSafetyClass) -> &'static str {
 fn write_hint(profile: Option<&str>, sql: &str) -> String {
     let profile = profile.unwrap_or("<profile>");
     format!(
-        "franken-snowflake query write --profile {profile} --sql \"{}\" --dry-run --json",
-        compact_sql(sql)
+        "franken-snowflake query write --profile {profile} --sql {} --dry-run --json",
+        sql_for_command(sql)
     )
+}
+
+/// The `--sql` argument for a suggested command. SQL carrying a secret value is
+/// never echoed, and a redacted copy must not be offered either: run as-is it
+/// would execute with `[REDACTED]` as the value (reality-check bead B5).
+fn sql_for_command(sql: &str) -> String {
+    if redact(sql) == sql {
+        format!("\"{}\"", compact_sql(sql))
+    } else {
+        "<the same SQL; its secret values are not echoed>".to_string()
+    }
 }
 
 /// `query write --dry-run` form with a neutral example, for preview/ceremony hints.
@@ -3788,12 +4362,18 @@ fn query_write_execute_dispatch(
     profile: String,
     sql: &str,
     plan: &WriteIntentPlan,
+    confirmed: bool,
 ) -> Outcome {
+    let idempotency_request_id = plan.receipt.request_id.as_str().to_string();
     let write = live::AuthorizedWrite {
         sql,
         statement_kind: plan.statement_kind.as_token(),
         safety_class: safety_class_token(plan.safety_class),
-        idempotency_request_id: plan.receipt.request_id.as_str().to_string(),
+        // A confirmed write submits its dry run's id as the SQL API requestId
+        // (with retry=true), so replaying the same --confirm after an
+        // indeterminate outcome returns the first result instead of writing twice.
+        confirmed_request_id: confirmed.then(|| idempotency_request_id.clone()),
+        idempotency_request_id,
         database: None,
         schema: None,
     };
@@ -3809,6 +4389,7 @@ fn query_write_execute_dispatch(
     profile: String,
     _sql: &str,
     plan: &WriteIntentPlan,
+    _confirmed: bool,
 ) -> Outcome {
     live_transport_required_with_data(
         format,
@@ -3917,7 +4498,7 @@ fn refusal(
     request_id: String,
     profile_id: Option<String>,
     code: SnowflakeErrorCode,
-    message: &'static str,
+    message: impl Into<String>,
     safe_next_commands: Vec<String>,
 ) -> Outcome {
     let mut envelope = base_envelope(
@@ -4082,7 +4663,7 @@ fn dataset_run_dispatch(
     let planned = match dataset_mode::plan_dataset(
         format,
         "query.run",
-        "fsnow.query.run.v1",
+        "fsnow.query.run.v2",
         &request_id,
         &spec,
     ) {
@@ -4100,7 +4681,7 @@ fn dataset_run_dispatch(
     live_transport_required_with_data(
         format,
         "query.run",
-        "fsnow.query.run.v1",
+        "fsnow.query.run.v2",
         request_id,
         Some(planned.profile.clone()),
         json_object(data),
@@ -4151,6 +4732,7 @@ fn export_run_dispatch(
     request_id: String,
     spec: catalog_surface::ExportPlanSpec,
     out: Option<String>,
+    _sandbox_out: bool,
 ) -> Outcome {
     live_transport_required_with_data(
         format,
@@ -4182,8 +4764,9 @@ fn export_run_dispatch(
     request_id: String,
     spec: catalog_surface::ExportPlanSpec,
     out: Option<String>,
+    sandbox_out: bool,
 ) -> Outcome {
-    live::export_run_outcome(format, request_id, spec, out)
+    live::export_run_outcome(format, request_id, spec, out, sandbox_out)
 }
 
 fn exit_code_json() -> Json {
@@ -4319,6 +4902,7 @@ fn extract_output_format(raw_args: Vec<String>) -> (OutputFormat, bool, Vec<Stri
 }
 
 fn validate_known_flags(output: OutputFormat, args: &[String]) -> Result<(), Outcome> {
+    let known = known_flags();
     let mut skip_next = false;
     for (index, arg) in args.iter().enumerate() {
         if skip_next {
@@ -4333,7 +4917,7 @@ fn validate_known_flags(output: OutputFormat, args: &[String]) -> Result<(), Out
         let flag_name = arg
             .split_once('=')
             .map_or(arg.as_str(), |(name, _value)| name);
-        if known_flags().iter().any(|known| known == &flag_name) {
+        if known.iter().any(|flag| flag == flag_name) {
             if flag_name == "--require-live" && arg.contains('=') {
                 return Err(usage_error(
                     output,
@@ -4373,7 +4957,10 @@ fn validate_known_flags(output: OutputFormat, args: &[String]) -> Result<(), Out
             ),
             vec!["franken-snowflake capabilities --json".to_string()],
             vec!["franken-snowflake --help".to_string()],
-            did_you_mean(flag_name, &known_flags()),
+            did_you_mean(
+                flag_name,
+                &known.iter().map(String::as_str).collect::<Vec<_>>(),
+            ),
         ));
     }
 
@@ -4394,51 +4981,138 @@ fn missing_flag_value_outcome(output: OutputFormat, flag_name: &str) -> Outcome 
     )
 }
 
-fn known_flags() -> Vec<&'static str> {
-    vec![
-        "--as-of",
-        "--bindings-env",
-        "--compression",
-        "--confirm",
-        "--database",
-        "--dataset",
-        "--dry-run",
-        "--entity",
-        "--execute",
-        "--filter",
-        "--format",
-        "--from",
-        "--header",
-        "--help",
-        "--http",
-        "--json",
-        "--jsonschema",
-        "--limit",
-        "--location",
-        "--max-file-size",
-        "--mermaid",
-        "--no-color",
-        "--online",
-        "--out",
-        "--overwrite",
-        "--profile",
-        "--query-id",
-        "--query-tag",
-        "--require-live",
-        "--refresh",
-        "--role",
-        "--schema",
-        "--select",
-        "--single",
-        "--sql",
-        "--statement-timeout",
-        "--stdio",
-        "--svg",
-        "--to",
-        "--toon",
-        "--warehouse",
-        "-h",
-    ]
+/// Every flag some command accepts, plus the global ones. The first,
+/// command-independent pass ([`validate_known_flags`]: typos, missing values)
+/// uses it; [`validate_command_flags`] then narrows to the parsed command's own
+/// flags.
+fn known_flags() -> Vec<String> {
+    let mut flags: std::collections::BTreeSet<String> =
+        ["--help", "-h", "--json", "--toon", "--no-color"]
+            .map(String::from)
+            .into();
+    for spec in COMMAND_SPECS {
+        flags.extend(command_flags(spec.id));
+    }
+    flags.into_iter().collect()
+}
+
+/// The capabilities-registry id of a parsed command (`None` for help).
+fn command_id(command: &Command) -> Option<&'static str> {
+    Some(match command {
+        Command::Help => return None,
+        Command::Onboard => "onboard",
+        Command::Capabilities { .. } => "capabilities",
+        Command::RobotDocsGuide => "robot-docs.guide",
+        Command::AgentHandbook => "agent-handbook",
+        Command::Doctor => "doctor",
+        Command::Selftest => "selftest",
+        Command::ProfileValidate { .. } => "profile.validate",
+        Command::ProfileDoctor { .. } => "profile.doctor",
+        Command::CatalogScan { .. } => "catalog.scan",
+        Command::CatalogGraph { .. } => "catalog.graph",
+        Command::CatalogDiff { .. } => "catalog.diff",
+        Command::DatasetInspect { .. } => "dataset.inspect",
+        Command::DatasetProfile { .. } => "dataset.profile",
+        Command::DatasetDescribeOperator { .. } => "dataset.describe_operator",
+        Command::QueryPlan { .. } => "query.plan",
+        Command::QueryRun { .. } => "query.run",
+        Command::QueryWrite { .. } => "query.write",
+        Command::QueryCancel { .. } => "query.cancel",
+        Command::ReceiptShow { .. } => "receipt.show",
+        Command::ExportPlan { .. } => "export.plan",
+        Command::ExportRun { .. } => "export.run",
+        Command::Tui { .. } => "tui",
+        Command::McpServe { .. } => "mcp.serve",
+    })
+}
+
+/// The flags a command accepts, derived from its documented inputs (the
+/// capabilities `input_schema`), so the parser and the registry cannot drift:
+/// a command accepts a flag exactly when its schema documents it.
+fn command_flags(command_id: &str) -> Vec<String> {
+    let mut flags = Vec::new();
+    for spec in command_inputs(command_id) {
+        // --json/--toon are global; positionals are not flags.
+        if spec.name == "output" || spec.description.starts_with("positional:") {
+            continue;
+        }
+        match (command_id, spec.name) {
+            ("catalog.graph", "format") => flags.extend(["--mermaid", "--svg"].map(String::from)),
+            ("catalog.diff", "base") => {
+                flags.extend(["--base", "--base-snapshot"].map(String::from));
+            }
+            ("catalog.diff", "target") => {
+                flags.extend(["--target", "--target-snapshot"].map(String::from));
+            }
+            (_, name) => flags.push(format!("--{}", name.replace('_', "-"))),
+        }
+    }
+    flags
+}
+
+/// Refuse any flag the parsed command does not document (reality-check bead
+/// C3): an irrelevant flag is a usage error, never silently ignored.
+fn validate_command_flags(
+    output: OutputFormat,
+    command: &Command,
+    args: &[String],
+) -> Result<(), Outcome> {
+    let Some(id) = command_id(command) else {
+        return Ok(());
+    };
+    let accepted = command_flags(id);
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if !arg.starts_with('-') {
+            continue;
+        }
+        let flag_name = arg
+            .split_once('=')
+            .map_or(arg.as_str(), |(name, _value)| name);
+        if accepted.iter().any(|flag| flag == flag_name) {
+            skip_next = flag_requires_value(flag_name) && !arg.contains('=');
+            continue;
+        }
+        let spec = COMMAND_SPECS.iter().find(|spec| spec.id == id);
+        let display = id.replace('.', " ").replace('_', "-");
+        let candidates: Vec<&str> = accepted.iter().map(String::as_str).collect();
+        return Err(error_outcome(
+            output,
+            id,
+            spec.map_or("fsnow.help.v1", |spec| spec.output_contract_id),
+            CoreExitCode::Usage,
+            "error",
+            error_info(
+                SnowflakeErrorCode::UsageError,
+                format!(
+                    "`{flag_name}` is not a flag of `{display}`; it accepts {}.",
+                    if accepted.is_empty() {
+                        "no flags besides --json/--toon".to_string()
+                    } else {
+                        accepted.join(", ")
+                    }
+                ),
+                vec![
+                    json_string(format!("flag={flag_name}")),
+                    json_string(format!("command={id}")),
+                ],
+            ),
+            vec![
+                spec.map_or_else(
+                    || "franken-snowflake --help".to_string(),
+                    |spec| spec.invocation.to_string(),
+                ),
+                "franken-snowflake capabilities --json".to_string(),
+            ],
+            vec!["franken-snowflake --help".to_string()],
+            did_you_mean(flag_name, &candidates),
+        ));
+    }
+    Ok(())
 }
 
 fn flag_requires_value(flag: &str) -> bool {
@@ -4449,7 +5123,9 @@ fn flag_requires_value(flag: &str) -> bool {
     // `--http`" *before* `parse_mcp` could run, shadowing the specific message.
     matches!(
         flag,
-        "--as-of"
+        "--allow-origin"
+            | "--allow-tool"
+            | "--as-of"
             | "--bindings-env"
             | "--compression"
             | "--confirm"
@@ -4567,353 +5243,60 @@ fn positional_profile(args: &[String]) -> Option<String> {
     args.get(2).filter(|value| !value.starts_with('-')).cloned()
 }
 
+/// Statement-boundary check on the shared core lexer
+/// (`franken_snowflake_core::sql_lexer`), which understands `$$`-quoted strings,
+/// quoted identifiers, `--`/`//`/`/* */` comments and `$`-bearing identifiers.
+/// True for two or more statements, or a second top-level separator
+/// (`select 1;;`, an empty statement). A single trailing `;` is allowed.
+/// Structurally ambiguous SQL is refused separately by
+/// [`ambiguous_sql_reason`], which callers check first.
 fn has_multiple_statements(sql: &str) -> bool {
-    // A bare `.contains(';')` over-refuses valid single statements whose text
-    // legitimately holds a semicolon inside a string literal (`select ';'`), a
-    // line comment (`select 1 -- a; b`), or a block comment (`/* a; b */ select`).
-    // Scan with the same quote/comment state machine as `skip_balanced_sql_parens`
-    // and only treat a *top-level* `;` as a separator. A single trailing separator
-    // (optionally followed by whitespace/comments) is allowed; a second top-level
-    // `;`, or any real content after one, means multiple statements.
-    let bytes = sql.as_bytes();
-    let mut cursor = 0usize;
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut in_line_comment = false;
-    let mut block_comment_depth = 0usize;
-    let mut separator_seen = false;
-
-    while cursor < bytes.len() {
-        if in_line_comment {
-            in_line_comment = bytes[cursor] != b'\n';
-            cursor += 1;
-            continue;
-        }
-        if block_comment_depth > 0 {
-            if bytes[cursor] == b'/' && bytes.get(cursor + 1) == Some(&b'*') {
-                block_comment_depth += 1;
-                cursor += 2;
-            } else if bytes[cursor] == b'*' && bytes.get(cursor + 1) == Some(&b'/') {
-                block_comment_depth -= 1;
-                cursor += 2;
-            } else {
-                cursor += 1;
-            }
-            continue;
-        }
-        if in_single_quote {
-            if bytes[cursor] == b'\\' {
-                cursor = (cursor + 2).min(bytes.len());
-            } else if bytes[cursor] == b'\'' {
-                if bytes.get(cursor + 1) == Some(&b'\'') {
-                    cursor += 2;
-                } else {
-                    in_single_quote = false;
-                    cursor += 1;
-                }
-            } else {
-                cursor += 1;
-            }
-            continue;
-        }
-        if in_double_quote {
-            if bytes[cursor] == b'"' {
-                if bytes.get(cursor + 1) == Some(&b'"') {
-                    cursor += 2;
-                } else {
-                    in_double_quote = false;
-                    cursor += 1;
-                }
-            } else {
-                cursor += 1;
-            }
-            continue;
-        }
-        match bytes[cursor] {
-            b'\'' => {
-                in_single_quote = true;
-                cursor += 1;
-            }
-            b'"' => {
-                in_double_quote = true;
-                cursor += 1;
-            }
-            b'-' if bytes.get(cursor + 1) == Some(&b'-') => {
-                in_line_comment = true;
-                cursor += 2;
-            }
-            b'/' if bytes.get(cursor + 1) == Some(&b'*') => {
-                block_comment_depth = 1;
-                cursor += 2;
-            }
-            b';' => {
-                if separator_seen {
-                    return true;
-                }
-                separator_seen = true;
-                cursor += 1;
-            }
-            other => {
-                if separator_seen && !other.is_ascii_whitespace() {
-                    return true;
-                }
-                cursor += 1;
-            }
-        }
-    }
-    false
+    let lexed = sql_lexer::lex(sql);
+    let separators = lexed
+        .significant()
+        .filter(|token| token.kind == SqlTokenKind::Semicolon)
+        .count();
+    lexed.is_unreliable() || lexed.statement_count() > 1 || separators > 1
 }
 
+/// Why the SQL's statement boundaries cannot be trusted, if they cannot: an
+/// unterminated quote/comment, or a nested block comment (whether Snowflake
+/// nests `/* */` is undocumented, and the two readings disagree about where
+/// statements start). Guards refuse such input instead of guessing.
+fn ambiguous_sql_reason(sql: &str) -> Option<&'static str> {
+    let lexed = sql_lexer::lex(sql);
+    if lexed.unterminated {
+        Some(
+            "The SQL has an unterminated string, quoted identifier, `$$` string or block comment, so its statement boundaries are ambiguous; it is refused. Close every quote and comment.",
+        )
+    } else if lexed.ambiguous {
+        Some(
+            "The SQL nests a block comment (`/* ... /* ... */`); Snowflake's handling of nested comments is undocumented and the two readings disagree about which statements run, so it is refused. Remove the inner `/*`.",
+        )
+    } else {
+        None
+    }
+}
+
+/// A read-path side effect (a non-allowlisted `SYSTEM$` function such as
+/// `SYSTEM$CANCEL_ALL_QUERIES`, or a sequence `NEXTVAL`), if the SQL has one.
+fn read_side_effect(sql: &str) -> Option<String> {
+    sql_lexer::read_side_effect(&sql_lexer::lex(sql))
+}
+
+fn side_effect_refusal_message(function: &str) -> String {
+    format!(
+        "`{}` has side effects (system functions outside the read-only allowlist can cancel queries, abort sessions or change objects, and NEXTVAL advances a sequence), so the read path refuses it. The allowlisted read-only SYSTEM$ functions (e.g. SYSTEM$TYPEOF, SYSTEM$CLUSTERING_INFORMATION, SYSTEM$WAIT) are accepted.",
+        function.to_ascii_uppercase()
+    )
+}
+
+/// True for a single trustworthy read statement with no side-effecting call.
 fn is_select_like(sql: &str) -> bool {
-    let start = skip_sql_ws_and_comments(sql, 0);
-    if consume_sql_keyword(sql, start, "with").is_some() {
-        return cte_select_tail_is_read(sql, start);
-    }
-    ["select", "show", "describe", "desc", "explain"]
-        .iter()
-        .any(|keyword| consume_sql_keyword(sql, start, keyword).is_some())
-}
-
-fn cte_select_tail_is_read(sql: &str, start: usize) -> bool {
-    let Some(mut index) = consume_sql_keyword(sql, start, "with") else {
-        return false;
-    };
-    index = skip_sql_ws_and_comments(sql, index);
-    if let Some(after_recursive) = consume_sql_keyword(sql, index, "recursive") {
-        index = skip_sql_ws_and_comments(sql, after_recursive);
-    }
-
-    loop {
-        let Some(after_name) = consume_sql_identifier(sql, index) else {
-            return false;
-        };
-        index = skip_sql_ws_and_comments(sql, after_name);
-
-        if sql[index..].starts_with('(') {
-            let Some(after_columns) = skip_balanced_sql_parens(sql, index) else {
-                return false;
-            };
-            index = skip_sql_ws_and_comments(sql, after_columns);
-        }
-
-        let Some(after_as) = consume_sql_keyword(sql, index, "as") else {
-            return false;
-        };
-        index = skip_sql_ws_and_comments(sql, after_as);
-
-        let Some(after_cte_query) = skip_balanced_sql_parens(sql, index) else {
-            return false;
-        };
-        index = skip_sql_ws_and_comments(sql, after_cte_query);
-
-        if sql[index..].starts_with(',') {
-            index = skip_sql_ws_and_comments(sql, index + 1);
-            continue;
-        }
-
-        return consume_sql_keyword(sql, index, "select").is_some();
-    }
-}
-
-fn skip_sql_ws_and_comments(sql: &str, mut index: usize) -> usize {
-    loop {
-        while let Some(ch) = sql[index..].chars().next() {
-            if !ch.is_whitespace() {
-                break;
-            }
-            index += ch.len_utf8();
-        }
-
-        if sql[index..].starts_with("--") {
-            match sql[index..].find('\n') {
-                Some(line_end) => {
-                    index += line_end + 1;
-                    continue;
-                }
-                None => return sql.len(),
-            }
-        }
-
-        if sql[index..].starts_with("/*") {
-            // Block comments nest in Snowflake (`/* /* inner */ outer */`), so
-            // the guard must track depth. Ending at the first `*/` let a
-            // mutation hidden after an inner comment (`/* /* x */ select 1 */
-            // delete from t`) classify as a read (the `selftest` read_only_guard
-            // fixture caught this). An unterminated comment consumes the rest.
-            let mut depth = 0usize;
-            let mut cursor = index;
-            loop {
-                if sql[cursor..].starts_with("/*") {
-                    depth += 1;
-                    cursor += 2;
-                } else if sql[cursor..].starts_with("*/") {
-                    depth -= 1;
-                    cursor += 2;
-                    if depth == 0 {
-                        break;
-                    }
-                } else {
-                    match sql[cursor..].chars().next() {
-                        Some(ch) => cursor += ch.len_utf8(),
-                        None => return sql.len(),
-                    }
-                }
-            }
-            index = cursor;
-            continue;
-        }
-
-        return index;
-    }
-}
-
-fn consume_sql_keyword(sql: &str, index: usize, keyword: &str) -> Option<usize> {
-    let rest = sql.get(index..)?;
-    // `rest.get(..keyword.len())` yields `None` when `keyword.len()` is past the
-    // end *or* lands inside a multi-byte UTF-8 char, so a non-ASCII statement
-    // (e.g. `query plan --sql "€€"`) can never panic on a non-char-boundary
-    // slice — the prior `rest[..keyword.len()]` did exactly that.
-    let head = rest.get(..keyword.len())?;
-    if !head.eq_ignore_ascii_case(keyword) {
-        return None;
-    }
-    let end = index + keyword.len();
-    match sql[end..].chars().next() {
-        Some(ch) if is_sql_identifier_continue(ch) => None,
-        _ => Some(end),
-    }
-}
-
-fn consume_sql_identifier(sql: &str, index: usize) -> Option<usize> {
-    let rest = sql.get(index..)?;
-    if rest.starts_with('"') {
-        let bytes = sql.as_bytes();
-        let mut cursor = index + 1;
-        while cursor < bytes.len() {
-            if bytes[cursor] == b'"' {
-                if bytes.get(cursor + 1) == Some(&b'"') {
-                    cursor += 2;
-                    continue;
-                }
-                return Some(cursor + 1);
-            }
-            cursor += 1;
-        }
-        return None;
-    }
-
-    let mut end = index;
-    let mut saw_char = false;
-    for (offset, ch) in rest.char_indices() {
-        if !is_sql_identifier_continue(ch) {
-            break;
-        }
-        saw_char = true;
-        end = index + offset + ch.len_utf8();
-    }
-    saw_char.then_some(end)
-}
-
-fn is_sql_identifier_continue(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$')
-}
-
-fn skip_balanced_sql_parens(sql: &str, index: usize) -> Option<usize> {
-    if !sql[index..].starts_with('(') {
-        return None;
-    }
-
-    let bytes = sql.as_bytes();
-    let mut cursor = index;
-    let mut depth = 0usize;
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut in_line_comment = false;
-    let mut block_comment_depth = 0usize;
-
-    while cursor < bytes.len() {
-        if in_line_comment {
-            in_line_comment = bytes[cursor] != b'\n';
-            cursor += 1;
-            continue;
-        }
-
-        if block_comment_depth > 0 {
-            if bytes[cursor] == b'/' && bytes.get(cursor + 1) == Some(&b'*') {
-                block_comment_depth += 1;
-                cursor += 2;
-            } else if bytes[cursor] == b'*' && bytes.get(cursor + 1) == Some(&b'/') {
-                block_comment_depth -= 1;
-                cursor += 2;
-            } else {
-                cursor += 1;
-            }
-            continue;
-        }
-
-        if in_single_quote {
-            if bytes[cursor] == b'\\' {
-                cursor = (cursor + 2).min(bytes.len());
-            } else if bytes[cursor] == b'\'' {
-                if bytes.get(cursor + 1) == Some(&b'\'') {
-                    cursor += 2;
-                } else {
-                    in_single_quote = false;
-                    cursor += 1;
-                }
-            } else {
-                cursor += 1;
-            }
-            continue;
-        }
-
-        if in_double_quote {
-            if bytes[cursor] == b'"' {
-                if bytes.get(cursor + 1) == Some(&b'"') {
-                    cursor += 2;
-                } else {
-                    in_double_quote = false;
-                    cursor += 1;
-                }
-            } else {
-                cursor += 1;
-            }
-            continue;
-        }
-
-        match bytes[cursor] {
-            b'\'' => {
-                in_single_quote = true;
-                cursor += 1;
-            }
-            b'"' => {
-                in_double_quote = true;
-                cursor += 1;
-            }
-            b'-' if bytes.get(cursor + 1) == Some(&b'-') => {
-                in_line_comment = true;
-                cursor += 2;
-            }
-            b'/' if bytes.get(cursor + 1) == Some(&b'*') => {
-                block_comment_depth = 1;
-                cursor += 2;
-            }
-            b'(' => {
-                depth += 1;
-                cursor += 1;
-            }
-            b')' => {
-                depth = depth.checked_sub(1)?;
-                cursor += 1;
-                if depth == 0 {
-                    return Some(cursor);
-                }
-            }
-            _ => cursor += 1,
-        }
-    }
-
-    None
+    let lexed = sql_lexer::lex(sql);
+    !lexed.is_unreliable()
+        && sql_lexer::is_read_statement(&lexed)
+        && sql_lexer::read_side_effect(&lexed).is_none()
 }
 
 fn compact_sql(sql: &str) -> String {
@@ -4967,29 +5350,6 @@ fn levenshtein(a: &str, b: &str) -> usize {
     }
 
     prev[b_len]
-}
-
-fn stable_request_id(seed: &str) -> String {
-    let h1 = fnv1a64(seed.as_bytes(), 0xcbf29ce484222325);
-    let h2 = fnv1a64(seed.as_bytes(), 0x84222325cbf29ce4);
-    let hex = format!("{h1:016x}{h2:016x}");
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    )
-}
-
-fn fnv1a64(bytes: &[u8], seed: u64) -> u64 {
-    let mut hash = seed;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
 }
 
 fn json_string(value: impl Into<String>) -> Json {
@@ -5180,6 +5540,10 @@ pub use mcp_surface::run_mcp_serve_process;
 #[cfg(feature = "live")]
 mod live;
 
+// Used by `export run` (live); compiled for tests in every build.
+#[cfg(any(feature = "live", test))]
+mod export_path;
+
 mod catalog_surface;
 mod dataset_mode;
 mod health;
@@ -5202,14 +5566,79 @@ fn live_transport_available() -> bool {
 }
 
 // Shared by `capabilities` and the `onboard` mega-command so the two surfaces
-// can never drift on what this binary actually has compiled in. `live`/`mcp`/
-// `tui`/`toon` are real CLI-crate features (reported via `cfg!`); `testkit` is
-// NOT a feature of this binary — that surface lives in a sibling crate — so it
-// is definitionally false for any `franken-snowflake`/`fsnow` build.
+// can never drift on what this binary actually has compiled in. Every flag is
+// computed with `cfg!`. `testkit` is the test-only `testkit-endpoint` feature
+// (a loopback SQL API endpoint for the socket e2e); a release build reports
+// false, and docs/RELEASE.md requires it.
+/// The commit and toolchain this binary was built from (reality-check bead
+/// H1; see `build.rs`). `dirty` is null when unknown. With `exe_hash`, also the
+/// SHA-256 of the running executable, computed from inside the process so a
+/// harness cannot compare a build against itself unnoticed.
+fn build_identity_json(exe_hash: bool) -> Json {
+    let features: Vec<String> = [
+        ("live", live_transport_available()),
+        ("mcp", mcp_surface_available()),
+        ("tui", cfg!(feature = "tui")),
+        ("toon", toon_output_available()),
+        ("frankenpandas", cfg!(feature = "frankenpandas")),
+        ("frankensearch", cfg!(feature = "frankensearch")),
+        ("testkit-endpoint", cfg!(feature = "testkit-endpoint")),
+    ]
+    .into_iter()
+    .filter(|(_, enabled)| *enabled)
+    .map(|(name, _)| name.to_string())
+    .collect();
+    let mut fields = vec![
+        ("version", json_string(env!("CARGO_PKG_VERSION"))),
+        ("git_sha", json_string(BUILD_GIT_SHA)),
+        (
+            "source_digest",
+            json_string(env!("FSNOW_BUILD_SOURCE_DIGEST")),
+        ),
+        (
+            "dirty",
+            match env!("FSNOW_BUILD_DIRTY") {
+                "true" => Json::Bool(true),
+                "false" => Json::Bool(false),
+                _ => Json::Null,
+            },
+        ),
+        ("target", json_string(env!("FSNOW_BUILD_TARGET"))),
+        ("profile", json_string(env!("FSNOW_BUILD_PROFILE"))),
+        ("rustc", json_string(env!("FSNOW_BUILD_RUSTC"))),
+        ("features", string_array(features)),
+    ];
+    if exe_hash {
+        fields.push((
+            "exe_sha256",
+            match current_exe_sha256() {
+                Ok(digest) => json_string(digest),
+                Err(error) => json_string(format!("unavailable: {error}")),
+            },
+        ));
+    }
+    json_object(fields)
+}
+
+/// The commit this binary was built from, or `unknown`.
+pub(crate) const BUILD_GIT_SHA: &str = env!("FSNOW_BUILD_GIT_SHA");
+
+fn current_exe_sha256() -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(std::env::current_exe()?)?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 fn feature_flags_json() -> Json {
     json_object(vec![
         ("live", Json::Bool(live_transport_available())),
-        ("testkit", Json::Bool(false)),
+        ("testkit", Json::Bool(cfg!(feature = "testkit-endpoint"))),
         ("mcp", Json::Bool(mcp_surface_available())),
         ("tui", Json::Bool(cfg!(feature = "tui"))),
         ("toon", Json::Bool(toon_output_available())),
@@ -5305,26 +5734,178 @@ mod tests {
                 }
             }
         }
-        // Every accepted value/boolean flag is described by at least one command.
-        for flag in known_flags() {
-            let name = flag.trim_start_matches('-');
-            if matches!(
-                flag,
-                "-h" | "--help" | "--no-color" | "--json" | "--toon" | "--mermaid" | "--svg"
-            ) {
-                continue;
+        // Every flag the parser reads is accepted by some command. A flag the
+        // parser reads but no schema documents is unreachable: the validator
+        // refuses it first (catalog diff `--base` was, before 2026-09-24).
+        let known = known_flags();
+        let source = include_str!("lib.rs");
+        for reader in [
+            "value_after(args, \"",
+            "value_after(&args, \"",
+            "has_flag(args, \"",
+            "has_flag(&args, \"",
+            "flag_present(args, \"",
+            "values_after(args, \"",
+        ] {
+            for (index, _) in source.match_indices(reader) {
+                let rest = &source[index + reader.len()..];
+                let flag = rest.split('"').next().unwrap_or_default();
+                assert!(
+                    known.iter().any(|known| known == flag),
+                    "the parser reads `{flag}` but no command documents it"
+                );
             }
-            let documented_here = documented.contains(name)
-                || (matches!(
-                    flag,
-                    "--dataset" | "--entity" | "--from" | "--to" | "--as-of" | "--select"
-                ));
-            assert!(
-                documented_here,
-                "flag {flag} is accepted but undocumented in capabilities"
-            );
         }
         Ok(())
+    }
+
+    /// Reality-check bead C3: every flag a command documents is accepted by
+    /// that command's parser (no documented flag is unreachable).
+    #[test]
+    fn every_documented_flag_is_accepted_by_its_command() {
+        for spec in COMMAND_SPECS {
+            let mut words: Vec<String> = spec
+                .id
+                .split('.')
+                .map(|word| word.replace('_', "-"))
+                .collect();
+            for input in command_inputs(spec.id) {
+                if input.description.starts_with("positional:") {
+                    words.push("demo".to_string());
+                }
+            }
+            for flag in command_flags(spec.id) {
+                let mut args = words.clone();
+                args.push(flag.clone());
+                if flag_requires_value(&flag) {
+                    args.push("1".to_string());
+                }
+                if let Err(outcome) = parse_invocation(args.clone()) {
+                    let rendered = match outcome.body {
+                        Body::Envelope { envelope, .. } => render_json(&envelope_json(&envelope)),
+                        Body::Raw { data } => data,
+                    };
+                    assert!(
+                        !rendered.contains("is not a flag of")
+                            && !rendered.contains("Unknown flag"),
+                        "{args:?} was refused as an unknown flag: {rendered}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Reality-check bead C3: a flag another command owns is refused with exit
+    /// 64 / FSNOW-1002 and suggestions from this command's own flags; it is
+    /// never accepted and ignored.
+    #[test]
+    fn irrelevant_flags_are_refused_per_command() {
+        let refused = |args: &[&str]| {
+            let outcome = execute(args.iter().map(|arg| (*arg).to_string()).collect());
+            let rendered = match &outcome.body {
+                Body::Envelope { envelope, .. } => render_json(&envelope_json(envelope)),
+                Body::Raw { data } => data.clone(),
+            };
+            (outcome.status.code(), rendered)
+        };
+        // The reality-check evidence invocation: ok:true with zero warnings before.
+        let (code, rendered) = refused(&[
+            "query",
+            "plan",
+            "--profile",
+            "demo",
+            "--sql",
+            "select 1",
+            "--out",
+            "/tmp/x",
+            "--format",
+            "parquet",
+            "--role",
+            "X",
+            "--execute",
+            "--online",
+            "--dry-run",
+            "--json",
+        ]);
+        assert_eq!(code, 64, "{rendered}");
+        assert!(rendered.contains("\"code\":\"FSNOW-1002\""), "{rendered}");
+        assert!(
+            rendered.contains("`--out` is not a flag of `query plan`"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\"ok\":false"), "{rendered}");
+        // Suggestions come from the command's own flags.
+        let (code, rendered) = refused(&["query", "run", "--sql", "select 1", "--svg"]);
+        assert_eq!(code, 64, "{rendered}");
+        assert!(
+            rendered.contains("\"did_you_mean\":[\"--sql\"]"),
+            "{rendered}"
+        );
+        let (code, rendered) = refused(&["catalog", "graph", "demo", "--sql", "x"]);
+        assert_eq!(code, 64, "{rendered}");
+        assert!(
+            rendered.contains("\"did_you_mean\":[\"--svg\"]"),
+            "{rendered}"
+        );
+        for args in [
+            &["capabilities", "--profile", "demo"][..],
+            &["profile", "validate", "demo", "--online"],
+            &[
+                "catalog",
+                "scan",
+                "demo",
+                "--database",
+                "D",
+                "--schema",
+                "S",
+                "--profile",
+                "x",
+            ],
+            &["dataset", "inspect", "d1", "--execute"],
+            &[
+                "query",
+                "write",
+                "--profile",
+                "p",
+                "--sql",
+                "delete from t",
+                "--role",
+                "R",
+            ],
+            &[
+                "write",
+                "--profile",
+                "p",
+                "--sql",
+                "delete from t",
+                "--limit",
+                "5",
+            ],
+            &[
+                "export",
+                "run",
+                "--profile",
+                "p",
+                "--sql",
+                "select 1",
+                "--out",
+                "x.csv",
+                "--location",
+                "@s",
+            ],
+            &["mcp", "serve", "--stdio", "--profile", "p"],
+        ] {
+            let (code, rendered) = refused(args);
+            assert_eq!(code, 64, "{args:?}: {rendered}");
+            assert!(
+                rendered.contains("is not a flag of"),
+                "{args:?}: {rendered}"
+            );
+        }
+        // catalog diff's documented --base/--target were unreachable before.
+        let (_, rendered) = refused(&["catalog", "diff", "demo", "--base", "a", "--target", "b"]);
+        assert!(!rendered.contains("Unknown flag"), "{rendered}");
+        assert!(!rendered.contains("is not a flag of"), "{rendered}");
     }
 
     /// Persist a small fixture snapshot (one dataset, three columns) into the
@@ -5937,12 +6518,12 @@ mod tests {
             "select ';'",
             "where name = 'a;b'",
             "select 1 -- trailing; comment",
+            "select 1 // trailing; comment",
             "select /* a; b */ 1",
-            "select /* /* inner; */ outer */ 1",
-            "select /* /* inner */ ; outer */ 1",
             "select 'don\\'t; do that' from t",
             "select 1; -- trailing comment only",
             "select \"weird;col\" from t",
+            "select $$a;b$$ from t",
         ] {
             assert!(
                 !has_multiple_statements(sql),
@@ -5950,12 +6531,16 @@ mod tests {
             );
         }
         // Genuine separators (real content after a top-level `;`, or an empty
-        // statement) must still be detected.
+        // statement) must still be detected, and so must nested block comments,
+        // whose statement boundaries are ambiguous (fail closed; these two used
+        // to be accepted on the unverified assumption that comments nest).
         for sql in [
             "select 1; select 2",
             "select 1;;",
             "select 1; -- c\nselect 2",
             "insert into t values (1); select 1",
+            "select /* /* inner; */ outer */ 1",
+            "select /* /* inner */ ; outer */ 1",
         ] {
             assert!(
                 has_multiple_statements(sql),
@@ -5965,9 +6550,15 @@ mod tests {
     }
 
     #[test]
-    fn skip_balanced_sql_parens_handles_nested_comments_and_escapes() {
-        let sql = "(a, /* /* inner */ outer */ b, 'don\\'t', c)";
-        assert_eq!(skip_balanced_sql_parens(sql, 0), Some(sql.len()));
+    fn cte_reads_with_column_lists_and_escapes_stay_reads() {
+        // Replaces the old paren-skipper unit test: the shared lexer handles the
+        // same escapes inside CTE bodies.
+        assert!(is_select_like(
+            "with x (a, b) as (select 'don\\'t', /* c; */ 1) select * from x"
+        ));
+        assert!(!is_select_like(
+            "with x (a, b) as (select 'don\\'t', 1) delete from t"
+        ));
     }
 
     #[cfg(feature = "toon")]
@@ -6213,9 +6804,9 @@ mod tests {
             "--sql".to_owned(),
             "select ?".to_owned(),
             "--bindings-env".to_owned(),
-            "HFDT_TYPED_BINDINGS_JSON".to_owned(),
+            "ACME_TYPED_BINDINGS_JSON".to_owned(),
             "--query-tag".to_owned(),
-            "hfdt.trace.123".to_owned(),
+            "acme.trace.123".to_owned(),
         ])
         .map_err(|e| format!("{e:?}"))?;
 
@@ -6223,9 +6814,9 @@ mod tests {
             Command::QueryRun { options, .. } => {
                 assert_eq!(
                     options.bindings_env.as_deref(),
-                    Some("HFDT_TYPED_BINDINGS_JSON")
+                    Some("ACME_TYPED_BINDINGS_JSON")
                 );
-                assert_eq!(options.query_tag.as_deref(), Some("hfdt.trace.123"));
+                assert_eq!(options.query_tag.as_deref(), Some("acme.trace.123"));
             }
             other => {
                 assert!(
@@ -6652,27 +7243,89 @@ mod tests {
     fn profile_doctor_reports_lifetime_warnings_without_secret_values() {
         let rendered = render_json(&envelope_for(&["profile", "doctor", "demo-prod"]));
         assert!(rendered.contains("\"credential_lifetime_warnings\""));
-        assert!(rendered.contains("programmatic_access_token"));
-        assert!(rendered.contains("15-day lifetime"));
-        assert!(rendered.contains("key_pair_jwt"));
-        assert!(rendered.contains("one-hour cap"));
-        assert!(rendered.contains("oauth_bearer_token"));
-        assert!(rendered.contains("roughly 10-minute lifetime"));
-        assert!(rendered.contains("workload_identity"));
         assert!(rendered.contains("\"secret_values_read\":false"));
         assert!(!rendered.contains("snowflake_pat_"));
         assert!(!rendered.contains("BEGIN PRIVATE KEY"));
         assert!(!rendered.contains("eyJ"));
     }
 
+    /// Reality-check bead C5 addendum: lifetime guidance follows the configured
+    /// lane instead of one canned list for every profile.
     #[test]
-    fn profile_validate_includes_workload_identity_in_supported_lanes_and_handle_sets() {
+    fn credential_lifetime_guidance_follows_the_configured_lane() {
+        let render = |lane: Option<&str>, validity: Option<&str>| {
+            render_json(&Json::Array(credential_lifetime_warnings(lane, validity)))
+        };
+        let all = render(None, None);
+        for lane in ["\"pat\"", "\"key_pair_jwt\"", "\"oauth_bearer\""] {
+            assert!(all.contains(lane), "{all}");
+        }
+        let pat = render(Some("pat"), None);
+        assert!(pat.contains("15 days by default"), "{pat}");
+        assert!(
+            !pat.contains("key_pair_jwt") && !pat.contains("oauth_bearer"),
+            "{pat}"
+        );
+        let oauth = render(Some("oauth_bearer"), None);
+        assert!(oauth.contains("cannot refresh"), "{oauth}");
+        assert!(!oauth.contains("\"pat\""), "{oauth}");
+        assert!(render(Some("jwt"), None).contains("3600 s (Snowflake's cap)"));
+        let over = render(Some("key_pair_jwt"), Some("7200"));
+        assert!(over.contains("\"severity\":\"warning\""), "{over}");
+        assert!(
+            over.contains("7200, above Snowflake's 3600 s cap"),
+            "{over}"
+        );
+        let under = render(Some("key_pair_jwt"), Some(" 900 "));
+        assert!(under.contains("signed for 900 s"), "{under}");
+        assert!(!under.contains("warning"), "{under}");
+        assert!(render(Some("key_pair_jwt"), Some("0")).contains("\"severity\":\"error\""));
+        assert!(render(Some("key_pair_jwt"), Some("1h")).contains("not a whole number"));
+        assert!(render(Some("workload_identity"), None).contains("quarantined"));
+        assert_eq!(render(Some("bogus_lane"), None), "[]");
+    }
+
+    /// Reality-check bead C7a: the workload-identity lane is quarantined (its
+    /// token exchange is not Snowflake's documented SQL API protocol). It is no
+    /// longer advertised as supported, its handle set is marked quarantined, and
+    /// a profile that selects it gets a failing lane check.
+    #[test]
+    fn workload_identity_lane_is_quarantined_not_advertised() {
         let rendered = render_json(&envelope_for(&["profile", "validate", "demo-prod"]));
         assert!(rendered.contains("\"command_id\":\"profile.validate\""));
-        assert!(rendered.contains("\"workload_identity\""));
-        assert!(rendered.contains("FRANKEN_SNOWFLAKE_DEMO_PROD_OIDC_TOKEN"));
-        assert!(rendered.contains("FRANKEN_SNOWFLAKE_DEMO_PROD_OIDC_TOKEN_FILE"));
-        assert!(rendered.contains("FRANKEN_SNOWFLAKE_DEMO_PROD_OIDC_TOKEN_URL"));
+        assert!(
+            rendered
+                .contains("\"supported_auth_lanes\":[\"pat\",\"key_pair_jwt\",\"oauth_bearer\"]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("\"status\":\"quarantined\""),
+            "{rendered}"
+        );
+        assert_eq!(
+            classify_auth_lane("workload_identity"),
+            AuthLaneStatus::Quarantined
+        );
+        assert_eq!(classify_auth_lane("oidc"), AuthLaneStatus::Quarantined);
+        assert_eq!(classify_auth_lane("pat"), AuthLaneStatus::Supported);
+        assert_eq!(classify_auth_lane("bogus_lane"), AuthLaneStatus::Unknown);
+        let presence = health::HandlePresence {
+            auth_lane: Some("workload_identity".to_owned()),
+            required_missing: vec![],
+            handles: vec![],
+            account_error: None,
+        };
+        let data = render_json(&profile_diagnostics_data(
+            "demo-prod",
+            false,
+            "findings",
+            &presence,
+        ));
+        assert!(
+            data.contains("\"name\":\"auth_lane\",\"status\":\"fail\""),
+            "{data}"
+        );
+        assert!(data.contains("not Snowflake's documented"), "{data}");
     }
 
     #[test]
@@ -6702,15 +7355,126 @@ mod tests {
         );
     }
 
+    /// Reality-check bead C4: a check whose subject is not compiled into the
+    /// binary must say so (`skipped`), never `pass`. Before 2026-09-24 both of
+    /// these reported pass from hardcoded data in builds without the feature.
+    #[test]
+    fn selftest_reports_uncompiled_checks_as_skipped_not_pass() {
+        let rendered = render_json(&envelope_for(&["selftest", "--json"]));
+        let status_of = |name: &str| {
+            let marker = format!("\"name\":\"{name}\",\"status\":\"");
+            rendered
+                .split(&marker)
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .map(str::to_owned)
+        };
+        let expect = |compiled: bool| if compiled { "pass" } else { "skipped" };
+        assert_eq!(
+            status_of("frame_codec_mapping").as_deref(),
+            Some(expect(cfg!(feature = "frankenpandas"))),
+            "{rendered}"
+        );
+        assert_eq!(
+            status_of("text_indexing_provenance").as_deref(),
+            Some(expect(cfg!(feature = "frankensearch"))),
+            "{rendered}"
+        );
+        // Every compiled check really passes.
+        assert_eq!(status_of("read_only_guard").as_deref(), Some("pass"));
+    }
+
     #[test]
     fn read_guard_handles_nested_block_comments_fail_closed() {
-        // Snowflake nests block comments, so the mutation after the outer
-        // comment is what actually runs. The guard must not stop at the first
-        // `*/` (the selftest fixture that found this stays in place).
+        // Whether Snowflake nests block comments is undocumented, and the two
+        // readings disagree about what runs: `/* /* nested */ select 1 */ delete
+        // from t` is a DELETE if comments nest. The guard refuses every nested
+        // comment (tightened 2026-09-24: the last two used to be accepted as
+        // reads on the unverified nesting assumption; the reality-check live
+        // probe D5 can relax this with evidence).
         assert!(!is_select_like("/* /* nested */ select 1 */ delete from t"));
-        assert!(is_select_like("/* /* nested */ delete from t */ select 1"));
-        assert!(is_select_like("select /* /* a */ b */ 1"));
+        assert!(!is_select_like("/* /* nested */ delete from t */ select 1"));
+        assert!(!is_select_like("select /* /* a */ b */ 1"));
         assert!(!is_select_like("/* unterminated select 1"));
+        assert!(ambiguous_sql_reason("select /* /* a */ b */ 1").is_some());
+        assert!(ambiguous_sql_reason("/* unterminated select 1").is_some());
+        // Non-nested comments stay fine.
+        assert!(is_select_like("/* hint */ select /* a */ 1"));
+        assert!(ambiguous_sql_reason("/* hint */ select /* a */ 1").is_none());
+    }
+
+    #[test]
+    fn read_guard_closes_the_dollar_quote_bypass_and_side_effects() {
+        // 2026-09-23 audit: an apostrophe inside `$$...$$` opened a phantom
+        // quoted string that hid the real separator on the read AND write paths.
+        let drop = ["DR", "OP TABLE t"].concat();
+        assert!(has_multiple_statements(&format!(
+            "SELECT $$ it's $$; {drop}"
+        )));
+        assert!(has_multiple_statements(&format!(
+            "INSERT INTO t VALUES ($$it's$$); {drop}"
+        )));
+        assert!(!has_multiple_statements("SELECT $$ ; not a separator $$"));
+        // `$` inside identifiers and positional/variable refs is not a quote.
+        assert!(is_select_like("select system$typeof(1), a$b, $1 from @s"));
+        assert!(!has_multiple_statements("select $1, a$b from @s"));
+        // Side-effecting system functions and NEXTVAL are refused on the read path.
+        assert_eq!(
+            read_side_effect("SELECT SYSTEM$CANCEL_ALL_QUERIES(1)").as_deref(),
+            Some("system$cancel_all_queries")
+        );
+        assert!(!is_select_like("SELECT SYSTEM$CANCEL_ALL_QUERIES(1)"));
+        assert!(!is_select_like("select seq1.nextval"));
+        assert!(is_select_like("select system$wait(1)"));
+        // A parenthesized query is a read; leading garbage is not.
+        assert!(is_select_like("(select 1)"));
+        assert!(!is_select_like("€€ select 1"));
+    }
+
+    #[test]
+    fn query_plan_names_the_refusal_reason() {
+        let ambiguous = render_json(&envelope_for(&[
+            "query",
+            "plan",
+            "--profile",
+            "demo",
+            "--sql",
+            "select /* /* a */ b */ 1",
+            "--json",
+        ]));
+        assert!(ambiguous.contains("\"code\":\"FSNOW-3002\""), "{ambiguous}");
+        assert!(ambiguous.contains("nests a block comment"), "{ambiguous}");
+        assert!(
+            !ambiguous.contains("Multiple SQL statements"),
+            "{ambiguous}"
+        );
+        let side_effect = render_json(&envelope_for(&[
+            "query",
+            "plan",
+            "--profile",
+            "demo",
+            "--sql",
+            "select system$abort_session(1)",
+            "--json",
+        ]));
+        assert!(
+            side_effect.contains("\"code\":\"FSNOW-3001\""),
+            "{side_effect}"
+        );
+        assert!(
+            side_effect.contains("SYSTEM$ABORT_SESSION"),
+            "{side_effect}"
+        );
+        let benign = render_json(&envelope_for(&[
+            "query",
+            "plan",
+            "--profile",
+            "demo",
+            "--sql",
+            "select system$typeof(1)",
+            "--json",
+        ]));
+        assert!(benign.contains("\"ok\":true"), "{benign}");
     }
 
     #[cfg(not(feature = "live"))]
@@ -6856,6 +7620,7 @@ mod tests {
             require_idempotency_request_id: true,
             require_append_only_audit: false,
             statement_allowlist: vec![StatementAllowlistEntry::new(cli_allowlist_id(kind), kind)],
+            ..WriteIntentPolicy::default()
         }
     }
 
@@ -7026,6 +7791,22 @@ mod tests {
         req.dry_run = true;
         req.allowlist_id = Some(cli_allowlist_id(WriteStatementKind::Insert));
         req.request_id = Some(RequestId::new("direct-req"));
+        // The audit rung is real (bead B4): without an append-only audit
+        // intent (no writable local store) the write does not proceed.
+        let unaudited = evaluate_write_intent(&req, &policy);
+        assert!(
+            matches!(
+                unaudited,
+                WriteIntentDecision::Refused {
+                    refusal: WriteIntentRefusal {
+                        code: WriteIntentRefusalCode::MissingAppendOnlyAudit,
+                        ..
+                    }
+                }
+            ),
+            "{unaudited:?}"
+        );
+        req.audit_intent = Some(AppendOnlyAuditIntent::append_only("test-audit"));
         // No confirmation token supplied — the default path needs none.
         let decision = evaluate_write_intent(&req, &policy);
         assert!(
@@ -7049,6 +7830,7 @@ mod tests {
         req.dry_run = true;
         req.allowlist_id = Some(cli_allowlist_id(WriteStatementKind::Insert));
         req.request_id = Some(RequestId::new("confirm-req"));
+        req.audit_intent = Some(AppendOnlyAuditIntent::append_only("test-audit"));
 
         let refused = evaluate_write_intent(&req, &policy);
         assert!(
@@ -7082,14 +7864,88 @@ mod tests {
         assert!(!off.allow_ddl);
         assert!(!off.require_dry_run);
         assert!(!off.require_exact_confirmation);
-        assert!(!off.require_append_only_audit);
+        assert!(off.require_append_only_audit);
+        assert!(!off.allow_procedures && !off.allow_external_unload);
+        assert_eq!(off.allowed_kinds, None);
 
         let strict = write_policy_from_flags(true, true, true, WriteStatementKind::Create);
         assert!(strict.enabled);
         assert!(strict.allow_ddl);
         assert!(strict.require_dry_run);
         assert!(strict.require_exact_confirmation);
-        assert!(!strict.require_append_only_audit);
+        assert!(strict.require_append_only_audit);
+    }
+
+    /// Reality-check bead B4: a token whose write already completed is refused,
+    /// as are a token for other SQL and a forged id; a fresh one is accepted.
+    #[test]
+    fn verify_confirmation_refuses_spent_foreign_and_unknown_tokens() -> Result<(), String> {
+        let store = local_store::open_store().map_err(|error| error.message())?;
+        let sql = "insert into spent_check values (1)";
+        let kind = WriteStatementKind::Insert;
+        let id = local_store::random_id()?;
+        record_issued_confirmation(&store, "trace-spent", "spent_profile", sql, kind, &id)?;
+        let token = format!("confirm:insert:{id}");
+        assert_eq!(
+            verify_confirmation(Some(&store), "spent_profile", sql, kind, &token),
+            Ok(id.clone())
+        );
+        let other = verify_confirmation(
+            Some(&store),
+            "spent_profile",
+            "insert into spent_check values (2)",
+            kind,
+            &token,
+        );
+        assert!(
+            other
+                .as_ref()
+                .is_err_and(|reason| reason.contains("different statement")),
+            "{other:?}"
+        );
+        let forged = verify_confirmation(
+            Some(&store),
+            "spent_profile",
+            sql,
+            kind,
+            "confirm:insert:00000000-0000-4000-8000-000000000000",
+        );
+        assert!(
+            forged
+                .as_ref()
+                .is_err_and(|reason| reason.contains("no dry run")),
+            "{forged:?}"
+        );
+        local_store::record_confirmation_consumed(&store, "trace-spent-2", &id, Some("receipt-x"))
+            .map_err(|error| error.to_string())?;
+        let spent = verify_confirmation(Some(&store), "spent_profile", sql, kind, &token);
+        assert!(
+            spent.as_ref().is_err_and(
+                |reason| reason.contains("already used") && reason.contains("receipt-x")
+            ),
+            "{spent:?}"
+        );
+        assert!(verify_confirmation(None, "spent_profile", sql, kind, &token).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn write_allowed_kinds_parse_strictly() {
+        assert_eq!(
+            parse_allowed_kinds("insert, MERGE,copy_into_table"),
+            Ok(vec![
+                WriteStatementKind::Insert,
+                WriteStatementKind::Merge,
+                WriteStatementKind::CopyIntoTable
+            ])
+        );
+        // An unknown kind is an error, never silently dropped.
+        assert_eq!(
+            parse_allowed_kinds("insert,upsert"),
+            Err("upsert".to_owned())
+        );
+        // Kinds the SQL API cannot run alone are not allowlistable at all.
+        assert_eq!(parse_allowed_kinds("put"), Err("put".to_owned()));
     }
 
     #[test]
@@ -7100,10 +7956,16 @@ mod tests {
             OutputFormat::Json,
             "req-test".to_string(),
             "demo".to_string(),
+            "insert into staging.events values (1)",
             &plan,
         );
         assert_eq!(outcome.status.code(), 0);
         let rendered = render_outcome(outcome);
+        // Secret-free SQL is echoed runnable in the confirm command.
+        assert!(
+            rendered.contains("--sql \\\"insert into staging.events values (1)\\\""),
+            "{rendered}"
+        );
         assert!(rendered.contains("\"command_id\":\"query.write\""));
         assert!(rendered.contains("\"ok\":true"));
         assert!(rendered.contains("\"execution_enabled\":false"));
@@ -7128,6 +7990,7 @@ mod tests {
             "demo".to_string(),
             "insert into t values (1)",
             &plan,
+            false,
         );
         assert_ne!(outcome.status.code(), 0, "no-transport build must refuse");
         let rendered = render_outcome(outcome);
@@ -7152,6 +8015,7 @@ mod tests {
             "no_creds_profile".to_string(),
             "insert into t values (1)",
             &plan,
+            false,
         );
         assert_ne!(
             outcome.status.code(),
