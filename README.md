@@ -7,7 +7,7 @@
 **A clean-room, Rust-first Snowflake SQL API connector built for coding agents.**
 
 ![License](https://img.shields.io/badge/license-MIT%20%2B%20OpenAI%2FAnthropic%20rider-blue)
-![Status](https://img.shields.io/badge/status-alpha%20%C2%B7%20CLI%20live%20proof%20pending-orange)
+![Status](https://img.shields.io/badge/status-alpha%20%C2%B7%20live%20reads%20proven%2C%20writes%20pending-orange)
 ![Language](https://img.shields.io/badge/language-Rust%202024-dea584)
 ![Runtime](https://img.shields.io/badge/runtime-Asupersync-8A2BE2)
 ![Forbidden deps](https://img.shields.io/badge/no-Tokio%20%C2%B7%20reqwest%20%C2%B7%20hyper-critical)
@@ -590,8 +590,9 @@ convention (or a VARIANT holding a number a JSON number cannot carry exactly,
 such as an integer beyond 64 bits) keeps the wire strings for all of its cells,
 `json_repr: "wire"`, and a warning names the column. `--raw-cells` returns
 every cell as the SQL API sent it (`row_encoding: "jsonv2.wire"`). The
-conventions follow the SQL API documentation; a live capture has not confirmed
-them yet. Local CSV and JSONL exports write DATE, TIME and TIMESTAMP cells in
+conventions follow the SQL API documentation, and a live capture confirmed them
+on 2026-09-28 (`crates/franken-snowflake-frame/tests/captured/jsonv2-wire-golden.json`,
+checked cell by cell against the literals it selected). Local CSV and JSONL exports write DATE, TIME and TIMESTAMP cells in
 the same text forms; other cells keep their wire text (JSONL writes numbers and
 booleans as JSON literals and VARIANT verbatim).
 
@@ -1084,9 +1085,11 @@ confirmation required, `FSNOW-3009` DDL not opted in) with an exact next command
 
 **Is this usable today?** For offline contract work, planning, and CI, yes: the
 default credential-free build covers them. The live path (`--features live` plus
-a profile's credential handles) is implemented for reads and writes; its last
-live proof is a driver-level read against a trial account (2026-06-26), and the
-end-to-end CLI run against a live account, including writes, is still pending.
+a profile's credential handles) is implemented for reads and writes. The CLI's
+reads ran end to end against a live account on 2026-09-28: the
+`scripts/live-proof-cli.sh` battery; a cell-by-cell match with the official
+Python connector; a Parquet readback; an in-flight cancel. Writes have not run
+live yet. See `docs/live_proof.md`.
 
 **How do I load or write data?** Enable writes for the profile with `export
 FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ENABLED=true`, then run `query write`: with the

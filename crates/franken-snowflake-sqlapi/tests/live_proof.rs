@@ -334,7 +334,18 @@ fn opt_in_live_sql_api_proof_lanes() -> Result<(), String> {
         }
     };
 
-    match run_live_lanes(&profile, &mut logger) {
+    // The driver's futures are large in a debug build; on the default 2 MiB
+    // test thread the first credentialed run (2026-09-28) overflowed the stack.
+    let lanes = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("live-proof-lanes".to_owned())
+            .stack_size(32 * 1024 * 1024)
+            .spawn_scoped(scope, || run_live_lanes(&profile, &mut logger))
+            .map_err(|error| format!("could not start the lanes thread: {error}"))?
+            .join()
+            .map_err(|_| "the live lanes thread panicked".to_owned())?
+    });
+    match lanes {
         Ok(()) => {
             let summary = logger.finish().map_err(|error| error.to_string())?;
             if summary.ok() {

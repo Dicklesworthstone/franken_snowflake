@@ -189,6 +189,23 @@ Fail-closed decisions:
   per the [SQL API reference](https://docs.snowflake.com/en/developer-guide/sql-api/reference);
   the parameter can also be set at account level, so it is pinned explicitly.)
 
+Live findings (2026-09-28, bead oj0.23; `sql_guard_*` steps of
+`scripts/live-proof-cli.sh`): each request pinned `MULTI_STATEMENT_COUNT` to the
+lexer's count, and Snowflake accepted every one. Its statement count therefore
+matched the lexer's for all of these shapes:
+
+- semicolons inside a string, a backslash-escaped string, a `$$` string and a
+  quoted identifier;
+- semicolons inside `--`, `//` and `/* */` comments;
+- a trailing `;`, and a trailing `;` followed by a line comment (one statement,
+  not two);
+- two statements (with `--allow-multiple-statements`).
+
+Two things are not probed. Nested block comments never reach the server,
+because the lexer refuses them locally. Whether an account- or user-level
+`MULTI_STATEMENT_COUNT` changes the default when a request omits it would
+require altering a user parameter on the test account.
+
 The strongest read-only guarantee is still Snowflake RBAC: give read profiles a
 role that cannot write (reality-check bead L4 adds a `profile doctor --online`
 check for this).

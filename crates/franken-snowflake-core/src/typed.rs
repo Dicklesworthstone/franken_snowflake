@@ -837,6 +837,61 @@ mod tests {
         assert_eq!(wire_fallbacks(&golden), Vec::<String>::new());
     }
 
+    /// The live capture decodes to the very literals its statement selected
+    /// (scripts/capture-jsonv2-golden.sh): the SQL is the ground truth, so a
+    /// codec that misread the units (nanoseconds for seconds), the TZ offset
+    /// bias, or the pre-epoch borrow fails here by value, not just by type.
+    #[test]
+    fn the_live_capture_decodes_to_the_literals_it_selected() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../franken-snowflake-frame/tests/captured/jsonv2-wire-golden.json");
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            println!("skip: no live capture at {}", path.display());
+            return;
+        };
+        let golden: Value = serde_json::from_str(&raw).expect("capture is JSON");
+        let expected = serde_json::json!({
+            // NUMBER(38,0): precision over 15 stays an exact decimal string.
+            "NUM_INT": "12345",
+            "NUM_BEYOND_I64": "99999999999999999999",
+            "NUM_SCALE": "123.45",
+            "NUM_NEGATIVE_SCALE": "-0.000001000",
+            "FLOAT_VAL": 1.5,
+            "FLOAT_NAN": "NaN",
+            "DECFLOAT_VAL": "1.5",
+            "BOOL_TRUE": true,
+            "BOOL_FALSE": false,
+            "DATE_VAL": "2026-09-04",
+            "DATE_PRE_EPOCH": "1969-12-31",
+            "TIME_VAL": "12:34:56.123456000",
+            "TS_NTZ": "2026-09-04T12:34:56.123456789",
+            "TS_NTZ_PRE_EPOCH": "1969-12-31T23:59:59.500000000",
+            "TS_TZ": "2026-09-04T12:34:56.123456789+05:30",
+            "TS_LTZ": "2026-09-04T12:34:56.123456789Z",
+            "BINARY_VAL": "676F6C64656E",
+            "VARIANT_VAL": {"k": [1, {"nested": true}], "s": "v"},
+            "OBJECT_VAL": {"k": 1},
+            "ARRAY_VAL": [1, "two"],
+            "NULL_VAL": null,
+            "VARCHAR_VAL": "text"
+        });
+        let columns = golden["columns"].as_array().expect("columns");
+        let row = golden["rows"][0].as_array().expect("row");
+        assert_eq!(columns.len(), expected.as_object().expect("map").len());
+        for (index, column) in columns.iter().enumerate() {
+            let name = column["name"].as_str().expect("name");
+            let codec = ColumnCodec::new(
+                column["type"].as_str().unwrap_or_default(),
+                column["precision"].as_i64(),
+                column["scale"].as_i64(),
+            );
+            let decoded = codec
+                .decode(row[index].as_str())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(decoded, expected[name], "{name} (wire {})", row[index]);
+        }
+    }
+
     /// The check has teeth: a DATE captured under a pinned DATE_OUTPUT_FORMAT
     /// (`"2026-09-04"`, not epoch days) is flagged; the documented encoding is not.
     #[test]

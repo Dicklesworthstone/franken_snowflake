@@ -1,0 +1,209 @@
+{
+ "schema": "franken_snowflake.jsonv2_wire_golden.v1",
+ "captured_via": "cli query run (cells are literal wire strings)",
+ "columns": [
+  {
+   "name": "NUM_INT",
+   "type": "fixed",
+   "nullable": false,
+   "precision": 38,
+   "scale": 0,
+   "json_repr": "wire"
+  },
+  {
+   "name": "NUM_BEYOND_I64",
+   "type": "fixed",
+   "nullable": false,
+   "precision": 38,
+   "scale": 0,
+   "json_repr": "wire"
+  },
+  {
+   "name": "NUM_SCALE",
+   "type": "fixed",
+   "nullable": false,
+   "precision": 10,
+   "scale": 2,
+   "json_repr": "wire"
+  },
+  {
+   "name": "NUM_NEGATIVE_SCALE",
+   "type": "fixed",
+   "nullable": false,
+   "precision": 38,
+   "scale": 9,
+   "json_repr": "wire"
+  },
+  {
+   "name": "FLOAT_VAL",
+   "type": "real",
+   "nullable": false,
+   "precision": null,
+   "scale": null,
+   "json_repr": "wire"
+  },
+  {
+   "name": "FLOAT_NAN",
+   "type": "real",
+   "nullable": false,
+   "precision": null,
+   "scale": null,
+   "json_repr": "wire"
+  },
+  {
+   "name": "DECFLOAT_VAL",
+   "type": "decfloat",
+   "nullable": false,
+   "precision": 38,
+   "scale": null,
+   "json_repr": "wire"
+  },
+  {
+   "name": "BOOL_TRUE",
+   "type": "boolean",
+   "nullable": true,
+   "precision": null,
+   "scale": null,
+   "json_repr": "wire"
+  },
+  {
+   "name": "BOOL_FALSE",
+   "type": "boolean",
+   "nullable": true,
+   "precision": null,
+   "scale": null,
+   "json_repr": "wire"
+  },
+  {
+   "name": "DATE_VAL",
+   "type": "date",
+   "nullable": false,
+   "precision": null,
+   "scale": null,
+   "json_repr": "wire"
+  },
+  {
+   "name": "DATE_PRE_EPOCH",
+   "type": "date",
+   "nullable": false,
+   "precision": null,
+   "scale": null,
+   "json_repr": "wire"
+  },
+  {
+   "name": "TIME_VAL",
+   "type": "time",
+   "nullable": false,
+   "precision": 0,
+   "scale": 9,
+   "json_repr": "wire"
+  },
+  {
+   "name": "TS_NTZ",
+   "type": "timestamp_ntz",
+   "nullable": false,
+   "precision": 0,
+   "scale": 9,
+   "json_repr": "wire"
+  },
+  {
+   "name": "TS_NTZ_PRE_EPOCH",
+   "type": "timestamp_ntz",
+   "nullable": false,
+   "precision": 0,
+   "scale": 9,
+   "json_repr": "wire"
+  },
+  {
+   "name": "TS_TZ",
+   "type": "timestamp_tz",
+   "nullable": false,
+   "precision": 0,
+   "scale": 9,
+   "json_repr": "wire"
+  },
+  {
+   "name": "TS_LTZ",
+   "type": "timestamp_ltz",
+   "nullable": false,
+   "precision": 0,
+   "scale": 9,
+   "json_repr": "wire"
+  },
+  {
+   "name": "BINARY_VAL",
+   "type": "binary",
+   "nullable": false,
+   "precision": null,
+   "scale": null,
+   "json_repr": "wire"
+  },
+  {
+   "name": "VARIANT_VAL",
+   "type": "variant",
+   "nullable": true,
+   "precision": null,
+   "scale": null,
+   "json_repr": "wire"
+  },
+  {
+   "name": "OBJECT_VAL",
+   "type": "object",
+   "nullable": true,
+   "precision": null,
+   "scale": null,
+   "json_repr": "wire"
+  },
+  {
+   "name": "ARRAY_VAL",
+   "type": "array",
+   "nullable": true,
+   "precision": null,
+   "scale": null,
+   "json_repr": "wire"
+  },
+  {
+   "name": "NULL_VAL",
+   "type": "text",
+   "nullable": true,
+   "precision": null,
+   "scale": null,
+   "json_repr": "wire"
+  },
+  {
+   "name": "VARCHAR_VAL",
+   "type": "text",
+   "nullable": false,
+   "precision": null,
+   "scale": null,
+   "json_repr": "wire"
+  }
+ ],
+ "rows": [
+  [
+   "12345",
+   "99999999999999999999",
+   "123.45",
+   "-0.000001000",
+   "1.5",
+   "NaN",
+   "1.5",
+   "true",
+   "false",
+   "20700",
+   "-1",
+   "45296.123456000",
+   "1788525296.123456789",
+   "-0.500000000",
+   "1788505496.123456789 1770",
+   "1788525296.123456789",
+   "676F6C64656E",
+   "{\n  \"k\": [\n    1,\n    {\n      \"nested\": true\n    }\n  ],\n  \"s\": \"v\"\n}",
+   "{\n  \"k\": 1\n}",
+   "[\n  1,\n  \"two\"\n]",
+   null,
+   "text"
+  ]
+ ],
+ "session_tz": "UTC (pinned in the request by the CLI)"
+}

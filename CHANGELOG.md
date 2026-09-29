@@ -54,9 +54,8 @@ implementation first and the test/hardening pass follows in a later wave. The
   is gated at runtime by credential availability. Reads (`query run`,
   `catalog scan`, `profile doctor --online`) and writes (`query write`) both run
   through it. The release binaries are built with `--features live,mcp`. The
-  CLI has not yet run against a live account: its proof is the no-account
-  suites (socket-level e2e over real TLS against a mock SQL API, and DPOR over
-  the production driver).
+  CLI's reads first ran against a live account on 2026-09-28 (see
+  `docs/live_proof.md`); writes have not run live yet.
 
 ## Version Timeline
 
@@ -154,6 +153,27 @@ implementation first and the test/hardening pass follows in a later wave. The
 - A result that Snowflake marks too large (code `391908`: "the response does
   not include the entire result set") is a typed error naming the fix, never
   returned as a complete result.
+
+### Verified live
+
+- 2026-09-28: the CLI's first end-to-end run against a live Snowflake account
+  (key-pair JWT), recorded in `docs/live_proof.md`:
+  - the `scripts/live-proof-cli.sh` battery (28 steps passed);
+  - the driver-level `live_proof` lanes, including an async cancel and a
+    two-partition, 50 000-row fetch;
+  - a cell-by-cell match with snowflake-connector-python 4.7.5 (27/27 columns);
+  - a Parquet readback (27/27 at nanosecond precision);
+  - a SIGINT cancel of an in-flight statement, acknowledged by Snowflake.
+
+  The result-encoding capture confirmed the codec: timestamps are fractional
+  epoch seconds, not nanoseconds. It is now a checked-in golden that the tests
+  decode cell by cell. Snowflake's statement count matched the lexer's on every
+  probed shape.
+
+### Fixed
+
+- The driver-level live-proof test overflowed its thread stack in a debug
+  build; its lanes now run on a thread with a 32 MiB stack.
 
 ### Added
 
