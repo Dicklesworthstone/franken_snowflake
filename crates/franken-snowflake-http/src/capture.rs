@@ -115,8 +115,9 @@ impl TranscriptBody {
 /// Writes redacted transcripts into one directory.
 pub struct TranscriptRecorder {
     dir: PathBuf,
-    /// Account host and account name, replaced wherever they appear.
-    account_strings: Vec<(String, &'static str)>,
+    /// Account host, account name and registered identifiers (user,
+    /// warehouse, database, ...), replaced wherever they appear, longest first.
+    account_strings: Vec<(String, String)>,
     secrets: Vec<String>,
     state: Mutex<RecorderState>,
 }
@@ -145,9 +146,9 @@ impl TranscriptRecorder {
     pub fn new(dir: impl Into<PathBuf>, host: &str) -> std::io::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
-        let mut account_strings = vec![(host.to_owned(), "<account-host>")];
+        let mut account_strings = vec![(host.to_owned(), "<account-host>".to_owned())];
         if let Some(account) = host.split('.').next().filter(|a| a.len() >= 3) {
-            account_strings.push((account.to_owned(), "<account>"));
+            account_strings.push((account.to_owned(), "<account>".to_owned()));
         }
         Ok(Self {
             dir,
@@ -168,6 +169,28 @@ impl TranscriptRecorder {
             .map(|secret| secret.trim().to_owned())
             .filter(|secret| secret.len() >= MIN_TOKEN_LEN)
             .collect();
+        self
+    }
+
+    /// Deployment names to replace with a placeholder wherever they appear
+    /// (case-insensitive), e.g. `("ANALYTICS_WH", "<warehouse>")`: a
+    /// transcript promoted to a public fixture must not name the account's
+    /// user, warehouse, database, schema or role. Values shorter than three
+    /// characters are ignored (they would match ordinary text).
+    #[must_use]
+    pub fn with_identifiers(
+        mut self,
+        names: impl IntoIterator<Item = (String, &'static str)>,
+    ) -> Self {
+        for (value, placeholder) in names {
+            let value = value.trim().to_owned();
+            if value.len() >= 3 {
+                self.account_strings.push((value, placeholder.to_owned()));
+            }
+        }
+        // Longest first, so `ANALYTICS_WH` is `<warehouse>`, not `<user>_WH`.
+        self.account_strings
+            .sort_by_key(|entry| std::cmp::Reverse(entry.0.len()));
         self
     }
 
@@ -264,7 +287,7 @@ impl TranscriptRecorder {
             out = out.replace(id.as_str(), placeholder);
         }
         for (value, placeholder) in &self.account_strings {
-            out = replace_ignore_ascii_case(&out, value, placeholder);
+            out = replace_ignore_ascii_case(&out, value, placeholder.as_str());
         }
         out
     }
@@ -760,6 +783,42 @@ mod tests {
             ),
         );
         assert!(!out.join("002-poll.json").exists() && !out.join("001-poll.json").exists());
+    }
+
+    /// Registered deployment names are replaced case-insensitively, the
+    /// longest first; a two-letter name is ignored rather than eating text.
+    #[test]
+    fn deployment_names_become_placeholders() {
+        let out = dir("identifiers");
+        let recorder = TranscriptRecorder::new(&out, HOST)
+            .expect("recorder")
+            .with_identifiers([
+                ("ANALYST".to_owned(), "<user>"),
+                ("ANALYST_WH".to_owned(), "<warehouse>"),
+                ("SALES_DB".to_owned(), "<database>"),
+                ("QA".to_owned(), "<schema>"),
+            ]);
+        recorder.record(
+            "POST",
+            &format!("https://{HOST}/api/v2/statements"),
+            &[],
+            br#"{"statement":"select 1","warehouse":"analyst_wh","database":"SALES_DB","schema":"QA"}"#,
+            &Response::new(
+                200,
+                "OK",
+                br#"{"data":[["ANALYST","CONSULTANT_ANALYST"]],"code":"090001"}"#.to_vec(),
+            ),
+        );
+        let text = read(&out, "001-submit.json");
+        for name in ["ANALYST", "analyst", "SALES_DB"] {
+            assert!(!text.contains(name), "{name} left in {text}");
+        }
+        assert!(text.contains(r#""warehouse": "<warehouse>""#), "{text}");
+        assert!(text.contains("CONSULTANT_<user>"), "{text}");
+        assert!(
+            text.contains(r#""schema": "QA""#),
+            "short names stay: {text}"
+        );
     }
 
     #[test]

@@ -4358,8 +4358,23 @@ fn transcript_recorder(conn: &LiveConn) -> Option<Arc<TranscriptRecorder>> {
                 .map(str::to_owned),
         );
     }
+    // Deployment names stay out of transcripts that may become public fixtures.
+    let mut identifiers = vec![
+        (conn.user.clone(), "<user>"),
+        (conn.warehouse.clone(), "<warehouse>"),
+    ];
+    identifiers.extend(conn.database.clone().map(|name| (name, "<database>")));
+    identifiers.extend(
+        conn.schema
+            .clone()
+            .filter(|name| !name.eq_ignore_ascii_case("PUBLIC"))
+            .map(|name| (name, "<schema>")),
+    );
+    identifiers.extend(conn.role.clone().map(|name| (name, "<role>")));
     match TranscriptRecorder::new(&dir, conn.endpoint.host()) {
-        Ok(recorder) => Some(Arc::new(recorder.with_secrets(secrets))),
+        Ok(recorder) => Some(Arc::new(
+            recorder.with_secrets(secrets).with_identifiers(identifiers),
+        )),
         Err(error) => {
             eprintln!("{CAPTURE_DIR_ENV}: capture is off, `{dir}` could not be created: {error}");
             None
