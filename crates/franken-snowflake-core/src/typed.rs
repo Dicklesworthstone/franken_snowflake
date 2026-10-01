@@ -242,7 +242,8 @@ impl ColumnCodec {
                     reason: "not an integer",
                 }),
             JsonRepr::DecimalString => {
-                if is_decimal(wire) {
+                // FIXED arrives as plain digits; only DECFLOAT uses an exponent.
+                if is_decimal(wire, self.logical == LogicalType::Decfloat) {
                     Ok(Value::String(wire.to_owned()))
                 } else {
                     Err(TypedCellError {
@@ -296,9 +297,44 @@ impl ColumnCodec {
                         reason: "holds a number a JSON number cannot carry exactly",
                     });
                 }
-                serde_json::from_str(wire).map_err(|_| TypedCellError { reason: "not JSON" })
+                serde_json::from_str(wire)
+                    .map(canonical_numbers)
+                    .map_err(|_| TypedCellError { reason: "not JSON" })
             }
         }
+    }
+}
+
+/// Rebuild every number as the `i64` or `f64` JSON number the exactness check
+/// admitted, so a cell decodes to the same value whether or not serde_json's
+/// `arbitrary_precision` feature is on in the build (it keeps a literal's
+/// spelling: `1.5e-3` rather than `0.0015`). One spelling still differs: that
+/// parser reads the integer literal `-0` as `0`, the default one as `-0.0`.
+fn canonical_numbers(value: Value) -> Value {
+    match value {
+        Value::Number(number) => canonical_number(number),
+        Value::Array(items) => Value::Array(items.into_iter().map(canonical_numbers).collect()),
+        Value::Object(entries) => Value::Object(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key, canonical_numbers(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn canonical_number(number: serde_json::Number) -> Value {
+    let text = number.to_string();
+    let integer = text
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b'-');
+    if integer && let Some(value) = number.as_i64() {
+        return Value::from(value);
+    }
+    match number.as_f64().and_then(serde_json::Number::from_f64) {
+        Some(float) => Value::Number(float),
+        None => Value::Number(number),
     }
 }
 
@@ -361,22 +397,23 @@ fn number_is_exact(token: &str) -> bool {
 
 /// `[-+]digits[.digits]`, as FIXED and DECFLOAT arrive; DECFLOAT may carry an
 /// exponent (`1.5E+39`).
-fn is_decimal(text: &str) -> bool {
+fn is_decimal(text: &str, allow_exponent: bool) -> bool {
     let unsigned = text.strip_prefix(['-', '+']).unwrap_or(text);
     let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
         Some((mantissa, exponent)) => (mantissa, Some(exponent)),
         None => (unsigned, None),
     };
-    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    let digits = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
-    let mantissa_ok = !whole.is_empty()
-        && digits(whole)
-        && digits(fraction)
-        && (fraction.is_empty() || !mantissa.ends_with('.'));
-    let exponent_ok = exponent.is_none_or(|exponent| {
-        let exponent = exponent.strip_prefix(['-', '+']).unwrap_or(exponent);
-        !exponent.is_empty() && digits(exponent)
-    });
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    let mantissa_ok = match mantissa.split_once('.') {
+        Some((whole, fraction)) => digits(whole) && digits(fraction),
+        None => digits(mantissa),
+    };
+    let exponent_ok = match exponent {
+        None => true,
+        Some(exponent) => {
+            allow_exponent && digits(exponent.strip_prefix(['-', '+']).unwrap_or(exponent))
+        }
+    };
     mantissa_ok && exponent_ok
 }
 
@@ -716,6 +753,12 @@ mod tests {
             ),
             serde_json::json!({"id": i64::MIN, "x": 0.0015})
         );
+        // The same value in every build, whatever the literal's spelling.
+        assert_eq!(
+            decode("variant", None, None, "[1e2, 7, 2.50]"),
+            serde_json::json!([100.0, 7, 2.5])
+        );
+        assert_eq!(decode("variant", None, None, "-0").as_f64(), Some(0.0));
         // Digits inside strings are text, not numbers.
         assert_eq!(
             decode("variant", None, None, r#"{"s":"99999999999999999999\"1"}"#),
@@ -754,6 +797,118 @@ mod tests {
         assert_eq!(
             LogicalType::from_row_type("timestamp_tz"),
             LogicalType::TimestampTz
+        );
+    }
+
+    /// Columns of a `jsonv2_wire_golden.v1` capture (as
+    /// `scripts/capture-jsonv2-golden.sh` writes it) holding a cell their
+    /// codec cannot type, i.e. columns `typed.v1` would leave as wire strings.
+    fn wire_fallbacks(golden: &Value) -> Vec<String> {
+        let columns = golden["columns"].as_array().expect("columns");
+        let rows = golden["rows"].as_array().expect("rows");
+        assert!(!rows.is_empty(), "the capture has rows");
+        columns
+            .iter()
+            .enumerate()
+            .filter(|(index, column)| {
+                let codec = ColumnCodec::new(
+                    column["type"].as_str().unwrap_or_default(),
+                    column["precision"].as_i64(),
+                    column["scale"].as_i64(),
+                );
+                rows.iter()
+                    .any(|row| codec.decode(row[*index].as_str()).is_err())
+            })
+            .map(|(_, column)| format!("{} ({})", column["name"], column["type"]))
+            .collect()
+    }
+
+    /// The live capture (bead w0i.13), once checked in, decodes cell by cell:
+    /// a column left as wire strings is a codec assumption the wire disproves.
+    #[test]
+    fn a_checked_in_live_capture_types_every_column() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../franken-snowflake-frame/tests/captured/jsonv2-wire-golden.json");
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            println!("skip: no live capture at {}", path.display());
+            return;
+        };
+        let golden: Value = serde_json::from_str(&raw).expect("capture is JSON");
+        assert_eq!(wire_fallbacks(&golden), Vec::<String>::new());
+    }
+
+    /// The live capture decodes to the very literals its statement selected
+    /// (scripts/capture-jsonv2-golden.sh): the SQL is the ground truth, so a
+    /// codec that misread the units (nanoseconds for seconds), the TZ offset
+    /// bias, or the pre-epoch borrow fails here by value, not just by type.
+    #[test]
+    fn the_live_capture_decodes_to_the_literals_it_selected() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../franken-snowflake-frame/tests/captured/jsonv2-wire-golden.json");
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            println!("skip: no live capture at {}", path.display());
+            return;
+        };
+        let golden: Value = serde_json::from_str(&raw).expect("capture is JSON");
+        let expected = serde_json::json!({
+            // NUMBER(38,0): precision over 15 stays an exact decimal string.
+            "NUM_INT": "12345",
+            "NUM_BEYOND_I64": "99999999999999999999",
+            "NUM_SCALE": "123.45",
+            "NUM_NEGATIVE_SCALE": "-0.000001000",
+            "FLOAT_VAL": 1.5,
+            "FLOAT_NAN": "NaN",
+            "DECFLOAT_VAL": "1.5",
+            "BOOL_TRUE": true,
+            "BOOL_FALSE": false,
+            "DATE_VAL": "2026-09-04",
+            "DATE_PRE_EPOCH": "1969-12-31",
+            "TIME_VAL": "12:34:56.123456000",
+            "TS_NTZ": "2026-09-04T12:34:56.123456789",
+            "TS_NTZ_PRE_EPOCH": "1969-12-31T23:59:59.500000000",
+            "TS_TZ": "2026-09-04T12:34:56.123456789+05:30",
+            "TS_LTZ": "2026-09-04T12:34:56.123456789Z",
+            "BINARY_VAL": "676F6C64656E",
+            "VARIANT_VAL": {"k": [1, {"nested": true}], "s": "v"},
+            "OBJECT_VAL": {"k": 1},
+            "ARRAY_VAL": [1, "two"],
+            "NULL_VAL": null,
+            "VARCHAR_VAL": "text"
+        });
+        let columns = golden["columns"].as_array().expect("columns");
+        let row = golden["rows"][0].as_array().expect("row");
+        assert_eq!(columns.len(), expected.as_object().expect("map").len());
+        for (index, column) in columns.iter().enumerate() {
+            let name = column["name"].as_str().expect("name");
+            let codec = ColumnCodec::new(
+                column["type"].as_str().unwrap_or_default(),
+                column["precision"].as_i64(),
+                column["scale"].as_i64(),
+            );
+            let decoded = codec
+                .decode(row[index].as_str())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(decoded, expected[name], "{name} (wire {})", row[index]);
+        }
+    }
+
+    /// The check has teeth: a DATE captured under a pinned DATE_OUTPUT_FORMAT
+    /// (`"2026-09-04"`, not epoch days) is flagged; the documented encoding is not.
+    #[test]
+    fn a_capture_with_formatted_dates_is_flagged() {
+        let capture = |date: &str| {
+            serde_json::json!({
+                "columns": [
+                    {"name": "N", "type": "fixed", "precision": 10, "scale": 2},
+                    {"name": "D", "type": "date", "precision": null, "scale": null}
+                ],
+                "rows": [["123.45", date], [null, null]]
+            })
+        };
+        assert_eq!(wire_fallbacks(&capture("20700")), Vec::<String>::new());
+        assert_eq!(
+            wire_fallbacks(&capture("2026-09-04")),
+            vec![r#""D" ("date")"#.to_owned()]
         );
     }
 

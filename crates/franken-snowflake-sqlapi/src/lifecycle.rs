@@ -27,6 +27,65 @@ use crate::status::ResponseClass;
 /// milliseconds and provoke server-side `429` rate limiting).
 pub const MIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Snowflake's billing minimum each time a warehouse starts or resumes
+/// (<https://docs.snowflake.com/en/user-guide/cost-understanding-compute>,
+/// consulted 2026-09-25: per-second billing, "with a 60-second (i.e. 1-minute)
+/// minimum" each time a warehouse is started or resumed).
+pub const RESUME_BILLING_MINIMUM: Duration = Duration::from_secs(60);
+
+/// An advisory client-side credit cap for one statement (reality-check bead E3).
+///
+/// The driver turns the cap into a time bound on execution and cancels with
+/// `CancelKind::CostBudget` past it, and it refuses to submit when resuming the
+/// warehouse alone would exceed the cap. Advisory: the warehouse's real bill
+/// (other queries, extra clusters) is Snowflake's to compute, and the server's
+/// statement timeout stays the enforceable guard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CostQuota {
+    /// The warehouse's rate, in millionths of a credit per hour.
+    pub microcredits_per_hour: u64,
+    /// The cap, in millionths of a credit.
+    pub max_microcredits: u64,
+    /// Whether the statement resumes a suspended warehouse (billed
+    /// [`RESUME_BILLING_MINIMUM`] at least).
+    pub resumes_warehouse: bool,
+}
+
+impl CostQuota {
+    /// How long the statement may execute before its estimate reaches the cap
+    /// (`None` for a zero rate, which never does).
+    #[must_use]
+    pub fn time_bound(&self) -> Option<Duration> {
+        if self.microcredits_per_hour == 0 {
+            return None;
+        }
+        let millis =
+            u128::from(self.max_microcredits) * 3_600_000 / u128::from(self.microcredits_per_hour);
+        Some(Duration::from_millis(
+            u64::try_from(millis).unwrap_or(u64::MAX),
+        ))
+    }
+
+    /// Estimated microcredits for `execution`: the rate for that long, and at
+    /// least the resume minimum when this statement resumes the warehouse.
+    #[must_use]
+    pub fn estimate(&self, execution: Duration) -> u64 {
+        let billed = if self.resumes_warehouse {
+            execution.max(RESUME_BILLING_MINIMUM)
+        } else {
+            execution
+        };
+        let micro = u128::from(self.microcredits_per_hour) * billed.as_millis() / 3_600_000;
+        u64::try_from(micro).unwrap_or(u64::MAX)
+    }
+
+    /// Whether resuming the warehouse alone would exceed the cap.
+    #[must_use]
+    pub fn below_resume_minimum(&self) -> bool {
+        self.resumes_warehouse && self.estimate(Duration::ZERO) > self.max_microcredits
+    }
+}
+
 /// How a `202` handle is polled: how many times, and how long to wait between
 /// `GET`s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +105,16 @@ pub struct PollPlan {
     /// assembled. The statement then completes early and reports itself
     /// partial (`CompletedStatement::is_partial`).
     pub row_cap: Option<usize>,
+    /// Client-side bound on execution, from submit (or resume) to a terminal
+    /// status: past it the driver cancels the statement with
+    /// `CancelKind::Deadline`, remote cancel included. A backstop for the
+    /// server's own statement timeout; partition downloads after completion
+    /// are not counted, and one in-flight poll exchange can overrun it by at
+    /// most the transport's per-exchange bound.
+    pub execution_timeout: Option<Duration>,
+    /// Advisory credit cap: past its time bound the driver cancels with
+    /// `CancelKind::CostBudget`, remote cancel included.
+    pub cost_quota: Option<CostQuota>,
 }
 
 /// Default partition fetch window.
@@ -60,6 +129,8 @@ impl Default for PollPlan {
             poll_interval: Duration::from_millis(1_000),
             partition_concurrency: DEFAULT_PARTITION_CONCURRENCY,
             row_cap: None,
+            execution_timeout: None,
+            cost_quota: None,
         }
     }
 }
@@ -102,6 +173,22 @@ impl PollPlan {
     #[must_use]
     pub fn with_row_cap(mut self, row_cap: Option<usize>) -> Self {
         self.row_cap = row_cap;
+        self
+    }
+
+    /// Bound execution client-side (see [`PollPlan::execution_timeout`]);
+    /// `None` leaves it to the server.
+    #[must_use]
+    pub fn with_execution_timeout(mut self, execution_timeout: Option<Duration>) -> Self {
+        self.execution_timeout = execution_timeout;
+        self
+    }
+
+    /// Cap the statement's estimated credits (see [`CostQuota`]); `None` sets no
+    /// cap.
+    #[must_use]
+    pub fn with_cost_quota(mut self, cost_quota: Option<CostQuota>) -> Self {
+        self.cost_quota = cost_quota;
         self
     }
 
@@ -165,6 +252,9 @@ pub enum Progress {
     Failed(QueryFailureStatus),
 }
 
+/// The `code` of a `200` result set that does not include the whole result.
+const RESULT_SET_TOO_LARGE: &str = "391908";
+
 /// A lifecycle-orchestration error (distinct from a *protocol* timeout/failure,
 /// which are [`Progress::TimedOut`] / [`Progress::Failed`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,6 +276,9 @@ pub enum LifecycleErrorCode {
     PollQuotaExhausted,
     /// Assembled row count did not match `resultSetMetaData.numRows`.
     PartitionRowMismatch,
+    /// Snowflake marked the result set too large (code `391908`): the
+    /// response does not include all of it.
+    ResultTooLarge,
 }
 
 impl LifecycleError {
@@ -202,7 +295,8 @@ impl LifecycleError {
         let code = match self.code {
             LifecycleErrorCode::DecodeFailed
             | LifecycleErrorCode::UnexpectedStatus
-            | LifecycleErrorCode::PartitionRowMismatch => SnowflakeErrorCode::UpstreamError,
+            | LifecycleErrorCode::PartitionRowMismatch
+            | LifecycleErrorCode::ResultTooLarge => SnowflakeErrorCode::UpstreamError,
             LifecycleErrorCode::PollQuotaExhausted => SnowflakeErrorCode::RetryBudgetExhausted,
         };
         SnowflakeError::new(code, self.message)
@@ -246,6 +340,9 @@ pub struct StatementMachine {
     poll_plan: PollPlan,
     polls_done: u32,
     phase: Phase,
+    /// Rows handed out by [`StatementMachine::drain_rows`] (streaming); they
+    /// still count toward the row cap and the final `numRows` check.
+    drained_rows: usize,
 }
 
 impl StatementMachine {
@@ -256,6 +353,32 @@ impl StatementMachine {
             poll_plan,
             polls_done: 0,
             phase: Phase::Pending,
+            drained_rows: 0,
+        }
+    }
+
+    /// Streaming (reality-check bead E5): take the rows assembled so far, in
+    /// partition order, so a caller can write them out before the next
+    /// partitions arrive. Drained rows still count toward
+    /// [`StatementMachine::rows_assembled`] and the final `numRows` check; the
+    /// completed statement then holds only the rows not yet drained.
+    pub fn drain_rows(&mut self) -> Vec<Vec<Option<String>>> {
+        match &mut self.phase {
+            Phase::Assembling { rows, .. } => {
+                let drained = std::mem::take(rows);
+                self.drained_rows = self.drained_rows.saturating_add(drained.len());
+                drained
+            }
+            Phase::Pending | Phase::Done => Vec::new(),
+        }
+    }
+
+    /// While assembling: the terminal result set (metadata and column types).
+    #[must_use]
+    pub fn result_set(&self) -> Option<&ResultSet> {
+        match &self.phase {
+            Phase::Assembling { result_set, .. } => Some(result_set),
+            Phase::Pending | Phase::Done => None,
         }
     }
 
@@ -278,7 +401,7 @@ impl StatementMachine {
     #[must_use]
     pub fn rows_assembled(&self) -> usize {
         match &self.phase {
-            Phase::Assembling { rows, .. } => rows.len(),
+            Phase::Assembling { rows, .. } => self.drained_rows.saturating_add(rows.len()),
             Phase::Pending | Phase::Done => 0,
         }
     }
@@ -428,7 +551,10 @@ impl StatementMachine {
         rows.append(&mut partition_rows);
         let upcoming = next.saturating_add(1);
         if upcoming >= total {
-            validate_total_row_count(rows.len(), result_set.result_set_meta_data.num_rows)?;
+            validate_total_row_count(
+                self.drained_rows.saturating_add(rows.len()),
+                result_set.result_set_meta_data.num_rows,
+            )?;
             Ok(Progress::Complete(CompletedStatement {
                 statement_handle: handle,
                 result_set,
@@ -486,7 +612,34 @@ impl StatementMachine {
 
     /// Enter partition assembly (or finish immediately for a single partition).
     fn enter_terminal_result(&mut self, result_set: ResultSet) -> Result<Progress, LifecycleError> {
+        // "If the `code` field in the response is set to `391908`, the result
+        // set is too large, and the response does not include the entire
+        // result set" (SQL API reference, POST /api/v2/statements, 200;
+        // consulted 2026-09-27). Its counts may still agree with its rows, so
+        // refuse it by code rather than pass part of a result as the whole.
+        if result_set.code == RESULT_SET_TOO_LARGE {
+            return Err(LifecycleError::new(
+                LifecycleErrorCode::ResultTooLarge,
+                "Snowflake returned code 391908: the result set is too large and the response \
+                 does not include all of it; narrow the query (filters or LIMIT) or export it \
+                 server-side with COPY INTO",
+            ));
+        }
         let handle = result_set.statement_handle.clone();
+        // A multi-statement parent's rows are only a status message ("Multiple
+        // statements executed successfully."); the results are its children's,
+        // fetched by the handles it lists. Nothing to assemble or reconcile.
+        if result_set.is_multi_statement() {
+            self.phase = Phase::Done;
+            let rows = result_set.data.clone();
+            return Ok(Progress::Complete(CompletedStatement {
+                statement_handle: handle,
+                result_set,
+                rows,
+                fetched_partitions: 1,
+                total_partitions: 1,
+            }));
+        }
         let total = partition_total(&result_set);
         let rows = result_set.data.clone();
         validate_partition_row_count(&result_set, 0, rows.len())?;
@@ -637,6 +790,41 @@ mod tests {
             ..PollPlan::default()
         };
         assert_eq!(hand_set.effective_poll_interval(), MIN_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn a_credit_cap_becomes_a_time_bound_and_an_estimate() {
+        // An X-Small warehouse: 1 credit per hour.
+        let running = CostQuota {
+            microcredits_per_hour: 1_000_000,
+            max_microcredits: 1_000,
+            resumes_warehouse: false,
+        };
+        assert_eq!(running.time_bound(), Some(Duration::from_millis(3_600)));
+        assert_eq!(running.estimate(Duration::from_millis(3_600)), 1_000);
+        assert!(!running.below_resume_minimum());
+
+        // Resuming bills a minute at least: 1/60 credit, over a 0.001 cap.
+        let resuming = CostQuota {
+            resumes_warehouse: true,
+            ..running
+        };
+        assert_eq!(resuming.estimate(Duration::ZERO), 16_666);
+        assert_eq!(resuming.estimate(Duration::from_secs(120)), 33_333);
+        assert!(resuming.below_resume_minimum());
+        let enough = CostQuota {
+            max_microcredits: 20_000,
+            ..resuming
+        };
+        assert!(!enough.below_resume_minimum());
+        assert_eq!(enough.time_bound(), Some(Duration::from_secs(72)));
+
+        let free = CostQuota {
+            microcredits_per_hour: 0,
+            ..running
+        };
+        assert_eq!(free.time_bound(), None);
+        assert_eq!(free.estimate(Duration::from_secs(60)), 0);
     }
 
     #[test]
@@ -902,6 +1090,55 @@ mod tests {
             }
             other => Err(format!("expected Complete, got {other:?}")),
         }
+    }
+
+    /// A result Snowflake marks too large (code 391908) is refused even when
+    /// its counts agree with its rows; the same body with a success code is not.
+    #[test]
+    fn a_result_set_snowflake_marks_too_large_is_refused() {
+        let body = |code: &str| {
+            format!(
+                r#"{{"resultSetMetaData":{{"numRows":1,"format":"jsonv2",
+                "rowType":[{{"name":"A","type":"TEXT","nullable":false}}],
+                "partitionInfo":[{{"rowCount":1,"uncompressedSize":1}}]}},
+                "data":[["x"]],"code":"{code}","statementHandle":"hl"}}"#
+            )
+        };
+        let complete = StatementMachine::new(PollPlan::default())
+            .on_submit(ResponseClass::Completed, body("090001").as_bytes());
+        assert!(
+            matches!(complete, Ok(Progress::Complete(_))),
+            "{complete:?}"
+        );
+        let refused = StatementMachine::new(PollPlan::default())
+            .on_submit(ResponseClass::Completed, body("391908").as_bytes());
+        assert!(
+            matches!(
+                &refused,
+                Err(LifecycleError {
+                    code: LifecycleErrorCode::ResultTooLarge,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        // The same refusal when the result arrives on a poll.
+        let mut machine = StatementMachine::new(PollPlan::default());
+        let _ = machine.on_submit(
+            ResponseClass::Running,
+            br#"{"code":"333334","statementHandle":"hl"}"#,
+        );
+        let polled = machine.on_poll(ResponseClass::Completed, body("391908").as_bytes());
+        assert!(
+            matches!(
+                &polled,
+                Err(LifecycleError {
+                    code: LifecycleErrorCode::ResultTooLarge,
+                    ..
+                })
+            ),
+            "{polled:?}"
+        );
     }
 
     #[test]

@@ -467,8 +467,10 @@ impl WriteIntentRefusal {
     }
 }
 
-/// Result of evaluating a write-intent request.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Result of evaluating a write-intent request. Serializable for reporting;
+/// deliberately not deserializable, since an authorization read from JSON
+/// would be a forged one.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum WriteIntentDecision {
     /// Request stopped at a safety rung.
@@ -485,9 +487,42 @@ pub enum WriteIntentDecision {
     /// this mutation. The core does not submit SQL; it only authorizes. The plan
     /// and receipt carry `execution_enabled = true`.
     ExecutionAuthorized {
-        /// Execution-authorized plan and receipt.
-        plan: WriteIntentPlan,
+        /// The proof the write path requires, carrying the authorized plan.
+        grant: WriteAuthorization,
     },
+}
+
+/// Proof that the write-intent ladder authorized one statement for execution
+/// (reality-check bead oj0.29). Only [`evaluate_write_intent`] mints it (its
+/// field is private), a live write submit requires one, and it covers only the
+/// statement it was minted for, so no read path can assemble a write
+/// submission:
+///
+/// ```compile_fail,E0451
+/// use franken_snowflake_core::write_intent::{WriteAuthorization, WriteIntentPlan};
+/// fn forge(plan: WriteIntentPlan) -> WriteAuthorization {
+///     WriteAuthorization { plan }
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct WriteAuthorization {
+    plan: WriteIntentPlan,
+}
+
+impl WriteAuthorization {
+    /// The execution-authorized plan and receipt.
+    #[must_use]
+    pub const fn plan(&self) -> &WriteIntentPlan {
+        &self.plan
+    }
+
+    /// Whether this authorization covers `sql`: the statement whose redacted
+    /// preview the ladder evaluated.
+    #[must_use]
+    pub fn covers(&self, sql: &str) -> bool {
+        redact(sql) == self.plan.redacted_sql_preview
+    }
 }
 
 /// Evaluate a request against the deferred write-intent ladder.
@@ -646,7 +681,9 @@ pub fn evaluate_write_intent(
         execution_enabled: true,
         ..plan
     };
-    WriteIntentDecision::ExecutionAuthorized { plan: authorized }
+    WriteIntentDecision::ExecutionAuthorized {
+        grant: WriteAuthorization { plan: authorized },
+    }
 }
 
 /// Classify a SQL preview into a write statement kind.
@@ -988,7 +1025,8 @@ mod tests {
             decision,
             WriteIntentDecision::ExecutionAuthorized { .. }
         ));
-        if let WriteIntentDecision::ExecutionAuthorized { plan } = decision {
+        if let WriteIntentDecision::ExecutionAuthorized { grant } = decision {
+            let plan = grant.plan();
             assert!(
                 plan.execution_enabled,
                 "authorized plan must enable execution"
@@ -1034,10 +1072,14 @@ mod tests {
             matches!(decision, WriteIntentDecision::ExecutionAuthorized { .. }),
             "default write-enabled policy must authorize a token-less direct write, got {decision:?}"
         );
-        if let WriteIntentDecision::ExecutionAuthorized { plan } = decision {
+        if let WriteIntentDecision::ExecutionAuthorized { grant } = decision {
+            let plan = grant.plan();
             assert!(plan.execution_enabled);
             assert!(plan.receipt.execution_enabled);
             assert!(!plan.receipt.dry_run);
+            // It covers the statement the ladder evaluated, and nothing else.
+            assert!(grant.covers(&plan.redacted_sql_preview));
+            assert!(!grant.covers("delete from t"));
         }
     }
 

@@ -279,6 +279,43 @@ impl TextChunk {
     }
 }
 
+/// The chunks of a query result's text columns: one per non-null, non-blank
+/// cell of each `(index, name)` column, in row order. The chunk ordinal is the
+/// zero-based row, so a handle names its cell; the `id_column` cell, when
+/// given, is the chunk's title (the row's own key, for display).
+#[must_use]
+pub fn chunks_from_rows(
+    source: &TextSourceRef,
+    columns: &[(usize, String)],
+    id_column: Option<usize>,
+    rows: &[Vec<Option<String>>],
+    rights_class: RightsClass,
+) -> Vec<TextChunk> {
+    let mut chunks = Vec::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        let Ok(ordinal) = u32::try_from(row_index) else {
+            break;
+        };
+        let title = id_column
+            .and_then(|index| row.get(index).cloned().flatten())
+            .filter(|id| !id.trim().is_empty());
+        for (index, name) in columns {
+            let Some(text) = row.get(*index).cloned().flatten() else {
+                continue;
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            let chunk = TextChunk::new(source.clone(), name.as_str(), ordinal, text, rights_class);
+            chunks.push(match &title {
+                Some(title) => chunk.with_title(title.as_str()),
+                None => chunk,
+            });
+        }
+    }
+    chunks
+}
+
 /// Text-indexing feature surface for capabilities/doctor output.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TextIndexingFeatureReport {
@@ -286,8 +323,6 @@ pub struct TextIndexingFeatureReport {
     pub schema_version: u16,
     /// Whether Frankensearch adapters are compiled in.
     pub frankensearch_enabled: bool,
-    /// Whether the rerank seam feature is compiled in.
-    pub rerank_feature_enabled: bool,
     /// Retrieval tiers allowed by this crate.
     pub allowed_tiers: Vec<TextRetrievalTier>,
 }
@@ -299,7 +334,6 @@ impl TextIndexingFeatureReport {
         Self {
             schema_version: TEXT_INDEX_SCHEMA_VERSION,
             frankensearch_enabled: cfg!(feature = "frankensearch"),
-            rerank_feature_enabled: cfg!(feature = "rerank"),
             allowed_tiers: vec![TextRetrievalTier::Hash, TextRetrievalTier::Lexical],
         }
     }
@@ -518,14 +552,17 @@ pub mod frankensearch_adapter {
     use std::sync::Arc;
 
     use frankensearch::{
-        Cx, Embedder, EmbedderStack, HashEmbedder, IndexBuildStats, IndexBuilder, ScoredResult,
-        SearchError, SearchResult, TantivyIndex, TwoTierConfig, TwoTierIndex, TwoTierMetrics,
-        TwoTierSearcher,
+        Cx, Embedder, EmbedderStack, HashEmbedder, IndexBuildStats, IndexBuilder,
+        IndexableDocument, LexicalWrite, ScoredResult, SearchError, SearchResult, TantivyIndex,
+        TwoTierConfig, TwoTierIndex, TwoTierMetrics, TwoTierSearcher,
     };
 
     use super::TextChunk;
 
-    /// Build a hash + lexical index from validated text chunks.
+    /// Build a hash + lexical index from validated text chunks: the vector
+    /// tiers through Frankensearch's builder, then the Tantivy lexical arm under
+    /// `index_dir/lexical`. (Frankensearch 0.6's builder writes only its Quill
+    /// engine; with `lexical-tantivy` alone it writes no lexical arm.)
     pub async fn build_hash_lexical_index(
         cx: &Cx,
         index_dir: impl AsRef<Path>,
@@ -534,23 +571,29 @@ pub mod frankensearch_adapter {
         let fast = Arc::new(HashEmbedder::default_256()) as Arc<dyn Embedder>;
         let quality = Arc::new(HashEmbedder::default_384()) as Arc<dyn Embedder>;
         let stack = EmbedderStack::from_parts(fast, Some(quality));
-        let mut builder = IndexBuilder::new(index_dir.as_ref()).with_embedder_stack(stack);
+        let mut documents = Vec::with_capacity(chunks.len());
         for chunk in chunks {
             chunk.validate().map_err(|err| SearchError::InvalidConfig {
                 field: "chunks.text".to_owned(),
                 value: chunk.handle.to_string(),
                 reason: err.to_string(),
             })?;
-            builder = match &chunk.title {
-                Some(title) => builder.add_document_with_title(
-                    chunk.handle.as_str(),
-                    chunk.text.as_str(),
-                    title.as_str(),
-                ),
-                None => builder.add_document(chunk.handle.as_str(), chunk.text.as_str()),
+            let document = IndexableDocument::new(chunk.handle.as_str(), chunk.text.as_str());
+            let document = match &chunk.title {
+                Some(title) => document.with_title(title.as_str()),
+                None => document,
             };
+            documents.push(document);
         }
-        builder.build(cx).await
+        let stats = IndexBuilder::new(index_dir.as_ref())
+            .with_embedder_stack(stack)
+            .add_documents(documents.iter().cloned())
+            .build(cx)
+            .await?;
+        let lexical = TantivyIndex::create(&index_dir.as_ref().join("lexical"))?;
+        lexical.index_documents(cx, &documents).await?;
+        lexical.commit(cx).await?;
+        Ok(stats)
     }
 
     /// Open a hash + lexical searcher over a previously built index.
@@ -652,6 +695,56 @@ mod tests {
                 max: DEFAULT_RERANK_MAX_TOP_K
             })
         ));
+    }
+
+    /// One chunk per non-null, non-blank cell of the chosen columns; the
+    /// ordinal is the row (so row 2's handle names row 2 even when row 1 held
+    /// nothing), and the id column is the title only where it has a value.
+    #[test]
+    fn result_rows_become_one_chunk_per_text_cell() {
+        let cell = |value: &str| Some(value.to_owned());
+        let rows = vec![
+            vec![cell("A1"), cell("refund policy memo"), cell("ops")],
+            vec![cell("A2"), None, cell("  ")],
+            vec![cell(" "), cell("billing dispute notes"), None],
+        ];
+        let columns = vec![(1, "BODY".to_owned()), (2, "TAGS".to_owned())];
+        let chunks = chunks_from_rows(
+            &query_source(),
+            &columns,
+            Some(0),
+            &rows,
+            RightsClass::Restricted,
+        );
+        let summary: Vec<(u32, &str, Option<&str>, &str)> = chunks
+            .iter()
+            .map(|chunk| {
+                (
+                    chunk.chunk_ordinal,
+                    chunk.column_or_path.as_str(),
+                    chunk.title.as_deref(),
+                    chunk.text.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (0, "BODY", Some("A1"), "refund policy memo"),
+                (0, "TAGS", Some("A1"), "ops"),
+                (2, "BODY", None, "billing dispute notes"),
+            ]
+        );
+        assert_eq!(
+            chunks[2].handle,
+            TextDocumentHandle::from_source(&query_source(), "BODY", 2)
+        );
+        assert!(chunks.iter().all(|chunk| chunk.validate().is_ok()));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.rights_class == RightsClass::Restricted)
+        );
     }
 
     #[test]
@@ -785,7 +878,6 @@ mod tests {
             report.frankensearch_enabled,
             cfg!(feature = "frankensearch")
         );
-        assert_eq!(report.rerank_feature_enabled, cfg!(feature = "rerank"));
     }
 
     #[test]
@@ -829,12 +921,27 @@ mod tests {
             let build = build_hash_lexical_index(&cx, &index_path, &chunks).await;
             assert!(build.as_ref().is_ok_and(|stats| stats.doc_count == 2));
 
-            let search = query_hash_lexical_index(&cx, &index_path, "transcript margin", 3).await;
-            assert!(
-                search
-                    .as_ref()
-                    .is_ok_and(|(results, _)| !results.is_empty())
+            // Frankensearch answers a short keyword query over a hash-embedded
+            // index from the lexical arm alone ("lexical short circuit"), so the
+            // attached Tantivy arm shows in the candidate count and the top hit.
+            let first = chunks[0].handle.to_string();
+            let (results, metrics) =
+                query_hash_lexical_index(&cx, &index_path, "transcript margin", 3)
+                    .await
+                    .expect("query");
+            assert_eq!(metrics.lexical_candidates, 1, "{metrics:?}");
+            assert_eq!(
+                results.first().map(|hit| hit.doc_id.as_str()),
+                Some(first.as_str())
             );
+
+            // Negative: a term in neither document draws no lexical candidate
+            // and no hit.
+            let (results, metrics) = query_hash_lexical_index(&cx, &index_path, "zeppelin", 3)
+                .await
+                .expect("query");
+            assert_eq!(metrics.lexical_candidates, 0, "{metrics:?}");
+            assert!(results.is_empty(), "{results:?}");
         });
         Ok(())
     }

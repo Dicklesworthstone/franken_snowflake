@@ -211,8 +211,8 @@ mod tests {
         // form, and the gzip packet must decompress to exactly it.
         assert!(PARTITION_1_PLAIN.starts_with(br#"{"data":"#));
         assert!(PARTITION_BARE_ARRAY_FALLBACK.starts_with(b"[["));
-        use asupersync::http::compress::{Decompressor, GzipDecompressor};
-        let mut decompressor = GzipDecompressor::new(Some(4096));
+        use asupersync::http::compress::{DecompressionLimit, Decompressor, GzipDecompressor};
+        let mut decompressor = GzipDecompressor::new(DecompressionLimit::new(4096));
         let mut plain = Vec::new();
         decompressor
             .decompress(PARTITION_1_GZIP, &mut plain)

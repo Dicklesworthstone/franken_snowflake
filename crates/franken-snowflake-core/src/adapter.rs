@@ -447,6 +447,441 @@ impl AdapterContractLogLine {
     }
 }
 
+/// The seven adapter operations with their contract ids, read-only
+/// private-data safety facets, and the error codes each may surface. Every
+/// adapter's provider manifest lists exactly these.
+#[must_use]
+pub fn standard_output_contracts() -> Vec<AdapterOutputContract> {
+    vec![
+        output_contract(
+            "adapter.provider_manifest",
+            ADAPTER_PROVIDER_MANIFEST_CONTRACT_ID,
+            false,
+            vec![SnowflakeErrorCode::Internal],
+        ),
+        output_contract(
+            "adapter.profile_diagnostics",
+            ADAPTER_PROFILE_DIAGNOSTICS_CONTRACT_ID,
+            false,
+            vec![
+                SnowflakeErrorCode::ProfileNotFound,
+                SnowflakeErrorCode::ProfileInvalid,
+                SnowflakeErrorCode::CredentialMissing,
+            ],
+        ),
+        output_contract(
+            "adapter.catalog_discovery",
+            ADAPTER_CATALOG_DISCOVERY_CONTRACT_ID,
+            true,
+            vec![
+                SnowflakeErrorCode::ProfileNotFound,
+                SnowflakeErrorCode::UpstreamError,
+                SnowflakeErrorCode::MetadataError,
+            ],
+        ),
+        output_contract(
+            "adapter.dataset_manifest",
+            ADAPTER_DATASET_MANIFEST_CONTRACT_ID,
+            false,
+            vec![SnowflakeErrorCode::MetadataError],
+        ),
+        output_contract(
+            "adapter.query_receipt",
+            ADAPTER_QUERY_RECEIPT_CONTRACT_ID,
+            false,
+            vec![
+                SnowflakeErrorCode::MetadataError,
+                SnowflakeErrorCode::CacheError,
+            ],
+        ),
+        output_contract(
+            "adapter.content_export",
+            ADAPTER_CONTENT_EXPORT_CONTRACT_ID,
+            false,
+            vec![
+                SnowflakeErrorCode::MetadataError,
+                SnowflakeErrorCode::CacheError,
+            ],
+        ),
+        output_contract(
+            "adapter.frame_ingest",
+            ADAPTER_FRAME_INGEST_CONTRACT_ID,
+            false,
+            vec![SnowflakeErrorCode::MetadataError],
+        ),
+    ]
+}
+
+fn output_contract(
+    command_id: &str,
+    output_contract_id: &str,
+    provider_network: bool,
+    possible_error_codes: Vec<SnowflakeErrorCode>,
+) -> AdapterOutputContract {
+    AdapterOutputContract {
+        command_id: command_id.to_owned(),
+        output_contract_id: output_contract_id.to_owned(),
+        safety: AdapterSafetyFacet::read_private(provider_network),
+        possible_error_codes,
+        safe_next_commands: vec!["franken-snowflake capabilities --json".to_owned()],
+    }
+}
+
+pub mod conformance {
+    //! The trait conformance suite every [`SnowflakeDataLakeAdapter`] must
+    //! pass (reality-check bead oj0.39): contract ids and outcome on every
+    //! envelope, provenance that agrees with the envelope's data source (an
+    //! adapter may not relabel fixture artifacts as live), typed errors for
+    //! unknown ids instead of empty successes, well-formed content addresses,
+    //! and no secret-shaped text anywhere in an answer.
+
+    use super::{
+        ADAPTER_CATALOG_DISCOVERY_CONTRACT_ID, ADAPTER_CONTENT_EXPORT_CONTRACT_ID,
+        ADAPTER_DATASET_MANIFEST_CONTRACT_ID, ADAPTER_FRAME_INGEST_CONTRACT_ID,
+        ADAPTER_PROFILE_DIAGNOSTICS_CONTRACT_ID, ADAPTER_PROVIDER_MANIFEST_CONTRACT_ID,
+        ADAPTER_QUERY_RECEIPT_CONTRACT_ID, AdapterProvenance, AdapterResult, ContentAddressRef,
+        SnowflakeDataLakeAdapter,
+    };
+    use crate::envelope::{Envelope, EnvelopeMeta};
+    use crate::error::SnowflakeErrorCode;
+    use crate::guardrails::RightsClass;
+    use crate::ids::{DatasetId, ProfileName, ReceiptHash};
+    use crate::outcome::{DataSource, OutcomeKind};
+
+    /// The artifacts to look up, and where they came from.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ConformanceProbe {
+        /// A profile the adapter knows.
+        pub profile: ProfileName,
+        /// A dataset the adapter knows.
+        pub dataset: DatasetId,
+        /// A query receipt the adapter knows.
+        pub receipt: ReceiptHash,
+        /// An export the adapter knows, when it has one.
+        pub export_id: Option<String>,
+        /// A frame the adapter knows, when it has one.
+        pub frame_id: Option<String>,
+        /// The data source the artifacts truly come from (`Live` for a store
+        /// fed by live runs, `Fixture` for fixtures).
+        pub expected_data_source: DataSource,
+    }
+
+    const UNKNOWN: &str = "fsnow-conformance-unknown-id";
+
+    /// Every way `adapter` breaks the contract for `probe`; empty when it
+    /// conforms.
+    #[must_use]
+    pub fn check_adapter_conformance<A: SnowflakeDataLakeAdapter + ?Sized>(
+        adapter: &A,
+        probe: &ConformanceProbe,
+    ) -> Vec<String> {
+        let mut violations = Vec::new();
+        let expected = probe.expected_data_source;
+
+        match adapter.provider_manifest() {
+            Ok(manifest) => {
+                check_meta(
+                    &mut violations,
+                    &manifest.meta,
+                    "adapter.provider_manifest",
+                    ADAPTER_PROVIDER_MANIFEST_CONTRACT_ID,
+                    expected,
+                    false,
+                );
+                if !manifest.data.authenticated_private_source {
+                    violations
+                        .push("provider_manifest: not an authenticated private source".into());
+                }
+                if manifest.data.contracts.len() != 7 {
+                    violations.push(format!(
+                        "provider_manifest: {} contracts, expected the 7 adapter operations",
+                        manifest.data.contracts.len()
+                    ));
+                }
+                for contract in &manifest.data.contracts {
+                    if !contract.safety.read_only
+                        || contract.safety.mutates_local_state
+                        || contract.safety.max_rights_class != RightsClass::Private
+                        || !contract.output_contract_id.starts_with("fsnow.adapter.")
+                        || contract.possible_error_codes.is_empty()
+                    {
+                        violations.push(format!(
+                            "provider_manifest: contract {} is not a read-only private-data operation with error codes",
+                            contract.command_id
+                        ));
+                    }
+                }
+                check_secret_free(&mut violations, "provider_manifest", &manifest);
+            }
+            Err(error) => violations.push(format!("provider_manifest failed: {}", error.message)),
+        }
+
+        match adapter.profile_diagnostics(&probe.profile) {
+            Ok(diagnostics) => {
+                check_meta(
+                    &mut violations,
+                    &diagnostics.meta,
+                    "adapter.profile_diagnostics",
+                    ADAPTER_PROFILE_DIAGNOSTICS_CONTRACT_ID,
+                    expected,
+                    false,
+                );
+                if diagnostics.data.profile_id != probe.profile {
+                    violations.push("profile_diagnostics: answered for another profile".into());
+                }
+                check_secret_free(&mut violations, "profile_diagnostics", &diagnostics);
+            }
+            Err(error) => violations.push(format!("profile_diagnostics failed: {}", error.message)),
+        }
+
+        match adapter.catalog_discovery(&probe.profile) {
+            Ok(catalog) => {
+                check_meta(
+                    &mut violations,
+                    &catalog.meta,
+                    "adapter.catalog_discovery",
+                    ADAPTER_CATALOG_DISCOVERY_CONTRACT_ID,
+                    expected,
+                    true,
+                );
+                check_provenance(
+                    &mut violations,
+                    "catalog_discovery",
+                    &catalog.meta,
+                    &catalog.data.provenance,
+                );
+                check_address(
+                    &mut violations,
+                    "catalog_discovery",
+                    &catalog.data.content_address,
+                );
+                if catalog.data.profile_id != probe.profile {
+                    violations.push("catalog_discovery: answered for another profile".into());
+                }
+                check_secret_free(&mut violations, "catalog_discovery", &catalog);
+            }
+            Err(error) => violations.push(format!("catalog_discovery failed: {}", error.message)),
+        }
+
+        match adapter.dataset_manifest(&probe.dataset) {
+            Ok(dataset) => {
+                check_meta(
+                    &mut violations,
+                    &dataset.meta,
+                    "adapter.dataset_manifest",
+                    ADAPTER_DATASET_MANIFEST_CONTRACT_ID,
+                    expected,
+                    true,
+                );
+                check_provenance(
+                    &mut violations,
+                    "dataset_manifest",
+                    &dataset.meta,
+                    &dataset.data.provenance,
+                );
+                check_address(
+                    &mut violations,
+                    "dataset_manifest",
+                    &dataset.data.content_address,
+                );
+                if dataset.data.dataset_id != probe.dataset {
+                    violations.push("dataset_manifest: answered for another dataset".into());
+                }
+                if dataset.data.fields.is_empty() {
+                    violations.push("dataset_manifest: no fields".into());
+                }
+                check_secret_free(&mut violations, "dataset_manifest", &dataset);
+            }
+            Err(error) => violations.push(format!("dataset_manifest failed: {}", error.message)),
+        }
+
+        match adapter.query_receipt(&probe.receipt) {
+            Ok(receipt) => {
+                check_meta(
+                    &mut violations,
+                    &receipt.meta,
+                    "adapter.query_receipt",
+                    ADAPTER_QUERY_RECEIPT_CONTRACT_ID,
+                    expected,
+                    true,
+                );
+                check_address(
+                    &mut violations,
+                    "query_receipt",
+                    &receipt.data.content_address,
+                );
+                if receipt.data.receipt_hash != probe.receipt
+                    || receipt.meta.receipt_hash.as_ref() != Some(&probe.receipt)
+                {
+                    violations.push("query_receipt: the receipt hash does not round-trip".into());
+                }
+                check_secret_free(&mut violations, "query_receipt", &receipt);
+            }
+            Err(error) => violations.push(format!("query_receipt failed: {}", error.message)),
+        }
+
+        if let Some(export_id) = &probe.export_id {
+            match adapter.content_export(export_id) {
+                Ok(export) => {
+                    check_meta(
+                        &mut violations,
+                        &export.meta,
+                        "adapter.content_export",
+                        ADAPTER_CONTENT_EXPORT_CONTRACT_ID,
+                        expected,
+                        true,
+                    );
+                    check_address(
+                        &mut violations,
+                        "content_export",
+                        &export.data.content_address,
+                    );
+                    if &export.data.export_id != export_id
+                        || export.meta.receipt_hash.as_ref() != Some(&export.data.receipt_hash)
+                    {
+                        violations.push("content_export: ids do not round-trip".into());
+                    }
+                    check_secret_free(&mut violations, "content_export", &export);
+                }
+                Err(error) => violations.push(format!("content_export failed: {}", error.message)),
+            }
+        }
+
+        if let Some(frame_id) = &probe.frame_id {
+            match adapter.frame_ingest(frame_id) {
+                Ok(frame) => {
+                    check_meta(
+                        &mut violations,
+                        &frame.meta,
+                        "adapter.frame_ingest",
+                        ADAPTER_FRAME_INGEST_CONTRACT_ID,
+                        expected,
+                        true,
+                    );
+                    check_address(&mut violations, "frame_ingest", &frame.data.content_address);
+                    if &frame.data.frame_id != frame_id || frame.data.columns.is_empty() {
+                        violations.push("frame_ingest: wrong frame or no columns".into());
+                    }
+                    check_secret_free(&mut violations, "frame_ingest", &frame);
+                }
+                Err(error) => violations.push(format!("frame_ingest failed: {}", error.message)),
+            }
+        }
+
+        // Unknown ids are typed errors, never empty successes.
+        let unknown_profile = ProfileName::new(UNKNOWN);
+        check_unknown(
+            &mut violations,
+            "profile_diagnostics",
+            adapter.profile_diagnostics(&unknown_profile),
+        );
+        check_unknown(
+            &mut violations,
+            "catalog_discovery",
+            adapter.catalog_discovery(&unknown_profile),
+        );
+        check_unknown(
+            &mut violations,
+            "dataset_manifest",
+            adapter.dataset_manifest(&DatasetId::new(UNKNOWN)),
+        );
+        check_unknown(
+            &mut violations,
+            "query_receipt",
+            adapter.query_receipt(&ReceiptHash::new(UNKNOWN)),
+        );
+        check_unknown(
+            &mut violations,
+            "content_export",
+            adapter.content_export(UNKNOWN),
+        );
+        check_unknown(
+            &mut violations,
+            "frame_ingest",
+            adapter.frame_ingest(UNKNOWN),
+        );
+        violations
+    }
+
+    /// `artifact` envelopes must carry the artifacts' true data source; the
+    /// others may leave it unspecified but may not claim another one.
+    fn check_meta(
+        violations: &mut Vec<String>,
+        meta: &EnvelopeMeta,
+        command_id: &str,
+        output_contract_id: &str,
+        expected: DataSource,
+        artifact: bool,
+    ) {
+        if !meta.ok || meta.outcome_kind != OutcomeKind::Success {
+            violations.push(format!("{command_id}: not a successful envelope"));
+        }
+        if meta.command_id != command_id || meta.output_contract_id != output_contract_id {
+            violations.push(format!(
+                "{command_id}: envelope names {} / {}",
+                meta.command_id, meta.output_contract_id
+            ));
+        }
+        let allowed = meta.data_source == expected
+            || (!artifact && meta.data_source == DataSource::Unspecified);
+        if !allowed {
+            violations.push(format!(
+                "{command_id}: data_source {:?}, the artifacts are {expected:?}",
+                meta.data_source
+            ));
+        }
+    }
+
+    fn check_provenance(
+        violations: &mut Vec<String>,
+        what: &str,
+        meta: &EnvelopeMeta,
+        provenance: &AdapterProvenance,
+    ) {
+        if provenance.data_source != meta.data_source {
+            violations.push(format!(
+                "{what}: envelope says {:?} but the artifact's provenance is {:?}",
+                meta.data_source, provenance.data_source
+            ));
+        }
+    }
+
+    fn check_address(violations: &mut Vec<String>, what: &str, address: &ContentAddressRef) {
+        if address.algorithm != "blake3" || address.digest_hex.is_empty() || address.byte_len == 0 {
+            violations.push(format!("{what}: malformed content address {address:?}"));
+        }
+    }
+
+    fn check_secret_free<T: serde::Serialize>(
+        violations: &mut Vec<String>,
+        what: &str,
+        envelope: &Envelope<T>,
+    ) {
+        match serde_json::to_string(envelope) {
+            Ok(text) if crate::redact::contains_secret(&text) => {
+                violations.push(format!("{what}: the answer carries secret-shaped text"));
+            }
+            Ok(_) => {}
+            Err(error) => violations.push(format!("{what}: does not serialize: {error}")),
+        }
+    }
+
+    fn check_unknown<T>(violations: &mut Vec<String>, what: &str, result: AdapterResult<T>) {
+        match result {
+            Ok(_) => violations.push(format!("{what}: an unknown id answered success")),
+            Err(error)
+                if matches!(
+                    error.code,
+                    SnowflakeErrorCode::ProfileNotFound | SnowflakeErrorCode::MetadataError
+                ) => {}
+            Err(error) => violations.push(format!(
+                "{what}: an unknown id answered {:?}, not ProfileNotFound/MetadataError",
+                error.code
+            )),
+        }
+    }
+}
+
 #[cfg(feature = "adapter-fixtures")]
 pub mod fixtures {
     //! Public adapter contract fixtures.
@@ -482,7 +917,7 @@ pub mod fixtures {
                     display_name: "Snowflake SQL API".to_owned(),
                     data_lake_kind: DataLakeKind::SnowflakeSqlApi,
                     authenticated_private_source: true,
-                    contracts: output_contracts(),
+                    contracts: standard_output_contracts(),
                     non_goals: vec![
                         "downstream adapters must not handle raw credentials".to_owned(),
                         "downstream adapters must not embed Snowflake protocol code".to_owned(),
@@ -800,82 +1235,6 @@ pub mod fixtures {
         })
     }
 
-    fn output_contracts() -> Vec<AdapterOutputContract> {
-        vec![
-            contract(
-                "adapter.provider_manifest",
-                ADAPTER_PROVIDER_MANIFEST_CONTRACT_ID,
-                false,
-                vec![SnowflakeErrorCode::Internal],
-            ),
-            contract(
-                "adapter.profile_diagnostics",
-                ADAPTER_PROFILE_DIAGNOSTICS_CONTRACT_ID,
-                false,
-                vec![
-                    SnowflakeErrorCode::ProfileNotFound,
-                    SnowflakeErrorCode::ProfileInvalid,
-                    SnowflakeErrorCode::CredentialMissing,
-                ],
-            ),
-            contract(
-                "adapter.catalog_discovery",
-                ADAPTER_CATALOG_DISCOVERY_CONTRACT_ID,
-                true,
-                vec![
-                    SnowflakeErrorCode::ProfileNotFound,
-                    SnowflakeErrorCode::UpstreamError,
-                    SnowflakeErrorCode::MetadataError,
-                ],
-            ),
-            contract(
-                "adapter.dataset_manifest",
-                ADAPTER_DATASET_MANIFEST_CONTRACT_ID,
-                false,
-                vec![SnowflakeErrorCode::MetadataError],
-            ),
-            contract(
-                "adapter.query_receipt",
-                ADAPTER_QUERY_RECEIPT_CONTRACT_ID,
-                false,
-                vec![
-                    SnowflakeErrorCode::MetadataError,
-                    SnowflakeErrorCode::CacheError,
-                ],
-            ),
-            contract(
-                "adapter.content_export",
-                ADAPTER_CONTENT_EXPORT_CONTRACT_ID,
-                false,
-                vec![
-                    SnowflakeErrorCode::MetadataError,
-                    SnowflakeErrorCode::CacheError,
-                ],
-            ),
-            contract(
-                "adapter.frame_ingest",
-                ADAPTER_FRAME_INGEST_CONTRACT_ID,
-                false,
-                vec![SnowflakeErrorCode::MetadataError],
-            ),
-        ]
-    }
-
-    fn contract(
-        command_id: &str,
-        output_contract_id: &str,
-        provider_network: bool,
-        possible_error_codes: Vec<SnowflakeErrorCode>,
-    ) -> AdapterOutputContract {
-        AdapterOutputContract {
-            command_id: command_id.to_owned(),
-            output_contract_id: output_contract_id.to_owned(),
-            safety: AdapterSafetyFacet::read_private(provider_network),
-            possible_error_codes,
-            safe_next_commands: vec!["franken-snowflake capabilities --json".to_owned()],
-        }
-    }
-
     fn envelope<T: serde::Serialize>(
         command_id: &str,
         output_contract_id: &str,
@@ -961,7 +1320,92 @@ pub mod fixtures {
 
 #[cfg(all(test, feature = "adapter-fixtures"))]
 mod tests {
+    use super::conformance::{ConformanceProbe, check_adapter_conformance};
     use super::fixtures::{FixtureSnowflakeAdapter, assert_adapter_contract};
+    use super::*;
+
+    fn fixture_probe(expected: DataSource) -> ConformanceProbe {
+        ConformanceProbe {
+            profile: ProfileName::new("fixture-private-lake"),
+            dataset: DatasetId::new("fixture.events_daily"),
+            receipt: ReceiptHash::new("blake3:fixture-query-receipt-0001"),
+            export_id: Some("export-fixture-0001".to_owned()),
+            frame_id: Some("frame-fixture-0001".to_owned()),
+            expected_data_source: expected,
+        }
+    }
+
+    /// Fixture data relabeled as live: what the suite must refuse.
+    struct RelabeledAsLive(FixtureSnowflakeAdapter);
+
+    fn live<T>(result: AdapterResult<T>) -> AdapterResult<T> {
+        result.map(|mut envelope| {
+            envelope.meta.data_source = DataSource::Live;
+            envelope
+        })
+    }
+
+    impl SnowflakeDataLakeAdapter for RelabeledAsLive {
+        fn provider_manifest(&self) -> AdapterResult<ProviderManifest> {
+            live(self.0.provider_manifest())
+        }
+        fn profile_diagnostics(&self, profile: &ProfileName) -> AdapterResult<ProfileDiagnostics> {
+            live(self.0.profile_diagnostics(profile))
+        }
+        fn catalog_discovery(
+            &self,
+            profile: &ProfileName,
+        ) -> AdapterResult<CatalogDiscoveryContract> {
+            live(self.0.catalog_discovery(profile))
+        }
+        fn dataset_manifest(&self, dataset: &DatasetId) -> AdapterResult<DatasetManifestContract> {
+            live(self.0.dataset_manifest(dataset))
+        }
+        fn query_receipt(&self, receipt: &ReceiptHash) -> AdapterResult<QueryReceiptContract> {
+            live(self.0.query_receipt(receipt))
+        }
+        fn content_export(&self, export_id: &str) -> AdapterResult<ContentExportContract> {
+            live(self.0.content_export(export_id))
+        }
+        fn frame_ingest(&self, frame_id: &str) -> AdapterResult<FrameIngestContract> {
+            live(self.0.frame_ingest(frame_id))
+        }
+    }
+
+    #[test]
+    fn the_fixture_adapter_passes_the_conformance_suite() {
+        let violations = check_adapter_conformance(
+            &FixtureSnowflakeAdapter,
+            &fixture_probe(DataSource::Fixture),
+        );
+        assert_eq!(violations, Vec::<String>::new());
+    }
+
+    #[test]
+    fn fixture_data_labeled_live_fails_the_conformance_suite() {
+        // Probed as live: the provenance still says fixture.
+        let violations = check_adapter_conformance(
+            &RelabeledAsLive(FixtureSnowflakeAdapter),
+            &fixture_probe(DataSource::Live),
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("provenance is Fixture")),
+            "{violations:?}"
+        );
+        // Probed as the fixture it is: every envelope claims live.
+        let violations = check_adapter_conformance(
+            &RelabeledAsLive(FixtureSnowflakeAdapter),
+            &fixture_probe(DataSource::Fixture),
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("data_source Live")),
+            "{violations:?}"
+        );
+    }
 
     #[test]
     fn fixture_adapter_satisfies_public_downstream_contract()

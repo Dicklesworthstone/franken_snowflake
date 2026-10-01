@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:franken-snowflake:typed-rows:v1",
+  "title": "typed.v1 result rows",
+  "description": "The row fields of a `fsnow.query.run.v2` envelope's `data` (also MCP query_run) when `row_encoding` is `typed.v1`. Every column's `json_repr` holds for all of its cells: validate cell i of every row against `$defs/cell_<json_repr of column i>`. SQL NULL is JSON null in every representation. Consumers must ignore fields they do not know.",
+  "type": "object",
+  "required": ["row_encoding", "columns", "rows"],
+  "properties": {
+    "row_encoding": { "const": "typed.v1" },
+    "columns": { "type": "array", "items": { "$ref": "#/$defs/column" } },
+    "rows": {
+      "type": "array",
+      "items": { "type": "array" }
+    }
+  },
+  "$defs": {
+    "column": {
+      "type": "object",
+      "required": ["name", "type", "nullable", "precision", "scale", "json_repr"],
+      "properties": {
+        "name": { "type": "string" },
+        "type": {
+          "type": "string",
+          "description": "The SQL API rowType type as sent (FIXED, NUMBER, REAL, DECFLOAT, TEXT, BOOLEAN, BINARY, DATE, TIME, TIMESTAMP_NTZ, TIMESTAMP_LTZ, TIMESTAMP_TZ, VARIANT, OBJECT, ARRAY, ...)."
+        },
+        "nullable": { "type": "boolean" },
+        "precision": { "type": ["integer", "null"] },
+        "scale": { "type": ["integer", "null"] },
+        "json_repr": {
+          "enum": [
+            "integer",
+            "decimal_string",
+            "float",
+            "bool",
+            "string",
+            "hex",
+            "date",
+            "time",
+            "timestamp_ntz",
+            "timestamp_utc",
+            "timestamp_offset",
+            "json",
+            "wire"
+          ]
+        }
+      }
+    },
+    "cell_integer": {
+      "description": "FIXED/NUMBER with scale 0 and precision <= 15: an exact JSON integer.",
+      "type": ["integer", "null"]
+    },
+    "cell_decimal_string": {
+      "description": "Other FIXED/NUMBER (never through a float) and DECFLOAT (which may carry an exponent): the exact decimal text.",
+      "type": ["string", "null"],
+      "pattern": "^[-+]?[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?$"
+    },
+    "cell_float": {
+      "description": "REAL/FLOAT: a JSON number, or one of the strings NaN, Infinity, -Infinity.",
+      "anyOf": [
+        { "type": "number" },
+        { "enum": ["NaN", "Infinity", "-Infinity"] },
+        { "type": "null" }
+      ]
+    },
+    "cell_bool": { "type": ["boolean", "null"] },
+    "cell_string": { "type": ["string", "null"] },
+    "cell_hex": {
+      "description": "BINARY: the bytes as hex.",
+      "type": ["string", "null"],
+      "pattern": "^([0-9A-Fa-f]{2})*$"
+    },
+    "cell_date": {
+      "description": "DATE: proleptic Gregorian YYYY-MM-DD; years outside 0000-9999 keep their sign and extra digits.",
+      "type": ["string", "null"],
+      "pattern": "^-?[0-9]{4,}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
+    },
+    "cell_time": {
+      "description": "TIME: HH:MM:SS with nine fractional digits.",
+      "type": ["string", "null"],
+      "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{9}$"
+    },
+    "cell_timestamp_ntz": {
+      "description": "TIMESTAMP_NTZ: wall-clock date and time, no offset.",
+      "type": ["string", "null"],
+      "pattern": "^-?[0-9]{4,}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{9}$"
+    },
+    "cell_timestamp_utc": {
+      "description": "TIMESTAMP_LTZ: the instant in UTC, RFC 3339 with Z.",
+      "type": ["string", "null"],
+      "pattern": "^-?[0-9]{4,}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{9}Z$"
+    },
+    "cell_timestamp_offset": {
+      "description": "TIMESTAMP_TZ: local date and time with the value's own offset, RFC 3339.",
+      "type": ["string", "null"],
+      "pattern": "^-?[0-9]{4,}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{9}[-+][0-9]{2}:[0-9]{2}$"
+    },
+    "cell_json": {
+      "description": "VARIANT/OBJECT/ARRAY: the parsed JSON value (a value holding a number JSON cannot carry exactly keeps the column on the wire instead)."
+    },
+    "cell_wire": {
+      "description": "Types without a typed form (GEOGRAPHY, GEOMETRY, unknown), and any column holding a cell that does not match its type's wire convention: the jsonv2 wire string.",
+      "type": ["string", "null"]
+    }
+  }
+}

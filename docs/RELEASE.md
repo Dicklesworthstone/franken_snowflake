@@ -6,18 +6,133 @@ requiring live Snowflake credentials.
 
 ## Current Release State
 
-- Package version: `0.0.4` (GitHub Release 2026-09-11). Built by `dsr` (run
-  `dd041529`, manifest source `edd80c7`) on all six targets with
-  `--features live,mcp`. `capabilities` reported `live=true, mcp=true` on every
-  artifact that was executed; `aarch64-pc-windows-msvc` has never been executed.
-- Publish state: all 14 crates are published on crates.io at `0.0.4` (first
+- Package version: `0.0.5`, a security release (GitHub Release 2026-09-25, tag
+  `v0.0.5` at `07ef0af`). Built by `dsr` in one run (`39a0a638`) on all six
+  targets with `--features live,mcp`; every binary reports `build.git_sha
+  07ef0af`, `dirty: false`, `profile: release`, `testkit: false` and source
+  digest `68cb0560...`. See "v0.0.5 release record" below.
+- Publish state: all 14 crates are published on crates.io at `0.0.5` (first
   published 2026-09-12); they configure `publish = ["crates-io"]` and declare
-  version requirements across internal path dependencies.
+  version requirements across internal path dependencies (sqlapi's testkit
+  dev-dependency is path-only: testkit depends on sqlapi).
+
+### v0.0.5 release record (2026-09-25)
+
+- Operator go-ahead: 2026-09-24, in this session ("Go: build and release", and
+  "Also publish crates" for crates.io).
+- Linux proof on `07ef0af`'s tree: every lane of "Required Local Proof" through
+  rch, plus `dsr quality franken_snowflake` 13/13 (receipt
+  `~/.local/state/dsr/quality-logs/franken_snowflake/20260925T023047-3245208`,
+  bound to `5666a1b`, whose crate sources and `Cargo.lock` are byte-identical to
+  `07ef0af`: same source digest). A first quality run passed 13/13 but was
+  invalidated by dsr because `HEAD` moved during it; it was rerun on a frozen
+  tree rather than accepted.
+- macOS and Windows: see "Cross-OS test runs" below.
+- Build: `dsr build franken_snowflake` (run `39a0a638`, 2385 s). The build
+  identity came from `FSNOW_BUILD_SHA`/`FSNOW_BUILD_DIRTY` set in
+  `repos.d/franken_snowflake.yaml` `env:` for this build only (dsr buildroots
+  carry no `.git`); set it again, naming the release commit, before the next
+  release build. dsr's rsync to the Windows host failed on its path conversion,
+  so the tagged tree reached it through `git archive` (verified by SHA-256).
+- Artifacts executed: Linux x86_64 (here), macOS arm64 and x86_64 (Rosetta) on
+  mmini, Windows x86_64 on wlap: `capabilities`, `selftest`, `doctor`, the
+  credential refusal (exit 3, `FSNOW-2003`), `mcp serve --http` startup. Linux
+  arm64 ran the same checks under qemu user-mode emulation.
+  `aarch64-pc-windows-msvc` has not been executed; its embedded git sha and
+  source digest match.
+- Release: `dsr release franken_snowflake 0.0.5 --verify-tag` (14 assets: six
+  archives, six `.sha256`, `SHA256SUMS`, the dsr manifest; no signatures);
+  `dsr release verify` passed. Notes carry the security advisory.
+- Installer smoke: `install.sh --version 0.0.5 --dest <empty dir> --verify` in a
+  clean `HOME`; the installed binary reports 0.0.5 and `07ef0af`.
+- crates.io: `scripts/publish-crates.py` stopped after four crates on the
+  sqlapi/testkit dev-dependency cycle; fixed in `e3c60d0` (path-only
+  dev-dependency) and resumed; all 14 crates at 0.0.5.
 - License metadata: workspace crates inherit `license-file = "LICENSE"` because
   the repository uses MIT plus the OpenAI/Anthropic rider.
 - Default feature policy: default features are intentionally lean; live, MCP,
   TUI, export, frame materialization, graph, and Frankensearch helpers stay
   feature-gated or opt-in according to `AGENTS.md`.
+
+### v0.0.4 release record (backfilled 2026-09-26)
+
+No record was written when v0.0.4 shipped; this one is reconstructed from dsr's
+own state and says what was never captured.
+
+- Source: tag `v0.0.4` at `edd80c7` (the dsr manifest's `source.git_sha`).
+- Build: `dsr build franken_snowflake` run `dd041529-ef5c-4620-8a5e-cfc1b7de2c3e`,
+  2026-09-12T03:10:41Z, 4005 s, 6/6 targets succeeded, dsr method `native` for
+  each: Linux x86_64 and aarch64 on trj (149 s, 150 s), macOS arm64 and x86_64
+  on mmini (1612 s, 536 s), Windows x86_64 and aarch64 on wlap (762 s, 746 s).
+  Manifest `franken_snowflake-v0.0.4-manifest.json`, SHA-256 `809b5cca...`.
+- Artifacts: six archives with SHA-256 in the manifest, all `signed: false`.
+- Never recorded: which proof lanes ran against `edd80c7`, which artifacts were
+  executed where, and any installer smoke. `aarch64-pc-windows-msvc` was
+  linked, not executed.
+- Shipped defects found by the 2026-09-23 audit: `mcp serve --http` was
+  exploitable cross-origin (fixed in v0.0.5); the Parquet export truncated
+  scaled `NUMBER`s, saturated large ones and mistyped timestamps (fixed after
+  v0.0.5); README claims had outlived their evidence.
+
+## Release Gates (every release)
+
+A release is cut only when every gate below has passed on the release commit,
+and its release record (template below) cites a receipt for each. A gate that
+cannot run is recorded as not run, with the reason; it is never skipped silently.
+
+1. Claims ledger: `python3 scripts/check-claims.py --self-test` and
+   `python3 scripts/check-claims.py` (`docs/claims.toml`), with
+   `--release-sha <sha>` once the README carries live claims.
+2. "Required Local Proof" below, every lane.
+3. Socket e2e: `scripts/e2e/socket_e2e.sh`; cite its `summary.json`.
+4. Security suite: the tests that pin the v0.0.5 fixes, all inside the lanes
+   above; the record names the lane that ran them:
+   `http_transport_refuses_the_cross_origin_exploit_and_requires_the_token`,
+   `http_without_a_token_refuses_to_start`, `missing_or_wrong_token_is_401`,
+   `foreign_origin_is_refused_even_with_a_valid_token` (MCP over HTTP);
+   `sandbox_refuses_absolute_parent_and_empty_paths` (export paths);
+   `read_guard_handles_nested_block_comments_fail_closed`,
+   `read_guard_closes_the_dollar_quote_bypass_and_side_effects` (read guard);
+   `confirmation_tokens_are_random_bound_and_expiring`,
+   `a_mismatched_confirm_token_is_refused_in_the_default_mode` (write ladder);
+   `secret_sql_literals_never_leave_the_process` (redaction);
+   `no_crate_derives_debug_over_a_credential` (Debug leak gate);
+   `workload_identity_lane_is_refused_before_any_request` (quarantined lane).
+5. `dsr quality franken_snowflake` and the cross-OS test runs of "Required
+   Cross-Platform Proof" (Linux, macOS, Windows).
+6. Live battery (`scripts/live-proof-cli.sh`) passed within 14 days on the
+   release build's sha, recorded in `docs/live_proof_state.json`. Until
+   credentials exist no release can run it: the release notes say so, and the
+   README carries no `live:` claim (the claims ledger enforces that part).
+7. Fresh-clone source build: in a container with no local checkout,
+   `install.sh --from-source --live --dest <tmp> --verify`, and `capabilities`
+   reports the release version and build sha.
+8. Artifacts executed on each target's platform; `aarch64-pc-windows-msvc`
+   stays "linked, not executed" until an ARM Windows host exists.
+9. Signatures: the record states whether the artifacts are signed. They are
+   not yet: dsr signing (minisign, `dsr signing init`) needs an operator-held
+   key, and none exists. `install.sh` verifies a Sigstore bundle only when one
+   is published and `cosign` is installed, and otherwise says the signature
+   was not verified; `install.ps1` always says so.
+
+Release record template:
+
+```text
+### vX.Y.Z release record (YYYY-MM-DD)
+- Operator go-ahead: <quote, date>
+- Source: tag vX.Y.Z at <sha>
+- Claims ledger: <check-claims.py summary line>
+- Local proof: <receipt per lane>
+- Socket e2e: <summary.json>
+- Security suite: <lane that ran each named test>
+- dsr quality: <receipt>; cross-OS tests: <host: result>
+- Live battery: <step dates on this sha> | not run: <reason>
+- Fresh-clone build: <log, version, build sha>
+- Build: dsr run <id>, manifest SHA-256, host per target
+- Artifacts executed: <per target>
+- Signatures: <how signed> | unsigned: <reason>
+- Release: dsr release ... ; dsr release verify
+```
 
 ## Required Local Proof
 
@@ -30,7 +145,15 @@ cargo check --workspace --no-default-features
 python3 scripts/check-dependency-admissibility.py
 scripts/check-asupersync-single-version.sh
 python3 scripts/check-golden-lf.py
+# README capability claims against their evidence (docs/claims.toml): every
+# tagged claim names tests that exist, and live evidence is fresh.
+python3 scripts/check-claims.py --self-test
+python3 scripts/check-claims.py
 cargo test --workspace --locked
+# Coverage floor per crate (docs/proof_lanes.md "Coverage Floor"); needs
+# cargo-llvm-cov and the pinned nightly's llvm-tools on the host running it
+# (the rch workers have neither):
+python3 scripts/check-coverage-floor.py
 cargo test --locked -p franken-snowflake-cli --features live,mcp
 # Socket e2e: the real binary over real TLS to a loopback mock SQL API
 # (tests/socket_e2e.rs). `testkit-endpoint` is test-only: a release artifact
@@ -45,6 +168,9 @@ cargo test --locked -p franken-snowflake-export --features export
 FSNOW_REQUIRE_EXTERNAL_PARQUET=1 cargo test --locked -p franken-snowflake-export --all-features --test parquet_conformance
 FSNOW_PRIVATE_DENYLIST=<path outside the repo> scripts/check-public-safety.sh
 cargo test --locked -p franken-snowflake-frame --features frankenpandas
+# Perf lane (wall-clock, so never in the default suite): the jsonv2 decoder's
+# 350 MB/s release target, with the host and CPU governor it ran on.
+cargo test --locked --release -p franken-snowflake-frame --features frankenpandas --test zero_copy_parity -- --ignored --nocapture
 cargo test --locked -p franken-snowflake-graph --features graph
 cargo test --locked -p franken-snowflake-http --features compression
 cargo test --locked -p franken-snowflake-tui --features tui
@@ -67,9 +193,9 @@ in a scanned lane blocks release.
 ## Required Cross-Platform Proof (dsr, never GitHub Actions)
 
 This repository does not use GitHub Actions: Actions are disabled in the
-repository settings, and no workflow may be added. The one leftover file,
-`.github/workflows/ci.yml`, is still tracked; deleting it awaits an explicit
-operator go-ahead. Cross-platform builds, tests, and release
+repository settings, and no workflow may be added (the leftover
+`.github/workflows/ci.yml` was removed on 2026-09-24 with the operator's
+go-ahead). Cross-platform builds, tests, and release
 artifacts run through `dsr` (Doodlestein Self-Releaser) on its Linux, macOS,
 and Windows build hosts. The repository is registered with `dsr` as the tool
 `franken_snowflake` (six targets: x86_64/aarch64 Linux, macOS, and Windows;
@@ -91,18 +217,21 @@ run output:
 - `python3 scripts/check-dependency-admissibility.py`
 - `python3 scripts/check-golden-lf.py`
 - `cargo test --workspace --locked` plus every optional feature lane listed
-  above (the `frankensqlite` lane is Unix-only)
+  above
+- `scripts/e2e/socket_e2e.sh`: the hermetic socket-level e2e (the real binary
+  over TLS to a loopback mock SQL API, every scenario of
+  `crates/franken-snowflake-cli/tests/socket_e2e.rs`); its run directory keeps
+  each scenario's requests, envelopes and store plus `summary.json`, and it
+  exits non-zero when a scenario fails
 
 The Linux lint lane must also pass:
 
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `scripts/check-asupersync-single-version.sh`
 
-The cache crate currently depends on FrankenSQLite candidate crates. On Windows,
-keep the fsqlite `cfg(unix)` prerequisite documented in
-`docs/dependency_admissibility.md` and set `FSNOW_SKIP_FSQLITE_WINDOWS_PREREQ`
-only for that known upstream prerequisite, not for forbidden-dependency
-failures.
+The cache crate's `frankensqlite` feature builds on Windows since FrankenSQLite
+0.4.x (fsqlite 0.4.4 with sqlmodel-frankensqlite 0.5.0): its 29 tests passed
+natively on wlap on 2026-09-25, so no lane is skipped on Windows any more.
 
 History: through 2026-09-03 the GitHub Actions workflow never executed a job
 (52 runs failed at workflow parse; the 10 after a fix were never assigned a
@@ -110,6 +239,44 @@ runner). Runs on 2026-09-12/13 did execute and failed on real defects (a
 `cli_e2e` TLS connection to `127.0.0.1.snowflakecomputing.com`, fixed in
 `9297728`, and a macOS installer step exiting 127); Actions were then disabled.
 Any "CI proof" wording older than this note is unbacked.
+
+### Cross-OS test runs
+
+2026-09-24, on the dsr build hosts, native toolchain `nightly-2026-08-31`,
+tree = commit `f374716` plus the two Windows fixes below (verified by file
+SHA-256 on each host). macOS got the tree through
+`dsr build franken_snowflake --target darwin/arm64 --sync-only`; dsr's rsync to
+the Windows host failed on a path-conversion bug, so Windows got it through
+`git archive HEAD` over ssh into the same buildroot. mmini's cargo is an rch
+shim, so the macOS runs set `RCH_SHIM_LOCAL_IDE=1 RCH_CARGO_WRAPPER_BYPASS=1
+RCH_REAL_CARGO=<toolchain>/bin/cargo-rch-real` to build locally; Windows ran
+inside `VsDevCmd.bat -arch=amd64`.
+
+| host | OS | lanes | result |
+|---|---|---|---|
+| mmini | macOS 26.2 arm64 | `cargo test --workspace --locked` and every feature lane above, including `franken-snowflake-cache --features frankensqlite`; `socket_e2e` + `mcp_http` with `live,mcp,testkit-endpoint,frankenpandas` | all green (socket 24/24, mcp_http 3/3) |
+| wlap | Windows 10.0.26220 x64 | the same, minus the Unix-only `frankensqlite` lane | all green after the fixes (socket 23/23; the SIGINT scenario is Unix-only; mcp_http 3/3) |
+
+The first Windows run failed 20 of 23 socket scenarios and 2 of 3 MCP HTTP
+tests. Two defects, both fixed: every live command and `mcp serve` overflowed
+the 1 MiB Windows main-thread stack in a debug build (the CLI build script now
+links the binaries with an 8 MiB stack, the Unix default), and the MCP HTTP test
+scrubbed `SYSTEMROOT`, which Windows sockets need. Not covered then: Ctrl-C on
+Windows, the `frankensqlite` lane on Windows, and a release-profile live run on
+Windows (whether the published v0.0.4 Windows binary also overflows on the live
+path is unknown). The first two are covered since 2026-09-25 (Asupersync 0.5
+tree): socket e2e `ctrl_c_cancels_the_statement_in_flight_on_windows` raises a
+real console CTRL_C_EVENT (28/28 on wlap), and `cargo test -p
+franken-snowflake-cache --features frankensqlite` passes 29/29 there.
+
+2026-09-25, Asupersync 0.5 tree (b541d30 plus the socket e2e artifact
+harness), file SHA-256 verified on each host:
+
+| host | platform | ran | result |
+|---|---|---|---|
+| mmini | macOS 26.2 arm64 | `scripts/e2e/socket_e2e.sh`; `cargo test --workspace`; every feature lane above | all green (socket e2e 28/28, cache frankensqlite 29/29) |
+| wlap | Windows 10.0.26220 x64 | `cargo test --workspace`; cli `live,mcp,testkit-endpoint,frankenpandas`; cache `frankensqlite`; text-indexing `frankensearch`; tui | all green (socket e2e 28/28 incl. the Ctrl-C scenario) |
+| rch workers | Linux x64 | workspace default and `--all-features` tests, the cli lanes, clippy `-D warnings` both configurations; `scripts/e2e/socket_e2e.sh` as an rch job | all green (socket e2e 28/28) |
 
 ## Cross-Compile Status (2026-09-03, local, `--features live,mcp --locked`)
 
@@ -304,3 +471,5 @@ with one inside the repository.
 4. Tag the release and build release artifacts from the clean tag.
 5. Publish checksums and install smoke-test the artifact in a clean environment.
 6. Update `CHANGELOG.md` with the tag date, commit range, and proof evidence.
+7. Write the release record ("Release Gates" template) under "Current Release
+   State".

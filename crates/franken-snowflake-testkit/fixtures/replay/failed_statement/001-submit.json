@@ -1,0 +1,130 @@
+{
+  "schema": "fsnow.wire_transcript.v1",
+  "seq": 1,
+  "route": "submit",
+  "request": {
+    "method": "POST",
+    "path": "/api/v2/statements",
+    "query": [
+      [
+        "requestId",
+        "00000000-0000-4000-8000-000000000001"
+      ],
+      [
+        "retry",
+        "true"
+      ]
+    ],
+    "headers": [
+      [
+        "Authorization",
+        "[REDACTED]"
+      ],
+      [
+        "X-Snowflake-Authorization-Token-Type",
+        "KEYPAIR_JWT"
+      ],
+      [
+        "Accept",
+        "application/json"
+      ],
+      [
+        "User-Agent",
+        "franken-snowflake/0.0.5"
+      ],
+      [
+        "Content-Type",
+        "application/json"
+      ]
+    ],
+    "body": {
+      "kind": "json",
+      "value": {
+        "statement": "SELECT * FROM FSNOW_NO_SUCH_TABLE_0928",
+        "timeout": 60,
+        "database": "<user>",
+        "schema": "PUBLIC",
+        "warehouse": "<warehouse>",
+        "parameters": {
+          "BINARY_OUTPUT_FORMAT": "HEX",
+          "MULTI_STATEMENT_COUNT": "1",
+          "QUERY_TAG": "fsnow:query.run:e74321b9-000f-4304-8018-a290898fbbf9",
+          "TIMEZONE": "UTC",
+          "USE_CACHED_RESULT": "FALSE"
+        }
+      }
+    }
+  },
+  "response": {
+    "status": 422,
+    "reason": "Unprocessable Entity",
+    "headers": [
+      [
+        "date",
+        "Tue, 29 Sep 2026 00:17:48 GMT"
+      ],
+      [
+        "content-type",
+        "application/json"
+      ],
+      [
+        "content-length",
+        "218"
+      ],
+      [
+        "server",
+        "SF-LB-T1"
+      ],
+      [
+        "x-envoy-upstream-service-time",
+        "668"
+      ],
+      [
+        "x-snowflake-fe-instance",
+        "-"
+      ],
+      [
+        "x-snowflake-fe-config",
+        "v20260925.0.0.1790327919.va4.1790640961008"
+      ],
+      [
+        "x-frame-options",
+        "deny"
+      ],
+      [
+        "x-envoy-attempt-count",
+        "1"
+      ],
+      [
+        "vary",
+        "Accept-Encoding"
+      ],
+      [
+        "x-content-type-options",
+        "nosniff"
+      ],
+      [
+        "x-xss-protection",
+        "1; mode=block"
+      ],
+      [
+        "expect-ct",
+        "enforce, max-age=3600"
+      ],
+      [
+        "strict-transport-security",
+        "max-age=31536000; includeSubDomains"
+      ]
+    ],
+    "content_encoding": null,
+    "body": {
+      "kind": "json",
+      "value": {
+        "code": "002003",
+        "message": "SQL compilation error:\nObject 'FSNOW_NO_SUCH_TABLE_0928' does not exist or not authorized.",
+        "sqlState": "42S02",
+        "statementHandle": "00000000-0000-4000-8000-000000000002"
+      }
+    }
+  }
+}

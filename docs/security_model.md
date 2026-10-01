@@ -53,11 +53,18 @@ when requested; tokens and private keys are **always** redacted.
 
 ## The Two Anti-Leak Mechanisms
 
-1. **Compile-time credential `Debug`-leak gate.** A build-time check scans crate
-   sources and fails the build if any `#[derive(Debug)]` struct has a
-   credential-shaped field (`*_api_key`, `*_password`, `*_private_key`,
-   `*_token`, ...) without a hand-rolled redacting `Debug`. Owned by bead
-   `fsnow-native-snowflake-connector-w0i.5`.
+1. **Credential `Debug`-leak gates.** The auth crate's build script scans its
+   sources and fails the build if a struct with a credential-shaped field
+   (`*_api_key`, `*_password`, `*_private_key`, `*_token`, ...) lacks a
+   hand-rolled redacting `Debug` (bead `fsnow-native-snowflake-connector-w0i.5`).
+   The workspace test `crates/franken-snowflake-testkit/tests/debug_leak_gate.rs`
+   scans every crate's `src/` for structs and enums (named fields, tuple fields,
+   and tuple variants named for a credential) whose derived `Debug` would print
+   a credential-shaped field or credential type (`SecretValue`,
+   `SecretString`, `EncodingKey`, `AuthorizationDescriptor`), or whose manual
+   `Debug`/`Display` prints the field or never redacts. A field whose type
+   has its own verified redacting `Debug` is safe under a derived one. Planted
+   controls prove every shape is still caught (bead oj0.10).
 2. **One composable redactor, one needle list.** The redactor sources its needle
    list from **one shared constant** — `franken-snowflake-core::redact::SECRET_PREFIXES`
    — so the redactor and the last-mile output scanner **cannot drift**. It uses
@@ -181,6 +188,23 @@ Fail-closed decisions:
   running it, whatever the account-level default is. (The request default is 1
   per the [SQL API reference](https://docs.snowflake.com/en/developer-guide/sql-api/reference);
   the parameter can also be set at account level, so it is pinned explicitly.)
+
+Live findings (2026-09-28, bead oj0.23; `sql_guard_*` steps of
+`scripts/live-proof-cli.sh`): each request pinned `MULTI_STATEMENT_COUNT` to the
+lexer's count, and Snowflake accepted every one. Its statement count therefore
+matched the lexer's for all of these shapes:
+
+- semicolons inside a string, a backslash-escaped string, a `$$` string and a
+  quoted identifier;
+- semicolons inside `--`, `//` and `/* */` comments;
+- a trailing `;`, and a trailing `;` followed by a line comment (one statement,
+  not two);
+- two statements (with `--allow-multiple-statements`).
+
+Two things are not probed. Nested block comments never reach the server,
+because the lexer refuses them locally. Whether an account- or user-level
+`MULTI_STATEMENT_COUNT` changes the default when a request omits it would
+require altering a user parameter on the test account.
 
 The strongest read-only guarantee is still Snowflake RBAC: give read profiles a
 role that cannot write (reality-check bead L4 adds a `profile doctor --online`

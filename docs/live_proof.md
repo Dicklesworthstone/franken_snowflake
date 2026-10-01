@@ -135,6 +135,85 @@ Missing credentials are not a pass-by-omission: the test writes a structured
 `franken_snowflake.live_gate.v1` skip event with the missing env handle names.
 Secrets are never written to the events or summaries.
 
+## Live Runs
+
+### 2026-09-28: first end-to-end CLI run
+
+This run used a production Snowflake account (not a trial) through the key-pair
+JWT lane. The account, user, warehouse and database names are withheld. The
+binary was a release build of `bcc10fe` with `--features live,mcp` (source
+digest `3edc59aa…`), run from the operator's host. The artifacts stayed local.
+
+| Step | Verdict |
+|---|---|
+| `profile validate`, `profile doctor --online` | pass (login 6.5 s, receipt recorded) |
+| `query run`: small read; a 50 000-row GENERATOR read with `--limit 10` | pass; the fetch stopped early (`partition_early_stop`) |
+| `receipt show` | pass |
+| 10 statement-count probes (`sql_guard_*`, bead oj0.23) | pass: Snowflake's count matched the lexer's on every shape, including a trailing `;` followed by a comment |
+| `query cancel` of a completed handle | pass |
+| `catalog scan` (with and without `--tags`), `catalog graph` | pass; the scratch schema had no tables, so the dataset lanes, `catalog search` and `catalog lineage` did not run |
+| `export plan`, `export run --format csv` | pass |
+| Differential against snowflake-connector-python 4.7.5 (bead oj0.22) | pass: 27/27 type-matrix columns match, compared to the microsecond |
+| `export run --format parquet` read back with pyarrow | pass: 27/27 columns equal the typed rows at nanosecond precision (a one-off check) |
+| In-flight cancel: SIGINT during `SELECT SYSTEM$WAIT(60)` | pass: `cancelled`, exit 130, and the remote cancel was acknowledged. **Finding:** the first Ctrl-C took effect only when the synchronous submit answered, about 40 s later |
+| jsonv2 capture (`capture-jsonv2-golden.sh`, bead w0i.13) | pass. It confirmed DATE as epoch days, TIME/NTZ/LTZ as fractional epoch **seconds** (not nanoseconds), TIMESTAMP_TZ as `<seconds> <offset+1440>`, and lower-case `rowType.type`. The golden is `crates/franken-snowflake-frame/tests/captured/jsonv2-wire-golden.json` |
+| Upstream error: a missing database | pass: typed `FSNOW-4002` carrying Snowflake's message |
+| Secret scan over every artifact and transcript | pass |
+
+These did not run:
+
+- write steps, which await the operator's go-ahead for this account;
+- the PAT lane, which the account's network policy blocks;
+- OAuth;
+- the dataset round trip, because the scratch schema had no table.
+
+## Wire Transcripts
+
+Every `scripts/live-proof-cli.sh` step runs with
+`FRANKEN_SNOWFLAKE_CAPTURE_DIR=<run dir>/transcripts/<step>`, so each live HTTP
+exchange is written as `<seq>-<route>.json`, where route is `submit`, `poll`,
+`partition` or `cancel` (bead oj0.21). The recorder
+(`franken_snowflake_http::capture`) makes these changes before writing:
+
+- it keeps only the path and query, never the host;
+- it replaces the account host and name wherever else they appear;
+- it writes `Authorization`, cookie and token header values as `[REDACTED]`;
+- it maps statement handles and request ids to stable placeholders;
+- it decodes gzip bodies and marks them.
+
+A transcript that still holds one of the profile's secret env values, or a
+bearer-token shape, is not written. A `refused-<seq>.txt` with the reason is
+left in its place, and the battery's secret scan covers the transcripts as well.
+
+`franken_snowflake_http::capture::ReplayHttp` serves a transcript directory
+back as the transport, so the production driver can run against what
+Snowflake actually sent. The socket e2e
+`a_captured_run_replays_through_the_production_driver` proves the full loop
+over TLS against the mock. To turn a live run into regression fixtures, review
+the transcripts and commit the steps under
+`crates/franken-snowflake-testkit/fixtures/replay/<step>/`.
+
+## Questions the First Credentialed Run Answers
+
+Besides the lanes above, `scripts/live-proof-cli.sh` answers three open questions
+in the same run:
+
+- **Statement counts (bead oj0.23):** ten SELECT-only `sql_guard_*` shapes run
+  (semicolons in strings, in `--`/`//`/block comments, in `$$` and quoted
+  identifiers; a trailing `;` with and without a comment; two statements). Every
+  request pins `MULTI_STATEMENT_COUNT` to the lexer's count, so Snowflake refuses,
+  without executing, any request whose count differs. A failing probe is a
+  finding that names the shape. Nested block comments are not probed, because
+  the lexer refuses them locally.
+- **Correctness against the incumbent (bead oj0.22):** when `uv` is available,
+  `scripts/differential-python-connector.py` runs one type-matrix SELECT through
+  fsnow and through `snowflake-connector-python==4.7.5`, then compares the cells
+  in `differential.json`. Times and timestamps are compared to the microsecond,
+  because Python's datetime stops there. `--self-test` checks the normalization
+  and the documented `connect()` arguments offline.
+- **Result encoding (bead w0i.13):** `scripts/capture-jsonv2-golden.sh` is run
+  separately.
+
 ## Spawned CLI Safety
 
 Any helper that spawns the CLI from the live proof harness must build a sanitized

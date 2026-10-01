@@ -7,7 +7,7 @@
 **A clean-room, Rust-first Snowflake SQL API connector built for coding agents.**
 
 ![License](https://img.shields.io/badge/license-MIT%20%2B%20OpenAI%2FAnthropic%20rider-blue)
-![Status](https://img.shields.io/badge/status-alpha%20%C2%B7%20CLI%20live%20proof%20pending-orange)
+![Status](https://img.shields.io/badge/status-alpha%20%C2%B7%20live%20reads%20proven%2C%20writes%20pending-orange)
 ![Language](https://img.shields.io/badge/language-Rust%202024-dea584)
 ![Runtime](https://img.shields.io/badge/runtime-Asupersync-8A2BE2)
 ![Forbidden deps](https://img.shields.io/badge/no-Tokio%20%C2%B7%20reqwest%20%C2%B7%20hyper-critical)
@@ -68,14 +68,14 @@ warehouse before any live credential exists.
 | Capability | What you get |
 |---|---|
 | Rust-first, memory-safe | `forbid(unsafe_code)` workspace-wide; lints `deny` `unwrap`/`expect`/`panic`/`todo`/`dbg!` |
-| No hidden async runtime | Built on Asupersync; production crates forbid Tokio, reqwest, hyper, axum, tower, sqlx, diesel, sea-orm |
-| Agent-ergonomic by default | Deterministic `--json` (or the alternate `--toon` encoding), `capabilities` with per-command JSON Schema inputs, `agent-handbook`, `onboard`, `did_you_mean`, stable exit codes |
-| Callable as a tool | Optional `mcp serve` exposing the same handlers and envelope contract over stdio or HTTP |
+| No hidden async runtime | Built on Asupersync; production crates forbid Tokio, reqwest, hyper, axum, tower, sqlx, diesel, sea-orm <!-- claim:no-hidden-runtime --> |
+| Agent-ergonomic by default | Deterministic `--json` (or the alternate `--toon` encoding), `capabilities` with per-command JSON Schema inputs <!-- claim:json-schema-registry -->, `agent-handbook`, `onboard`, `did_you_mean`, stable exit codes |
+| Callable as a tool | Optional `mcp serve` exposing the same handlers and envelope contract over stdio or HTTP <!-- claim:mcp-same-contract --> |
 | Deterministic tests | A mock SQL API server and a codec lane under a lab runtime exercise the contracts with no warehouse |
-| Never a fixture posing as live data | `data_source` provenance on every envelope; the live path refuses cleanly when credentials are absent |
-| Safe writes | `query write` runs DML and COPY INTO directly once a profile sets `WRITE_ENABLED`; `--dry-run` previews and binds a (profile, SQL) confirmation token, `WRITE_REQUIRE_CONFIRM` re-arms that ceremony, and DDL needs a separate opt-in |
-| Secrets stay secret | No secret in config, `Debug`, JSON, or panic text; a compile-time leak gate enforces it |
-| Auditable after the fact | Every live execution writes a BLAKE3 content-addressed receipt plus partition evidence and an append-only audit event to a local store; `receipt show <hash>` reads them back |
+| Never a fixture posing as live data | `data_source` provenance on every envelope; the live path refuses cleanly when credentials are absent <!-- claim:provenance-and-refusal --> |
+| Safe writes | `query write` runs DML and COPY INTO directly once a profile sets `WRITE_ENABLED`; `--dry-run` previews and binds a (profile, SQL) confirmation token <!-- claim:safe-writes -->, `WRITE_REQUIRE_CONFIRM` re-arms that ceremony, and DDL needs a separate opt-in |
+| Secrets stay secret | No secret in config, `Debug`, JSON, or panic text; a compile-time leak gate enforces it <!-- claim:secrets-leak-gate --> |
+| Auditable after the fact | Every live execution writes a BLAKE3 content-addressed receipt plus partition evidence and an append-only audit event to a local store; `receipt show <hash>` reads them back <!-- claim:receipts --> |
 
 ---
 
@@ -84,7 +84,7 @@ warehouse before any live credential exists.
 The commands below cover discovery, self-description, and offline planning, and
 they need no credentials. Read commands emit a deterministic JSON envelope on
 stdout (`--json`, the default) or the alternate `--toon` encoding (same data,
-round-trips exactly; byte size is comparable, token savings depend on your
+round-trips exactly <!-- claim:toon-round-trip -->; byte size is comparable, token savings depend on your
 tokenizer and payload shape).
 Diagnostics go to stderr. An empty-but-valid result is exit 0 with an empty
 payload, never a non-zero exit.
@@ -154,44 +154,73 @@ observations, and the project's own conformance fixtures.
 HTTP/TLS client and gzip carry the transport, and the statement driver returns
 Asupersync's four-valued `Outcome` (`Ok` / `Err` / `Cancelled` / `Panicked`),
 which reaches the CLI envelope intact (a cancellation reads `cancelled` or
-`timeout`, never an internal error). Once a statement is submitted, every error
+`timeout`, never an internal error) <!-- claim:outcome-intact -->. Once a statement is submitted, every error
 path and every deadline, budget, shutdown, or user cancellation fires a
-best-effort remote cancel, and the
+best-effort remote cancel. <!-- claim:remote-cancel-every-path --> A cancel that arrives while the submit itself is in
+flight waits for Snowflake's answer <!-- claim:masked-submit -->, which names the statement (a synchronous
+submit is answered within 45 s, with the result or the handle), then cancels it;
+a second Ctrl-C exits at once. The
 server-side `STATEMENT_TIMEOUT_IN_SECONDS` (60 s by default) is sent with every
-request as the backstop. The retry loop is the project's own, built on that
+request as the backstop. Each HTTP exchange is bounded (300 s), so a stalled
+connection ends as a `timeout` with the remote cancel instead of hanging, and a
+statement still running 5 s past its statement timeout is cancelled by the client <!-- claim:client-deadline -->
+(outcome `timeout`, remote cancel sent). With `MAX_CREDITS` set, a statement whose
+estimated credits reach the cap is cancelled the same way <!-- claim:credit-cap --> (cancel kind
+`CostBudget`). The retry loop is the project's own, built on that
 client. While a statement runs, Ctrl-C (SIGINT) or SIGTERM cancels it the same
-way (a second signal exits at once); a process killed with SIGKILL still leaves
-it to the server timeout. Not yet wired: a drop guard for the statement handle,
-capability-row narrowing, and a cost budget on the live path. The testkit explores a model of the driver's
-cancel and retry interleavings with DPOR.
+way: the envelope reads `cancelled` and the exit status is 130 (SIGINT) or 143
+(SIGTERM) <!-- claim:signals -->, as for any interrupted command; a second signal exits at once. The
+receipt of a run that ended without rows names the statement handle, says
+whether Snowflake ever accepted the statement (`accepted_by_snowflake`), and
+records whether the remote cancel was acknowledged (`remote_cancel`). A
+process killed with SIGKILL still leaves
+it to the server timeout. A running statement is also held by a drop guard: if
+the driver's future is dropped mid-flight (a library caller abandons it, a panic
+unwinds through it), the remote cancel is still sent <!-- claim:drop-guard -->, from a thread and runtime
+of its own, and the binary waits up to 10 s for it before exiting. The running
+statement is also an Asupersync `Lease` obligation held by the task that drives
+it <!-- claim:lease-obligation -->: committed when the statement ends, aborted as cancelled when it is cancelled
+or dropped, aborted as an error when a local failure abandons it. A lab-runtime
+test checks all four endings under the obligation-leak oracle, and a driver
+leaked without being dropped trips the runtime's leak check. Not yet wired:
+capability-row narrowing. The testkit explores cancel and retry interleavings
+with DPOR, over a model of the driver and over the production driver itself <!-- claim:dpor-production-driver -->: a
+cancel raced against a running statement, every request a real HTTP/1 exchange
+over virtual TCP, and a lost submit answer recovered by the idempotent
+resubmit (one execution).
 
 **Deterministic tests.** The protocol is exercised without a warehouse. Two
 lanes carry the proof: a deterministic codec lane over a virtual TCP transport
 under the lab runtime, and an integration lane against a mock SQL API server.
 Live tests are opt-in and emit a typed skip or refusal when credentials are
-absent, rather than silently passing.
+absent, rather than silently passing. <!-- claim:live-tests-opt-in -->
 
 **Agent-ergonomic JSON contracts.** Every command returns a versioned envelope
 with a typed `outcome_kind`, a `data_source` provenance field, a stable error
 code from a central registry that gives each code a default recovery path,
 `did_you_mean` suggestions, and a documented exit-code scheme where an
-empty-but-valid result is exit 0. The CLI and the MCP server share the exact
-same handlers, so the two surfaces cannot drift into two contracts.
+empty-but-valid result is exit 0 <!-- claim:empty-exit-zero -->. The CLI and the MCP server share the exact
+same handlers, so the two surfaces cannot drift into two contracts. <!-- claim:cli-mcp-same-handlers -->
 
 **Forbid-unsafe and deny-panic.** The workspace sets `unsafe_code = "forbid"`
 and denies `clippy::unwrap_used`, `expect_used`, `panic`, `todo`, and
 `dbg_macro`. Every crate inherits the policy through `[lints] workspace = true`,
-and the policy is verified to actually fail a build or clippy run.
+and the policy is verified to actually fail a build or clippy run <!-- claim:lint-policy-verified -->.
 
 **Safe writes, redaction, guardrails, and budgets.** Secrets never appear in
-config, `Debug`, JSON output, or panic text; a compile-time gate fails the build
-if a credential-shaped field derives `Debug`. Reads run with read-only
-capabilities, while writes are gated behind a per-profile `WRITE_ENABLED` opt-in
+config, `Debug`, JSON output, or panic text: the auth crate's build fails if one
+of its credential-shaped fields derives `Debug`, and a workspace test fails if
+any crate's struct or enum would print one through `Debug` (derived, or a
+manual impl that prints the field or never redacts). Reads pass the
+one-statement read guard <!-- claim:read-guard -->; a write reaches the SQL API only with a
+`WriteAuthorization`, which only the core write-intent ladder can mint <!-- claim:write-authorization --> (the
+type cannot be built anywhere else, a compile-fail test holds that) and which
+covers only the statement it was minted for. Writes are gated behind a per-profile `WRITE_ENABLED` opt-in
 and execute directly once enabled; `--dry-run` previews and binds a confirmation
 token to the exact statement, and `WRITE_REQUIRE_CONFIRM` makes that ceremony
 mandatory for cautious profiles. Cost and safety
 guardrails bound work before it is dispatched, and result rows are capped into a
-response envelope with an explicit `truncated` flag so an agent never receives
+response envelope with an explicit `truncated` flag <!-- claim:truncated-flag --> so an agent never receives
 an unbounded payload by surprise.
 
 **Deterministic testkit.** A shared golden framework, a JSON-line logger, a
@@ -241,7 +270,7 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_snowflake
 irm https://raw.githubusercontent.com/Dicklesworthstone/franken_snowflake/main/install.ps1 | iex
 ```
 
-> `v0.0.4` ships Windows assets for both `x86_64-pc-windows-msvc` and
+> `v0.0.5` ships Windows assets for both `x86_64-pc-windows-msvc` and
 > `aarch64-pc-windows-msvc`; only the older `v0.0.2` release lacked them.
 
 The installer accepts these flags (pass after `bash -s --` for the curl form):
@@ -259,17 +288,15 @@ The installer accepts these flags (pass after `bash -s --` for the curl form):
 | `--no-gum` | Plain output with no styled prompts |
 | `--force` | Overwrite an existing install |
 
-The `v0.0.4` release binaries are built with `--features live,mcp`: they report
+The `v0.0.5` release binaries are built with `--features live,mcp`: they report
 `feature_flags.live=true, mcp=true` in `capabilities`, so downloaded binaries
 run live reads and writes out of the box. Credentials are always runtime-gated:
 a live-capable binary refuses live operations cleanly (exit 3) when the
 selected profile or environment does not provide credential handles, so the
 offline surfaces still work with no credentials at all.
 
-This README tracks `main`. Surfaces added after `v0.0.4` need a source build
-until the next release: `catalog diff`, `export run --format parquet`, the
-bearer-token and origin checks on `mcp serve --http`, per-command flag
-validation, the stricter `profile validate`, and `capabilities.build`.
+This README tracks `main`. Surfaces added after `v0.0.5` need a source build
+until the next release.
 
 To build the live-capable binary from source in one shot, pass both
 `--from-source` and `--live` through the pipe:
@@ -278,7 +305,7 @@ To build the live-capable binary from source in one shot, pass both
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_snowflake/main/install.sh | bash -s -- --from-source --live
 ```
 
-> `--from-source` builds from a fresh standalone clone: the FrankenSuite
+> `--from-source` builds from a fresh standalone clone: the FrankenSuite <!-- claim:fresh-clone-source-build -->
 > dependencies resolve from crates.io, so no local sibling checkout is required.
 
 On Windows the `irm ... | iex` one-liner cannot forward arguments, so download
@@ -391,8 +418,12 @@ Asupersync dependency set; the pinned toolchain lives in `rust-toolchain.toml`.
 
 The canonical binary is `franken-snowflake`; `fsnow` is the identical alias.
 Read commands default to `--json`. Pass `--toon` for the alternate TOON
-encoding (available when the default `toon` feature is compiled in). `--no-color`
-is accepted and ignored. There is no `--version` flag; the compiled version and
+encoding (available when the default `toon` feature is compiled in); a payload
+holding a control character TOON cannot escape (Snowflake names, comments and
+cells are data and can carry terminal escapes) is printed as JSON instead, with
+a note on stderr. No output mode writes a raw control character: JSON escapes
+them, and `--mermaid`/`--svg` show them as visible symbols. The CLI never
+colors its output, so `--no-color` is accepted and ignored. There is no `--version` flag; the compiled version and
 feature set are reported inside the `capabilities` and `onboard` envelopes.
 
 Every command that takes `--profile` (or a positional `<profile>`) also reads
@@ -440,8 +471,8 @@ handle sets per auth lane.
 
 | Command | What it does |
 |---|---|
-| `fsnow catalog scan <profile> --database <db> --schema <schema> [--require-live] --json` | Discover tables, views, and columns through bound `INFORMATION_SCHEMA` statements, build dataset manifests (field roles, row/byte hints), and persist the snapshot to the local store; `--require-live` hard-refuses with `FSNOW-3003` unless served by the live transport |
-| `fsnow catalog graph <profile> --database <db> [--schema <schema>] [--refresh] [--json\|--toon\|--mermaid\|--svg]` | Render the catalog graph (containment: profile > database > schema > object > column, plus dataset-to-object and field-to-column edges; view-dependency and foreign-key lineage are not extracted yet) from the local snapshot, or from a live scan with `--refresh` |
+| `fsnow catalog scan <profile> --database <db> --schema <schema> [--max-view-refs <n>] [--tags] [--require-live] --json` | Discover tables, views, and columns through bound `INFORMATION_SCHEMA` statements, then the relation pass (primary keys, foreign keys, view dependencies, stages, file formats, external-table sources, and with `--tags` tag assignments); build dataset manifests (field roles, row/byte hints, primary keys) and persist the snapshot to the local store; `--require-live` hard-refuses with `FSNOW-3003` unless served by the live transport |
+| `fsnow catalog graph <profile> --database <db> [--schema <schema>] [--refresh] [--json\|--toon\|--mermaid\|--svg]` | Render the catalog graph (containment: profile > database > schema > object > column; dataset-to-object and field-to-column edges; view dependencies, foreign keys, stage and file-format use, and tags from the relation pass) from the local snapshot, or from a live scan with `--refresh` |
 | `fsnow catalog diff <profile> [--database <db>] [--schema <schema>] [--base <snapshot-id>] [--target <snapshot-id>] --json` | Compare two catalog snapshots or audit schema drift across historical scans from the local store; reports added/removed/modified tables and columns with breaking-change classification and envelope warnings |
 
 Both `--database` and `--schema` are required for `catalog scan`. `catalog
@@ -454,6 +485,21 @@ feature plus credentials (the default build returns a typed "live transport
 required" envelope); `catalog graph`, `catalog diff`, `dataset inspect`, and `dataset profile`
 then work offline from the persisted snapshot.
 
+The relation pass reads `SHOW PRIMARY KEYS IN SCHEMA` (quoted identifiers:
+SHOW takes no binds), `INFORMATION_SCHEMA` `TABLE_CONSTRAINTS` +
+`REFERENTIAL_CONSTRAINTS` (foreign keys, table level: Snowflake's documented
+views do not map key columns, and a constraint name that does not identify
+one table is reported, not guessed), `STAGES`, `FILE_FORMATS`,
+`EXTERNAL_TABLES` (only when the schema has one), and
+`GET_OBJECT_REFERENCES` once per view (the view's whole dependency closure;
+`--max-view-refs`, default 25, max 500, 0 skips). `--tags` adds
+`SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES`, which needs the `GOVERNANCE_VIEWER`
+database role and lags up to two hours. A source Snowflake refuses
+(privileges, edition, a view it cannot resolve) makes the scan
+`partial_success` (exit 1) with a warning naming the source; the snapshot is
+still persisted and records the gap, so a missing relation is never a silent
+empty. Transport, auth, and cancel errors still fail the scan.
+
 ```bash
 fsnow catalog scan demo-prod --database ANALYTICS --schema PUBLIC --json
 fsnow catalog diff demo-prod --database ANALYTICS --schema PUBLIC --json
@@ -465,14 +511,38 @@ fsnow catalog graph demo-prod --database ANALYTICS --schema PUBLIC --svg
 
 | Command | What it does |
 |---|---|
-| `fsnow dataset inspect <dataset-id> --json` | Return the dataset manifest (roles, limits, row/byte hints), its column catalog, and the operator catalog from the local store |
+| `fsnow dataset inspect <dataset-id> --json` | Return the dataset manifest (roles, limits, row/byte hints), its column catalog (with column tags), its primary key and relations, and the operator catalog from the local store |
 | `fsnow dataset profile <dataset-id> [--execute] --json` | Build the pushed-down `APPROX_COUNT_DISTINCT` / null-count / min-max profiling statement; `--execute` runs it live and returns the stats |
+| `fsnow dataset validate-manifest --json` | Parse the dataset manifest overlay and check each entry's fields against the datasets in the local store |
 | `fsnow dataset describe-operator <operator> --jsonschema` | Return the catalog entry and JSON Schema 2020-12 for one of the 11 filter operators (`eq neq lt lte gt gte between in is_null is_not_null contains`) |
 
 `dataset describe-operator` is fully offline and deterministic. `dataset
 inspect` and `dataset profile` read the snapshot a `catalog scan` persisted; an
 unknown dataset is a typed `FSNOW-7002` error naming the scan command. Dataset
 ids look like `<db>_<schema>_<object>_b3_<hash>` and are listed by `catalog scan`.
+
+Discovery infers field roles from names and types. A non-secret TOML overlay
+(`FRANKEN_SNOWFLAKE_MANIFEST`, or `<data dir>/datasets.toml`) confirms or
+corrects them per dataset (by `id`, or `database` + `schema` + `object`):
+field roles, `rights_class` (an unknown label fails closed to `restricted`),
+`default_limit`, `max_rows_without_export`, and `description`. It applies at
+read time to `dataset inspect`, `query plan|run --dataset`, and `dataset
+profile`; overlaid fields report `role_confidence: overlay`. A field naming a
+column the dataset lacks is a usage error with suggestions, a key that looks
+like a credential is refused, and `dataset validate-manifest --json` checks the
+file against the local store.
+
+```toml
+[[datasets]]
+database = "ANALYTICS"
+schema = "PUBLIC"
+object = "EVENTS"
+default_limit = 500
+
+[[datasets.fields]]
+column = "ACCOUNT_REF"
+role = "entity_key"
+```
 
 ```bash
 fsnow dataset describe-operator between --jsonschema
@@ -486,7 +556,7 @@ fsnow dataset profile events_daily --json
 |---|---|
 | `fsnow query plan --profile <profile> --sql <sql> --json` | Validate and explain a read plan without submitting it |
 | `fsnow query plan --dataset <id> [--entity <v>] [--from <t>] [--to <t>] [--as-of <t>] [--select a,b] [--filter <json>] [--limit <n>] --json` | Dataset mode: compile pushed-down SQL with positional typed bindings, Time Travel `AT(TIMESTAMP => ...)` for `--as-of`, and an enforced limit, offline from the local snapshot |
-| `fsnow query run --profile <profile> --sql <sql> [--limit <rows>] [--role <r>] [--warehouse <w>] [--statement-timeout <s>] [--require-live] [--raw-cells] --json` | Submit a single read statement (SELECT / WITH / SHOW / DESCRIBE / EXPLAIN); every flag is honored or rejected, never silently ignored. Rows are typed (`row_encoding: typed.v1`, see [Result cells](#result-cells)); `--raw-cells` returns the SQL API jsonv2 wire strings instead. Result partitions are fetched in a concurrent window and the fetch stops once `--limit` rows are assembled (`partitions_fetched` and a warning say so). `--require-live` hard-refuses with `FSNOW-3003` unless the envelope is backed by the live transport |
+| `fsnow query run --profile <profile> --sql <sql> [--limit <rows>] [--role <r>] [--warehouse <w>] [--statement-timeout <s>] [--require-live] [--raw-cells] [--allow-multiple-statements] --json` | Submit a single read statement (SELECT / WITH / SHOW / DESCRIBE / EXPLAIN); every flag is honored or rejected, never silently ignored. `--allow-multiple-statements` runs a batch of reads as one request (`MULTI_STATEMENT_COUNT` = the batch size) and answers each statement in order under `data.statements[]`; a mutation anywhere in the batch, bindings, or an empty statement is refused before any request. Rows are typed (`row_encoding: typed.v1`, see [Result cells](#result-cells)); `--raw-cells` returns the SQL API jsonv2 wire strings instead. Result partitions are fetched in a concurrent window and the fetch stops once `--limit` rows are assembled (`partitions_fetched` and a warning say so). `--require-live` hard-refuses with `FSNOW-3003` unless the envelope is backed by the live transport |
 | `fsnow query run --dataset <id> ... --json` | Dataset mode: plan as above, then execute live with the same bindings |
 | `fsnow query write --profile <profile> --sql <sql> [--dry-run \| --confirm <token>] --json` | Execute a mutation; direct once `WRITE_ENABLED` is set, with `--dry-run` as an optional preview (see [Writes](#writes)) |
 | `fsnow query --sql <sql> --profile <profile> --json` | Shorthand that maps to `query run` |
@@ -520,8 +590,9 @@ convention (or a VARIANT holding a number a JSON number cannot carry exactly,
 such as an integer beyond 64 bits) keeps the wire strings for all of its cells,
 `json_repr: "wire"`, and a warning names the column. `--raw-cells` returns
 every cell as the SQL API sent it (`row_encoding: "jsonv2.wire"`). The
-conventions follow the SQL API documentation; a live capture has not confirmed
-them yet. Local CSV and JSONL exports write DATE, TIME and TIMESTAMP cells in
+conventions follow the SQL API documentation, and a live capture confirmed them
+on 2026-09-28 (`crates/franken-snowflake-frame/tests/captured/jsonv2-wire-golden.json`,
+checked cell by cell against the literals it selected). Local CSV and JSONL exports write DATE, TIME and TIMESTAMP cells in
 the same text forms; other cells keep their wire text (JSONL writes numbers and
 booleans as JSON literals and VARIANT verbatim).
 
@@ -641,9 +712,14 @@ that live transport and credentials are required); it never fakes an execution.
 
 | Command | What it does |
 |---|---|
+| `fsnow catalog relates <profile> <object> [--depth <n>] --json` | What relates to a catalog object (a node key, dataset id, or `DB.SCHEMA.OBJECT[.COLUMN]`, case-insensitive) within `--depth` hops, offline from the local snapshot; an unknown object is `FSNOW-7002` with suggestions |
+| `fsnow catalog search <profile> "<words>" [--limit <n>] --json` | Rank the newest snapshot's datasets by the query's words in their names, columns, comments, and tags (whole words weigh twice a prefix; matching every word adds half), with where each word matched; offline, and nothing matching is an empty success |
+| `fsnow catalog lineage <profile> <object> --up\|--down --json` | Dependency lineage, transitively: `--up` is what the object reads or references (view sources, referenced tables, stages, file formats), `--down` is what reads or references it (views, datasets, referencing tables); each node carries its depth and the edge kind that reached it. Containment is not lineage; a snapshot scanned before the relation pass says so in a warning |
+| `fsnow catalog cycles <profile> --json` | Dependency cycles in the catalog graph |
 | `fsnow receipt show <receipt-hash> --json` | Look up a content-addressed query receipt, its partition evidence, and the audit events that reference it |
+| `fsnow receipt refetch <receipt-hash> [--profile <p>] [--limit <rows>] [--raw-cells] --json` | Re-read a completed statement's rows from Snowflake's result cache (`RESULT_SCAN` on the receipt's query id, kept about 24 hours) without running it again; an older receipt is refused (`FSNOW-7001`), an unknown one is `FSNOW-7002` (live feature) |
 | `fsnow export plan --profile <p> --sql <select>\|--query-id <id> --location @stage/path [--format csv\|jsonl] [--compression gzip] [--header false] [--overwrite] [--single] [--max-file-size <bytes>] --json` | Build a content-addressed `COPY INTO <stage>` plan (Snowflake-side unload) and the exact `query write` command that executes it |
-| `fsnow export run --profile <p> --sql <select>\|--query-id <id> --format csv\|jsonl\|parquet\|frame [--compression none\|snappy\|gzip] --out <path> [--overwrite] --json` | Run a read live and write a content-addressed local CSV/JSONL/Parquet/frame artifact (live feature; frame requires `--features frankenpandas`). An existing file is replaced only with `--overwrite` (atomically, via rename); a symlink or non-file target is refused. The envelope reports `resolved_path` and `overwrote` |
+| `fsnow export run --profile <p> --sql <select>\|--query-id <id> --format csv\|jsonl\|parquet\|frame [--compression none\|snappy\|gzip] --out <path> [--overwrite] [--max-rows <n>] [--progress] --json` | Run a read live and write a content-addressed local CSV/JSONL/Parquet/frame artifact (live feature; frame requires `--features frankenpandas`). CSV and JSONL stream to the file partition by partition; a result over `--max-rows` (default 1000000) is refused with no file left. `--progress` (also on `query run`) writes one JSON object per statement event (`submitted`, `polled`, `partition_fetched` with rows and bytes, `completed`) to stderr; stdout stays the single envelope. An existing file is replaced only with `--overwrite` (atomically, via rename); a symlink or non-file target is refused. The envelope reports `resolved_path` and `overwrote` |
 
 ```bash
 fsnow export plan --profile demo-prod --sql "select * from events" --location @my_stage/exports/run_001 --format jsonl --json
@@ -657,13 +733,30 @@ append-only JSONL store under the platform data directory
 or `%APPDATA%\franken-snowflake`); `FRANKEN_SNOWFLAKE_DATA_DIR` overrides it.
 `doctor` reports the resolved directory.
 
+### Text search
+
+With `--features frankensearch` (and `live` for `text index`), the text of a
+query result can be indexed locally and searched offline: filings, transcripts,
+notes, support tickets, any column of prose. Retrieval is Frankensearch's hash
+and lexical (Tantivy BM25) tiers only; nothing downloads a model. <!-- claim:text-search -->
+
+| Command | What it does |
+|---|---|
+| `fsnow text index --profile <p> --sql <select> --column <COL> [--column <COL>]... [--id-column <COL>] --name <index> [--max-rows <n>] --json` | Run one read statement live (the same guard, receipt and `--max-rows` bound as `export run`) and index every non-null, non-blank cell of the named columns. Each document keeps its row, column, `--id-column` value, and the statement's receipt hash. An unknown column is a usage error that lists the result's columns and points at `receipt refetch`, so the rows need not be read again. A rebuild of the same name replaces what `text search` reads; the older version stays on disk under `<data dir>/text-indexes/<name>/` and is never read again. Query text carries no rights label, so documents are `restricted` |
+| `fsnow text search <index> "<words>" [--limit <n>] --json` | Rank the index's documents by the query, offline. Each hit has its row, column, id, a snippet of at most 240 characters around the first query word, and a rights class; `data.source` names the receipt, statement handle and SQL preview the text came from. Nothing matching is an empty success; a missing index is `FSNOW-7002` naming `text index` |
+
+```bash
+fsnow text index --profile demo-prod --sql "select ticket_id, body from support.tickets where opened_at > dateadd(day, -30, current_date)" --column BODY --id-column TICKET_ID --name tickets --json
+fsnow text search tickets "refund policy" --limit 5 --json
+```
+
 ### MCP and TUI
 
 | Command | What it does |
 |---|---|
 | `fsnow mcp serve --stdio` | Serve the read verbs as MCP tools over stdio (requires the `mcp` feature) |
 | `fsnow mcp serve --http <addr> [--allow-origin <origin>]... [--allow-tool <tool>]... [--allow-remote]` | Serve over HTTP at `/mcp`; requires a bearer token in `FRANKEN_SNOWFLAKE_MCP_TOKEN` (at least 32 characters), checks `Host` and `Origin`, binds loopback only unless `--allow-remote`, and exposes only read-only tools unless `--allow-tool` names more |
-| `fsnow tui --profile <profile>` | Interactive catalog browser + query planner (FrankenTUI) over the profile's latest local snapshot; needs a build with `--features tui` and a real terminal (a non-TTY invocation refuses typed instead of hanging). With `--features live`, submitting a planned query executes it through the same live path as `query run` (results land in the log pane; v1 blocks the UI until the statement returns); without `live`, submit logs a typed pointer to `query run` |
+| `fsnow tui --profile <profile>` | Interactive catalog browser + query planner (FrankenTUI) over the profile's latest local snapshot; needs a build with `--features tui` and a real terminal (a non-TTY invocation refuses typed instead of hanging). With `--features live`, submitting a planned query executes it through the same live path as `query run` on a background task: the UI stays live, the progress pane follows the statement (handle, partitions, rows), Esc on the progress pane cancels it (SQL API remote cancel included), and results land in the log pane; without `live`, submit logs a typed pointer to `query run` |
 
 ```bash
 fsnow mcp serve --stdio
@@ -698,7 +791,7 @@ normalized to `_`, then prefixed with `FRANKEN_SNOWFLAKE_`. The profile
 
 | Handle | Purpose |
 |---|---|
-| `<PREFIX>_ACCOUNT` | Snowflake account locator or full `https://...snowflakecomputing.com` URL |
+| `<PREFIX>_ACCOUNT` | Snowflake account identifier (`orgname-account_name`, underscores allowed, or a locator such as `xy12345.us-east-2.aws`) or the full account URL; China-region locators (`xy12345.cn-northwest-1.aws`) resolve to `snowflakecomputing.cn` |
 | `<PREFIX>_USER` | Snowflake user |
 | `<PREFIX>_AUTH` | Auth lane: `pat`, `oauth_bearer`, or `key_pair_jwt` |
 | `<PREFIX>_WAREHOUSE` | Warehouse for submitted statements |
@@ -706,9 +799,13 @@ normalized to `_`, then prefixed with `FRANKEN_SNOWFLAKE_`. The profile
 | `<PREFIX>_SCHEMA` | Optional default schema (overridden by `--schema`) |
 | `<PREFIX>_ROLE` | Optional role |
 | `<PREFIX>_MAX_POLLS` | Optional poll budget (default 120) |
-| `<PREFIX>_STATEMENT_TIMEOUT_SECONDS` | Optional SQL API statement timeout in seconds (default 60; `--statement-timeout` overrides per run) |
+| `<PREFIX>_STATEMENT_TIMEOUT_SECONDS` | Optional SQL API statement timeout in seconds (default 60; `--statement-timeout` overrides per run). The client also cancels a statement still running 5 s past it (outcome `timeout`, remote cancel sent) |
+| `<PREFIX>_MAX_CREDITS` | Optional advisory credit cap per request, e.g. `0.05`. A statement whose estimate reaches it is cancelled (outcome `cancelled`, cancel kind `CostBudget`, remote cancel sent), and a query is refused before it is submitted when resuming a suspended warehouse (billed 60 s at least) would already exceed it. The estimate is the warehouse's rate times execution time; Snowflake's bill (other queries, extra clusters) can differ, and the statement timeout stays the enforceable guard |
+| `<PREFIX>_WAREHOUSE_CREDITS_PER_HOUR` | Optional warehouse rate for `MAX_CREDITS`. Without it the rate comes from `SHOW WAREHOUSES` (published Gen1 standard rates: X-Small 1 credit/hour, doubling per size); Gen2 and Snowpark-optimized warehouses have no published per-size rate, so they need this set |
 | `<PREFIX>_PARTITION_CONCURRENCY` | Optional partition fetch window, 1-16 (default 4): how many result partitions are downloaded at once; assembly stays in order |
 | `<PREFIX>_QUERY_TAG` | Optional. Unset: every live statement carries `QUERY_TAG = fsnow:<command_id>:<request_id>`, so Snowflake's query history ties back to the envelope and its receipt; a value fixes the tag for the profile; `off` sends none. `--query-tag` overrides it per run |
+| `<PREFIX>_EXPORT_MAX_ROWS` | Optional row limit for `export run` (default 1000000; `--max-rows` overrides per run): a larger result is refused (`FSNOW-3004`) and leaves no file |
+| `<PREFIX>_READ_ONLY_EXPECTED` | Set to `true` on a read profile to make `profile doctor --online` fail (`FSNOW-2002`, exit 3) when the role can write or its grants cannot be fully checked; without it a write-capable role on a read profile is a warning. Give each read profile a read-only role: Snowflake's RBAC is the enforceable guard, the client-side SQL check is a second line |
 | `<PREFIX>_CA_BUNDLE` | Optional path to a PEM CA bundle, for a proxy that re-signs TLS traffic: the server certificate must chain to this bundle instead of the OS trust store. An unreadable bundle, or one without a certificate, is `FSNOW-2002`, never a fallback to the OS store. Connections on this path are not pooled |
 | `<PREFIX>_WRITE_ENABLED` | Set to `true` to enable data writes (DML, COPY INTO) for the profile; a bare `query write` then executes directly |
 | `<PREFIX>_WRITE_REQUIRE_CONFIRM` | Set to `true` to require the dry-run to confirm ceremony on every write (cautious opt-in); a bare `query write` refuses until you `--dry-run`, then `--confirm <token>` |
@@ -830,7 +927,7 @@ statement handle.
     catalog (info-schema discovery · manifests · operator catalog · dataset planner · predicate AST)
     graph (containment + dataset edges · Mermaid/SVG) · export (COPY INTO plans + local CSV/JSONL/Parquet/frame writers)
     cache (local store: append-only JSONL by default; FrankenSQLite backend opt-in)
-    frame (fp-columnar/fp-types via --features frankenpandas) · text-indexing (frankensearch via --features frankensearch)
+    frame (fp-columnar/fp-types via --features frankenpandas) · text-indexing (text index/search: frankensearch via --features frankensearch)
     interactive surface: tui (FrankenTUI via --features tui)
               |
               v
@@ -838,7 +935,7 @@ statement handle.
 
    testkit  (parallel to all of the above; no warehouse required)
    deterministic codec lane under the lab runtime · mock SQL API server
-   replay · DPOR model of the driver's cancel/retry races · golden/clock/canary/logger harness
+   replay · DPOR over the driver's cancel/retry races · golden/clock/canary/logger harness
 ```
 
 Once a statement is submitted, the driver fires a best-effort remote cancel on
@@ -856,10 +953,13 @@ SQL mode is the expert path. Both modes share one planner.
 ## MCP surface
 
 With the `mcp` feature compiled in, `fsnow mcp serve` exposes the connector's
-read verbs, plus `query_cancel` and `export_run`, as MCP tools backed by the same
+read verbs, plus `query_cancel`, `export_run` and `text_index`, as MCP tools backed by the same
 CLI handlers and the same JSON envelope, so the CLI and the MCP server cannot
 diverge into two contracts. The server runs over stdio or HTTP and is
-stdio-first by design; data writes go through the CLI `query write` ladder.
+stdio-first by design; data writes go through the CLI `query write` ladder. A
+`notifications/cancelled` for a running call, a stdio client closing its input,
+or an HTTP client closing its connection mid-call cancels the statement it
+started, SQL API remote cancel included.
 
 The exposed tools mirror the CLI read and discovery verbs:
 
@@ -867,14 +967,20 @@ The exposed tools mirror the CLI read and discovery verbs:
 capabilities          onboard               doctor
 agent_handbook        robot_docs_guide      selftest
 profile_validate      profile_doctor        catalog_scan
-catalog_graph         catalog_diff          dataset_inspect
-dataset_profile       query_plan            query_run
-query_cancel          receipt_show          export_plan
-export_run            dataset_describe_operator
+catalog_graph         catalog_diff          catalog_search
+catalog_relates       catalog_lineage       catalog_cycles
+dataset_inspect       dataset_profile       dataset_validate_manifest
+dataset_describe_operator                   query_plan
+query_run             query_cancel          receipt_show
+receipt_refetch       export_plan           export_run
+text_index            text_search
 ```
 
-`query_cancel` and `export_run` are not read-only (the first cancels a remote
-statement, the second writes a local file), and their MCP annotations say so.
+`query_cancel`, `export_run` and `text_index` are not read-only (the first
+cancels a remote statement, the others write local files), and their MCP
+annotations say so. `text_index` takes its columns comma-separated
+(`columns: "BODY,TITLE"`); `text_search` and `text_index` answer with a typed
+refusal in a build without `frankensearch`.
 `export_run` from MCP is confined to the `exports/` directory under the data
 directory: its `out` must be a relative path without `..` or symlinked
 components, and an existing file is replaced only with `overwrite: true`.
@@ -958,13 +1064,14 @@ confirmation required, `FSNOW-3009` DDL not opted in) with an exact next command
   is refused, never rounded. Arrow IPC is not implemented locally, and large
   export uses Snowflake-side `COPY INTO`.
 - The local store is an append-only JSONL file store; the FrankenSQLite-backed
-  store exists in the cache crate behind its `frankensqlite` feature but is not
-  the CLI default (the locked fsqlite crates do not build on Windows yet).
+  store is opt-in: a build with `--features sqlite-store` and
+  `FRANKEN_SNOWFLAKE_STORE=sqlite` uses it (built and tested on Linux, macOS and
+  Windows), importing the JSONL store in the same directory on first open.
 - The TUI is opt-in (`--features tui`): it browses the persisted snapshot and
   plans raw SQL through the shared planner. Submitting a planned query from
   inside the session executes through the live path when `--features live` is
-  compiled (blocking v1: results land in the log pane when the statement
-  returns); without `live` it logs a typed pointer to `query run`. Any
+  compiled, on a background task with live progress and Esc-to-cancel; without
+  `live` it logs a typed pointer to `query run`. Any
   invocation without a real terminal answers a typed refusal.
 - The `--toon` encoding is byte-size-neutral rather than smaller for row
   payloads.
@@ -978,9 +1085,11 @@ confirmation required, `FSNOW-3009` DDL not opted in) with an exact next command
 
 **Is this usable today?** For offline contract work, planning, and CI, yes: the
 default credential-free build covers them. The live path (`--features live` plus
-a profile's credential handles) is implemented for reads and writes; its last
-live proof is a driver-level read against a trial account (2026-06-26), and the
-end-to-end CLI run against a live account, including writes, is still pending.
+a profile's credential handles) is implemented for reads and writes. The CLI's
+reads ran end to end against a live account on 2026-09-28: the
+`scripts/live-proof-cli.sh` battery; a cell-by-cell match with the official
+Python connector; a Parquet readback; an in-flight cancel. Writes have not run
+live yet. See `docs/live_proof.md`.
 
 **How do I load or write data?** Enable writes for the profile with `export
 FRANKEN_SNOWFLAKE_<PROFILE>_WRITE_ENABLED=true`, then run `query write`: with the

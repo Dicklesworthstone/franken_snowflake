@@ -49,9 +49,10 @@ pub struct SubmitStatementRequest {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub bindings: Option<BTreeMap<String, Binding>>,
 
-    /// Session parameters pinned for deterministic output (e.g. `TIMEZONE`, the
-    /// `*_OUTPUT_FORMAT` params, `USE_CACHED_RESULT`, `MULTI_STATEMENT_COUNT`).
-    /// Values are strings on the wire.
+    /// Session parameters pinned for deterministic output (e.g. `TIMEZONE`,
+    /// `USE_CACHED_RESULT`, `MULTI_STATEMENT_COUNT`). Values are strings on the
+    /// wire. A DATE/TIME/TIMESTAMP `*_OUTPUT_FORMAT` set here replaces the
+    /// jsonv2 encoding [`crate::wire`] decodes.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub parameters: Option<BTreeMap<String, String>>,
 }

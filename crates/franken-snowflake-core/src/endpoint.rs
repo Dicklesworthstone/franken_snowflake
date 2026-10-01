@@ -3,7 +3,8 @@
 //! `profile validate` so all three agree on which accounts are usable.
 //!
 //! The rule is fail-closed: the only acceptable endpoint is
-//! `https://<account>.snowflakecomputing.com` with a canonical host. IP
+//! `https://<account>.snowflakecomputing.com` (or, for the China region,
+//! `.snowflakecomputing.cn`) with a canonical host. IP
 //! literals, `localhost`, ports, paths, credentials, fragments, query strings
 //! and look-alike suffixes (`x.snowflakecomputing.com.evil.com`) are refused
 //! before any socket opens, so a crafted `<PREFIX>_ACCOUNT` cannot point the
@@ -13,6 +14,20 @@
 
 /// The required host suffix.
 pub const SNOWFLAKE_HOST_SUFFIX: &str = ".snowflakecomputing.com";
+/// The China (Ningxia) region's host suffix: "This region utilizes the
+/// `snowflakecomputing.cn` domain instead of the `snowflakecomputing.com`
+/// domain" (account identifier docs, consulted 2026-09-26:
+/// <https://docs.snowflake.com/en/user-guide/admin-account-identifier>).
+pub const SNOWFLAKE_CHINA_HOST_SUFFIX: &str = ".snowflakecomputing.cn";
+/// The China region's locator region id.
+const CHINA_REGION_ID: &str = "cn-northwest-1";
+
+/// The Snowflake host suffix `host` ends with, if any.
+fn snowflake_suffix(host: &str) -> Option<&'static str> {
+    [SNOWFLAKE_HOST_SUFFIX, SNOWFLAKE_CHINA_HOST_SUFFIX]
+        .into_iter()
+        .find(|suffix| host.ends_with(suffix) && host.len() > suffix.len())
+}
 
 fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     (s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix))
@@ -20,7 +35,10 @@ fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a st
 }
 
 /// Build the SQL API base URL for an account handle. Locators and org-account
-/// names become `https://<account>.snowflakecomputing.com`; an explicit
+/// names become `https://<account>.snowflakecomputing.com` (a China-region
+/// locator, `<locator>.cn-northwest-1[.aws]`, gets `.snowflakecomputing.cn`).
+/// Underscores in an account name are kept: Snowflake supports both
+/// `acme-marketing_test_account` and its dashed variant in the URL. An explicit
 /// `https://...snowflakecomputing.com` URL is normalized. Anything else (IP
 /// literals, `localhost`, host:port, a foreign URL, an explicit `http://`) is
 /// passed through unchanged so that [`validate_endpoint`] refuses it explicitly
@@ -47,8 +65,10 @@ pub fn endpoint_url(account: &str) -> String {
     }
     let lower = rest.to_ascii_lowercase();
     let is_ip_or_loopback = lower.parse::<std::net::IpAddr>().is_ok() || lower == "localhost";
-    if lower.ends_with(SNOWFLAKE_HOST_SUFFIX) || had_scheme || is_ip_or_loopback {
+    if snowflake_suffix(&lower).is_some() || had_scheme || is_ip_or_loopback {
         format!("https://{lower}")
+    } else if lower.split('.').any(|label| label == CHINA_REGION_ID) {
+        format!("https://{lower}{SNOWFLAKE_CHINA_HOST_SUFFIX}")
     } else {
         format!("https://{lower}{SNOWFLAKE_HOST_SUFFIX}")
     }
@@ -83,15 +103,17 @@ pub fn validate_endpoint(raw: &str) -> Result<(String, String), &'static str> {
     Ok((format!("https://{host}"), host))
 }
 
+/// Letters, digits, `.`, `-` and `_` (Snowflake account names may contain
+/// underscores, and its own converted account URLs do), ending in a Snowflake
+/// domain.
 fn is_canonical_host(host: &str) -> bool {
     host.bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
         && host.contains('.')
         && !host.starts_with('.')
         && !host.ends_with('.')
         && !host.contains("..")
-        && host.ends_with(SNOWFLAKE_HOST_SUFFIX)
-        && host.len() > SNOWFLAKE_HOST_SUFFIX.len()
+        && snowflake_suffix(host).is_some()
 }
 
 /// Validate an account handle end to end (build the URL, then validate it).
@@ -114,6 +136,29 @@ mod tests {
                 "https://xy12345.us-east-1.snowflakecomputing.com",
             ),
             ("myorg-prod2", "https://myorg-prod2.snowflakecomputing.com"),
+            // Underscore account names, as Snowflake documents and converts them.
+            (
+                "acme-marketing_test_account",
+                "https://acme-marketing_test_account.snowflakecomputing.com",
+            ),
+            (
+                "https://acme-test_aws_us_east_2.snowflakecomputing.com",
+                "https://acme-test_aws_us_east_2.snowflakecomputing.com",
+            ),
+            // Private connectivity keeps its own subdomain.
+            (
+                "myorg-myaccount.privatelink",
+                "https://myorg-myaccount.privatelink.snowflakecomputing.com",
+            ),
+            // The China region lives on snowflakecomputing.cn.
+            (
+                "xy12345.cn-northwest-1.aws",
+                "https://xy12345.cn-northwest-1.aws.snowflakecomputing.cn",
+            ),
+            (
+                "https://XY12345.cn-northwest-1.aws.snowflakecomputing.cn",
+                "https://xy12345.cn-northwest-1.aws.snowflakecomputing.cn",
+            ),
             (
                 "https://XY12345.snowflakecomputing.com/",
                 "https://xy12345.snowflakecomputing.com",
@@ -138,6 +183,10 @@ mod tests {
             "https://evil.example",
             "http://xy12345.snowflakecomputing.com",
             "https://x.snowflakecomputing.com.evil.com",
+            "https://x.snowflakecomputing.cn.evil.com",
+            "https://x_y.evil.com",
+            "https://snowflakecomputing.cn",
+            "https://.snowflakecomputing.cn",
             "https://snowflakecomputing.com@evil.com",
             "https://x.snowflakecomputing.com/path",
             "https://x.snowflakecomputing.com?q=1",

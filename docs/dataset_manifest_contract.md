@@ -25,11 +25,15 @@ never serializes secrets.
    into catalog output.
 
 2. Collect raw catalog rows.
-   The first implementation queries `INFORMATION_SCHEMA` for databases, schemas,
-   tables, views, columns, stages, and file formats where available. It also
-   captures table/view comments and tags when the authenticated role can see
-   them. `ACCOUNT_USAGE` is a later enhancement because its availability depends
-   on account-level privileges and latency.
+   `INFORMATION_SCHEMA.TABLES` and `COLUMNS` give the objects, comments, and
+   row/byte hints. The relation pass then reads `SHOW PRIMARY KEYS`,
+   `TABLE_CONSTRAINTS` + `REFERENTIAL_CONSTRAINTS` (table-level foreign keys),
+   `STAGES`, `FILE_FORMATS`, `EXTERNAL_TABLES`, and `GET_OBJECT_REFERENCES`
+   per view (bounded). Tags come from `SNOWFLAKE.ACCOUNT_USAGE.TAG_REFERENCES`
+   only on request (`--tags`), since it needs the `GOVERNANCE_VIEWER` role and
+   lags up to two hours. A source the role cannot read is recorded as a gap
+   (`failed`, `skipped`, `truncated`, or `unresolved`) in the snapshot, never
+   as an empty result.
 
 3. Normalize object identity.
    Every discovered object is assigned a stable, fully-qualified identity:
@@ -81,7 +85,7 @@ The persisted hand-editable form is TOML. The CLI/MCP wire form is the same
 logical model in deterministic JSON.
 
 ```toml
-schema_version = "franken_snowflake.dataset_manifest.v1"
+schema_version = "franken_snowflake.dataset_manifest.v2"
 
 [[datasets]]
 id = "events_daily"
@@ -159,6 +163,36 @@ Field roles are drawn from a fixed enum:
 
 `role_confidence` is one of `confirmed`, `inferred`, or `overlay`. Inference
 never bypasses rights, cost, or dtype validation.
+
+## Overlay
+
+The hand-edited overlay (`FRANKEN_SNOWFLAKE_MANIFEST`, or
+`<data dir>/datasets.toml`) uses the `[[datasets]]` / `[[datasets.fields]]`
+shape above. An entry matches a discovered dataset by `id`, or by
+`database` + `schema` + `object` (ASCII case-insensitive); it may set
+`rights_class`, `default_limit`, `max_rows_without_export`, `description`, and
+field roles (`column` + `role` [+ `required`]). The overlay applies at read
+time, so no rescan is needed; an overlaid field reports
+`role_confidence = "overlay"`, and an inferred field that held a single-valued
+role (entity key, time index, known-at) the overlay gives another column
+becomes a feature. Unknown keys and roles are refused; a column the dataset
+lacks is a usage error with suggestions; an unknown rights label is the most
+restrictive class; credential-like keys (`password`, `token`, `secret`,
+`*_key`, ...) are refused before the file is read further. `dataset
+validate-manifest` reports each entry and the datasets it matches.
+
+## Relations
+
+Schema v2 snapshots carry the relation pass next to the three artifacts:
+`relations_discovered` (false for a snapshot that never ran it, whose missing
+relations mean "unknown", not "none"), `relations` (tagged by `kind`:
+`view_depends_on` {view, source, source_type}, `foreign_key` {from, to,
+constraint}, `uses_stage` {object, stage}, `uses_file_format` {object,
+file_format}; every endpoint is an exact `{database, schema, name}`),
+`primary_keys` {object, columns in key order, constraint}, `stages`,
+`file_formats`, `tags` {tag, value, object, column}, and `gaps` {source, kind,
+detail}. Column tags are also copied into the column catalog's `tags` as
+`DB.SCHEMA.TAG=value`.
 
 ## Column Catalog Schema
 

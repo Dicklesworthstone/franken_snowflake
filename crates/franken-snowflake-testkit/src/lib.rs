@@ -27,6 +27,11 @@
 //! `fsnow-deterministic-testkit-bak`; the VirtualTcp/DPOR race suite lands in
 //! `fsnow-native-snowflake-connector-w0i.4`.
 
+// The race suite spawns the production driver as a lab task, and proving that
+// future `Send` walks the whole async chain (driver, transport, HTTP/1 codec)
+// past the default depth of 128 (rustc `recursion_depth_exceeding_limit`).
+#![recursion_limit = "256"]
+
 pub mod e2e;
 pub mod harness;
 pub mod mock;

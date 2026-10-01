@@ -22,7 +22,6 @@ from typing import Iterable
 
 
 GATE = "dependency-admissibility"
-FSNOW_SKIP_FSQLITE_WINDOWS_PREREQ = "FSNOW_SKIP_FSQLITE_WINDOWS_PREREQ"
 WORKSPACE_LANE_PACKAGE = "<workspace>"
 
 FORBIDDEN_PACKAGES = {
@@ -190,7 +189,7 @@ PRODUCTION_FEATURES = {
     "graph",
     "live",
     "mcp",
-    "rerank",
+    "sqlite-store",
     "toon",
     "tui",
 }
@@ -525,15 +524,6 @@ def scan_lane(lane: Lane) -> int:
     return len(lane_violations) + len(lane_single_version_violations)
 
 
-def is_fsqlite_windows_prereq_lane(lane: Lane) -> bool:
-    return (
-        sys.platform.startswith("win")
-        and os.environ.get(FSNOW_SKIP_FSQLITE_WINDOWS_PREREQ) == "1"
-        and lane.package == "franken-snowflake-cache"
-        and any(arg == "frankensqlite" for arg in lane.args)
-    )
-
-
 def run_self_test() -> None:
     synthetic_tree = """
     franken-snowflake-frame v0.0.0 (/repo/crates/franken-snowflake-frame)
@@ -579,7 +569,10 @@ def run_self_test() -> None:
     )
 
     feature_packages: list[dict[str, object]] = [
-        {"name": "franken-snowflake-cli", "features": {"default": [], "toon": []}},
+        {
+            "name": "franken-snowflake-cli",
+            "features": {"default": [], "toon": [], "sqlite-store": []},
+        },
         {"name": "franken-snowflake-export", "features": {"export": []}},
         {"name": "franken-snowflake-frame", "features": {"frankenpandas": []}},
         {"name": "franken-snowflake-graph", "features": {"default": [], "graph": []}},
@@ -590,7 +583,7 @@ def run_self_test() -> None:
         {"name": "franken-snowflake-mcp", "features": {"mcp": []}},
         {
             "name": "franken-snowflake-text-indexing",
-            "features": {"frankensearch": [], "rerank": []},
+            "features": {"frankensearch": []},
         },
         {"name": "franken-snowflake-tui", "features": {"tui": []}},
     ]
@@ -681,16 +674,6 @@ def main() -> int:
     failure_count = coverage_failures
     skipped_count = 0
     for lane in lanes:
-        if is_fsqlite_windows_prereq_lane(lane):
-            skipped_count += 1
-            emit(
-                "lane_skipped",
-                package=lane.package,
-                lane=lane.name,
-                scope=lane.scope,
-                reason="upstream fsqlite-vfs/fsqlite-mvcc must gate nix with cfg(unix) before Windows cache-feature scanning",
-            )
-            continue
         failure_count += scan_lane(lane)
 
     if failure_count:

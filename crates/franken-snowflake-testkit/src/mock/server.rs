@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! POST /api/v2/statements            -> 202 running (async) | 200 terminal (immediate)
+//!      ?requestId=R&retry=true, R seen -> the statement's current status, not run again
 //! GET  /api/v2/statements/{handle}   -> 202 running ×N, then the terminal response
 //! POST /api/v2/statements/{handle}/cancel -> cancel response
 //! ```
@@ -14,7 +15,7 @@
 //! `franken_snowflake_core::redact` needle list, so an auth-leak inspection test
 //! never has to hold a raw token.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use franken_snowflake_core::redact::redact;
 
@@ -73,15 +74,13 @@ fn route(path: &str) -> Route {
 }
 
 fn partition_query_value(query: Option<&str>) -> Option<u32> {
-    query.and_then(|query| {
-        query.split('&').find_map(|pair| {
-            let (key, value) = pair.split_once('=')?;
-            if key == "partition" {
-                value.parse::<u32>().ok()
-            } else {
-                None
-            }
-        })
+    query_value(query, "partition").and_then(|value| value.parse::<u32>().ok())
+}
+
+fn query_value<'q>(query: Option<&'q str>, name: &str) -> Option<&'q str> {
+    query?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == name).then_some(value)
     })
 }
 
@@ -98,6 +97,12 @@ pub struct MockSqlApi {
     poll_counts: BTreeMap<String, u32>,
     cancelled: BTreeMap<String, bool>,
     log: Vec<RecordedRequest>,
+    /// Times the statement was started (a submit Snowflake would execute).
+    executions: u32,
+    /// Every `requestId` a submit carried.
+    request_ids: BTreeSet<String>,
+    /// Replaces the answer to the first execution (it ran, the answer was lost).
+    lost_submit_answer: Option<MockHttpResponse>,
 }
 
 impl MockSqlApi {
@@ -122,6 +127,9 @@ impl MockSqlApi {
             poll_counts: BTreeMap::new(),
             cancelled: BTreeMap::new(),
             log: Vec::new(),
+            executions: 0,
+            request_ids: BTreeSet::new(),
+            lost_submit_answer: None,
         }
     }
 
@@ -148,6 +156,15 @@ impl MockSqlApi {
         self
     }
 
+    /// The first submit starts the statement but is answered with `response`
+    /// (an answer lost after the statement ran, e.g. a `500`), so the client's
+    /// resubmit meets a statement that already exists (builder).
+    #[must_use]
+    pub fn with_lost_submit_answer(mut self, response: MockHttpResponse) -> Self {
+        self.lost_submit_answer = Some(response);
+        self
+    }
+
     /// The handle this mock issues.
     #[must_use]
     pub fn statement_handle(&self) -> &str {
@@ -165,8 +182,9 @@ impl MockSqlApi {
             header_count: request.headers.len(),
         });
 
+        let query = request.path.split_once('?').map(|(_, query)| query);
         match (&request.method, route(&request.path)) {
-            (Method::Post, Route::Submit) => self.on_submit(),
+            (Method::Post, Route::Submit) => self.on_submit(query),
             (Method::Get, Route::Statement(handle)) => self.on_poll(&handle),
             (Method::Get, Route::Partition { handle, partition }) => {
                 self.on_partition(&handle, partition)
@@ -176,8 +194,41 @@ impl MockSqlApi {
         }
     }
 
-    fn on_submit(&mut self) -> MockHttpResponse {
+    /// Snowflake does not execute a statement again when a request with the same
+    /// `requestId` is resubmitted with `retry=true` (SQL API docs, "Resubmitting
+    /// a request to execute SQL statements", consulted 2026-09-25:
+    /// <https://docs.snowflake.com/en/developer-guide/sql-api/submitting-requests#resubmitting-a-request-to-execute-sql-statements>).
+    /// The docs do not say what such a resubmit returns; this mock answers with
+    /// the statement's current status, as a poll of its handle would. Without
+    /// `retry=true` the same `requestId` runs the statement again, which is the
+    /// double execution the docs warn about.
+    fn on_submit(&mut self, query: Option<&str>) -> MockHttpResponse {
+        let request_id = query_value(query, "requestId").filter(|id| !id.is_empty());
+        let retry = query_value(query, "retry") == Some("true");
+        if let Some(request_id) = request_id {
+            if retry && self.request_ids.contains(request_id) {
+                return self.current_status();
+            }
+            self.request_ids.insert(request_id.to_owned());
+        }
+        self.executions = self.executions.saturating_add(1);
+        if let Some(lost) = self.lost_submit_answer.take() {
+            return lost;
+        }
         if self.immediate {
+            self.terminal.clone()
+        } else {
+            self.running.clone()
+        }
+    }
+
+    /// The statement's status, without counting a poll.
+    fn current_status(&self) -> MockHttpResponse {
+        if self.is_cancelled(&self.statement_handle) {
+            cancelled_status(&self.statement_handle)
+        } else if self.immediate
+            || self.poll_count(&self.statement_handle) > self.polls_before_complete
+        {
             self.terminal.clone()
         } else {
             self.running.clone()
@@ -219,6 +270,12 @@ impl MockSqlApi {
         }
         self.cancelled.insert(handle.to_owned(), true);
         self.cancel.clone()
+    }
+
+    /// How many times a submit started the statement.
+    #[must_use]
+    pub const fn executions(&self) -> u32 {
+        self.executions
     }
 
     /// How many times `handle` has been polled.
@@ -338,6 +395,65 @@ mod tests {
             404
         );
         Ok(())
+    }
+
+    /// Bead o2o: a resubmit with the same `requestId` and `retry=true` meets the
+    /// statement already running (same handle) and starts nothing new; a new
+    /// `requestId` is a new statement.
+    #[test]
+    fn a_retry_resubmit_of_a_known_request_id_runs_nothing_again() {
+        let mut mock = scenarios::default_async_lifecycle();
+        let submit = |id: &str| {
+            MockHttpRequest::post(
+                format!("/api/v2/statements?requestId={id}&retry=true"),
+                scenarios::SUBMIT_SELECT_REQUEST.to_vec(),
+            )
+        };
+        let first = mock.respond(&submit("r-1"));
+        assert_eq!((first.status, mock.executions()), (202, 1));
+        let again = mock.respond(&submit("r-1"));
+        assert_eq!((again.status, mock.executions()), (202, 1));
+        assert!(String::from_utf8_lossy(&again.body).contains(mock.statement_handle()));
+        // Answered from the statement's status: no poll was counted.
+        assert_eq!(mock.poll_count(mock.statement_handle()), 0);
+        mock.respond(&submit("r-2"));
+        assert_eq!(mock.executions(), 2);
+    }
+
+    /// The negative the docs warn about: the same `requestId` without
+    /// `retry=true` (or with no `requestId` at all) runs the statement again.
+    #[test]
+    fn a_resubmit_without_retry_true_runs_the_statement_again() {
+        let mut mock = scenarios::default_async_lifecycle();
+        let body = scenarios::SUBMIT_SELECT_REQUEST.to_vec();
+        let with_id = "/api/v2/statements?requestId=r-1";
+        mock.respond(&MockHttpRequest::post(with_id, body.clone()));
+        mock.respond(&MockHttpRequest::post(with_id, body.clone()));
+        assert_eq!(mock.executions(), 2);
+        mock.respond(&MockHttpRequest::post("/api/v2/statements", body.clone()));
+        mock.respond(&MockHttpRequest::post("/api/v2/statements", body));
+        assert_eq!(mock.executions(), 4);
+    }
+
+    /// A lost answer: the statement ran, the client saw a `500`; its resubmit
+    /// finds the statement (completed once polled past the threshold) instead
+    /// of running it twice.
+    #[test]
+    fn a_lost_submit_answer_is_recovered_by_the_retry_resubmit() {
+        let mut mock = scenarios::default_async_lifecycle()
+            .with_lost_submit_answer(MockHttpResponse::json(500, b"{}".to_vec()));
+        let submit = MockHttpRequest::post(
+            "/api/v2/statements?requestId=r-1&retry=true",
+            scenarios::SUBMIT_SELECT_REQUEST.to_vec(),
+        );
+        assert_eq!(mock.respond(&submit).status, 500);
+        assert_eq!(mock.respond(&submit).status, 202);
+        let poll = format!("/api/v2/statements/{}", mock.statement_handle());
+        for _ in 0..3 {
+            mock.respond(&MockHttpRequest::get(&poll));
+        }
+        assert_eq!(mock.respond(&submit).status, 200);
+        assert_eq!(mock.executions(), 1);
     }
 
     #[test]

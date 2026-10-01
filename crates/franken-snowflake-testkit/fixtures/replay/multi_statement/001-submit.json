@@ -1,0 +1,171 @@
+{
+  "schema": "fsnow.wire_transcript.v1",
+  "seq": 1,
+  "route": "submit",
+  "request": {
+    "method": "POST",
+    "path": "/api/v2/statements",
+    "query": [
+      [
+        "requestId",
+        "00000000-0000-4000-8000-000000000001"
+      ],
+      [
+        "retry",
+        "true"
+      ]
+    ],
+    "headers": [
+      [
+        "Authorization",
+        "[REDACTED]"
+      ],
+      [
+        "X-Snowflake-Authorization-Token-Type",
+        "KEYPAIR_JWT"
+      ],
+      [
+        "Accept",
+        "application/json"
+      ],
+      [
+        "User-Agent",
+        "franken-snowflake/0.0.5"
+      ],
+      [
+        "Content-Type",
+        "application/json"
+      ]
+    ],
+    "body": {
+      "kind": "json",
+      "value": {
+        "statement": "SELECT 1 AS X; SELECT 2 AS Y",
+        "timeout": 60,
+        "database": "<user>",
+        "schema": "PUBLIC",
+        "warehouse": "<warehouse>",
+        "parameters": {
+          "BINARY_OUTPUT_FORMAT": "HEX",
+          "MULTI_STATEMENT_COUNT": "2",
+          "QUERY_TAG": "fsnow:query.run:2079fb14-000f-42ed-8f18-a2902d2f26c8",
+          "TIMEZONE": "UTC",
+          "USE_CACHED_RESULT": "FALSE"
+        }
+      }
+    }
+  },
+  "response": {
+    "status": 200,
+    "reason": "OK",
+    "headers": [
+      [
+        "date",
+        "Tue, 29 Sep 2026 00:17:47 GMT"
+      ],
+      [
+        "content-type",
+        "application/json"
+      ],
+      [
+        "link",
+        "</api/v2/statements/00000000-0000-4000-8000-000000000004?requestId=f24d9169-c01a-4eee-beec-527d97fde939&partition=0>; rel=\"first\",</api/v2/statements/00000000-0000-4000-8000-000000000004?requestId=d61c45c8-de8c-496c-b4a1-d5a5e16a42db&partition=0>; rel=\"last\""
+      ],
+      [
+        "vary",
+        "Accept-Encoding, User-Agent"
+      ],
+      [
+        "server",
+        "SF-LB-T1"
+      ],
+      [
+        "x-envoy-upstream-service-time",
+        "762"
+      ],
+      [
+        "x-snowflake-fe-instance",
+        "-"
+      ],
+      [
+        "x-snowflake-fe-config",
+        "v20260925.0.0.1790327919.va4.1790640961008"
+      ],
+      [
+        "x-frame-options",
+        "deny"
+      ],
+      [
+        "x-envoy-attempt-count",
+        "1"
+      ],
+      [
+        "x-content-type-options",
+        "nosniff"
+      ],
+      [
+        "x-xss-protection",
+        "1; mode=block"
+      ],
+      [
+        "expect-ct",
+        "enforce, max-age=3600"
+      ],
+      [
+        "strict-transport-security",
+        "max-age=31536000; includeSubDomains"
+      ],
+      [
+        "transfer-encoding",
+        "chunked"
+      ]
+    ],
+    "content_encoding": null,
+    "body": {
+      "kind": "json",
+      "value": {
+        "resultSetMetaData": {
+          "numRows": 1,
+          "format": "jsonv2",
+          "partitionInfo": [
+            {
+              "rowCount": 1,
+              "uncompressedSize": 57
+            }
+          ],
+          "rowType": [
+            {
+              "name": "multiple statement execution",
+              "database": "",
+              "schema": "",
+              "table": "",
+              "collation": null,
+              "byteLength": 134217728,
+              "nullable": false,
+              "precision": null,
+              "scale": null,
+              "length": 134217728,
+              "type": "text"
+            }
+          ]
+        },
+        "data": [
+          [
+            "Multiple statements executed successfully."
+          ]
+        ],
+        "code": "090001",
+        "statementHandles": [
+          "00000000-0000-4000-8000-000000000002",
+          "00000000-0000-4000-8000-000000000003"
+        ],
+        "statementStatusUrl": "/api/v2/statements/00000000-0000-4000-8000-000000000004?requestId=00000000-0000-4000-8000-000000000001",
+        "requestId": "00000000-0000-4000-8000-000000000001",
+        "sqlState": "00000",
+        "statementHandle": "00000000-0000-4000-8000-000000000004",
+        "message": "Statement executed successfully.",
+        "createdOn": 1790641067127
+      }
+    }
+  }
+}

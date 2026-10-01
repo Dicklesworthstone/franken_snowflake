@@ -18,7 +18,7 @@ Read these skill references before implementing the connector spine:
 - `asupersync-mega-skill` → `LAB-TRACE-DPOR.md`
 - `asupersync-mega-skill` → `WEB-GRPC-HTTP.md` (request-region pattern, for the MCP/HTTP surface)
 
-## Status (2026-09-24)
+## Status (2026-09-25)
 
 This is the target contract; not every line below is wired yet.
 
@@ -32,14 +32,31 @@ This is the target contract; not every line below is wired yet.
   (`User`/`Shutdown`), so the driver fires the remote cancel; outside a
   statement the signals keep their default action (signal-hook flag API, not
   Asupersync's global dispatcher, which would swallow them process-wide).
-- Not wired yet: a `bracket` or drop guard for the statement handle (a process
-  killed with SIGKILL, or a panic, still leaves a submitted statement to the
-  server-side `STATEMENT_TIMEOUT_IN_SECONDS`); capability rows (the types
-  exist in `franken-snowflake-core::capabilities`, but no call path narrows its
-  `Cx`); the cost quota on the live path; `web::request_region` around MCP calls;
-  `cli::progress` events; the declared `PoolConfig`; backup requests.
-- The LabRuntime/DPOR suite explores a model of the driver's cancel and retry
-  interleavings in the testkit, not the production driver itself.
+- Wired since 2026-09-25: each running statement is an `ObligationKind::Lease`
+  held by the task that drives it (`sqlapi::driver::DropGuard`), committed when
+  the statement ends server-side, aborted `Cancel` when it is cancelled or its
+  driver future is dropped, aborted `Error` when a local failure abandons it
+  behind a best-effort cancel. Every live CLI and MCP statement is driven from
+  `block_on` on a current-thread runtime whose root task holds real leases; a
+  request-scoped `Cx` holds none and keeps the guard alone. The release is the
+  drop guard, not `bracket`: a drop-time release cannot await the cancel request,
+  so the guard sends it from a thread and runtime of its own. A process killed
+  with SIGKILL still leaves the statement to `STATEMENT_TIMEOUT_IN_SECONDS`.
+  The driver's execution deadline (statement timeout + 5 s) and an advisory
+  credit cap (`MAX_CREDITS`, cancel kind `CostBudget`) are enforced by the
+  driver, not by `Budget`'s cost quota.
+- Not wired yet: capability rows (the types exist in
+  `franken-snowflake-core::capabilities`, but no call path narrows its `Cx`);
+  `web::request_region` itself (an MCP-over-HTTP call whose client hangs up is
+  cancelled by the HTTP front's own hang-up watch instead); `cli::progress`
+  events; the declared `PoolConfig`; backup requests.
+- The LabRuntime/DPOR suite (testkit `race`) explores a model of the driver's
+  cancel and retry interleavings and, since 2026-09-26, the production driver
+  itself: `run_statement_hooked` over `SnowflakeHttpClient`, each request a
+  real HTTP/1 exchange over `VirtualTcpStream`, raced by a canceller task, with
+  the leak verdict read from the runtime's obligation arena (the driver's own
+  `Lease`). It found that a cancel landing during the submit exchange orphaned
+  the accepted statement; the submit now runs under the cancellation mask.
 
 ## Mapping
 
@@ -67,8 +84,10 @@ Each line is `concern → primitive — payoff`, kept compact deliberately:
   SQL-compile path. The transport layer needs a narrowed `Cx` granting `IO` (and
   `TIME`/`SPAWN`) but never `REMOTE`. Only the write-intent ladder widens further.
   Read-only is compiler-enforced.
-- **No orphan statement handles** → `bracket` (acquire/use/release) — a submitted
-  handle is an obligation; the remote cancel endpoint always fires on drop/cancel.
+- **No orphan statement handles** → an `ObligationKind::Lease` per running
+  statement plus a drop guard (`bracket`'s drop-time release cannot await the
+  cancel request) — a submitted handle is an obligation the lab oracle checks;
+  the remote cancel endpoint fires on drop/cancel.
 - **No orphan partition fetchers** → `Scope` + bounded child regions — concurrent
   fetch under one capped region; cancellation drains the whole region.
 - **Tail latency on fetch** → Asupersync's optional backup-request combinator

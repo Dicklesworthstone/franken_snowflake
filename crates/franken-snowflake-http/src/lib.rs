@@ -16,7 +16,9 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use asupersync::http::compress::{Decompressor, GzipDecompressor, IdentityDecompressor};
+use asupersync::http::compress::{
+    DecompressionLimit, Decompressor, GzipDecompressor, IdentityDecompressor,
+};
 use asupersync::http::h1::Http1Client;
 use asupersync::http::{
     Client as AsupersyncHttpClient, ClientError as AsupersyncClientError, Method, ParsedUrl,
@@ -31,6 +33,8 @@ use franken_snowflake_core::ids::{RequestId, StatementHandle};
 use franken_snowflake_core::redact::{REDACTION_PLACEHOLDER, redact};
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 
+pub mod capture;
+
 /// Crate version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -40,6 +44,14 @@ const HEADER_TOKEN_TYPE: &str = "X-Snowflake-Authorization-Token-Type";
 const HEADER_CONTENT_TYPE: &str = "Content-Type";
 const HEADER_ACCEPT: &str = "Accept";
 const HEADER_ACCEPT_ENCODING: &str = "Accept-Encoding";
+const HEADER_USER_AGENT: &str = "User-Agent";
+/// The `User-Agent` every request carries. The SQL API reference lists the
+/// header as required ("the name and version of your application", RFC 7231
+/// product syntax; "Request headers for all operations", consulted 2026-09-26:
+/// <https://docs.snowflake.com/en/developer-guide/sql-api/reference>). Without
+/// it, the CA-bundle transport sent none and the pooled client sent its own
+/// `asupersync/<version>`.
+pub const USER_AGENT: &str = concat!("franken-snowflake/", env!("CARGO_PKG_VERSION"));
 const HEADER_CONTENT_ENCODING: &str = "Content-Encoding";
 const JSON_MEDIA_TYPE: &str = "application/json";
 const PARTITION_ACCEPT_ENCODING: &str = "gzip, identity";
@@ -214,7 +226,9 @@ impl RawHttp for PemBundleHttp {
                 )
                 .body(body)
                 .build();
-            let (response, _connection) =
+            // The third value says whether the body was withheld (the
+            // connection must not be reused); each exchange opens its own.
+            let (response, _connection, _body_withheld) =
                 Http1Client::request_with_io_and_max_body_size(tls, request, self.max_body_bytes)
                     .await?;
             Ok(response)
@@ -242,6 +256,9 @@ pub enum LiveHttp {
     NativeRoots(AsupersyncHttpClient),
     /// Fresh connections verified against a caller-provided PEM bundle.
     PemBundle(PemBundleHttp),
+    /// Either of the above, with every exchange written as a redacted
+    /// transcript ([`SnowflakeHttpClient::capturing`], bead oj0.21).
+    Capturing(Box<LiveHttp>, std::sync::Arc<capture::TranscriptRecorder>),
 }
 
 impl RawHttp for LiveHttp {
@@ -257,6 +274,19 @@ impl RawHttp for LiveHttp {
         match self {
             Self::NativeRoots(client) => client.send(cx, method, url, headers, body, timeout).await,
             Self::PemBundle(client) => client.send(cx, method, url, headers, body, timeout).await,
+            Self::Capturing(inner, recorder) => {
+                let request = (
+                    method.as_str().to_owned(),
+                    url.clone(),
+                    headers.clone(),
+                    body.clone(),
+                );
+                let result = Box::pin(inner.send(cx, method, url, headers, body, timeout)).await;
+                if let Ok(response) = &result {
+                    recorder.record(&request.0, &request.1, &request.2, &request.3, response);
+                }
+                result
+            }
         }
     }
 }
@@ -293,6 +323,16 @@ impl SnowflakeHttpClient {
             }
         };
         Ok(Self { config, client })
+    }
+
+    /// Write every exchange this client makes as a redacted transcript
+    /// (see [`capture`]); the requests themselves are unchanged.
+    #[must_use]
+    pub fn capturing(self, recorder: std::sync::Arc<capture::TranscriptRecorder>) -> Self {
+        Self {
+            config: self.config,
+            client: LiveHttp::Capturing(Box::new(self.client), recorder),
+        }
     }
 }
 
@@ -618,7 +658,10 @@ impl<H: RawHttp> SnowflakeHttpClient<H> {
                         .map(|h| (h.name.clone(), h.value.clone()))
                         .collect(),
                     wire.body.clone(),
-                    budget_timeout_at(attempt_budget, budget_now),
+                    sooner(
+                        budget_timeout_at(attempt_budget, budget_now),
+                        self.config.attempt_timeout_for(route_kind),
+                    ),
                 )
                 .await;
 
@@ -733,6 +776,7 @@ impl<H: RawHttp> SnowflakeHttpClient<H> {
 
         let mut headers = auth.wire_headers()?;
         headers.push(Header::new(HEADER_ACCEPT, JSON_MEDIA_TYPE)?);
+        headers.push(Header::new(HEADER_USER_AGENT, USER_AGENT)?);
         if matches!(route_kind, TransportRouteKind::Partition) {
             headers.push(Header::new(
                 HEADER_ACCEPT_ENCODING,
@@ -752,6 +796,18 @@ impl<H: RawHttp> SnowflakeHttpClient<H> {
     }
 }
 
+/// Default bound on one HTTP exchange (connect, TLS, request, response). The
+/// SQL API holds a synchronous submit for up to about 45 s before answering
+/// `202`, and a result partition is a bounded download, so five minutes only
+/// ever cuts a stalled connection.
+pub const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Longest one remote-cancel exchange may take (reality-check bead E3: the
+/// cancel runs under a short, masked bound). A cancel is a small POST Snowflake
+/// answers at once; a stalled one must not hold a command that is already
+/// ending (Ctrl-C, a deadline, a credit cap) for the full exchange bound.
+pub const DEFAULT_CANCEL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Immutable transport configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransportConfig {
@@ -767,6 +823,14 @@ pub struct TransportConfig {
     pub retry: RetryPolicy,
     /// Attempt-log behavior.
     pub log: AttemptLogPolicy,
+    /// Longest one exchange may take before it is cancelled with a deadline
+    /// (reality-check bead E3: without it a stalled connection hangs the
+    /// command, since the HTTP client imposes no timeout of its own). The
+    /// ambient budget's deadline still applies when it is sooner.
+    pub attempt_timeout: Option<Duration>,
+    /// Longest one remote-cancel exchange may take (the sooner of this and
+    /// `attempt_timeout` applies to a cancel).
+    pub cancel_attempt_timeout: Option<Duration>,
 }
 
 impl TransportConfig {
@@ -780,7 +844,31 @@ impl TransportConfig {
             limits: BodyLimits::default(),
             retry: RetryPolicy::default(),
             log: AttemptLogPolicy::default(),
+            attempt_timeout: Some(DEFAULT_ATTEMPT_TIMEOUT),
+            cancel_attempt_timeout: Some(DEFAULT_CANCEL_ATTEMPT_TIMEOUT),
         }
+    }
+
+    /// The bound on one exchange of `route_kind`: the sooner of the cancel
+    /// bound and the exchange bound for a remote cancel, the exchange bound
+    /// otherwise.
+    #[must_use]
+    pub fn attempt_timeout_for(&self, route_kind: TransportRouteKind) -> Option<Duration> {
+        match route_kind {
+            TransportRouteKind::Cancel => sooner(self.attempt_timeout, self.cancel_attempt_timeout),
+            TransportRouteKind::Submit
+            | TransportRouteKind::Poll
+            | TransportRouteKind::Partition => self.attempt_timeout,
+        }
+    }
+}
+
+/// The sooner of two optional bounds.
+fn sooner(left: Option<Duration>, right: Option<Duration>) -> Option<Duration> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, None) => left,
+        (None, right) => right,
     }
 }
 
@@ -1686,7 +1774,7 @@ fn decode_partition_response(
                 .and_then(|()| decompressor.finish(&mut decoded))
         }
         ContentEncoding::Gzip => {
-            let mut decompressor = GzipDecompressor::new(Some(max_uncompressed));
+            let mut decompressor = GzipDecompressor::new(DecompressionLimit::new(max_uncompressed));
             decompressor
                 .decompress(response.body.as_slice(), &mut decoded)
                 .and_then(|()| decompressor.finish(&mut decoded))
@@ -1936,7 +2024,11 @@ async fn wait_retry_delay(cx: &Cx, delay: Duration) -> Result<(), CancelReason> 
     Ok(())
 }
 
-async fn run_with_cancellation_mask<T>(cx: &Cx, future: impl Future<Output = T>) -> T {
+/// Drive `future` with `cx`'s cancellation masked: its checkpoints and I/O do
+/// not observe a cancel requested meanwhile (deadlines still apply). Used for
+/// requests that must finish once started: the cleanup cancel, and the submit
+/// whose answer names the statement to cancel.
+pub async fn run_with_cancellation_mask<T>(cx: &Cx, future: impl Future<Output = T>) -> T {
     let mut future = Box::pin(future);
     std::future::poll_fn(|task| cx.masked(|| future.as_mut().poll(task))).await
 }
@@ -2464,7 +2556,9 @@ mod tests {
         std::fs::write(&empty, "not a certificate\n").unwrap();
         let refused = PemBundleHttp::from_pem_file(&empty, &limits).err().unwrap();
         assert_eq!(refused.code, TransportErrorCode::TlsRootPolicyRefused);
-        assert!(refused.message.contains("no PEM certificate"), "{refused}");
+        // Asupersync's PEM reader itself rejects a file without a certificate;
+        // either way the refusal names the bundle.
+        assert!(refused.message.contains("empty.pem"), "{refused}");
 
         let mut config = TransportConfig::new(endpoint());
         config.tls_roots = TlsRootPolicy::TestOnlyInsecureDisabledByDefault;
@@ -3092,6 +3186,49 @@ mod tests {
         Ok(())
     }
 
+    /// Every route names the application once, the way the SQL API requires.
+    /// The raw transport receives the header too, so the CA-bundle path (which
+    /// adds no default of its own) sends it.
+    #[test]
+    fn every_route_names_the_application_in_user_agent() -> Result<(), String> {
+        let client = SnowflakeHttpClient::new(
+            TransportConfig::new(endpoint()),
+            AsupersyncHttpClient::new(),
+        );
+        let handle = StatementHandle::new("stmt-1");
+        let routes = [
+            TransportRoute::Submit,
+            TransportRoute::Poll {
+                handle: handle.clone(),
+            },
+            TransportRoute::Partition {
+                handle: handle.clone(),
+                partition: 1,
+            },
+            TransportRoute::Cancel { handle },
+        ];
+        for route in routes {
+            let kind = route.kind();
+            let body = if kind.method() == Method::Post {
+                b"{}".to_vec()
+            } else {
+                Vec::new()
+            };
+            let wire = client
+                .wire_request(kind.method(), route, body, &auth(), false)
+                .map_err(|error| format!("{kind:?}: {error}"))?;
+            let agents: Vec<&str> = wire
+                .headers
+                .iter()
+                .filter(|header| header.name.eq_ignore_ascii_case("user-agent"))
+                .map(|header| header.value.as_str())
+                .collect();
+            assert_eq!(agents, [USER_AGENT], "{kind:?}");
+        }
+        assert_eq!(USER_AGENT, format!("franken-snowflake/{VERSION}"));
+        Ok(())
+    }
+
     #[test]
     fn partition_wire_plan_advertises_gzip() -> Result<(), String> {
         let client = SnowflakeHttpClient::new(
@@ -3314,10 +3451,15 @@ mod tests {
                 );
             }
             // The resubmit is byte-identical to the original: same URL, same body,
-            // and with an unlimited budget neither attempt carries a timeout.
+            // and with an unlimited budget each attempt carries only the
+            // default exchange bound.
             assert_eq!(requests[0].url, requests[1].url);
             assert_eq!(requests[0].body, requests[1].body);
-            assert!(requests.iter().all(|request| request.timeout.is_none()));
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.timeout == Some(DEFAULT_ATTEMPT_TIMEOUT))
+            );
         });
     }
 
@@ -3429,6 +3571,64 @@ mod tests {
                 requests[1].url
             );
             assert_eq!(requests[1].method, Method::Get);
+        });
+    }
+
+    /// Reality-check bead E3: every exchange is bounded by default (a stalled
+    /// connection cannot hang a command); the sooner bound wins; turning the
+    /// default off leaves the ambient budget alone.
+    #[test]
+    fn every_exchange_carries_a_bound() {
+        assert_eq!(
+            sooner(Some(Duration::from_secs(9)), Some(Duration::from_secs(3))),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            sooner(None, Some(Duration::from_secs(3))),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            sooner(Some(Duration::from_secs(9)), None),
+            Some(Duration::from_secs(9))
+        );
+        assert_eq!(sooner(None, None), None);
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::for_testing();
+            let bounded = scripted_client(1, vec![ok_json(200, "{}")]);
+            let _ = bounded.poll_statement(&cx, poll_request()).await;
+            assert_eq!(
+                bounded.client.requests()[0].timeout,
+                Some(DEFAULT_ATTEMPT_TIMEOUT)
+            );
+            let mut config = fast_retry_config(1);
+            config.attempt_timeout = None;
+            let unbounded =
+                SnowflakeHttpClient::new(config, ScriptedRaw::new(vec![ok_json(200, "{}")]));
+            let _ = unbounded.poll_statement(&cx, poll_request()).await;
+            assert_eq!(unbounded.client.requests()[0].timeout, None);
+
+            // A remote cancel gets the short cancel bound, not the 300 s one.
+            let cancel = CancelHttpRequest {
+                auth: auth(),
+                statement_handle: StatementHandle::new("stmt-cancel-1"),
+                reason_kind: CancelKind::User,
+            };
+            let canceller = scripted_client(1, vec![ok_json(200, "{}")]);
+            let _ = canceller.cancel_statement(&cx, cancel.clone()).await;
+            assert_eq!(
+                canceller.client.requests()[0].timeout,
+                Some(DEFAULT_CANCEL_ATTEMPT_TIMEOUT)
+            );
+            // A tighter exchange bound still wins.
+            let mut config = fast_retry_config(1);
+            config.attempt_timeout = Some(Duration::from_secs(2));
+            let tight =
+                SnowflakeHttpClient::new(config, ScriptedRaw::new(vec![ok_json(200, "{}")]));
+            let _ = tight.cancel_statement(&cx, cancel).await;
+            assert_eq!(
+                tight.client.requests()[0].timeout,
+                Some(Duration::from_secs(2))
+            );
         });
     }
 

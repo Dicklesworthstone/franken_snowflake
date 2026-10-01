@@ -18,8 +18,13 @@ pub fn run_mcp_serve_process(http: Option<McpHttpArgs>) -> ! {
     franken_snowflake_mcp::run_mcp_serve_process(mode, run_cli_contract)
 }
 
-fn run_cli_contract(args: Vec<String>) -> franken_snowflake_mcp::CliContractOutput {
-    let output = execute_cli_contract(args);
+/// Run one CLI invocation for an MCP tool call; a statement it starts is
+/// cancelled (remote cancel included) when the MCP request is.
+fn run_cli_contract(
+    args: Vec<String>,
+    cancel: franken_snowflake_mcp::CancelProbe,
+) -> franken_snowflake_mcp::CliContractOutput {
+    let output = crate::with_external_cancel(cancel, || execute_cli_contract(args));
     franken_snowflake_mcp::CliContractOutput {
         exit_code: output.exit_code,
         stdout: output.stdout,

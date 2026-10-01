@@ -91,3 +91,4 @@ Desktop.ini
 /fsnow-golden-teeth/
 .rch-target/
 .rch-tmp/
+__pycache__/

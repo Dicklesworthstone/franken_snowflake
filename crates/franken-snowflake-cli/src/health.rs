@@ -183,13 +183,14 @@ fn local_store_check() -> Json {
                 .audit_events()
                 .map(|events| events.len())
                 .unwrap_or(0);
-            let skipped = store.cache.skipped_lines();
+            let skipped = store.skipped_lines;
             check_json_owned(
                 "local_store",
                 if skipped == 0 { "pass" } else { "warn" },
                 format!(
-                    "opened {} (schema v{}); {manifests} dataset manifests, {audit} audit events, {skipped} unreadable log lines",
+                    "opened {} ({} store, schema v{}); {manifests} dataset manifests, {audit} audit events, {skipped} unreadable log lines",
                     store.dir.display(),
+                    store.backend.as_str(),
                     store.cache.schema_version().0
                 ),
             )
@@ -768,7 +769,12 @@ pub fn profile_handle_presence(profile: &str) -> HandlePresence {
     ] {
         push(key, false, false);
     }
-    for key in ["WRITE_ENABLED", "WRITE_ALLOW_DDL", "WRITE_REQUIRE_CONFIRM"] {
+    for key in [
+        "WRITE_ENABLED",
+        "WRITE_ALLOW_DDL",
+        "WRITE_REQUIRE_CONFIRM",
+        "READ_ONLY_EXPECTED",
+    ] {
         push(key, false, false);
     }
     match secret_key {

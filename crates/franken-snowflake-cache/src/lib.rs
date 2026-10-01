@@ -573,6 +573,8 @@ pub trait CacheBackend {
 
     fn append_export(&self, record: ExportRecord) -> CacheResult<()>;
     fn exports_for_receipt(&self, receipt_id: &str) -> CacheResult<Vec<ExportRecord>>;
+    /// One export by its id (the id `export run` reports).
+    fn export(&self, export_id: &str) -> CacheResult<Option<ExportRecord>>;
 
     fn append_cost_history(&self, record: CostHistoryRecord) -> CacheResult<()>;
     fn cost_history_for_profile(&self, profile_id: &str) -> CacheResult<Vec<CostHistoryRecord>>;
@@ -843,6 +845,10 @@ impl CacheBackend for InMemoryCache {
                 .then_with(|| a.export_id.cmp(&b.export_id))
         });
         Ok(exports)
+    }
+
+    fn export(&self, export_id: &str) -> CacheResult<Option<ExportRecord>> {
+        Ok(self.exports.borrow().get(export_id).cloned())
     }
 
     fn append_cost_history(&self, record: CostHistoryRecord) -> CacheResult<()> {
@@ -1324,6 +1330,18 @@ impl CacheBackend for FrankenSqliteCache {
         .iter()
         .map(row_export)
         .collect()
+    }
+
+    fn export(&self, export_id: &str) -> CacheResult<Option<ExportRecord>> {
+        self.query(
+            "SELECT export_id, receipt_id, export_kind, target_uri_redacted, content_hash, \
+                    byte_len, row_count, created_at_ms \
+             FROM exports WHERE export_id = ?1",
+            &[Value::Text(export_id.to_owned())],
+        )?
+        .first()
+        .map(row_export)
+        .transpose()
     }
 
     fn append_cost_history(&self, record: CostHistoryRecord) -> CacheResult<()> {
@@ -2207,7 +2225,9 @@ mod tests {
             created_at_ms: 7,
         };
         cache.append_export(record.clone())?;
-        assert_eq!(cache.exports_for_receipt("r1")?, vec![record]);
+        assert_eq!(cache.exports_for_receipt("r1")?, vec![record.clone()]);
+        assert_eq!(cache.export("exp-1")?, Some(record));
+        assert_eq!(cache.export("exp-missing")?, None);
 
         // A malformed address still fails closed: unsupported algorithm.
         let mut malformed = ExportRecord {

@@ -3,7 +3,7 @@
 All notable changes to `franken_snowflake` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at the
-workspace version (`0.0.4`). All 14 crates are published on crates.io (first
+workspace version (`0.0.5`). All 14 crates are published on crates.io (first
 published 2026-09-12).
 
 ## Scope and method
@@ -23,7 +23,8 @@ immediately after that window, then 17 more non-merge commits through the
 - [`v0.0.1`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.1)
   is a **published GitHub Release** (2026-06-30, tag
   [`fae8bed`](https://github.com/Dicklesworthstone/franken_snowflake/commit/fae8bed20bda3353edf1beb46ea3cedb86885cf4)).
-  It is the only GitHub Release in this repo.
+  It was the only GitHub Release when this synthesis was written; v0.0.2
+  through v0.0.5 followed (see "Version state").
 
 The record is organized by landed capability wave rather than raw commit order,
 with representative commit links so another agent can navigate from a theme to
@@ -43,15 +44,18 @@ implementation first and the test/hardening pass follows in a later wave. The
 
 ## Version state
 
-- Package version: `0.0.4` across the workspace; crates configured for
-  crates.io publishing.
+- Package version: `0.0.5` across the workspace; all 14 crates published on
+  crates.io.
 - Tags/releases: `v0.0.0` (tag only, 2026-06-29), `v0.0.1` (GitHub Release,
   2026-06-30), `v0.0.2` (GitHub Release, 2026-08-24), `v0.0.3`
-  (GitHub Release, 2026-09-04), and `v0.0.4` (GitHub Release, 2026-09-11).
+  (GitHub Release, 2026-09-04), `v0.0.4` (GitHub Release, 2026-09-11), and
+  `v0.0.5` (GitHub Release, 2026-09-25).
 - Live Snowflake transport is enabled with the `live` feature (default-off) and
   is gated at runtime by credential availability. Reads (`query run`,
   `catalog scan`, `profile doctor --online`) and writes (`query write`) both run
-  through it. The release binaries are built with `--features live,mcp`.
+  through it. The release binaries are built with `--features live,mcp`. The
+  CLI's reads first ran against a live account on 2026-09-28 (see
+  `docs/live_proof.md`); writes have not run live yet.
 
 ## Version Timeline
 
@@ -68,6 +72,7 @@ implementation first and the test/hardening pass follows in a later wave. The
 | 2026-08-24 | GitHub Release [`v0.0.2`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.2) — standalone buildability, Windows x64 via cargo-xwin, but default-feature binaries (no `live`/`mcp`) and no Windows-installer coverage |
 | 2026-09-02 → 2026-09-04 | Reality-check remediation wave: every CLI surface wired to real implementations, safe live writes, receipts + audit trail, in-flight-cancel DPOR race case, `--require-live` gate, TUI executor bridge — shipped as [`v0.0.3`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.3) (2026-09-04, six native dsr targets with `live,mcp`) |
 | 2026-09-04 → 2026-09-11 | Hardening, dependency currency, and release readiness: TUI executor typed bindings, jsonv2 golden validation loop, feature-lane clippy cleanups, library upgrades, and crates.io publishing enablement — shipped as [`v0.0.4`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.4) (2026-09-11) |
+| 2026-09-23 → 2026-09-25 | Reality-check bridge work: security fixes (MCP HTTP auth and origin checks, export path confinement, secret redaction in stored SQL, one shared SQL lexer), typed result rows, socket-level e2e over real TLS, cancellation on signals and MCP requests, streaming exports, catalog relations and search, query batches, a downstream adapter, native macOS/Windows test runs — shipped as [`v0.0.5`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.5) (2026-09-25) |
 
 ---
 
@@ -107,6 +112,127 @@ implementation first and the test/hardening pass follows in a later wave. The
 ---
 
 ## [Unreleased]
+
+### Fixed
+
+- A cancel that landed while the submit request was in flight (Ctrl-C,
+  SIGTERM, a deadline, the credit cap, an MCP cancel) could leave the statement
+  running on Snowflake until its server-side timeout: the driver dropped the
+  answer that named the statement, so no cancel was sent. The submit now
+  completes under the cancellation mask and the statement it names is
+  cancelled; a first Ctrl-C can therefore wait for Snowflake's answer (a
+  synchronous submit is answered within 45 s), and a second one exits at once.
+  Found by the new DPOR suite over the production driver (`35a58bf`).
+- Every request now carries `User-Agent: franken-snowflake/<version>`, which
+  the SQL API reference lists as required; with a CA bundle
+  (`<PREFIX>_CA_BUNDLE`), requests carried none (`176d7ce`).
+- Dataset mode bound date, time and timestamp filters with the SQL API's
+  `DATE`/`TIME`/`TIMESTAMP_*` binding types, which take epoch numbers, so
+  `--from 2024-01-01` would have been refused (100037) on a live account; a
+  decimal on a number column went out as `FIXED`, which takes integers only.
+  The planner now binds date, time and timestamp strings (and decimals, binary
+  hex and variants) as `TEXT`, which the docs name for strings, integers as
+  `FIXED` and `true`/`false` as `BOOLEAN`. Bindings passed with
+  `--bindings-env` are checked against the documented rules before any request,
+  with the fix named (e.g. "DATE takes epoch milliseconds; bind a date string
+  as TEXT").
+- Accounts whose names contain underscores (`acme-marketing_test_account`,
+  and the `..._aws_us_east_2` URLs Snowflake gives converted accounts) were
+  refused as non-canonical, and China-region accounts
+  (`snowflakecomputing.cn`) were refused; both now connect, and a bare
+  `<locator>.cn-northwest-1[.aws]` resolves to `snowflakecomputing.cn`.
+- Every live request set `DATE_OUTPUT_FORMAT`, `TIME_OUTPUT_FORMAT` and the
+  `TIMESTAMP_*_OUTPUT_FORMAT` parameters. The SQL API docs say a format set in
+  the request replaces the documented encoding (epoch days, epoch seconds) with
+  formatted text. `typed.v1` would have left every date, time and timestamp
+  column as wire strings with a warning. Frame materialization would have
+  failed, and Parquet export would have failed on TIME and TIMESTAMP. The
+  request no longer sets them; the SQL API ignores account and user settings for
+  them, so output stays deterministic. `scripts/capture-jsonv2-golden.sh` now
+  records wire strings (`--raw-cells`) with SQL that Snowflake compiles.
+- A result that Snowflake marks too large (code `391908`: "the response does
+  not include the entire result set") is a typed error naming the fix, never
+  returned as a complete result.
+
+### Verified live
+
+- 2026-09-28: the CLI's first end-to-end run against a live Snowflake account
+  (key-pair JWT), recorded in `docs/live_proof.md`:
+  - the `scripts/live-proof-cli.sh` battery (28 steps passed);
+  - the driver-level `live_proof` lanes, including an async cancel and a
+    two-partition, 50 000-row fetch;
+  - a cell-by-cell match with snowflake-connector-python 4.7.5 (27/27 columns);
+  - a Parquet readback (27/27 at nanosecond precision);
+  - a SIGINT cancel of an in-flight statement, acknowledged by Snowflake.
+
+  The result-encoding capture confirmed the codec: timestamps are fractional
+  epoch seconds, not nanoseconds. It is now a checked-in golden that the tests
+  decode cell by cell. Snowflake's statement count matched the lexer's on every
+  probed shape.
+
+### Fixed
+
+- The driver-level live-proof test overflowed its thread stack in a debug
+  build; its lanes now run on a thread with a 32 MiB stack.
+
+### Added
+
+- `text index` and `text search` (with `--features frankensearch`; `text
+  index` also needs `live`), plus the MCP tools `text_index` and `text_search`.
+  They index the text columns of a query result locally with Frankensearch's
+  hash and lexical tiers, and rank them offline. Each hit names its row,
+  column, id value, snippet, and the receipt of the statement the text came
+  from. The text-indexing crate was linked before but reachable only from a
+  doctor check.
+- A first SIGINT/SIGTERM during a statement prints one stderr line saying the
+  cancel is under way and that a second signal exits at once (`1e703fc`).
+- Each running statement is an Asupersync `Lease` obligation held by the task
+  that drives it, checked by the lab runtime's obligation-leak oracle
+  (`fcd6679`).
+- Release proof: README capability claims checked against their evidence
+  (`scripts/check-claims.py`, `docs/claims.toml`), a per-crate coverage floor
+  (`scripts/check-coverage-floor.py`), and the release gates in
+  `docs/RELEASE.md` (`467ff03`, `5f5fa5a`, `8969ca7`).
+- The installers say when a signature was not verified (no release is signed
+  yet) instead of staying silent (`8969ca7`).
+
+---
+
+## [v0.0.5] — 2026-09-25
+
+### Security advisory
+
+Affected: franken-snowflake v0.0.4 and earlier. Upgrade to v0.0.5.
+
+- `mcp serve --http` accepted requests without authentication and echoed any
+  `Origin`, so a web page open in the operator's browser could call the MCP
+  tools cross-origin, including live Snowflake reads with the serving shell's
+  credentials and `export_run` writing a file at any path. v0.0.5 requires a
+  bearer token (`FRANKEN_SNOWFLAKE_MCP_TOKEN`), refuses foreign `Host` and
+  `Origin` headers, binds loopback unless `--allow-remote`, and exposes only
+  read-only tools unless `--allow-tool` names more. If you cannot upgrade, do
+  not use `--http`; use `mcp serve --stdio`.
+- The MCP `export_run` tool wrote to any path, and `export run --out`
+  overwrote existing files. Both are confined now (see below).
+- Secret values in SQL text (`PASSWORD = '...'`, `CREDENTIALS = (...)`,
+  `MASTER_KEY`, ...) were stored unredacted in the append-only audit log,
+  receipts and envelopes, including on `--dry-run`. If such SQL ran through
+  v0.0.4 or earlier, treat the local store (`FRANKEN_SNOWFLAKE_DATA_DIR`, or the
+  platform data directory) as holding those secrets and rotate them.
+- A `$$`-quoted string could hide a second statement from the one-statement
+  read guard, and live submits did not pin `MULTI_STATEMENT_COUNT=1`.
+
+Also fixed in this release: Parquet exports truncated scaled NUMBER values
+(`1.50` became `1`); on Windows every live command and `mcp serve` crashed with
+a main-thread stack overflow in a debug build (whether the published v0.0.4
+Windows binaries were affected on the live path is not known); catalog text
+carrying terminal escape sequences reached the terminal raw under `--toon`,
+`--mermaid` and `--svg`.
+
+Proof: the local proof in `docs/RELEASE.md`, and native macOS and Windows
+runs of the workspace suite, every feature lane, and the socket-level e2e
+(`docs/RELEASE.md`, Cross-OS test runs). Nothing in this release was exercised
+against a live Snowflake account.
 
 ### Security
 
@@ -194,8 +320,107 @@ implementation first and the test/hardening pass follows in a later wave. The
   `profile doctor` gives lifetime guidance for the configured lane only.
 - **Ctrl-C cancels a running statement.** SIGINT (or SIGTERM) while a live
   statement runs cancels it through the driver, which sends the SQL API
-  remote cancel, and the envelope reads `cancelled`; a second signal exits at
-  once (130/143). Outside a statement the signals keep their default action.
+  remote cancel; the envelope reads `cancelled` and the exit status is 130
+  (SIGINT) or 143 (SIGTERM), the shell convention; a second signal exits at
+  once. Outside a statement the signals keep their default action. The
+  receipt (and envelope) of a failed or cancelled run names the statement
+  handle, whether Snowflake accepted the statement, and whether the remote
+  cancel was acknowledged; `--progress` shows it as a `remote_cancel` event.
+- **Catalog graph verbs.** `catalog relates <profile> <object> [--depth n]`,
+  `catalog lineage <profile> <object> --up|--down` and `catalog cycles
+  <profile>` (MCP `catalog_relates`, `catalog_lineage`, `catalog_cycles`) answer
+  from the newest local snapshot: an object is a node key, a dataset id, or a
+  case-insensitive `DB.SCHEMA.OBJECT[.COLUMN]`; an unknown one is `FSNOW-7002`
+  with suggestions. `lineage` follows dependency edges only (view sources,
+  foreign keys, stage and file-format use, datasets), never containment.
+- **Workspace credential Debug-leak gate.** A test scans every crate's
+  sources (structs, enums, tuple variants) for a `Debug` that would print a
+  credential-shaped field or credential type; before, only the auth crate's
+  own sources were gated. Planted controls cover each shape.
+- **Bounded HTTP exchanges.** Every SQL API exchange (connect, TLS, request,
+  response) is bounded at 300 s (`TransportConfig::attempt_timeout`); the
+  HTTP client imposes no timeout of its own, so a stalled connection used to
+  hang the command. A breach is a deadline cancel: outcome `timeout`, remote
+  cancel sent.
+- **MCP cancellation.** A `notifications/cancelled` for a running tool call
+  (stdio or HTTP), a stdio client closing its input, or an HTTP client closing
+  the call's connection cancels the statement the call started, with the SQL
+  API remote cancel; stdin is read by a watcher thread because FastMCP's stdio
+  loop handles one request at a time, and an HTTP call's socket is watched
+  while it runs.
+- **Terminal escapes in Snowflake data stay inert.** Table names, comments and
+  cell values are data: `catalog graph --mermaid|--svg` render their control
+  characters as visible symbols (ESC as U+241B), and `--toon` output that would
+  carry a control character TOON cannot escape is printed as JSON (which escapes
+  it) with a note on stderr. Before, such text reached the terminal raw.
+- **The TUI no longer blocks on a query.** A submitted query runs on a
+  background task; the progress pane follows the driver's events (statement
+  handle, partitions fetched, rows), Esc on the pane cancels the statement
+  (remote cancel included), and a second submit while one runs is refused.
+- **Batches of reads.** `query run --allow-multiple-statements` (MCP
+  `allow_multiple_statements`) runs two or more read statements as one SQL API
+  request with `MULTI_STATEMENT_COUNT` set to the batch size, fetches each
+  statement's result by the handle Snowflake lists, and answers them in order
+  under `data.statements[]`. Every statement must pass the read guard;
+  bindings and empty statements are refused before any request.
+- **Published typed-rows schema.** `docs/protocol/typed_rows.v1.schema.json`
+  (JSON Schema 2020-12) describes `typed.v1` columns and one cell shape per
+  `json_repr`; `typed_rows.v1.example.json` is the codec fixture's exact
+  projection. A CLI test validates every representation against it cell by
+  cell and checks that naive shapes (a FIXED through a float, a DATE day count,
+  a TIMESTAMP_TZ without its offset) fail.
+- **A downstream adapter over the local store, and its conformance suite.**
+  `franken_snowflake_cli::adapter::LocalStoreAdapter` implements
+  `SnowflakeDataLakeAdapter` over what `catalog scan`, `query run` and
+  `export run` persisted (offline; profile diagnostics name env handles only).
+  `franken_snowflake_core::adapter::conformance::check_adapter_conformance`
+  checks any adapter: contract ids, provenance that matches the envelope's data
+  source (fixture data labeled live fails), typed errors for unknown ids,
+  content addresses, secret-free answers. The fixture adapter and the local
+  store adapter pass it; `examples/adapter_conformance.rs` runs it.
+- **Catalog search.** `catalog search <profile> "<words>"` (MCP
+  `catalog_search`) ranks the newest snapshot's datasets by the words in their
+  names, columns, comments and tags, with where each word matched; offline and
+  deterministic, always over the latest scan.
+- **Dataset manifest overlay.** A non-secret TOML file
+  (`FRANKEN_SNOWFLAKE_MANIFEST` or `<data dir>/datasets.toml`) overrides
+  discovery's inferred field roles, rights class, limits and description per
+  dataset at read time (`dataset inspect`, dataset-mode planning, `dataset
+  profile`); unknown columns are usage errors with suggestions, unknown rights
+  labels fail closed, credential-like keys are refused, and `dataset
+  validate-manifest` (MCP `dataset_validate_manifest`) checks the file.
+- **Catalog relation pass.** `catalog scan` also reads primary keys (`SHOW
+  PRIMARY KEYS`), table-level foreign keys (`TABLE_CONSTRAINTS` +
+  `REFERENTIAL_CONSTRAINTS`), view dependencies (`GET_OBJECT_REFERENCES` per
+  view, `--max-view-refs`), stages, file formats, external-table sources and,
+  with `--tags`, `ACCOUNT_USAGE.TAG_REFERENCES`. The snapshot (schema
+  `dataset_manifest.v2`) carries the relations, keys, stages, formats, tags,
+  and every gap; the graph gains `view_depends_on`, `foreign_key`,
+  `uses_stage`, `uses_file_format` and `tagged` edges; `catalog diff` reports
+  added and removed relations; `dataset inspect` shows an object's key,
+  relations and tags. A refused source is `partial_success` (exit 1) naming
+  it, never a silent empty.
+- **Streaming local exports.** `export run --format csv|jsonl` writes rows to
+  the file as each partition window arrives (peak memory is one window, not the
+  result) into a temporary file that replaces the target only on success; a
+  failed or refused export leaves no file. `--max-rows` (default 1000000,
+  `<PREFIX>_EXPORT_MAX_ROWS`) refuses a larger result with `FSNOW-3004` and
+  cancels the statement; parquet and frame exports stop fetching just past the
+  limit. The receipt's content address covers exactly the bytes written.
+  `--progress` on `export run` and `query run` writes NDJSON statement events
+  (`submitted`, `polled`, `partition_fetched` with rows and bytes, `completed`,
+  each with `elapsed_ms`) to stderr; off by default, and stdout is unchanged.
+- **`profile doctor --online` checks the role's grants.** It walks
+  `SHOW GRANTS TO ROLE` from `CURRENT_ROLE()` through granted roles (up to 8,
+  `partial` beyond) and reports write-capable privileges (INSERT, UPDATE,
+  DELETE, TRUNCATE, OWNERSHIP, ALL, EXECUTE TASK, CREATE *, APPLY *); on a read
+  profile they are a warning, and `<PREFIX>_READ_ONLY_EXPECTED=true` makes them,
+  or an incomplete check, a profile error.
+- **`receipt refetch <hash>`** (and MCP `receipt_refetch`) re-reads a completed
+  statement's rows with `RESULT_SCAN` on the query id its receipt recorded,
+  without running the statement again; the id is validated as a query id before
+  it reaches SQL, a receipt older than the ~24 h result retention is refused
+  (`FSNOW-7001`), and the refetch writes its own receipt.
 - **Typed query results (`typed.v1`), output contract `fsnow.query.run.v2`.**
   `query run`, dataset mode, MCP `query_run` and the `query write` result decode
   each cell by its column's `rowType`: DATE `"YYYY-MM-DD"`, TIME/TIMESTAMP
@@ -299,8 +524,8 @@ closes those gaps:
   created jobs that were never assigned a hosted runner). Per project policy
   this repository never uses Actions: Actions are disabled in the repository
   settings, and `docs/RELEASE.md` specifies the `dsr` cross-platform proof
-  instead. `.github/workflows/ci.yml` is still tracked; deleting it awaits an
-  explicit operator go-ahead.
+  instead. The leftover `.github/workflows/ci.yml` was removed on 2026-09-24
+  with the operator's go-ahead.
 - **Local store.** `franken-snowflake-cache` gained an append-only JSONL
   `FileCache` backend (first-write-wins, tamper-detected receipts, malformed
   lines skipped and counted), a platform data-dir resolver

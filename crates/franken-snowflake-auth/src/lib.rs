@@ -1751,10 +1751,14 @@ fn account_identifier_input(account: &str) -> &str {
     }
     let host = s.split('/').next().unwrap_or(s);
     let host = host.split(':').next().unwrap_or(host);
-    if let Some(idx) = host.to_ascii_lowercase().rfind(".snowflakecomputing.com")
-        && idx + ".snowflakecomputing.com".len() == host.len()
-    {
-        return &host[..idx];
+    // Every region uses snowflakecomputing.com except China (Ningxia), which
+    // uses snowflakecomputing.cn.
+    for suffix in [".snowflakecomputing.com", ".snowflakecomputing.cn"] {
+        if let Some(idx) = host.to_ascii_lowercase().rfind(suffix)
+            && idx + suffix.len() == host.len()
+        {
+            return &host[..idx];
+        }
     }
     host
 }
@@ -1954,6 +1958,16 @@ mod tests {
         );
         assert_eq!(normalize_account_for_jwt("org.account")?, "ORG-ACCOUNT");
         assert_eq!(normalize_user_for_jwt("svc_user")?, "SVC_USER");
+        // Underscores in account names stay; only periods become hyphens.
+        assert_eq!(
+            normalize_account_for_jwt("acme-marketing_test_account")?,
+            "ACME-MARKETING_TEST_ACCOUNT"
+        );
+        // A China-region URL drops its snowflakecomputing.cn domain and region.
+        assert_eq!(
+            normalize_account_for_jwt("https://xy12345.cn-northwest-1.aws.snowflakecomputing.cn")?,
+            "XY12345"
+        );
         Ok(())
     }
 

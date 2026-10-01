@@ -228,8 +228,9 @@ fn zero_copy_fuzz_malformed_and_truncated_inputs() {
     }
 }
 
-#[test]
-fn zero_copy_high_throughput_benchmark_exceeds_350_mb_s() -> Result<(), String> {
+/// A 100,000-row partition covering every column shape, for the decode test
+/// and the release throughput lane.
+fn large_partition() -> (Vec<SnowflakeColumn>, Vec<u8>, usize) {
     let columns = vec![
         col("ID", "FIXED").with_scale(0).nullable(false),
         col("CUSTOMER_ID", "NUMBER").with_scale(0).nullable(true),
@@ -268,7 +269,31 @@ fn zero_copy_high_throughput_benchmark_exceeds_350_mb_s() -> Result<(), String> 
         payload.extend_from_slice(row_str.as_bytes());
     }
     payload.push(b']');
+    (columns, payload, num_rows)
+}
 
+#[test]
+fn zero_copy_decodes_a_100k_row_partition() -> Result<(), String> {
+    let (columns, payload, num_rows) = large_partition();
+    let frame = materialize_partition_bytes(&columns, &payload)
+        .map_err(|e| format!("decode failed: {e}"))?;
+    assert_eq!(frame.row_count, num_rows);
+    Ok(())
+}
+
+/// The release throughput target, in the perf lane only (bead g021): a
+/// wall-clock verdict depends on the machine's load (the same test inputs
+/// failed on a loaded worker and passed on an idle one), so the default suite
+/// checks the decode and this runs on request, in release:
+/// `cargo test --release -p franken-snowflake-frame --features frankenpandas
+/// --test zero_copy_parity -- --ignored --nocapture`.
+#[test]
+#[ignore = "perf lane: run with --release -- --ignored (docs/RELEASE.md)"]
+fn zero_copy_decoder_meets_350_mb_s_in_release() -> Result<(), String> {
+    if cfg!(debug_assertions) {
+        return Err("the perf lane measures release builds; run it with --release".to_owned());
+    }
+    let (columns, payload, num_rows) = large_partition();
     let payload_len_bytes = payload.len();
     let payload_len_mb = payload_len_bytes as f64 / (1024.0 * 1024.0);
 
@@ -308,13 +333,19 @@ fn zero_copy_high_throughput_benchmark_exceeds_350_mb_s() -> Result<(), String> 
     println!("Row rate: {:.0} rows/s", rows_per_sec);
     println!("------------------------------------------\n");
 
-    let target = if cfg!(debug_assertions) { 20.0 } else { 350.0 };
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .unwrap_or_else(|_| "unknown".to_owned());
+    let governor = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+        .unwrap_or_else(|_| "unknown".to_owned());
+    println!(
+        "Measured on host {} (governor {}, {} logical CPUs), release build",
+        host.trim(),
+        governor.trim(),
+        std::thread::available_parallelism().map_or(0, usize::from)
+    );
     assert!(
-        throughput_mb_s >= target,
-        "decoder throughput ({:.2} MB/s) failed to meet target >{:.0} MB/s (debug: {})",
-        throughput_mb_s,
-        target,
-        cfg!(debug_assertions)
+        throughput_mb_s >= 350.0,
+        "decoder throughput ({throughput_mb_s:.2} MB/s) failed to meet the 350 MB/s release target"
     );
 
     Ok(())

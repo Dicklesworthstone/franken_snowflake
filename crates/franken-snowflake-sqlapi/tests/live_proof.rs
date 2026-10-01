@@ -334,7 +334,18 @@ fn opt_in_live_sql_api_proof_lanes() -> Result<(), String> {
         }
     };
 
-    match run_live_lanes(&profile, &mut logger) {
+    // The driver's futures are large in a debug build; on the default 2 MiB
+    // test thread the first credentialed run (2026-09-28) overflowed the stack.
+    let lanes = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("live-proof-lanes".to_owned())
+            .stack_size(32 * 1024 * 1024)
+            .spawn_scoped(scope, || run_live_lanes(&profile, &mut logger))
+            .map_err(|error| format!("could not start the lanes thread: {error}"))?
+            .join()
+            .map_err(|_| "the live lanes thread panicked".to_owned())?
+    });
+    match lanes {
         Ok(()) => {
             let summary = logger.finish().map_err(|error| error.to_string())?;
             if summary.ok() {
@@ -414,8 +425,8 @@ fn run_live_lanes(profile: &LiveProfile, logger: &mut RunLogger) -> Result<(), S
         .map_err(|error| error.to_string())?;
     runtime.block_on(async {
         let cx = Cx::current().ok_or_else(|| "Asupersync runtime did not install Cx".to_string())?;
-        let client =
-            SnowflakeHttpClient::default_for_runtime(TransportConfig::new(profile.endpoint.clone()), &cx);
+        let client = SnowflakeHttpClient::for_runtime(TransportConfig::new(profile.endpoint.clone()))
+            .map_err(|error| error.to_string())?;
         let mut auth = profile
             .auth_profile
             .resolve(&ProcessSecretResolver, &profile.account, &profile.user)
@@ -698,26 +709,11 @@ fn require_rows(
     }
 }
 
+/// The CLI's session pins. No DATE/TIME/TIMESTAMP output format: one set in
+/// the request replaces the documented jsonv2 encoding the decoders read.
 fn deterministic_session_parameters() -> BTreeMap<String, String> {
     BTreeMap::from([
         ("TIMEZONE".to_string(), "UTC".to_string()),
-        ("DATE_OUTPUT_FORMAT".to_string(), "YYYY-MM-DD".to_string()),
-        (
-            "TIME_OUTPUT_FORMAT".to_string(),
-            "HH24:MI:SS.FF9".to_string(),
-        ),
-        (
-            "TIMESTAMP_NTZ_OUTPUT_FORMAT".to_string(),
-            "YYYY-MM-DD HH24:MI:SS.FF9".to_string(),
-        ),
-        (
-            "TIMESTAMP_LTZ_OUTPUT_FORMAT".to_string(),
-            "YYYY-MM-DD HH24:MI:SS.FF9 TZHTZM".to_string(),
-        ),
-        (
-            "TIMESTAMP_TZ_OUTPUT_FORMAT".to_string(),
-            "YYYY-MM-DD HH24:MI:SS.FF9 TZHTZM".to_string(),
-        ),
         ("BINARY_OUTPUT_FORMAT".to_string(), "HEX".to_string()),
         ("USE_CACHED_RESULT".to_string(), "FALSE".to_string()),
     ])

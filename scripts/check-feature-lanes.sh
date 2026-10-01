@@ -24,11 +24,11 @@ LANES=(
   "-p franken-snowflake-cli|toon"
   "-p franken-snowflake-cli|frankenpandas"
   "-p franken-snowflake-cli|frankensearch"
+  "-p franken-snowflake-cli|live,sqlite-store"
   "-p franken-snowflake-mcp|mcp"
   "-p franken-snowflake-tui|tui"
   "-p franken-snowflake-frame|frankenpandas"
   "-p franken-snowflake-text-indexing|frankensearch"
-  "-p franken-snowflake-text-indexing|frankensearch,rerank"
   "-p franken-snowflake-http|live"
   "-p franken-snowflake-http|testkit"
   "-p franken-snowflake-http|testkit-endpoint"
@@ -51,10 +51,6 @@ emit() { printf '{"gate":"feature-lanes","event":"%s",%s}\n' "$1" "$2"; }
 for lane in "${LANES[@]}"; do
   scope="${lane%%|*}"
   features="${lane#*|}"
-  if [ "$features" = "frankensqlite" ] && [ "$(uname -s)" != "Linux" ] && [ "$(uname -s)" != "Darwin" ]; then
-    emit lane_skipped "\"scope\":\"$scope\",\"features\":\"$features\",\"reason\":\"fsqlite is Unix-only\""
-    continue
-  fi
   for attempt in 1 2 3 4 5; do
     # shellcheck disable=SC2086
     if [ -n "$features" ]; then

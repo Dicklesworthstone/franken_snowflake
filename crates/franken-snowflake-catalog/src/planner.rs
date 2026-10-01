@@ -959,15 +959,49 @@ fn push_binding(
     value: String,
 ) -> String {
     let key = next_binding.to_string();
+    let binding_type = sql_api_binding_type(dtype, &value);
+    let value = if binding_type == "BOOLEAN" {
+        value.to_ascii_lowercase()
+    } else {
+        value
+    };
     bindings.insert(
         key,
         TypedBinding {
-            binding_type: dtype.default_binding_type().to_owned(),
+            binding_type: binding_type.to_owned(),
             value,
         },
     );
     *next_binding += 1;
     "?".to_owned()
+}
+
+/// The SQL API binding type for `value` compared with a column of class
+/// `dtype`, as "Using bind variables in a statement" documents it (consulted
+/// 2026-09-26, <https://docs.snowflake.com/en/developer-guide/sql-api/submitting-requests>):
+/// the DATE binding takes epoch milliseconds and TIME/TIMESTAMP* take epoch
+/// nanoseconds, so a date or time *string* (what `--from 2024-01-01` or a
+/// predicate carries) binds as TEXT, which Snowflake converts by AUTO
+/// detection ("if the value is a string representing a date ... use the TEXT
+/// binding type"). FIXED takes integers only, so any other number binds as
+/// TEXT (exact; the comparison casts it). BOOLEAN takes `true`/`false`.
+/// BINARY columns take hex through TEXT, and VARIANT is no binding type.
+#[must_use]
+pub fn sql_api_binding_type(dtype: DtypeClass, value: &str) -> &'static str {
+    match dtype {
+        DtypeClass::Number if is_integer_literal(value) => "FIXED",
+        DtypeClass::Boolean
+            if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false") =>
+        {
+            "BOOLEAN"
+        }
+        _ => "TEXT",
+    }
+}
+
+fn is_integer_literal(value: &str) -> bool {
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Quote one Snowflake identifier part. Embedded quotes are doubled.
@@ -1240,6 +1274,46 @@ mod tests {
     };
     use crate::operator::{OperatorArity, OutputDtypeRule, built_in_operator_catalog};
 
+    /// Bug found 2026-09-26 against the SQL API docs ("Using bind variables in
+    /// a statement"): the planner bound date strings as DATE, which takes epoch
+    /// milliseconds, so `--from 2024-01-01` would fail with 100037 live.
+    #[test]
+    fn bindings_follow_the_sql_api_binding_rules() {
+        use DtypeClass as C;
+        for (dtype, value, expected) in [
+            (C::Date, "2024-01-01", "TEXT"),
+            (C::Timestamp, "2024-01-01T00:00:00Z", "TEXT"),
+            (C::Time, "12:30:00", "TEXT"),
+            (C::Number, "42", "FIXED"),
+            (C::Number, "-7", "FIXED"),
+            (C::Number, "1.50", "TEXT"),
+            (C::Number, "1e3", "TEXT"),
+            (C::Number, "-", "TEXT"),
+            (C::Number, "", "TEXT"),
+            (C::Boolean, "TRUE", "BOOLEAN"),
+            (C::Boolean, "yes", "TEXT"),
+            (C::Binary, "DEADBEEF", "TEXT"),
+            (C::Variant, "x", "TEXT"),
+            (C::String, "123", "TEXT"),
+        ] {
+            assert_eq!(
+                sql_api_binding_type(dtype, value),
+                expected,
+                "{dtype:?} {value:?}"
+            );
+        }
+        // A BOOLEAN binding carries the lower-case literal the docs name.
+        let mut bindings = BTreeMap::new();
+        let mut next = 1;
+        push_binding(&mut bindings, &mut next, C::Boolean, "TRUE".to_owned());
+        assert_eq!(
+            bindings
+                .get("1")
+                .map(|b| (b.binding_type.as_str(), b.value.as_str())),
+            Some(("BOOLEAN", "true"))
+        );
+    }
+
     #[test]
     fn dataset_plan_pushes_safe_predicates_with_typed_bindings() {
         let request = DatasetQueryRequest {
@@ -1290,11 +1364,31 @@ mod tests {
                 plan.bindings.get("4").map(|binding| binding.value.as_str()),
                 Some("0 OR 1=1")
             );
+            // The DATE time index binds the ISO strings as TEXT: the SQL API's
+            // DATE binding takes epoch milliseconds, and would refuse them.
+            for (position, value) in [("2", "2024-01-01"), ("3", "2024-12-31")] {
+                let binding = plan.bindings.get(position);
+                assert_eq!(
+                    binding.map(|binding| (binding.binding_type.as_str(), binding.value.as_str())),
+                    Some(("TEXT", value)),
+                    "binding {position}"
+                );
+            }
+            // The limit is an integer: FIXED.
+            assert_eq!(
+                plan.bindings
+                    .get("5")
+                    .map(|binding| (binding.binding_type.as_str(), binding.value.as_str())),
+                Some(("FIXED", "1000"))
+            );
+            // Not an integer, so not FIXED (the SQL API's FIXED takes integers
+            // only): it stays bound as TEXT, and Snowflake's numeric cast
+            // refuses it; it never reaches the SQL text.
             assert_eq!(
                 plan.bindings
                     .get("4")
                     .map(|binding| binding.binding_type.as_str()),
-                Some("FIXED")
+                Some("TEXT")
             );
             assert_eq!(plan.guardrails.query_tag, "trace-abc");
             assert_eq!(plan.guardrails.statement_timeout_seconds, 60);

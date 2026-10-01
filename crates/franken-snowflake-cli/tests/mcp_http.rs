@@ -54,7 +54,8 @@ fn start(label: &str, extra_args: &[&str]) -> Server {
     let data_dir = temp_dir(label);
     let mut args = vec!["mcp", "serve", "--http", "127.0.0.1:0"];
     args.extend_from_slice(extra_args);
-    let mut child = Command::new(BIN)
+    let mut command = Command::new(BIN);
+    command
         .args(&args)
         .env_clear()
         .env("HOME", &data_dir)
@@ -62,9 +63,13 @@ fn start(label: &str, extra_args: &[&str]) -> Server {
         .env("FRANKEN_SNOWFLAKE_MCP_TOKEN", TOKEN)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn mcp serve --http");
+        .stderr(Stdio::piped());
+    // Windows sockets need SYSTEMROOT to initialize (the scrubbed environment
+    // otherwise kills the server before it binds; seen on the dsr Windows host).
+    if let Some(root) = std::env::var_os("SYSTEMROOT") {
+        command.env("SYSTEMROOT", root);
+    }
+    let mut child = command.spawn().expect("spawn mcp serve --http");
     let stderr = child.stderr.take().expect("stderr");
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {

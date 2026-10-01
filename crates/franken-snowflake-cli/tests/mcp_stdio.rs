@@ -104,8 +104,15 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
     );
 
     let init = &responses[&1]["result"];
-    assert_eq!(init["serverInfo"]["name"], "franken-snowflake");
+    assert_eq!(
+        init["serverInfo"]["name"], "franken-snowflake",
+        "{:?}",
+        responses[&1]
+    );
     assert_eq!(init["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
+    // The client asked for 2025-03-26; the server answers with the version it
+    // serves (MCP version negotiation) instead of refusing the handshake.
+    assert_eq!(init["protocolVersion"], "2024-11-05");
 
     let tools = responses[&2]["result"]["tools"]
         .as_array()
@@ -114,7 +121,7 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(tools.len(), 20, "{names:?}");
+    assert_eq!(tools.len(), 28, "{names:?}");
     for expected in [
         "capabilities",
         "onboard",
@@ -124,8 +131,10 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
         "catalog_scan",
         "catalog_graph",
         "catalog_diff",
+        "catalog_search",
         "dataset_inspect",
         "dataset_describe_operator",
+        "dataset_validate_manifest",
         "query_plan",
         "query_run",
         "query_cancel",
@@ -134,9 +143,26 @@ fn mcp_stdio_handshake_lists_tools_and_returns_cli_envelopes() {
         "export_run",
         "dataset_profile",
         "profile_doctor",
+        "text_index",
+        "text_search",
     ] {
         assert!(names.contains(&expected), "missing tool {expected}");
     }
+
+    // Hints follow the MCP schema: `openWorldHint` is a boolean, true only for
+    // the tools that can reach Snowflake.
+    let hint = |name: &str, key: &str| {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .map(|tool| tool["annotations"][key].clone())
+    };
+    assert_eq!(hint("capabilities", "openWorldHint"), Some(false.into()));
+    assert_eq!(hint("query_run", "openWorldHint"), Some(true.into()));
+    assert_eq!(hint("query_run", "readOnlyHint"), Some(true.into()));
+    assert_eq!(hint("export_run", "destructiveHint"), Some(true.into()));
+    assert_eq!(hint("text_index", "destructiveHint"), Some(true.into()));
+    assert_eq!(hint("text_search", "readOnlyHint"), Some(true.into()));
 
     // Parity: the tool result IS the CLI envelope for the same verb.
     let text = responses[&3]["result"]["content"][0]["text"]

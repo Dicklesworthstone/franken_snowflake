@@ -21,11 +21,12 @@
 //!   already redacted and the crate-root `sanitize_envelope` pass runs the
 //!   secret-leak redactor over the whole envelope before output.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
@@ -35,14 +36,18 @@ use franken_snowflake_auth::{
     ReauthDecision, SecretSource, SnowflakeAuth,
 };
 use franken_snowflake_cache::{
-    CacheBackend, CatalogSnapshotRecord, ContentAddress as CacheAddress, ExportKind, ExportRecord,
-    VerifiedPayload,
+    CatalogSnapshotRecord, ContentAddress as CacheAddress, ExportKind, ExportRecord,
+    QueryReceiptRecord, VerifiedPayload,
 };
 use franken_snowflake_catalog::discovery::{
     CatalogDiscoveryInput, CatalogDiscoveryTables, DiscoveryStatementKind,
     build_information_schema_requests, build_snapshot_from_information_schema, persist_snapshot,
 };
-use franken_snowflake_catalog::model::{CatalogSnapshot, DataSourceClass};
+use franken_snowflake_catalog::model::{CatalogSnapshot, DataSourceClass, DiscoveryGapKind};
+use franken_snowflake_catalog::relations::{
+    RelationOptions, RelationOutcome, RelationSource, apply_relation_results,
+    plan_relation_discovery,
+};
 use franken_snowflake_core::cancel::{
     CancelKind, attempts_remote_cancel, cancel_outcome_kind, cancel_policy,
 };
@@ -56,17 +61,24 @@ use franken_snowflake_core::outcome::{DataSource, OutcomeKind};
 use franken_snowflake_core::redact::redact;
 use franken_snowflake_core::typed::{ColumnCodec, JsonRepr, TYPED_ROW_ENCODING, WIRE_ROW_ENCODING};
 use franken_snowflake_export::{
-    CopySource, ExportColumn, LocalExportInput, ResultPartition, export_csv, export_jsonl,
+    CopySource, ExportColumn, ExportReceipt, LocalExportInput, ResultPartition,
+    StreamingTextExport, TextFormat,
 };
 use franken_snowflake_http::{
     AuthorizationDescriptor, CancelHttpRequest, SnowflakeAuthTokenType, SnowflakeEndpoint,
     SnowflakeHttpClient, StatusClass, TlsRootPolicy, TransportConfig, TransportError,
+    capture::{CAPTURE_DIR_ENV, TranscriptRecorder},
 };
-use franken_snowflake_sqlapi::driver::{AuthProvider, DriverStats, run_statement_with_auth};
+use franken_snowflake_sqlapi::driver::{
+    AuthProvider, DriverEvent, DriverObserver, DriverStats, RowSink, StatementHooks,
+    run_multi_statement_hooked, run_statement_hooked,
+};
 use franken_snowflake_sqlapi::lifecycle::{
-    CompletedStatement, DEFAULT_PARTITION_CONCURRENCY, MAX_PARTITION_CONCURRENCY, PollPlan,
+    CompletedStatement, CostQuota, DEFAULT_PARTITION_CONCURRENCY, MAX_PARTITION_CONCURRENCY,
+    PollPlan,
 };
 use franken_snowflake_sqlapi::request::{Binding, SubmitQueryParams, SubmitStatementRequest};
+use franken_snowflake_sqlapi::response::ResultSet;
 
 use crate::catalog_surface::{self, DATA_SOURCE_CACHE, ExportPlanSpec};
 use crate::local_store::{self, ExecutionFacts, Store};
@@ -83,6 +95,9 @@ const DEFAULT_STATEMENT_TIMEOUT_SECONDS: u32 = 60;
 const MAX_STATEMENT_TIMEOUT_SECONDS: u32 = 86_400;
 /// Poll budget if a profile does not override `<PREFIX>_MAX_POLLS`.
 const DEFAULT_MAX_POLLS: u32 = 120;
+/// How long past the statement timeout the client waits before cancelling on
+/// its own: a healthy server reports its own timeout first.
+const CLIENT_DEADLINE_MARGIN: Duration = Duration::from_secs(5);
 /// Maximum rows materialized into a single response envelope by default. The
 /// driver still assembles the full result; this only bounds the JSON payload an
 /// agent sees. `--limit` overrides it up to [`MAX_ROW_EMIT_CAP`].
@@ -205,7 +220,8 @@ pub fn run_query_outcome(
     let conn = match LiveConn::resolve(&profile, &overrides) {
         Ok(conn) => conn
             .tagged("query.run", &request_id)
-            .with_statement_tag(request_options.query_tag.as_deref()),
+            .with_statement_tag(request_options.query_tag.as_deref())
+            .with_progress(options.progress),
         Err(error) => return fail(&error, profile),
     };
     match execute(&conn, sql, request_options) {
@@ -246,6 +262,441 @@ pub fn run_query_outcome(
             &conn,
             &request_id,
             sql,
+            &error,
+        ),
+    }
+}
+
+/// `query run --allow-multiple-statements` (reality-check bead L1): run a
+/// batch of reads as one multi-statement request (`MULTI_STATEMENT_COUNT` =
+/// the batch size) and answer each statement's rows, in order, under
+/// `data.statements[]`. The caller already refused bindings, empty
+/// statements, and anything but reads.
+pub fn run_batch_query_outcome(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    sql: &str,
+    statements: &[&str],
+    options: &QueryRunOptions,
+) -> crate::Outcome {
+    let fail = |error: &SnowflakeError, profile: String| {
+        failure_outcome(
+            format,
+            "query.run",
+            "fsnow.query.run.v2",
+            request_id.clone(),
+            profile,
+            error,
+        )
+    };
+    let mut request_options = match query_request_options(None, None, options.query_tag.as_deref())
+    {
+        Ok(request_options) => request_options,
+        Err(error) => return fail(&error, profile),
+    };
+    let emit_cap = match parse_limit(options.limit.as_deref()) {
+        Ok(cap) => cap,
+        Err(error) => return fail(&error, profile),
+    };
+    // Per statement: do not download partitions the envelope will never show.
+    request_options.row_cap = Some(emit_cap);
+    let overrides = match session_overrides(options, None, None) {
+        Ok(overrides) => overrides,
+        Err(error) => return fail(&error, profile),
+    };
+    let conn = match LiveConn::resolve(&profile, &overrides) {
+        Ok(conn) => conn
+            .tagged("query.run", &request_id)
+            .with_statement_tag(request_options.query_tag.as_deref())
+            .with_progress(options.progress),
+        Err(error) => return fail(&error, profile),
+    };
+    match execute_batch(&conn, sql, statements.len(), request_options) {
+        Ok((parent, results)) => {
+            if let Err(error) = enforce_require_live(options.require_live, DataSource::Live) {
+                return fail(&error, profile);
+            }
+            let per_statement: Vec<serde_json::Value> = results
+                .iter()
+                .map(|rows| {
+                    serde_json::json!({
+                        "statement_handle": rows.statement_handle,
+                        "row_count": rows.total_rows,
+                        "columns": rows
+                            .column_pairs()
+                            .into_iter()
+                            .map(|(name, snowflake_type)| {
+                                serde_json::json!({ "name": name, "type": snowflake_type })
+                            })
+                            .collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            let (receipt_hash, warnings) = record_receipt(
+                "query.run",
+                &conn,
+                &request_id,
+                sql,
+                &parent,
+                "statement_executed",
+                serde_json::json!({ "statements": per_statement }),
+            );
+            batch_success(
+                format,
+                request_id,
+                profile,
+                &parent,
+                &results,
+                statements,
+                emit_cap,
+                RowEncoding::from_raw_cells(options.raw_cells),
+                receipt_hash.clone(),
+                warnings,
+                vec![receipt_show_command(receipt_hash.as_deref())],
+            )
+        }
+        Err(error) => with_terminal_receipt(
+            fail(&error, profile),
+            "query.run",
+            &conn,
+            &request_id,
+            sql,
+            &error,
+        ),
+    }
+}
+
+/// Run `sql`, a batch of `count` statements, as one multi-statement request
+/// and assemble each statement's rows (reality-check bead L1). Returns the
+/// parent (its `total_rows` is the batch's total; its own row is Snowflake's
+/// status message) and each statement in order.
+fn execute_batch(
+    conn: &LiveConn,
+    sql: &str,
+    count: usize,
+    options: QueryRequestOptions,
+) -> Result<(LiveRows, Vec<LiveRows>), SnowflakeError> {
+    let row_cap = options.row_cap;
+    let mut request = build_request(conn, sql, options);
+    // The one place the pinned single-statement count is lifted: the guard
+    // counted the batch with the shared lexer, and Snowflake refuses the
+    // request (422) when its own count differs.
+    request
+        .parameters
+        .get_or_insert_with(BTreeMap::new)
+        .insert("MULTI_STATEMENT_COUNT".to_owned(), count.to_string());
+    let query_tag = request
+        .parameters
+        .as_ref()
+        .and_then(|parameters| parameters.get("QUERY_TAG"))
+        .cloned();
+    let sql_api_request_id = unique_request_id();
+    LAST_RUN.with(RefCell::take);
+    #[cfg(test)]
+    if conn.script.is_some() {
+        return Err(SnowflakeError::new(
+            SnowflakeErrorCode::Internal,
+            "the scripted test transport does not model multi-statement requests",
+        ));
+    }
+    let params = SubmitQueryParams {
+        request_id: Some(sql_api_request_id.clone()),
+        retry: true,
+        asynchronous: false,
+        nullable: None,
+    };
+    let poll_plan = PollPlan::with_max_polls(conn.max_polls)
+        .with_partition_concurrency(conn.partition_concurrency)
+        .with_row_cap(row_cap)
+        .with_execution_timeout(conn.execution_timeout_for(count))
+        .with_cost_quota(conn.cost_quota()?);
+    let progress = conn.progress;
+    let (outcome, stats, facts) = with_runtime(conn, move |cx, client, auth| {
+        Box::pin(async move {
+            let mut observer = RunObserver::new(progress);
+            let (outcome, stats) = run_multi_statement_hooked(
+                cx,
+                client,
+                auth,
+                request,
+                params,
+                poll_plan,
+                Some(&mut observer),
+            )
+            .await;
+            Ok((outcome, stats, observer.facts))
+        })
+    })?;
+    LAST_RUN.with(|slot| *slot.borrow_mut() = facts);
+    let result = outcome_into_result(outcome, "the statements", true)?;
+    let statements: Vec<LiveRows> = result
+        .statements
+        .into_iter()
+        .map(|done| {
+            let mut rows = into_rows(done, DriverStats::default(), sql_api_request_id.clone());
+            rows.query_tag.clone_from(&query_tag);
+            rows
+        })
+        .collect();
+    let mut parent = into_rows(result.parent, stats, sql_api_request_id);
+    parent.query_tag = query_tag;
+    parent.total_rows = statements.iter().map(|rows| rows.total_rows).sum();
+    Ok((parent, statements))
+}
+
+/// A batch's envelope: each statement's columns and rows, projected like a
+/// single statement's and capped at `emit_cap` each, under
+/// `data.statements[]` in order.
+#[allow(clippy::too_many_arguments)]
+fn batch_success(
+    format: OutputFormat,
+    request_id: String,
+    profile: String,
+    parent: &LiveRows,
+    results: &[LiveRows],
+    statements: &[&str],
+    emit_cap: usize,
+    encoding: RowEncoding,
+    receipt_hash: Option<String>,
+    mut warnings: Vec<Json>,
+    safe_next_commands: Vec<String>,
+) -> crate::Outcome {
+    let mut entries = Vec::with_capacity(results.len());
+    for (index, rows) in results.iter().enumerate() {
+        let position = index + 1;
+        let returned = rows.rows.len().min(emit_cap);
+        let truncated = rows.rows.len() > emit_cap;
+        let projected = project_rows(rows, returned, encoding);
+        warnings.extend(projected.warnings.into_iter().map(|warning| match warning {
+            Json::String(text) => json_string(format!("statement {position}: {text}")),
+            other => other,
+        }));
+        if truncated {
+            warnings.push(json_string(format!(
+                "statement {position}: result truncated to {emit_cap} rows in this envelope; {} total rows were returned (raise --limit up to {MAX_ROW_EMIT_CAP})",
+                rows.total_rows
+            )));
+        }
+        let statement = statements.get(index).copied().unwrap_or_default();
+        entries.push(json_object(vec![
+            ("index", Json::Number(index as i64)),
+            (
+                "statement_handle",
+                json_string(rows.statement_handle.clone()),
+            ),
+            (
+                "sql_preview_redacted",
+                json_string(crate::compact_sql(&redact(statement))),
+            ),
+            ("columns", projected.columns),
+            ("rows", projected.rows),
+            ("row_count", Json::Number(rows.total_rows)),
+            ("returned_rows", Json::Number(returned as i64)),
+            ("partition_count", Json::Number(rows.partition_count as i64)),
+            (
+                "partitions_fetched",
+                Json::Number(i64::from(rows.fetched_partitions)),
+            ),
+            ("truncated", Json::Bool(truncated)),
+        ]));
+    }
+    let data = json_object(vec![
+        ("row_encoding", json_string(encoding.token())),
+        ("statement_count", Json::Number(results.len() as i64)),
+        ("statements", json_array(entries)),
+        ("row_emit_cap", Json::Number(emit_cap as i64)),
+        (
+            "sql_api_request_id",
+            json_string(parent.sql_api_request_id.clone()),
+        ),
+    ]);
+    let mut envelope = base_envelope(
+        true,
+        "success",
+        "query.run",
+        "fsnow.query.run.v2",
+        request_id,
+        data,
+    );
+    stamp_live(&mut envelope, &profile, parent, receipt_hash);
+    envelope.safe_next_commands = safe_next_commands;
+    envelope.warnings = warnings;
+    crate::Outcome {
+        status: CoreExitCode::Success,
+        body: Body::Envelope { envelope, format },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// receipt refetch (reality-check bead L5)
+// ---------------------------------------------------------------------------
+
+/// How long Snowflake keeps a query's result for `RESULT_SCAN` ("persisted
+/// query results" are kept 24 hours; docs.snowflake.com/en/user-guide/querying-persisted-results,
+/// consulted 2026-09-24).
+const RESULT_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Whether `id` has the shape of a Snowflake query id (a UUID, 8-4-4-4-12 hex).
+fn is_query_id(id: &str) -> bool {
+    let parts: Vec<&str> = id.split('-').collect();
+    parts.len() == 5
+        && parts.iter().zip([8, 4, 4, 4, 12]).all(|(part, len)| {
+            part.len() == len && part.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+/// The query id a receipt's rows can be re-read with, or the typed reason not.
+fn refetch_query_id(record: &QueryReceiptRecord, now_ms: u64) -> Result<String, SnowflakeError> {
+    if !record.is_successful_result_scan_candidate() {
+        return Err(SnowflakeError::new(
+            SnowflakeErrorCode::MetadataError,
+            format!(
+                "receipt `{}` ({}, receipt_state {}) has no completed result to refetch",
+                record.receipt_id, record.command_id, record.receipt_state
+            ),
+        ));
+    }
+    let query_id = record.snowflake_query_id.clone().unwrap_or_default();
+    if !is_query_id(&query_id) {
+        return Err(SnowflakeError::new(
+            SnowflakeErrorCode::MetadataError,
+            format!(
+                "receipt `{}` records a query id that is not a Snowflake query id; refusing to build RESULT_SCAN",
+                record.receipt_id
+            ),
+        ));
+    }
+    let age_ms = now_ms.saturating_sub(record.created_at_ms);
+    if age_ms > RESULT_RETENTION_MS {
+        return Err(SnowflakeError::new(
+            SnowflakeErrorCode::CacheError,
+            format!(
+                "receipt `{}` is {} h old; Snowflake keeps a query's result for RESULT_SCAN about 24 h, so it has likely expired; run the statement again",
+                record.receipt_id,
+                age_ms / 3_600_000
+            ),
+        ));
+    }
+    Ok(query_id)
+}
+
+/// Re-read a completed statement's rows from Snowflake's result cache with
+/// `RESULT_SCAN` on the query id its receipt recorded, without running the
+/// statement again. The refetch itself gets a receipt.
+pub fn run_receipt_refetch_outcome(
+    format: OutputFormat,
+    request_id: String,
+    receipt_hash: String,
+    profile_override: Option<String>,
+    limit: Option<&str>,
+    raw_cells: bool,
+) -> crate::Outcome {
+    let fail = |error: &SnowflakeError, profile: String| {
+        failure_outcome(
+            format,
+            "receipt.refetch",
+            "fsnow.receipt.refetch.v1",
+            request_id.clone(),
+            profile,
+            error,
+        )
+    };
+    let receipt_id = receipt_hash
+        .trim()
+        .strip_prefix("blake3:")
+        .unwrap_or(receipt_hash.trim())
+        .to_ascii_lowercase();
+    let fallback_profile = profile_override.clone().unwrap_or_default();
+    let store = match local_store::open_store() {
+        Ok(store) => store,
+        Err(error) => {
+            return fail(
+                &SnowflakeError::new(SnowflakeErrorCode::CacheError, error.message()),
+                fallback_profile,
+            );
+        }
+    };
+    let record = match store.cache.query_receipt(&receipt_id) {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return fail(
+                &SnowflakeError::new(
+                    SnowflakeErrorCode::MetadataError,
+                    format!(
+                        "receipt `{receipt_id}` is not in the local store at {}",
+                        store.dir.display()
+                    ),
+                ),
+                fallback_profile,
+            );
+        }
+        Err(error) => {
+            return fail(
+                &SnowflakeError::new(SnowflakeErrorCode::CacheError, error.to_string()),
+                fallback_profile,
+            );
+        }
+    };
+    let profile = profile_override.unwrap_or_else(|| record.profile_id.clone());
+    let query_id = match refetch_query_id(&record, local_store::now_unix_ms()) {
+        Ok(query_id) => query_id,
+        Err(error) => return fail(&error, profile),
+    };
+    let emit_cap = match parse_limit(limit) {
+        Ok(cap) => cap,
+        Err(error) => return fail(&error, profile),
+    };
+    let conn = match LiveConn::resolve(&profile, &SessionOverrides::default()) {
+        Ok(conn) => conn.tagged("receipt.refetch", &request_id),
+        Err(error) => return fail(&error, profile),
+    };
+    // The id was checked to be UUID-shaped above, so it is inlined as a
+    // literal: RESULT_SCAN takes a string, and a bind variable in that
+    // position is not confirmed for the SQL API.
+    let sql = format!("SELECT * FROM TABLE(RESULT_SCAN('{query_id}'))");
+    let request_options = QueryRequestOptions {
+        row_cap: Some(emit_cap),
+        ..QueryRequestOptions::default()
+    };
+    match execute(&conn, &sql, request_options) {
+        Ok(rows) => {
+            let (receipt_hash, warnings) = record_receipt(
+                "receipt.refetch",
+                &conn,
+                &request_id,
+                &sql,
+                &rows,
+                "statement_executed",
+                serde_json::json!({
+                    "source_receipt_id": record.receipt_id,
+                    "source_query_id": query_id,
+                }),
+            );
+            rows_success(
+                format,
+                request_id,
+                profile,
+                "receipt.refetch",
+                "fsnow.receipt.refetch.v1",
+                vec![
+                    ("source_receipt_id", json_string(record.receipt_id.clone())),
+                    ("source_query_id", json_string(query_id)),
+                ],
+                &rows,
+                emit_cap,
+                RowEncoding::from_raw_cells(raw_cells),
+                receipt_hash.clone(),
+                warnings,
+                vec![receipt_show_command(receipt_hash.as_deref())],
+            )
+        }
+        Err(error) => with_terminal_receipt(
+            fail(&error, profile),
+            "receipt.refetch",
+            &conn,
+            &request_id,
+            &sql,
             &error,
         ),
     }
@@ -297,7 +748,8 @@ pub fn run_dataset_query_outcome(
     let conn = match LiveConn::resolve(&profile, &overrides) {
         Ok(conn) => conn
             .tagged("query.run", &request_id)
-            .with_statement_tag(Some(&planned.plan.guardrails.query_tag)),
+            .with_statement_tag(Some(&planned.plan.guardrails.query_tag))
+            .with_progress(options.progress),
         Err(error) => return fail(&error),
     };
     // Every planner binding becomes a positional SQL API binding; values never
@@ -383,6 +835,9 @@ pub fn run_dataset_query_outcome(
 /// identifiers the receipt envelope surfaces. No SQL is submitted until the CLI
 /// has the authorized plan in hand.
 pub struct AuthorizedWrite<'a> {
+    /// The ladder's proof: only core's write-intent ladder mints one, so no
+    /// read path can build an `AuthorizedWrite` (reality-check bead oj0.29).
+    pub grant: &'a franken_snowflake_core::write_intent::WriteAuthorization,
     /// The exact mutating statement the ladder authorized.
     pub sql: &'a str,
     /// Stable statement-kind token (e.g. `insert`, `copy_into_table`).
@@ -412,6 +867,19 @@ pub fn run_write_outcome(
     profile: String,
     write: &AuthorizedWrite<'_>,
 ) -> crate::Outcome {
+    if !write.grant.covers(write.sql) {
+        return failure_outcome(
+            format,
+            "query.write",
+            "fsnow.query.write.v1",
+            request_id,
+            profile,
+            &SnowflakeError::new(
+                SnowflakeErrorCode::MutationRefused,
+                "the write authorization does not cover this statement",
+            ),
+        );
+    }
     let overrides = SessionOverrides {
         database: write.database.clone(),
         schema: write.schema.clone(),
@@ -627,28 +1095,36 @@ fn write_success(
 // catalog scan / catalog graph
 // ---------------------------------------------------------------------------
 
-/// A live discovery scan: the snapshot, its store record, the two statements'
-/// row sets, and what happened to persistence.
+/// A live discovery scan: the snapshot, its store record, the TABLES/COLUMNS
+/// row sets, the relation pass's statement count and polls, and what happened
+/// to persistence.
 struct ScanResult {
     input: CatalogDiscoveryInput,
     snapshot: CatalogSnapshot,
     record: CatalogSnapshotRecord,
     tables: LiveRows,
     columns: LiveRows,
+    relation_statements: usize,
+    relation_polls: u32,
     store_dir: Option<String>,
     drift: Option<franken_snowflake_catalog::diff::CatalogDiff>,
     warnings: Vec<Json>,
 }
 
 /// Run the catalog crate's bound INFORMATION_SCHEMA discovery statements
-/// (TABLES + COLUMNS) live, build the snapshot, and persist it to the local
-/// store. `schema = None` scans every schema in the database.
+/// (TABLES + COLUMNS) live, then its relation pass (keys, view dependencies,
+/// stages, file formats, external tables, opt-in tags), build the snapshot,
+/// and persist it to the local store. `schema = None` scans every schema in
+/// the database. A relation statement Snowflake rejects (privilege, edition,
+/// a view it cannot resolve) becomes a gap in the snapshot; any other error
+/// ends the scan.
 fn scan_catalog(
     conn: &LiveConn,
     profile: &str,
     database: &str,
     schema: Option<&str>,
     trace_id: &str,
+    relation_options: RelationOptions,
 ) -> Result<ScanResult, SnowflakeError> {
     let now_ms = local_store::now_unix_ms();
     let snapshot_id = format!(
@@ -701,7 +1177,27 @@ fn scan_catalog(
         tables: tables.completed_view(),
         columns: columns.completed_view(),
     };
-    let snapshot = build_snapshot_from_information_schema(&input, &discovery_tables);
+    let mut snapshot = build_snapshot_from_information_schema(&input, &discovery_tables);
+    let plan = plan_relation_discovery(&input, &snapshot, relation_options);
+    let relation_statements = plan.statements.len();
+    let mut relation_polls = 0_u32;
+    let mut relation_results = Vec::with_capacity(relation_statements);
+    for statement in plan.statements {
+        let mut request = statement.request.clone();
+        apply_session(conn, &mut request);
+        let outcome = match execute_request(conn, request, None, None) {
+            Ok((completed, stats, _)) => {
+                relation_polls = relation_polls.saturating_add(stats.polls);
+                RelationOutcome::Completed(completed)
+            }
+            Err(error) if error.code == SnowflakeErrorCode::StatementFailed => {
+                RelationOutcome::Failed(error.message)
+            }
+            Err(error) => return Err(error),
+        };
+        relation_results.push((statement, outcome));
+    }
+    apply_relation_results(&mut snapshot, plan.gaps, relation_results);
     let canonical = serde_json::to_string(&snapshot).map_err(|error| {
         SnowflakeError::new(
             SnowflakeErrorCode::Internal,
@@ -737,7 +1233,7 @@ fn scan_catalog(
                 Some(prev) => franken_snowflake_catalog::diff::diff_snapshots(prev, &snapshot),
                 None => franken_snowflake_catalog::diff::CatalogDiff::initial_scan(&snapshot),
             };
-            let dir = match persist_snapshot(&store.cache, &input, &snapshot, now_ms) {
+            let dir = match persist_snapshot(&*store.cache, &input, &snapshot, now_ms) {
                 Ok(()) => Some(store.dir.display().to_string()),
                 Err(error) => {
                     warnings.push(json_string(format!(
@@ -762,6 +1258,8 @@ fn scan_catalog(
         record,
         tables,
         columns,
+        relation_statements,
+        relation_polls,
         store_dir,
         drift,
         warnings,
@@ -770,6 +1268,8 @@ fn scan_catalog(
 
 /// `catalog scan <profile> --database <db> --schema <schema>`: live discovery
 /// through the catalog crate, persisted locally, summarized in the envelope.
+/// A relation source Snowflake refused makes the scan `partial_success`
+/// (exit 1) with a warning naming the source; the snapshot is still kept.
 pub fn run_catalog_scan_outcome(
     format: OutputFormat,
     request_id: String,
@@ -777,6 +1277,7 @@ pub fn run_catalog_scan_outcome(
     database: String,
     schema: String,
     require_live: bool,
+    relations: RelationOptions,
 ) -> crate::Outcome {
     let fail = |error: &SnowflakeError| {
         failure_outcome(
@@ -803,7 +1304,14 @@ pub fn run_catalog_scan_outcome(
         Ok(conn) => conn.tagged("catalog.scan", &request_id),
         Err(error) => return fail(&error),
     };
-    let scan = match scan_catalog(&conn, &profile, &database, Some(&schema), &request_id) {
+    let scan = match scan_catalog(
+        &conn,
+        &profile,
+        &database,
+        Some(&schema),
+        &request_id,
+        relations,
+    ) {
         Ok(scan) => scan,
         Err(error) => return fail(&error),
     };
@@ -814,7 +1322,10 @@ pub fn run_catalog_scan_outcome(
         "catalog.scan",
         &conn,
         &request_id,
-        "INFORMATION_SCHEMA.TABLES + INFORMATION_SCHEMA.COLUMNS discovery",
+        &format!(
+            "INFORMATION_SCHEMA.TABLES + INFORMATION_SCHEMA.COLUMNS discovery and {} relation statements",
+            scan.relation_statements
+        ),
         &scan.tables,
         "catalog_scanned",
         serde_json::json!({
@@ -825,6 +1336,27 @@ pub fn run_catalog_scan_outcome(
         }),
     );
     warnings.extend(scan.warnings.iter().cloned());
+    let mut relation_failed = false;
+    for gap in &scan.snapshot.gaps {
+        let what = match gap.kind {
+            DiscoveryGapKind::Skipped => continue,
+            DiscoveryGapKind::Failed => {
+                relation_failed = true;
+                "was refused"
+            }
+            DiscoveryGapKind::Truncated => "was truncated",
+            DiscoveryGapKind::Unresolved => "left rows unresolved",
+        };
+        let documentation = relation_source_documentation(&gap.source);
+        warnings.push(json_string(format!(
+            "catalog relation source `{}` {what}: {}{}",
+            gap.source,
+            gap.detail,
+            documentation
+                .map(|url| format!(" (see {url})"))
+                .unwrap_or_default()
+        )));
+    }
 
     let mut data = vec![
         ("profile_id", json_string(profile.clone())),
@@ -883,28 +1415,28 @@ pub fn run_catalog_scan_outcome(
     ));
     let mut envelope = base_envelope(
         true,
-        "success",
+        if relation_failed {
+            "partial_success"
+        } else {
+            "success"
+        },
         "catalog.scan",
         "fsnow.catalog.scan.v1",
         request_id,
         json_object(data),
     );
     stamp_live(&mut envelope, &profile, &scan.tables, receipt_hash);
-    envelope.budget_consumed = json_object(vec![
-        ("deadline_ms", Json::Number(0)),
-        (
-            "polls",
-            Json::Number(i64::from(scan.tables.stats.polls) + i64::from(scan.columns.stats.polls)),
-        ),
-        (
-            "rows",
-            Json::Number(
-                scan.tables
-                    .total_rows
-                    .saturating_add(scan.columns.total_rows),
-            ),
-        ),
-    ]);
+    envelope.budget_consumed = budget_consumed(
+        scan.tables
+            .stats
+            .polls
+            .saturating_add(scan.columns.stats.polls)
+            .saturating_add(scan.relation_polls),
+        &scan.tables.stats,
+        scan.tables
+            .total_rows
+            .saturating_add(scan.columns.total_rows),
+    );
     envelope.warnings = warnings;
     let example_dataset = scan
         .snapshot
@@ -915,12 +1447,34 @@ pub fn run_catalog_scan_outcome(
     envelope.safe_next_commands = vec![
         format!("franken-snowflake dataset inspect {example_dataset} --json"),
         format!("franken-snowflake catalog graph {profile} --database {database} --mermaid"),
+        format!("franken-snowflake catalog lineage {profile} <DB.SCHEMA.OBJECT> --down --json"),
         format!("franken-snowflake dataset profile {example_dataset} --json"),
     ];
     crate::Outcome {
-        status: CoreExitCode::Success,
+        status: if relation_failed {
+            CoreExitCode::Findings
+        } else {
+            CoreExitCode::Success
+        },
         body: Body::Envelope { envelope, format },
     }
+}
+
+/// The documentation URL of a relation source named in a gap.
+fn relation_source_documentation(source: &str) -> Option<&'static str> {
+    [
+        RelationSource::PrimaryKeys,
+        RelationSource::TableConstraints,
+        RelationSource::ReferentialConstraints,
+        RelationSource::Stages,
+        RelationSource::FileFormats,
+        RelationSource::ExternalTables,
+        RelationSource::ObjectReferences,
+        RelationSource::TagReferences,
+    ]
+    .into_iter()
+    .find(|candidate| candidate.as_str() == source)
+    .map(RelationSource::documentation)
 }
 
 /// `catalog graph` in the live build: render from the local snapshot when one
@@ -994,7 +1548,14 @@ pub fn run_catalog_graph_outcome(
         Ok(conn) => conn.tagged("catalog.graph", &request_id),
         Err(error) => return fail(&error),
     };
-    let scan = match scan_catalog(&conn, &profile, &database, schema.as_deref(), &request_id) {
+    let scan = match scan_catalog(
+        &conn,
+        &profile,
+        &database,
+        schema.as_deref(),
+        &request_id,
+        RelationOptions::default(),
+    ) {
         Ok(scan) => scan,
         Err(error) => return fail(&error),
     };
@@ -1346,137 +1907,196 @@ pub fn export_run_outcome(
         ));
     }
     let conn = match LiveConn::resolve(&profile, &SessionOverrides::default()) {
-        Ok(conn) => conn.tagged("export.run", &request_id),
+        Ok(conn) => conn
+            .tagged("export.run", &request_id)
+            .with_progress(spec.progress),
         Err(error) => return fail(&error),
     };
-    let rows = match execute(&conn, &sql, QueryRequestOptions::default()) {
-        Ok(rows) => rows,
-        Err(error) => {
-            return with_terminal_receipt(
-                fail(&error),
-                "export.run",
-                &conn,
-                &request_id,
-                &sql,
-                &error,
-            );
-        }
+    let max_rows = match export_max_rows(spec.max_rows.as_deref(), &profile) {
+        Ok(max_rows) => max_rows,
+        Err(error) => return fail(&error),
     };
-    let input = LocalExportInput::new(
-        rows.columns
-            .iter()
-            .map(|column| {
-                ExportColumn::new(column.name.clone(), column.type_name.clone())
-                    .nullable(column.nullable)
-                    .precision_scale(column.precision, column.scale)
-            })
-            .collect(),
-        vec![ResultPartition::new(0, rows.rows.clone())],
-    );
     let created_at_ms = local_store::now_unix_ms();
     let target_label = redact(&out_path).into_owned();
-    let parquet_compression = match spec
-        .compression
-        .as_deref()
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        None | Some("snappy") => franken_snowflake_export::ParquetCompression::Snappy,
-        Some("gzip") => franken_snowflake_export::ParquetCompression::Gzip,
-        Some("none") | Some("uncompressed") => {
-            franken_snowflake_export::ParquetCompression::Uncompressed
-        }
-        Some(other) => {
-            return fail(&usage(&format!(
-                "Unknown --compression `{other}`; for parquet use snappy (default), gzip, or none."
-            )));
-        }
+    let text_format = match export_format {
+        "csv" => Some(TextFormat::Csv),
+        "jsonl" => Some(TextFormat::Jsonl),
+        _ => None,
     };
-    let parquet_opts = franken_snowflake_export::ParquetWriterOptions {
-        compression: parquet_compression,
-        ..Default::default()
-    };
-    let artifact = match export_format {
-        "csv" => export_csv(&input, target_label.clone(), created_at_ms),
-        "parquet" => franken_snowflake_export::export_parquet(
-            &input,
-            target_label.clone(),
+    let (rows, receipt, log_line) = if let Some(text_format) = text_format {
+        // CSV/JSONL stream to the file as each fetch window completes
+        // (reality-check bead E5): peak memory is one window, not the result.
+        let file = match crate::export_path::open_artifact(&target) {
+            Ok(file) => file,
+            Err(message) => {
+                return fail(&SnowflakeError::new(
+                    SnowflakeErrorCode::Internal,
+                    format!("could not open {target_label}: {message}"),
+                ));
+            }
+        };
+        match stream_text_export(
+            &conn,
+            &sql,
+            file,
+            text_format,
+            max_rows,
+            &target_label,
             created_at_ms,
-            Some(parquet_opts),
-        ),
-        "frame" => {
-            #[cfg(feature = "frankenpandas")]
-            {
-                let frame_cols: Vec<franken_snowflake_frame::SnowflakeColumn> = rows
-                    .columns
-                    .iter()
-                    .map(|column| {
-                        franken_snowflake_frame::SnowflakeColumn::new(
-                            column.name.clone(),
-                            column.type_name.clone(),
-                        )
+        ) {
+            Ok(done) => done,
+            Err(error) => {
+                return with_terminal_receipt(
+                    fail(&error),
+                    "export.run",
+                    &conn,
+                    &request_id,
+                    &sql,
+                    &error,
+                );
+            }
+        }
+    } else {
+        // Parquet and frame need the whole result; the row cap stops the fetch
+        // just past --max-rows so an oversized result is refused, not buffered.
+        let request_options = QueryRequestOptions {
+            row_cap: Some(max_rows.saturating_add(1)),
+            ..QueryRequestOptions::default()
+        };
+        let rows = match execute(&conn, &sql, request_options) {
+            Ok(rows) => rows,
+            Err(error) => {
+                return with_terminal_receipt(
+                    fail(&error),
+                    "export.run",
+                    &conn,
+                    &request_id,
+                    &sql,
+                    &error,
+                );
+            }
+        };
+        if rows.rows.len() > max_rows {
+            return fail(&max_rows_error(max_rows));
+        }
+        let input = LocalExportInput::new(
+            rows.columns
+                .iter()
+                .map(|column| {
+                    ExportColumn::new(column.name.clone(), column.type_name.clone())
                         .nullable(column.nullable)
-                    })
-                    .collect();
-                let frame_partitions = vec![franken_snowflake_frame::ResultPartition::new(
-                    0,
-                    rows.rows.clone(),
-                )];
-                match franken_snowflake_frame::materialize_partitions(&frame_cols, frame_partitions)
+                        .precision_scale(column.precision, column.scale)
+                })
+                .collect(),
+            vec![ResultPartition::new(0, rows.rows.clone())],
+        );
+        let parquet_compression = match spec
+            .compression
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("snappy") => franken_snowflake_export::ParquetCompression::Snappy,
+            Some("gzip") => franken_snowflake_export::ParquetCompression::Gzip,
+            Some("none") | Some("uncompressed") => {
+                franken_snowflake_export::ParquetCompression::Uncompressed
+            }
+            Some(other) => {
+                return fail(&usage(&format!(
+                    "Unknown --compression `{other}`; for parquet use snappy (default), gzip, or none."
+                )));
+            }
+        };
+        let parquet_opts = franken_snowflake_export::ParquetWriterOptions {
+            compression: parquet_compression,
+            ..Default::default()
+        };
+        let artifact = match export_format {
+            "parquet" => franken_snowflake_export::export_parquet(
+                &input,
+                target_label.clone(),
+                created_at_ms,
+                Some(parquet_opts),
+            ),
+            "frame" => {
+                #[cfg(feature = "frankenpandas")]
                 {
-                    Ok(frame) => match serde_json::to_vec_pretty(&frame) {
-                        Ok(bytes) => {
-                            let content_address =
-                                franken_snowflake_export::ContentAddress::blake3(&bytes);
-                            let receipt = franken_snowflake_export::ExportReceipt::new(
-                                franken_snowflake_export::ExportReceiptKind::LocalJsonl,
-                                Some(franken_snowflake_export::ExportFormat::Jsonl),
-                                target_label.clone(),
-                                content_address,
-                                Some(frame.row_count as u64),
-                                None,
-                                None,
-                                created_at_ms,
-                                vec!["format:frame".to_string()],
-                            );
-                            let log_line = serde_json::to_string(&receipt).unwrap_or_default();
-                            Ok(franken_snowflake_export::LocalExportArtifact {
-                                bytes,
-                                receipt,
-                                log_line,
-                            })
-                        }
+                    let frame_cols: Vec<franken_snowflake_frame::SnowflakeColumn> = rows
+                        .columns
+                        .iter()
+                        .map(|column| {
+                            franken_snowflake_frame::SnowflakeColumn::new(
+                                column.name.clone(),
+                                column.type_name.clone(),
+                            )
+                            .nullable(column.nullable)
+                        })
+                        .collect();
+                    let frame_partitions = vec![franken_snowflake_frame::ResultPartition::new(
+                        0,
+                        rows.rows.clone(),
+                    )];
+                    match franken_snowflake_frame::materialize_partitions(
+                        &frame_cols,
+                        frame_partitions,
+                    ) {
+                        Ok(frame) => match serde_json::to_vec_pretty(&frame) {
+                            Ok(bytes) => {
+                                let content_address =
+                                    franken_snowflake_export::ContentAddress::blake3(&bytes);
+                                let receipt = franken_snowflake_export::ExportReceipt::new(
+                                    franken_snowflake_export::ExportReceiptKind::LocalJsonl,
+                                    Some(franken_snowflake_export::ExportFormat::Jsonl),
+                                    target_label.clone(),
+                                    content_address,
+                                    Some(frame.row_count as u64),
+                                    None,
+                                    None,
+                                    created_at_ms,
+                                    vec!["format:frame".to_string()],
+                                );
+                                let log_line = serde_json::to_string(&receipt).unwrap_or_default();
+                                Ok(franken_snowflake_export::LocalExportArtifact {
+                                    bytes,
+                                    receipt,
+                                    log_line,
+                                })
+                            }
+                            Err(err) => Err(franken_snowflake_export::ExportError::Json {
+                                message: err.to_string(),
+                            }),
+                        },
                         Err(err) => Err(franken_snowflake_export::ExportError::Json {
                             message: err.to_string(),
                         }),
-                    },
-                    Err(err) => Err(franken_snowflake_export::ExportError::Json {
-                        message: err.to_string(),
-                    }),
+                    }
+                }
+                #[cfg(not(feature = "frankenpandas"))]
+                {
+                    unreachable!("guarded above");
                 }
             }
-            #[cfg(not(feature = "frankenpandas"))]
-            {
-                unreachable!("guarded above");
+            other => Err(franken_snowflake_export::ExportError::Json {
+                message: format!("format `{other}` is written by the streaming path"),
+            }),
+        };
+        let artifact = match artifact {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                return fail(&SnowflakeError::new(
+                    SnowflakeErrorCode::UsageError,
+                    format!("local export failed: {error}"),
+                ));
             }
-        }
-        _ => export_jsonl(&input, target_label.clone(), created_at_ms),
-    };
-    let artifact = match artifact {
-        Ok(artifact) => artifact,
-        Err(error) => {
+        };
+        if let Err(error) = crate::export_path::write_artifact(&target, &artifact.bytes) {
             return fail(&SnowflakeError::new(
-                SnowflakeErrorCode::UsageError,
-                format!("local export failed: {error}"),
+                SnowflakeErrorCode::Internal,
+                format!("could not write {target_label}: {error}"),
             ));
         }
+        (rows, artifact.receipt, artifact.log_line)
     };
-    if let Err(error) = crate::export_path::write_artifact(&target, &artifact.bytes) {
-        return fail(&SnowflakeError::new(
-            SnowflakeErrorCode::Internal,
-            format!("could not write {target_label}: {error}"),
-        ));
-    }
     let (receipt_hash, mut warnings) = record_receipt(
         "export.run",
         &conn,
@@ -1486,14 +2106,15 @@ pub fn export_run_outcome(
         "export_written",
         serde_json::json!({
             "format": export_format,
-            "export_id": artifact.receipt.export_id,
-            "content_hash": artifact.receipt.content_address.digest_hex,
-            "byte_len": artifact.receipt.content_address.byte_len,
+            "export_id": receipt.export_id,
+            "content_hash": receipt.content_address.digest_hex,
+            "byte_len": receipt.content_address.byte_len,
+            "streamed": text_format.is_some(),
         }),
     );
     if let (Some(receipt_id), Ok(store)) = (receipt_hash.as_ref(), local_store::open_store()) {
         let record = ExportRecord {
-            export_id: artifact.receipt.export_id.clone(),
+            export_id: receipt.export_id.clone(),
             receipt_id: receipt_id.clone(),
             export_kind: if export_format == "csv" {
                 ExportKind::LocalCsv
@@ -1506,11 +2127,11 @@ pub fn export_run_outcome(
             },
             target_uri_redacted: target_label.clone(),
             content_address: CacheAddress {
-                algorithm: artifact.receipt.content_address.algorithm.clone(),
-                digest_hex: artifact.receipt.content_address.digest_hex.clone(),
-                byte_len: artifact.receipt.content_address.byte_len,
+                algorithm: receipt.content_address.algorithm.clone(),
+                digest_hex: receipt.content_address.digest_hex.clone(),
+                byte_len: receipt.content_address.byte_len,
             },
-            row_count: artifact.receipt.row_count,
+            row_count: receipt.row_count,
             created_at_ms,
         };
         if let Err(error) = store.cache.append_export(record) {
@@ -1534,13 +2155,18 @@ pub fn export_run_outcome(
             ("overwrote", Json::Bool(target.overwrite)),
             (
                 "bytes_written",
-                Json::Number(i64::try_from(artifact.bytes.len()).unwrap_or(i64::MAX)),
+                Json::Number(i64::try_from(receipt.content_address.byte_len).unwrap_or(i64::MAX)),
             ),
             ("row_count", Json::Number(rows.total_rows)),
-            ("export_receipt", Json::from_value(&artifact.receipt)),
+            ("streamed", Json::Bool(text_format.is_some())),
+            (
+                "max_rows",
+                Json::Number(i64::try_from(max_rows).unwrap_or(i64::MAX)),
+            ),
+            ("export_receipt", Json::from_value(&receipt)),
             (
                 "export_log_line",
-                json_string(artifact.log_line.trim_end().to_string()),
+                json_string(log_line.trim_end().to_string()),
             ),
         ]),
     );
@@ -1551,6 +2177,430 @@ pub fn export_run_outcome(
         status: CoreExitCode::Success,
         body: Body::Envelope { envelope, format },
     }
+}
+
+/// Default `--max-rows` for `export run` (reality-check bead E5).
+const DEFAULT_EXPORT_MAX_ROWS: usize = 1_000_000;
+
+/// `--max-rows`, else `<PREFIX>_EXPORT_MAX_ROWS`, else 1,000,000.
+fn export_max_rows(flag: Option<&str>, profile: &str) -> Result<usize, SnowflakeError> {
+    let env_name = format!("{}_EXPORT_MAX_ROWS", crate::profile_env_prefix(profile));
+    let (raw, source) = match flag {
+        Some(value) => (Some(value.to_owned()), "--max-rows".to_owned()),
+        None => (env_value(&env_name), env_name),
+    };
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_EXPORT_MAX_ROWS);
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(value) if value > 0 => Ok(value),
+        _ => Err(SnowflakeError::new(
+            SnowflakeErrorCode::UsageError,
+            format!("{source} must be a positive row count (got `{raw}`)"),
+        )),
+    }
+}
+
+fn max_rows_error(max_rows: usize) -> SnowflakeError {
+    SnowflakeError::new(
+        SnowflakeErrorCode::RowCapExceeded,
+        format!(
+            "the result has more than {max_rows} rows (--max-rows); raise --max-rows, or unload it in Snowflake with `export plan` (COPY INTO a stage)"
+        ),
+    )
+}
+
+/// `text index` (bead acl8): run one read statement and index the text of the
+/// named columns with Frankensearch (hash + lexical), each document tied to
+/// the statement's receipt, cell by cell. Bounded by `--max-rows` like `export
+/// run`.
+#[cfg(feature = "frankensearch")]
+pub fn text_index_outcome(
+    format: OutputFormat,
+    request_id: String,
+    spec: crate::text_surface::TextIndexSpec,
+) -> crate::Outcome {
+    use crate::text_surface::{
+        TEXT_INDEX_ENGINE, TEXT_INDEX_SCHEMA, TextIndexManifest, build_index, manifest_json,
+        validate_index_name,
+    };
+    use franken_snowflake_core::guardrails::RightsClass;
+    use franken_snowflake_core::ids::{QueryId, ReceiptHash};
+    use franken_snowflake_text_indexing::{TextSourceRef, chunks_from_rows};
+
+    const COMMAND: &str = "text.index";
+    const CONTRACT: &str = "fsnow.text.index.v1";
+    let profile = spec.profile.clone().unwrap_or_default();
+    let fail = |error: &SnowflakeError| {
+        failure_outcome(
+            format,
+            COMMAND,
+            CONTRACT,
+            request_id.clone(),
+            profile.clone(),
+            error,
+        )
+    };
+    let usage = |message: String| SnowflakeError::new(SnowflakeErrorCode::UsageError, message);
+    if profile.is_empty() {
+        return fail(&usage(
+            "Missing --profile for `text index`. Pass --profile <profile> or set FRANKEN_SNOWFLAKE_DEFAULT_PROFILE.".to_owned(),
+        ));
+    }
+    let Some(name) = spec.name.clone() else {
+        return fail(&usage(
+            "Missing --name <index> for `text index`.".to_owned(),
+        ));
+    };
+    if let Err(message) = validate_index_name(&name) {
+        return fail(&usage(message));
+    }
+    if spec.columns.is_empty() {
+        return fail(&usage(
+            "Name the text to index with --column <COL> (repeat it for several columns)."
+                .to_owned(),
+        ));
+    }
+    let Some(sql) = spec.sql.clone() else {
+        return fail(&usage(
+            "Missing --sql <select> for `text index`.".to_owned(),
+        ));
+    };
+    if !crate::is_select_like(&sql) || crate::has_multiple_statements(&sql) {
+        return fail(&SnowflakeError::new(
+            SnowflakeErrorCode::MutationRefused,
+            "text index only indexes a single read statement (SELECT/WITH/SHOW/DESCRIBE/EXPLAIN)",
+        ));
+    }
+    let conn = match LiveConn::resolve(&profile, &SessionOverrides::default()) {
+        Ok(conn) => conn.tagged(COMMAND, &request_id),
+        Err(error) => return fail(&error),
+    };
+    let max_rows = match export_max_rows(spec.max_rows.as_deref(), &profile) {
+        Ok(max_rows) => max_rows,
+        Err(error) => return fail(&error),
+    };
+    let request_options = QueryRequestOptions {
+        row_cap: Some(max_rows.saturating_add(1)),
+        ..QueryRequestOptions::default()
+    };
+    let rows = match execute(&conn, &sql, request_options) {
+        Ok(rows) => rows,
+        Err(error) => {
+            return with_terminal_receipt(fail(&error), COMMAND, &conn, &request_id, &sql, &error);
+        }
+    };
+    if rows.rows.len() > max_rows {
+        return fail(&max_rows_error(max_rows));
+    }
+    let find = |wanted: &str| {
+        rows.columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case(wanted))
+    };
+    let mut unknown = Vec::new();
+    let mut text_columns: Vec<(usize, String)> = Vec::new();
+    for wanted in &spec.columns {
+        match find(wanted) {
+            Some(index) if !text_columns.iter().any(|(seen, _)| *seen == index) => {
+                text_columns.push((index, rows.columns[index].name.clone()));
+            }
+            Some(_) => {}
+            None => unknown.push(wanted.clone()),
+        }
+    }
+    let id_column = match spec.id_column.as_deref() {
+        None => None,
+        Some(wanted) => match find(wanted) {
+            Some(index) => Some(index),
+            None => {
+                unknown.push(wanted.to_owned());
+                None
+            }
+        },
+    };
+    let (receipt_hash, mut warnings) = record_receipt(
+        COMMAND,
+        &conn,
+        &request_id,
+        &sql,
+        &rows,
+        if unknown.is_empty() {
+            "text_indexed"
+        } else {
+            "text_index_refused"
+        },
+        serde_json::json!({ "index": name, "columns": spec.columns }),
+    );
+    if !unknown.is_empty() {
+        let available: Vec<&str> = rows
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect();
+        let mut outcome = fail(&usage(format!(
+            "the result has no column {}; it has {}",
+            unknown
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            available.join(", ")
+        )));
+        if let (crate::Body::Envelope { envelope, .. }, Some(hash)) =
+            (&mut outcome.body, receipt_hash.as_deref())
+        {
+            // The rows are in Snowflake's result cache: re-read, don't re-run.
+            envelope.safe_next_commands = vec![format!(
+                "franken-snowflake receipt refetch {hash} --profile {profile} --json"
+            )];
+            envelope.receipt_hash = Some(hash.to_owned());
+        }
+        return outcome;
+    }
+    let Some(receipt) = receipt_hash.clone() else {
+        return fail(&SnowflakeError::new(
+            SnowflakeErrorCode::CacheError,
+            "the receipt was not recorded, and every indexed document must name one",
+        ));
+    };
+    let source = TextSourceRef::QueryResult {
+        receipt_hash: ReceiptHash::new(receipt.clone()),
+        statement_handle: Some(StatementHandle::new(rows.statement_handle.clone())),
+        query_id: Some(QueryId::new(rows.statement_handle.clone())),
+        dataset_id: None,
+        object_ref_redacted: None,
+    };
+    // Query text carries no rights label of its own: fail closed.
+    let chunks = chunks_from_rows(
+        &source,
+        &text_columns,
+        id_column,
+        &rows.rows,
+        RightsClass::Restricted,
+    );
+    let manifest = TextIndexManifest {
+        schema: TEXT_INDEX_SCHEMA.to_owned(),
+        name: name.clone(),
+        version: String::new(),
+        profile_id: profile.clone(),
+        receipt_hash: receipt.clone(),
+        statement_handle: rows.statement_handle.clone(),
+        sql_preview_redacted: crate::compact_sql(&redact(&sql)),
+        columns: text_columns.iter().map(|(_, name)| name.clone()).collect(),
+        id_column: id_column.map(|index| rows.columns[index].name.clone()),
+        rows: rows.rows.len() as u64,
+        documents: 0,
+        created_at_ms: local_store::now_unix_ms(),
+        engine: TEXT_INDEX_ENGINE.to_owned(),
+    };
+    let built = match build_index(manifest.clone(), &chunks) {
+        Ok(built) => built,
+        Err(message) => {
+            return fail(&SnowflakeError::new(
+                SnowflakeErrorCode::CacheError,
+                format!("text index `{name}` was not written: {message}"),
+            ));
+        }
+    };
+    if chunks.is_empty() {
+        warnings.push(json_string(format!(
+            "no cell of {} held text; the index is empty",
+            manifest.columns.join(", ")
+        )));
+    }
+    let published = TextIndexManifest {
+        version: built.version.clone(),
+        documents: chunks.len() as u64,
+        ..manifest
+    };
+    let mut envelope = base_envelope(
+        true,
+        "success",
+        COMMAND,
+        CONTRACT,
+        request_id,
+        json_object(vec![
+            ("index", json_string(name.clone())),
+            ("replaced_version", option_json(built.replaced_version)),
+            (
+                "directory",
+                json_string(redact(&built.directory.to_string_lossy()).into_owned()),
+            ),
+            ("source", manifest_json(&published)),
+        ]),
+    );
+    stamp_live(&mut envelope, &profile, &rows, receipt_hash.clone());
+    envelope.warnings = warnings;
+    envelope.safe_next_commands = vec![
+        format!("franken-snowflake text search {name} \"<words>\" --json"),
+        receipt_show_command(receipt_hash.as_deref()),
+    ];
+    crate::Outcome {
+        status: CoreExitCode::Success,
+        body: Body::Envelope { envelope, format },
+    }
+}
+
+/// Writes a streaming CSV/JSONL export as rows arrive; refuses once the
+/// export would pass `--max-rows` (the driver then cancels the statement).
+struct ExportSink {
+    format: TextFormat,
+    file: Option<crate::export_path::ArtifactFile>,
+    writer: Option<StreamingTextExport<crate::export_path::ArtifactFile>>,
+    max_rows: usize,
+}
+
+impl RowSink for ExportSink {
+    fn accept(
+        &mut self,
+        result_set: &ResultSet,
+        rows: Vec<Vec<Option<String>>>,
+    ) -> Result<(), SnowflakeError> {
+        let export_error = |error: franken_snowflake_export::ExportError| {
+            SnowflakeError::new(
+                SnowflakeErrorCode::UsageError,
+                format!("local export failed: {error}"),
+            )
+        };
+        if self.writer.is_none() {
+            let columns = result_set
+                .result_set_meta_data
+                .row_type
+                .iter()
+                .map(|column| {
+                    ExportColumn::new(column.name.clone(), column.column_type.clone())
+                        .nullable(column.nullable)
+                        .precision_scale(
+                            column.precision.and_then(|p| u32::try_from(p).ok()),
+                            column.scale.and_then(|s| u32::try_from(s).ok()),
+                        )
+                })
+                .collect();
+            let Some(file) = self.file.take() else {
+                return Err(SnowflakeError::new(
+                    SnowflakeErrorCode::Internal,
+                    "the export file is already in use",
+                ));
+            };
+            self.writer =
+                Some(StreamingTextExport::new(self.format, columns, file).map_err(export_error)?);
+        }
+        let Some(writer) = self.writer.as_mut() else {
+            return Err(SnowflakeError::new(
+                SnowflakeErrorCode::Internal,
+                "the export writer is missing",
+            ));
+        };
+        let written = usize::try_from(writer.rows_written()).unwrap_or(usize::MAX);
+        if written.saturating_add(rows.len()) > self.max_rows {
+            return Err(max_rows_error(self.max_rows));
+        }
+        writer.write_rows(&rows).map_err(export_error)
+    }
+}
+
+/// [`execute`], handing rows to `sink` as each fetch window completes; the
+/// returned rows carry the metadata only. The sink is owned so it can ride
+/// into the runtime and come back.
+fn execute_streaming<S: RowSink + 'static>(
+    conn: &LiveConn,
+    sql: &str,
+    options: QueryRequestOptions,
+    sink: S,
+) -> Result<(LiveRows, S), SnowflakeError> {
+    let fixed_request_id = options.sql_api_request_id.clone();
+    let request = build_request(conn, sql, options);
+    let query_tag = request
+        .parameters
+        .as_ref()
+        .and_then(|parameters| parameters.get("QUERY_TAG"))
+        .cloned();
+    let sql_api_request_id = fixed_request_id.unwrap_or_else(unique_request_id);
+    LAST_RUN.with(RefCell::take);
+    #[cfg(test)]
+    if let Some(script) = &conn.script {
+        let mut sink = sink;
+        let plan = PollPlan::with_max_polls(conn.max_polls)
+            .with_execution_timeout(conn.execution_timeout())
+            .with_cost_quota(conn.cost_quota()?);
+        let (mut done, stats, id) = script.execute(request, plan, &sql_api_request_id)?;
+        let rows = std::mem::take(&mut done.rows);
+        sink.accept(&done.result_set, rows)?;
+        let mut live = into_rows(done, stats, id);
+        live.query_tag = query_tag;
+        return Ok((live, sink));
+    }
+    let params = SubmitQueryParams {
+        request_id: Some(sql_api_request_id.clone()),
+        retry: true,
+        asynchronous: false,
+        nullable: None,
+    };
+    let poll_plan = PollPlan::with_max_polls(conn.max_polls)
+        .with_partition_concurrency(conn.partition_concurrency)
+        .with_execution_timeout(conn.execution_timeout())
+        .with_cost_quota(conn.cost_quota()?);
+    let progress = conn.progress;
+    let (outcome, stats, sink, facts) = with_runtime(conn, move |cx, client, auth| {
+        Box::pin(async move {
+            let mut sink = sink;
+            let mut observer = RunObserver::new(progress);
+            let hooks = StatementHooks {
+                sink: Some(&mut sink),
+                observer: Some(&mut observer),
+            };
+            let (outcome, stats) =
+                run_statement_hooked(cx, client, auth, request, params, poll_plan, hooks).await;
+            Ok((outcome, stats, sink, observer.facts))
+        })
+    })?;
+    LAST_RUN.with(|slot| *slot.borrow_mut() = facts);
+    let done = outcome_into_result(outcome, "the statement", true)?;
+    let mut live = into_rows(done, stats, sql_api_request_id);
+    live.query_tag = query_tag;
+    Ok((live, sink))
+}
+
+/// Stream a CSV/JSONL export into `file` and commit it; the receipt's content
+/// address covers exactly the bytes written.
+fn stream_text_export(
+    conn: &LiveConn,
+    sql: &str,
+    file: crate::export_path::ArtifactFile,
+    format: TextFormat,
+    max_rows: usize,
+    target_label: &str,
+    created_at_ms: u64,
+) -> Result<(LiveRows, ExportReceipt, String), SnowflakeError> {
+    let sink = ExportSink {
+        format,
+        file: Some(file),
+        writer: None,
+        max_rows,
+    };
+    let (rows, sink) = execute_streaming(conn, sql, QueryRequestOptions::default(), sink)?;
+    let Some(writer) = sink.writer else {
+        return Err(SnowflakeError::new(
+            SnowflakeErrorCode::Internal,
+            "the statement completed without result metadata",
+        ));
+    };
+    let (file, receipt, log_line) = writer
+        .finish(target_label.to_owned(), created_at_ms)
+        .map_err(|error| {
+            SnowflakeError::new(
+                SnowflakeErrorCode::UsageError,
+                format!("local export failed: {error}"),
+            )
+        })?;
+    file.commit().map_err(|message| {
+        SnowflakeError::new(
+            SnowflakeErrorCode::Internal,
+            format!("could not write {target_label}: {message}"),
+        )
+    })?;
+    Ok((rows, receipt, log_line))
 }
 
 // ---------------------------------------------------------------------------
@@ -1598,6 +2648,27 @@ pub fn profile_doctor_online_outcome(
             );
             let (credential, mut lifetime_warnings) = online_credential_lifetime(&conn);
             warnings.append(&mut lifetime_warnings);
+            let prefix = crate::profile_env_prefix(&profile);
+            let flag = |key: &str| {
+                env_value(&format!("{prefix}_{key}"))
+                    .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+            };
+            let (role_privileges, mut role_warnings, refusal) = role_verdict(
+                &role_write_check(&conn),
+                !flag("WRITE_ENABLED"),
+                flag("READ_ONLY_EXPECTED"),
+            );
+            if let Some(error) = refusal {
+                return failure_outcome(
+                    format,
+                    "profile.doctor",
+                    "fsnow.profile.doctor.v1",
+                    request_id,
+                    profile,
+                    &error,
+                );
+            }
+            warnings.append(&mut role_warnings);
             probe_success(
                 format,
                 request_id,
@@ -1607,6 +2678,7 @@ pub fn profile_doctor_online_outcome(
                 receipt_hash,
                 warnings,
                 credential,
+                role_privileges,
             )
         }
         Err(error) => with_terminal_receipt(
@@ -1667,6 +2739,213 @@ fn online_credential_lifetime(conn: &LiveConn) -> (Json, Vec<Json>) {
         }
     }
     (json_object(fields), warnings)
+}
+
+/// How many roles the grant walk visits before it reports `partial`.
+const ROLE_WALK_LIMIT: usize = 8;
+
+/// What `SHOW GRANTS TO ROLE` says the profile's role (and the roles granted to
+/// it) may do.
+#[derive(Debug, Default)]
+struct RoleCheck {
+    role: Option<String>,
+    /// Write-capable grants, e.g. `INSERT on TABLE DB.S.T (via LOADER)`.
+    write_grants: Vec<String>,
+    roles_checked: Vec<String>,
+    /// The walk stopped at [`ROLE_WALK_LIMIT`] with roles left unvisited.
+    partial: bool,
+    /// Why the check could not run (the role may not see its own grants).
+    error: Option<String>,
+}
+
+/// Privileges that let a role change data or objects.
+fn is_write_capable_privilege(privilege: &str) -> bool {
+    let privilege = privilege.trim().to_ascii_uppercase();
+    matches!(
+        privilege.as_str(),
+        "INSERT"
+            | "UPDATE"
+            | "DELETE"
+            | "TRUNCATE"
+            | "OWNERSHIP"
+            | "ALL"
+            | "ALL PRIVILEGES"
+            | "EXECUTE TASK"
+    ) || privilege.starts_with("CREATE ")
+        || privilege.starts_with("APPLY ")
+}
+
+/// A role name as a quoted identifier (SHOW takes no bind variables).
+fn quoted_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Walk `SHOW GRANTS TO ROLE` from `CURRENT_ROLE()` through the roles granted
+/// to it (reality-check bead oj0.25; the enforceable read-only guard is
+/// Snowflake's RBAC, not the client-side SQL classifier). Columns per
+/// docs.snowflake.com/en/sql-reference/sql/show-grants (consulted 2026-09-24):
+/// privilege, granted_on, name.
+fn role_write_check(conn: &LiveConn) -> RoleCheck {
+    let mut check = RoleCheck::default();
+    let current = match execute(
+        conn,
+        "SELECT CURRENT_ROLE()",
+        QueryRequestOptions::default(),
+    ) {
+        Ok(rows) => rows
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .cloned()
+            .flatten(),
+        Err(error) => {
+            check.error = Some(format!("CURRENT_ROLE() failed ({})", error.stable_code()));
+            return check;
+        }
+    };
+    let Some(current) = current else {
+        check.error = Some("the session has no current role".to_owned());
+        return check;
+    };
+    check.role = Some(current.clone());
+    let mut pending = vec![current];
+    while let Some(role) = pending.pop() {
+        if check.roles_checked.contains(&role) {
+            continue;
+        }
+        if check.roles_checked.len() >= ROLE_WALK_LIMIT {
+            check.partial = true;
+            break;
+        }
+        let sql = format!("SHOW GRANTS TO ROLE {}", quoted_identifier(&role));
+        let rows = match execute(conn, &sql, QueryRequestOptions::default()) {
+            Ok(rows) => rows,
+            Err(error) => {
+                check.error = Some(format!(
+                    "SHOW GRANTS TO ROLE {role} failed ({})",
+                    error.stable_code()
+                ));
+                return check;
+            }
+        };
+        let column = |name: &str| {
+            rows.columns
+                .iter()
+                .position(|column| column.name.eq_ignore_ascii_case(name))
+        };
+        let (Some(privilege_at), Some(granted_on_at), Some(name_at)) =
+            (column("privilege"), column("granted_on"), column("name"))
+        else {
+            check.error = Some("unrecognized SHOW GRANTS columns".to_owned());
+            return check;
+        };
+        let via = if check.roles_checked.is_empty() {
+            String::new()
+        } else {
+            format!(" (via {role})")
+        };
+        for row in &rows.rows {
+            let cell = |at: usize| row.get(at).cloned().flatten().unwrap_or_default();
+            let (privilege, granted_on, name) =
+                (cell(privilege_at), cell(granted_on_at), cell(name_at));
+            if granted_on.eq_ignore_ascii_case("ROLE") && privilege.eq_ignore_ascii_case("USAGE") {
+                pending.push(name);
+            } else if is_write_capable_privilege(&privilege) {
+                check
+                    .write_grants
+                    .push(format!("{privilege} on {granted_on} {name}{via}"));
+            }
+        }
+        check.roles_checked.push(role);
+    }
+    check
+}
+
+/// The doctor's reading of a [`RoleCheck`]: the `role_privileges` field, the
+/// warnings, and a refusal when the profile expects a read-only role
+/// (`<PREFIX>_READ_ONLY_EXPECTED=true`) but the role can write or the check
+/// could not prove otherwise.
+fn role_verdict(
+    check: &RoleCheck,
+    read_profile: bool,
+    read_only_expected: bool,
+) -> (Json, Vec<Json>, Option<SnowflakeError>) {
+    let write_capable = if check.write_grants.is_empty() {
+        if check.error.is_some() || check.partial {
+            Json::Null
+        } else {
+            Json::Bool(false)
+        }
+    } else {
+        Json::Bool(true)
+    };
+    let data = json_object(vec![
+        ("role", option_json(check.role.clone())),
+        ("write_capable", write_capable),
+        (
+            "write_grants",
+            json_array(
+                check
+                    .write_grants
+                    .iter()
+                    .take(10)
+                    .map(|grant| json_string(grant.clone()))
+                    .collect(),
+            ),
+        ),
+        (
+            "roles_checked",
+            json_array(
+                check
+                    .roles_checked
+                    .iter()
+                    .map(|role| json_string(role.clone()))
+                    .collect(),
+            ),
+        ),
+        ("partial", Json::Bool(check.partial)),
+        ("note", option_json(check.error.clone())),
+    ]);
+    let role = check.role.clone().unwrap_or_else(|| "?".to_owned());
+    let mut warnings = Vec::new();
+    let mut problem = None;
+    if !check.write_grants.is_empty() && (read_profile || read_only_expected) {
+        let shown: Vec<&str> = check
+            .write_grants
+            .iter()
+            .take(3)
+            .map(String::as_str)
+            .collect();
+        problem = Some(format!(
+            "this read profile's role `{role}` can mutate data ({}{}); give read profiles a read-only role",
+            shown.join(", "),
+            if check.write_grants.len() > 3 {
+                ", ..."
+            } else {
+                ""
+            }
+        ));
+    } else if read_only_expected && (check.error.is_some() || check.partial) {
+        problem = Some(format!(
+            "READ_ONLY_EXPECTED is set but the grants of role `{role}` could not be fully checked ({})",
+            check
+                .error
+                .clone()
+                .unwrap_or_else(|| format!("more than {ROLE_WALK_LIMIT} roles"))
+        ));
+    }
+    let refusal = match problem {
+        Some(message) if read_only_expected => Some(SnowflakeError::new(
+            SnowflakeErrorCode::ProfileInvalid,
+            message,
+        )),
+        Some(message) => {
+            warnings.push(json_string(message));
+            None
+        }
+        None => None,
+    };
+    (data, warnings, refusal)
 }
 
 /// Remaining lifetime of a resolved credential, with a warning when it is
@@ -1765,6 +3044,7 @@ fn probe_success(
     receipt_hash: Option<String>,
     warnings: Vec<Json>,
     credential_lifetime: Json,
+    role_privileges: Json,
 ) -> crate::Outcome {
     let data = json_object(vec![
         ("profile_id", json_string(profile.clone())),
@@ -1774,6 +3054,7 @@ fn probe_success(
         // The probe authenticates, so the credential was read (never emitted).
         ("secret_values_read", Json::Bool(true)),
         ("credential_lifetime", credential_lifetime),
+        ("role_privileges", role_privileges),
         (
             "snowflake_version",
             match version {
@@ -1837,6 +3118,16 @@ struct LiveConn {
     /// request sets its own (`--query-tag`, the dataset planner); set by
     /// [`LiveConn::tagged`].
     query_tag: Option<String>,
+    /// `--progress`: NDJSON progress events on stderr (reality-check bead E5).
+    progress: bool,
+    /// `<PREFIX>_MAX_CREDITS`: the advisory credit cap per request, in
+    /// millionths of a credit (reality-check bead E3).
+    max_microcredits: Option<u64>,
+    /// `<PREFIX>_WAREHOUSE_CREDITS_PER_HOUR`: the warehouse's rate when the
+    /// profile states it (else `SHOW WAREHOUSES` supplies it), in millionths.
+    microcredits_per_hour: Option<u64>,
+    /// The resolved credit cap, looked up once per invocation.
+    cost_quota: std::cell::OnceCell<Result<Option<CostQuota>, SnowflakeError>>,
     /// Test-only: answers every `execute_request` from a script instead of the
     /// SQL API (see `test_support`). Always `None` in production builds.
     #[cfg(test)]
@@ -1844,6 +3135,48 @@ struct LiveConn {
 }
 
 impl LiveConn {
+    /// The client-side execution bound: the statement timeout plus a margin
+    /// (`0`, Snowflake's "no limit", sets none).
+    fn execution_timeout(&self) -> Option<Duration> {
+        self.execution_timeout_for(1)
+    }
+
+    /// The credit cap for this invocation's requests: `None` unless the profile
+    /// sets `MAX_CREDITS`. The warehouse's rate is the profile's
+    /// `WAREHOUSE_CREDITS_PER_HOUR` or, once per invocation, `SHOW WAREHOUSES`
+    /// (which also says whether the warehouse is suspended, i.e. whether the
+    /// run pays the resume minimum). A stated rate assumes a running warehouse.
+    fn cost_quota(&self) -> Result<Option<CostQuota>, SnowflakeError> {
+        self.cost_quota
+            .get_or_init(|| {
+                let Some(max_microcredits) = self.max_microcredits else {
+                    return Ok(None);
+                };
+                let (microcredits_per_hour, resumes_warehouse) = match self.microcredits_per_hour {
+                    Some(rate) => (rate, false),
+                    None => warehouse_rate(self)?,
+                };
+                Ok(Some(CostQuota {
+                    microcredits_per_hour,
+                    max_microcredits,
+                    resumes_warehouse,
+                }))
+            })
+            .clone()
+    }
+
+    /// The bound for a request running `statements` statements one after
+    /// another (a multi-statement batch's parent spans all of them): the
+    /// statement timeout for each, plus one margin.
+    fn execution_timeout_for(&self, statements: usize) -> Option<Duration> {
+        (self.statement_timeout_seconds > 0).then(|| {
+            let statements = u32::try_from(statements.max(1)).unwrap_or(u32::MAX);
+            Duration::from_secs(u64::from(self.statement_timeout_seconds))
+                .saturating_mul(statements)
+                + CLIENT_DEADLINE_MARGIN
+        })
+    }
+
     fn resolve(profile: &str, overrides: &SessionOverrides) -> Result<Self, SnowflakeError> {
         #[cfg(test)]
         if let Some(conn) = test_support::scripted_conn(profile, overrides) {
@@ -1954,9 +3287,19 @@ impl LiveConn {
                 .clamp(1, MAX_PARTITION_CONCURRENCY),
             query_tag_policy: query_tag_policy(env_value(&name(&prefix, "QUERY_TAG")).as_deref())?,
             query_tag: None,
+            progress: false,
+            max_microcredits: env_microcredits(&name(&prefix, "MAX_CREDITS"))?,
+            microcredits_per_hour: env_microcredits(&name(&prefix, "WAREHOUSE_CREDITS_PER_HOUR"))?,
+            cost_quota: std::cell::OnceCell::new(),
             #[cfg(test)]
             script: None,
         })
+    }
+
+    /// Report progress on stderr as NDJSON (`--progress`).
+    fn with_progress(mut self, progress: bool) -> Self {
+        self.progress = progress;
+        self
     }
 
     /// Bind the invocation's default QUERY_TAG (reality-check bead L5), so
@@ -2121,6 +3464,10 @@ where
                 format!("the profile's CA bundle was refused: {}", error.message),
             )
         })?;
+        let client = match transcript_recorder(conn) {
+            Some(recorder) => client.capturing(recorder),
+            None => client,
+        };
         let mut mechanism = conn
             .auth_profile
             .resolve(&ProcessSecretResolver, &conn.account, &conn.user)
@@ -2200,9 +3547,10 @@ struct SignalFlags {
     in_flight: AtomicUsize,
 }
 
+static SIGNAL_FLAGS: OnceLock<Option<SignalFlags>> = OnceLock::new();
+
 fn signal_flags() -> Option<&'static SignalFlags> {
-    static FLAGS: OnceLock<Option<SignalFlags>> = OnceLock::new();
-    FLAGS
+    SIGNAL_FLAGS
         .get_or_init(|| {
             use signal_hook::consts::{SIGINT, SIGTERM};
             use signal_hook::flag;
@@ -2224,6 +3572,28 @@ fn signal_flags() -> Option<&'static SignalFlags> {
             Some(flags)
         })
         .as_ref()
+}
+
+/// The exit status of a run that a signal cancelled: 130 after SIGINT, 143
+/// after SIGTERM (the shell convention, so a script's `set -e` or loop stops
+/// as it would for any interrupted command). `None` when no signal arrived;
+/// never installs the handlers itself.
+pub(crate) fn signal_exit_status() -> Option<u8> {
+    let flags = SIGNAL_FLAGS.get().and_then(Option::as_ref)?;
+    signal_status(
+        flags.interrupt.load(Ordering::SeqCst),
+        flags.terminate.load(Ordering::SeqCst),
+    )
+}
+
+fn signal_status(interrupt: bool, terminate: bool) -> Option<u8> {
+    if interrupt {
+        Some(130)
+    } else if terminate {
+        Some(143)
+    } else {
+        None
+    }
 }
 
 /// Marks a statement in flight for the signal handlers; restores the default
@@ -2251,12 +3621,64 @@ impl Drop for InFlight {
     }
 }
 
-/// Drive `work` to completion; a pending SIGINT/SIGTERM cancels `cx` once.
+/// Reports whether the MCP request a statement serves was cancelled.
+pub(crate) type CancelProbe = Arc<dyn Fn() -> bool + Send + Sync>;
+
+thread_local! {
+    /// The cancel probe of the MCP request or TUI query this thread is
+    /// serving, if any.
+    static EXTERNAL_CANCEL: RefCell<Option<CancelProbe>> = const { RefCell::new(None) };
+}
+
+/// Receives every driver event of the statements this thread runs (the TUI's
+/// progress pane).
+pub(crate) type ProgressSink = Arc<dyn Fn(&DriverEvent) + Send + Sync>;
+
+thread_local! {
+    /// The progress sink of the TUI query this thread is running, if any.
+    static PROGRESS_SINK: RefCell<Option<ProgressSink>> = const { RefCell::new(None) };
+}
+
+/// Run `work` with `sink` receiving this thread's driver events.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
+pub(crate) fn with_progress_sink<T>(sink: ProgressSink, work: impl FnOnce() -> T) -> T {
+    struct Reset(Option<ProgressSink>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            PROGRESS_SINK.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+    let _reset = Reset(PROGRESS_SINK.with(|slot| slot.borrow_mut().replace(sink)));
+    work()
+}
+
+/// Run `work` with `cancel` as this thread's external cancel probe.
+#[cfg_attr(not(any(feature = "mcp", feature = "tui")), allow(dead_code))]
+pub(crate) fn with_external_cancel<T>(cancel: CancelProbe, work: impl FnOnce() -> T) -> T {
+    struct Reset(Option<CancelProbe>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            EXTERNAL_CANCEL.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+    let _reset = Reset(EXTERNAL_CANCEL.with(|slot| slot.borrow_mut().replace(cancel)));
+    work()
+}
+
+/// Drive `work` to completion; a pending SIGINT/SIGTERM, or the external
+/// cancel probe of an MCP request, cancels `cx` once.
 async fn cancel_on_signal<T>(cx: &Cx, work: impl std::future::Future<Output = T>) -> T {
-    let Some(flags) = signal_flags() else {
-        return work.await;
-    };
-    cancel_on_flags(cx, work, &flags.interrupt, &flags.terminate).await
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    let external = EXTERNAL_CANCEL.with(|slot| slot.borrow().clone());
+    match signal_flags() {
+        Some(flags) => {
+            cancel_on_flags(cx, work, &flags.interrupt, &flags.terminate, external).await
+        }
+        None if external.is_some() => cancel_on_flags(cx, work, &NEVER, &NEVER, external).await,
+        None => work.await,
+    }
 }
 
 /// The signal-independent core of [`cancel_on_signal`] (unit-testable).
@@ -2265,6 +3687,7 @@ async fn cancel_on_flags<T>(
     work: impl std::future::Future<Output = T>,
     interrupt: &AtomicBool,
     terminate: &AtomicBool,
+    external: Option<CancelProbe>,
 ) -> T {
     use std::task::Poll;
     let mut work = std::pin::pin!(work);
@@ -2288,27 +3711,167 @@ async fn cancel_on_flags<T>(
         if !raised {
             if interrupt.load(Ordering::SeqCst) {
                 cx.cancel_with(CancelKind::User, Some("interrupted (SIGINT)"));
+                signal_notice("SIGINT");
                 raised = true;
             } else if terminate.load(Ordering::SeqCst) {
                 cx.cancel_with(CancelKind::Shutdown, Some("terminated (SIGTERM)"));
+                signal_notice("SIGTERM");
+                raised = true;
+            } else if external.as_ref().is_some_and(|cancelled| cancelled()) {
+                cx.cancel_with(
+                    CancelKind::User,
+                    Some("the request was cancelled (MCP cancellation or TUI Esc)"),
+                );
                 raised = true;
             }
         }
     }
 }
 
-/// Submit one prepared request and drive it to completion. Returns the completed
-/// statement, the driver's poll/partition stats, and the SQL API `requestId`.
+/// Tell the person at the terminal what the first signal does: the statement
+/// is being cancelled, which can wait for Snowflake to answer a submit still in
+/// flight, and a second signal exits at once. Stderr only; stdout keeps the
+/// envelope.
+fn signal_notice(signal: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "{signal}: cancelling the statement (the remote cancel may wait for Snowflake to answer the submit); send it again to exit at once"
+    );
+}
+
+/// What one statement run learned beyond its outcome: the handle Snowflake
+/// issued (none when the statement was never accepted) and the answer to the
+/// remote cancel, when one was sent (reality-check bead E1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RunFacts {
+    statement_handle: Option<String>,
+    remote_cancel: Option<(bool, String)>,
+}
+
+thread_local! {
+    /// The facts of the last statement run on this thread, for the terminal
+    /// receipt of a run that ended without rows.
+    static LAST_RUN: RefCell<RunFacts> = RefCell::new(RunFacts::default());
+}
+
+/// Watches every live statement: records its [`RunFacts`] and, with
+/// `--progress`, prints one JSON object per driver event on stderr (stdout
+/// keeps the single envelope), with the milliseconds since the statement
+/// started.
+struct RunObserver {
+    started: Instant,
+    progress: bool,
+    facts: RunFacts,
+    sink: Option<ProgressSink>,
+}
+
+impl RunObserver {
+    fn new(progress: bool) -> Self {
+        Self {
+            started: Instant::now(),
+            progress,
+            facts: RunFacts::default(),
+            sink: PROGRESS_SINK.with(|slot| slot.borrow().clone()),
+        }
+    }
+}
+
+impl DriverObserver for RunObserver {
+    fn event(&mut self, event: DriverEvent) {
+        match &event {
+            DriverEvent::Submitted {
+                statement_handle: Some(handle),
+                ..
+            } => self.facts.statement_handle = Some(handle.clone()),
+            DriverEvent::RemoteCancel {
+                statement_handle,
+                acknowledged,
+                detail,
+            } => {
+                self.facts
+                    .statement_handle
+                    .get_or_insert_with(|| statement_handle.clone());
+                self.facts.remote_cancel = Some((*acknowledged, detail.clone()));
+            }
+            _ => {}
+        }
+        if let Some(sink) = &self.sink {
+            sink(&event);
+        }
+        if self.progress {
+            use std::io::Write as _;
+            let elapsed_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let line = progress_line(&event, elapsed_ms);
+            let _ = writeln!(std::io::stderr().lock(), "{line}");
+        }
+    }
+}
+
+fn progress_line(event: &DriverEvent, elapsed_ms: u64) -> String {
+    let value = match event {
+        DriverEvent::Submitted {
+            statement_handle,
+            running,
+        } => serde_json::json!({
+            "event": "submitted", "statement_handle": statement_handle,
+            "running": running, "elapsed_ms": elapsed_ms,
+        }),
+        DriverEvent::Polled { polls } => {
+            serde_json::json!({ "event": "polled", "polls": polls, "elapsed_ms": elapsed_ms })
+        }
+        DriverEvent::PartitionFetched { index, rows, bytes } => serde_json::json!({
+            "event": "partition_fetched", "index": index, "rows": rows,
+            "bytes": bytes, "elapsed_ms": elapsed_ms,
+        }),
+        DriverEvent::Completed { rows, partitions } => serde_json::json!({
+            "event": "completed", "rows": rows, "partitions": partitions,
+            "elapsed_ms": elapsed_ms,
+        }),
+        DriverEvent::RemoteCancel {
+            statement_handle,
+            acknowledged,
+            detail,
+        } => serde_json::json!({
+            "event": "remote_cancel", "statement_handle": statement_handle,
+            "acknowledged": acknowledged, "detail": detail, "elapsed_ms": elapsed_ms,
+        }),
+    };
+    value.to_string()
+}
+
+/// Submit one prepared request and drive it to completion under the profile's
+/// bounds and credit cap. Returns the completed statement, the driver's
+/// stats, and the SQL API `requestId`.
 fn execute_request(
     conn: &LiveConn,
     request: SubmitStatementRequest,
     row_cap: Option<usize>,
     fixed_request_id: Option<String>,
 ) -> Result<(CompletedStatement, DriverStats, String), SnowflakeError> {
+    let cost_quota = conn.cost_quota()?;
+    drive_request(conn, request, row_cap, fixed_request_id, cost_quota)
+}
+
+/// [`execute_request`] with an explicit credit cap (the rate lookup's own
+/// `SHOW WAREHOUSES` runs without one).
+fn drive_request(
+    conn: &LiveConn,
+    request: SubmitStatementRequest,
+    row_cap: Option<usize>,
+    fixed_request_id: Option<String>,
+    cost_quota: Option<CostQuota>,
+) -> Result<(CompletedStatement, DriverStats, String), SnowflakeError> {
     let sql_api_request_id = fixed_request_id.unwrap_or_else(unique_request_id);
+    LAST_RUN.with(RefCell::take);
+    let poll_plan = PollPlan::with_max_polls(conn.max_polls)
+        .with_partition_concurrency(conn.partition_concurrency)
+        .with_row_cap(row_cap)
+        .with_execution_timeout(conn.execution_timeout())
+        .with_cost_quota(cost_quota);
     #[cfg(test)]
     if let Some(script) = &conn.script {
-        return script.execute(request, row_cap, &sql_api_request_id);
+        return script.execute(request, poll_plan, &sql_api_request_id);
     }
     let params = SubmitQueryParams {
         request_id: Some(sql_api_request_id.clone()),
@@ -2316,15 +3879,20 @@ fn execute_request(
         asynchronous: false,
         nullable: None,
     };
-    let max_polls = conn.max_polls;
-    let poll_plan = PollPlan::with_max_polls(max_polls)
-        .with_partition_concurrency(conn.partition_concurrency)
-        .with_row_cap(row_cap);
-    let (outcome, stats) = with_runtime(conn, move |cx, client, auth| {
+    let progress = conn.progress;
+    let (outcome, stats, facts) = with_runtime(conn, move |cx, client, auth| {
         Box::pin(async move {
-            Ok(run_statement_with_auth(cx, client, auth, request, params, poll_plan).await)
+            let mut observer = RunObserver::new(progress);
+            let hooks = StatementHooks {
+                sink: None,
+                observer: Some(&mut observer),
+            };
+            let (outcome, stats) =
+                run_statement_hooked(cx, client, auth, request, params, poll_plan, hooks).await;
+            Ok((outcome, stats, observer.facts))
         })
     })?;
+    LAST_RUN.with(|slot| *slot.borrow_mut() = facts);
     outcome_into_result(outcome, "the statement", true)
         .map(|done| (done, stats, sql_api_request_id))
 }
@@ -2488,12 +4056,13 @@ fn with_terminal_receipt(
     let cancel_kind = error.cancel_kind.map(|kind| format!("{kind:?}"));
     let message = redact(&error.message);
     let preview = crate::compact_sql(&redact(sql));
+    let run = LAST_RUN.with(RefCell::take);
     let facts = ExecutionFacts {
         command_id,
         profile: &conn.profile,
         trace_id,
         sql_preview_redacted: &preview,
-        statement_handle: None,
+        statement_handle: run.statement_handle.as_deref(),
         sql_api_request_id: None,
         query_tag: conn.query_tag.as_deref(),
         row_count: 0,
@@ -2506,7 +4075,7 @@ fn with_terminal_receipt(
         statement_timeout_seconds: conn.statement_timeout_seconds,
         polls: 0,
         event_kind: "statement_terminal",
-        extra: serde_json::json!({}),
+        extra: terminal_run_json(&run),
         terminal_failure: Some(local_store::TerminalFailure {
             outcome_kind,
             error_code: error.stable_code(),
@@ -2520,6 +4089,10 @@ fn with_terminal_receipt(
             local_store::record_execution(&store, &facts).map_err(|error| error.to_string())
         });
     if let crate::Body::Envelope { envelope, .. } = &mut outcome.body {
+        if run.statement_handle.is_some() {
+            envelope.statement_handle.clone_from(&run.statement_handle);
+            envelope.query_id.clone_from(&run.statement_handle);
+        }
         match recorded {
             Ok(hash) => {
                 envelope
@@ -2535,6 +4108,23 @@ fn with_terminal_receipt(
     outcome
 }
 
+/// The terminal receipt's account of the run: whether Snowflake ever accepted
+/// the statement (a run cancelled while connecting never was) and, when a
+/// remote cancel was sent, whether Snowflake acknowledged it.
+fn terminal_run_json(run: &RunFacts) -> serde_json::Value {
+    let mut extra = serde_json::json!({
+        "accepted_by_snowflake": run.statement_handle.is_some(),
+    });
+    if let (Some((acknowledged, detail)), Some(body)) = (&run.remote_cancel, extra.as_object_mut())
+    {
+        body.insert(
+            "remote_cancel".to_owned(),
+            serde_json::json!({ "acknowledged": acknowledged, "detail": detail }),
+        );
+    }
+    extra
+}
+
 /// Stamp the live provenance fields shared by every successful live envelope.
 fn stamp_live(
     envelope: &mut crate::Envelope,
@@ -2547,11 +4137,195 @@ fn stamp_live(
     envelope.statement_handle = Some(rows.statement_handle.clone());
     envelope.query_id = Some(rows.statement_handle.clone());
     envelope.receipt_hash = receipt_hash;
-    envelope.budget_consumed = json_object(vec![
-        ("deadline_ms", Json::Number(0)),
-        ("polls", Json::Number(i64::from(rows.stats.polls))),
-        ("rows", Json::Number(rows.total_rows)),
-    ]);
+    envelope.budget_consumed = budget_consumed(rows.stats.polls, &rows.stats, rows.total_rows);
+}
+
+/// `budget_consumed` for a live run: what was measured (polls, execution
+/// time, rows) beside the bounds each statement ran under: the poll quota, the
+/// client-side execution deadline (absent when none was set) and, with a credit
+/// cap, the warehouse rate, the cap and the estimate, in millionths of a credit.
+fn budget_consumed(polls: u32, bounds: &DriverStats, rows: i64) -> Json {
+    let millis =
+        |duration: Duration| Json::Number(i64::try_from(duration.as_millis()).unwrap_or(i64::MAX));
+    let micro = |value: u64| Json::Number(i64::try_from(value).unwrap_or(i64::MAX));
+    let mut fields = vec![
+        ("polls", Json::Number(i64::from(polls))),
+        ("poll_quota", Json::Number(i64::from(bounds.poll_quota))),
+    ];
+    if let Some(timeout) = bounds.execution_timeout {
+        fields.push(("execution_timeout_ms", millis(timeout)));
+    }
+    if let Some(execution) = bounds.execution {
+        fields.push(("execution_ms", millis(execution)));
+    }
+    if let Some(quota) = bounds.cost_quota {
+        fields.push(("microcredits_per_hour", micro(quota.microcredits_per_hour)));
+        fields.push(("max_microcredits", micro(quota.max_microcredits)));
+        fields.push((
+            "estimated_microcredits",
+            micro(quota.estimate(bounds.execution.unwrap_or_default())),
+        ));
+    }
+    fields.push(("rows", Json::Number(rows)));
+    json_object(fields)
+}
+
+/// `<PREFIX>_MAX_CREDITS` / `<PREFIX>_WAREHOUSE_CREDITS_PER_HOUR`: a positive
+/// decimal number of credits with at most six decimals, in millionths.
+fn env_microcredits(key: &str) -> Result<Option<u64>, SnowflakeError> {
+    let Some(value) = env_value(key) else {
+        return Ok(None);
+    };
+    parse_microcredits(&value).map(Some).ok_or_else(|| {
+        SnowflakeError::new(
+            SnowflakeErrorCode::ProfileInvalid,
+            format!("{key} must be a positive number of credits with at most six decimals"),
+        )
+    })
+}
+
+/// A positive decimal (`0.05`, `1`, `.25`) in millionths, exactly.
+fn parse_microcredits(text: &str) -> Option<u64> {
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    let digits = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
+    if (whole.is_empty() && fraction.is_empty())
+        || !digits(whole)
+        || !digits(fraction)
+        || fraction.len() > 6
+    {
+        return None;
+    }
+    let whole: u64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().ok()?
+    };
+    let fraction: u64 = format!("{fraction:0<6}").parse().ok()?;
+    let micro = whole.checked_mul(1_000_000)?.checked_add(fraction)?;
+    (micro > 0).then_some(micro)
+}
+
+/// Where the rates of warehouses without a published per-size rate live
+/// (Gen2 standard and Snowpark-optimized; consulted 2026-09-25).
+const CREDIT_TABLE_URL: &str = "https://www.snowflake.com/legal-files/CreditConsumptionTable.pdf";
+
+/// The warehouse's rate (millionths of a credit per hour) and whether it is
+/// suspended, from `SHOW WAREHOUSES`. Only Gen1 standard warehouses have a
+/// published per-size rate; any other warehouse is refused with the profile
+/// variable that states the rate.
+fn warehouse_rate(conn: &LiveConn) -> Result<(u64, bool), SnowflakeError> {
+    let quoted = conn
+        .warehouse
+        .strip_prefix('"')
+        .and_then(|name| name.strip_suffix('"'));
+    let wanted = quoted.map_or_else(|| conn.warehouse.clone(), |name| name.replace("\"\"", "\""));
+    let sql = format!("SHOW WAREHOUSES LIKE '{}'", wanted.replace('\'', "''"));
+    let request = build_request(conn, &sql, QueryRequestOptions::default());
+    let (done, stats, id) = drive_request(conn, request, None, None, None)?;
+    let listed = into_rows(done, stats, id);
+    let column = |name: &str| {
+        listed
+            .columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case(name))
+    };
+    let (name_at, state_at, type_at, size_at, generation_at) = (
+        column("name"),
+        column("state"),
+        column("type"),
+        column("size"),
+        column("generation"),
+    );
+    let cell = |row: &Vec<Option<String>>, at: Option<usize>| {
+        at.and_then(|at| row.get(at)).and_then(|cell| cell.clone())
+    };
+    let row = listed
+        .rows
+        .iter()
+        .find(|row| {
+            cell(row, name_at).is_some_and(|name| {
+                if quoted.is_some() {
+                    name == wanted
+                } else {
+                    name.eq_ignore_ascii_case(&wanted)
+                }
+            })
+        })
+        .ok_or_else(|| {
+            SnowflakeError::new(
+                SnowflakeErrorCode::ProfileInvalid,
+                format!(
+                    "MAX_CREDITS needs the warehouse's credit rate, and SHOW WAREHOUSES does not list {} for this role",
+                    conn.warehouse
+                ),
+            )
+        })?;
+    warehouse_row_rate(
+        cell(row, type_at).as_deref(),
+        cell(row, size_at).as_deref(),
+        cell(row, generation_at).as_deref(),
+        cell(row, state_at).as_deref(),
+    )
+    .map_err(|what| {
+        let prefix = crate::profile_env_prefix(&conn.profile);
+        SnowflakeError::new(
+            SnowflakeErrorCode::ProfileInvalid,
+            format!(
+                "the credit rate of {what} is not published in Snowflake's docs; set {} to its credits per hour ({CREDIT_TABLE_URL})",
+                name(&prefix, "WAREHOUSE_CREDITS_PER_HOUR")
+            ),
+        )
+    })
+}
+
+/// A `SHOW WAREHOUSES` row's rate and whether the warehouse is suspended, or
+/// what makes its rate unknown.
+fn warehouse_row_rate(
+    kind: Option<&str>,
+    size: Option<&str>,
+    generation: Option<&str>,
+    state: Option<&str>,
+) -> Result<(u64, bool), String> {
+    let kind = kind.unwrap_or("STANDARD");
+    if !kind.eq_ignore_ascii_case("STANDARD") {
+        return Err(format!("a {kind} warehouse"));
+    }
+    if let Some(generation) = generation.filter(|generation| generation.trim() != "1") {
+        return Err(format!("a generation {generation} standard warehouse"));
+    }
+    let size = size.unwrap_or("(no size)");
+    let rate =
+        gen1_microcredits_per_hour(size).ok_or_else(|| format!("a warehouse of size {size}"))?;
+    Ok((
+        rate,
+        state.is_some_and(|state| state.eq_ignore_ascii_case("SUSPENDED")),
+    ))
+}
+
+/// The Gen1 standard warehouse rate for a `SHOW WAREHOUSES` size, in millionths
+/// of a credit per hour
+/// (<https://docs.snowflake.com/en/user-guide/warehouses-overview>, consulted
+/// 2026-09-25: X-Small 1 credit per hour, doubling per size to 6X-Large 512).
+fn gen1_microcredits_per_hour(size: &str) -> Option<u64> {
+    let key: String = size
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+    let credits: u64 = match key.as_str() {
+        "xsmall" => 1,
+        "small" => 2,
+        "medium" => 4,
+        "large" => 8,
+        "xlarge" => 16,
+        "2xlarge" | "x2large" | "xxlarge" => 32,
+        "3xlarge" | "x3large" | "xxxlarge" => 64,
+        "4xlarge" | "x4large" => 128,
+        "5xlarge" | "x5large" => 256,
+        "6xlarge" | "x6large" => 512,
+        _ => return None,
+    };
+    Some(credits * 1_000_000)
 }
 
 /// The copy-pasteable `receipt show` command for a given receipt hash.
@@ -2559,6 +4333,52 @@ fn receipt_show_command(receipt_hash: Option<&str>) -> String {
     match receipt_hash {
         Some(hash) => format!("franken-snowflake receipt show {hash} --json"),
         None => "franken-snowflake receipt show <receipt-hash> --json".to_string(),
+    }
+}
+
+/// With `FRANKEN_SNOWFLAKE_CAPTURE_DIR` set, a recorder that writes each
+/// exchange as a redacted transcript (bead oj0.21), refusing any transcript
+/// that still holds one of this profile's secret values.
+fn transcript_recorder(conn: &LiveConn) -> Option<Arc<TranscriptRecorder>> {
+    let dir = env_value(CAPTURE_DIR_ENV)?;
+    let prefix = crate::profile_env_prefix(&conn.profile);
+    let mut secrets: Vec<String> = [
+        "PAT",
+        "OAUTH_BEARER",
+        "PRIVATE_KEY_PASSPHRASE",
+        "OIDC_TOKEN",
+    ]
+    .iter()
+    .filter_map(|key| env_value(&name(&prefix, key)))
+    .collect();
+    if let Some(pem) = env_value(&name(&prefix, "PRIVATE_KEY_PEM")) {
+        secrets.extend(
+            pem.lines()
+                .filter(|line| !line.contains("-----"))
+                .map(str::to_owned),
+        );
+    }
+    // Deployment names stay out of transcripts that may become public fixtures.
+    let mut identifiers = vec![
+        (conn.user.clone(), "<user>"),
+        (conn.warehouse.clone(), "<warehouse>"),
+    ];
+    identifiers.extend(conn.database.clone().map(|name| (name, "<database>")));
+    identifiers.extend(
+        conn.schema
+            .clone()
+            .filter(|name| !name.eq_ignore_ascii_case("PUBLIC"))
+            .map(|name| (name, "<schema>")),
+    );
+    identifiers.extend(conn.role.clone().map(|name| (name, "<role>")));
+    match TranscriptRecorder::new(&dir, conn.endpoint.host()) {
+        Ok(recorder) => Some(Arc::new(
+            recorder.with_secrets(secrets).with_identifiers(identifiers),
+        )),
+        Err(error) => {
+            eprintln!("{CAPTURE_DIR_ENV}: capture is off, `{dir}` could not be created: {error}");
+            None
+        }
     }
 }
 
@@ -2752,14 +4572,13 @@ fn validate_bindings(bindings: &BTreeMap<String, Binding>) -> Result<(), Snowfla
             "binding keys must be contiguous 1-based positions",
         ));
     }
-    if bindings
-        .values()
-        .any(|binding| !is_safe_binding_type(&binding.value_type))
-    {
-        return Err(SnowflakeError::new(
-            SnowflakeErrorCode::UsageError,
-            "binding type names must be uppercase Snowflake type tokens",
-        ));
+    for (position, binding) in bindings {
+        if let Err(reason) = check_binding(&binding.value_type, &binding.value) {
+            return Err(SnowflakeError::new(
+                SnowflakeErrorCode::UsageError,
+                format!("binding {position}: {reason}"),
+            ));
+        }
     }
     Ok(())
 }
@@ -2789,14 +4608,53 @@ fn is_safe_env_name(value: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-fn is_safe_binding_type(value: &str) -> bool {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return false;
+/// Check one caller-supplied binding against the SQL API's binding rules
+/// ("Using bind variables in a statement", consulted 2026-09-26:
+/// <https://docs.snowflake.com/en/developer-guide/sql-api/submitting-requests>),
+/// so a value Snowflake would refuse with 100037 is a local usage error that
+/// names the fix instead.
+fn check_binding(binding_type: &str, value: &str) -> Result<(), String> {
+    let integer = |text: &str| {
+        let digits = text.strip_prefix('-').unwrap_or(text);
+        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
     };
-    value.len() <= 64
-        && first.is_ascii_uppercase()
-        && chars.all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+    let ok = match binding_type {
+        "TEXT" => true,
+        "FIXED" => integer(value),
+        "REAL" | "DECFLOAT" => value.trim().parse::<f64>().is_ok_and(f64::is_finite),
+        "BOOLEAN" => ["true", "false", "0", "1"]
+            .iter()
+            .any(|literal| value.eq_ignore_ascii_case(literal)),
+        "DATE" | "TIME" | "TIMESTAMP_NTZ" | "TIMESTAMP_LTZ" => integer(value),
+        "TIMESTAMP_TZ" => value
+            .split_once(' ')
+            .is_some_and(|(nanos, offset)| integer(nanos) && integer(offset)),
+        "BINARY" => value.len().is_multiple_of(2) && value.bytes().all(|b| b.is_ascii_hexdigit()),
+        _ => {
+            return Err(format!(
+                "`{binding_type}` is not a SQL API binding type (FIXED, REAL, DECFLOAT, TEXT, \
+                 BINARY, BOOLEAN, DATE, TIME, TIMESTAMP_TZ, TIMESTAMP_LTZ, TIMESTAMP_NTZ)"
+            ));
+        }
+    };
+    if ok {
+        return Ok(());
+    }
+    Err(match binding_type {
+        "FIXED" => "FIXED takes an integer; bind a decimal as REAL or TEXT".to_owned(),
+        "REAL" | "DECFLOAT" => format!("{binding_type} takes a number"),
+        "BOOLEAN" => "BOOLEAN takes true, false, 0 or 1".to_owned(),
+        "DATE" => "DATE takes epoch milliseconds (e.g. 1704067200000); bind a date string \
+                   like 2024-01-01 as TEXT"
+            .to_owned(),
+        "TIMESTAMP_TZ" => "TIMESTAMP_TZ takes epoch nanoseconds, a space and an offset in \
+                           minutes; bind a timestamp string as TEXT"
+            .to_owned(),
+        "BINARY" => "BINARY takes hex digits".to_owned(),
+        other => {
+            format!("{other} takes epoch nanoseconds; bind a time or timestamp string as TEXT")
+        }
+    })
 }
 
 fn authorization_descriptor(
@@ -3121,28 +4979,17 @@ fn outcome_kind_for(code: SnowflakeErrorCode) -> &'static str {
     }
 }
 
-/// Deterministic session output formats so live results are stable across runs
-/// (UTC, fixed date/time/timestamp/binary formats, result cache disabled).
+/// Deterministic session parameters (UTC, hex binary, result cache disabled).
+///
+/// DATE/TIME/TIMESTAMP output formats are deliberately **not** set: the SQL
+/// API ignores account- and user-level settings for them, and a format set in
+/// the request replaces the documented encoding (epoch days, epoch seconds,
+/// `"<seconds> <offset+1440>"`) that `typed.v1`, frames and Parquet export
+/// decode ("Handling responses", consulted 2026-09-27:
+/// <https://docs.snowflake.com/en/developer-guide/sql-api/handling-responses>).
 fn deterministic_session_parameters() -> BTreeMap<String, String> {
     BTreeMap::from([
         ("TIMEZONE".to_string(), "UTC".to_string()),
-        ("DATE_OUTPUT_FORMAT".to_string(), "YYYY-MM-DD".to_string()),
-        (
-            "TIME_OUTPUT_FORMAT".to_string(),
-            "HH24:MI:SS.FF9".to_string(),
-        ),
-        (
-            "TIMESTAMP_NTZ_OUTPUT_FORMAT".to_string(),
-            "YYYY-MM-DD HH24:MI:SS.FF9".to_string(),
-        ),
-        (
-            "TIMESTAMP_LTZ_OUTPUT_FORMAT".to_string(),
-            "YYYY-MM-DD HH24:MI:SS.FF9 TZHTZM".to_string(),
-        ),
-        (
-            "TIMESTAMP_TZ_OUTPUT_FORMAT".to_string(),
-            "YYYY-MM-DD HH24:MI:SS.FF9 TZHTZM".to_string(),
-        ),
         ("BINARY_OUTPUT_FORMAT".to_string(), "HEX".to_string()),
         ("USE_CACHED_RESULT".to_string(), "FALSE".to_string()),
     ])
@@ -3244,15 +5091,17 @@ mod test_support {
     pub(super) struct Script(Rc<RefCell<ScriptState>>);
 
     impl Script {
+        /// Stands in for the driver: answers the next scripted response and,
+        /// like the driver, reports the plan's bounds in the stats.
         pub(super) fn execute(
             &self,
             request: SubmitStatementRequest,
-            row_cap: Option<usize>,
+            poll_plan: PollPlan,
             sql_api_request_id: &str,
         ) -> Result<(CompletedStatement, DriverStats, String), SnowflakeError> {
             let mut state = self.0.borrow_mut();
             state.submitted.push(request);
-            state.row_caps.push(row_cap);
+            state.row_caps.push(poll_plan.row_cap);
             state.request_ids.push(sql_api_request_id.to_owned());
             let ordinal = state.submitted.len();
             match state.responses.pop_front() {
@@ -3261,6 +5110,10 @@ mod test_support {
                     DriverStats {
                         polls: 1,
                         partitions_fetched: 0,
+                        poll_quota: poll_plan.max_polls,
+                        execution_timeout: poll_plan.execution_timeout,
+                        cost_quota: poll_plan.cost_quota,
+                        execution: None,
                     },
                     format!("scripted-request-{ordinal}"),
                 )),
@@ -3357,6 +5210,10 @@ mod test_support {
                 partition_concurrency: DEFAULT_PARTITION_CONCURRENCY,
                 query_tag_policy: QueryTagPolicy::Generated,
                 query_tag: None,
+                progress: false,
+                max_microcredits: None,
+                microcredits_per_hour: None,
+                cost_quota: std::cell::OnceCell::new(),
                 script: Some(scripted.script.clone()),
             })
         })
@@ -3477,6 +5334,48 @@ mod tests {
         assert!(validate_bindings(&unsafe_type).is_err());
     }
 
+    /// Bindings follow the SQL API's documented rules, so a value Snowflake
+    /// would refuse (100037) is refused locally with the fix named.
+    #[test]
+    fn bindings_are_checked_against_the_sql_api_binding_rules() {
+        let one = |binding_type: &str, value: &str| {
+            validate_bindings(&BTreeMap::from([(
+                "1".to_owned(),
+                Binding::new(binding_type, value),
+            )]))
+        };
+        for (binding_type, value) in [
+            ("TEXT", "2024-01-01"),
+            ("FIXED", "-42"),
+            ("REAL", "1.5"),
+            ("DECFLOAT", "1.23e-40"),
+            ("BOOLEAN", "TRUE"),
+            ("DATE", "1704067200000"),
+            ("TIME", "45000000000000"),
+            ("TIMESTAMP_NTZ", "1704067200000000000"),
+            ("TIMESTAMP_TZ", "1616173619000000000 960"),
+            ("BINARY", "DEADBEEF"),
+        ] {
+            assert!(one(binding_type, value).is_ok(), "{binding_type} {value}");
+        }
+        for (binding_type, value, hint) in [
+            ("DATE", "2024-01-01", "as TEXT"),
+            ("TIMESTAMP_NTZ", "2024-01-01T00:00:00", "as TEXT"),
+            ("TIMESTAMP_TZ", "1616173619000000000", "offset"),
+            ("FIXED", "1.5", "REAL or TEXT"),
+            ("BOOLEAN", "yes", "true, false"),
+            ("BINARY", "zz", "hex"),
+            ("VARIANT", "{}", "not a SQL API binding type"),
+        ] {
+            let error = one(binding_type, value).expect_err(binding_type);
+            assert!(
+                error.message.contains(hint),
+                "{binding_type}: {}",
+                error.message
+            );
+        }
+    }
+
     #[test]
     fn query_tag_and_binding_env_names_are_bounded() {
         assert!(validate_query_tag("acme.trace.123").is_ok());
@@ -3559,7 +5458,7 @@ mod tests {
         database: &str,
         schema: &str,
     ) -> Vec<Result<CompletedStatement, SnowflakeError>> {
-        vec![
+        let mut script = vec![
             Ok(completed(
                 "01b2c3d4-0000-0000-0000-00000000cc01",
                 &[
@@ -3638,6 +5537,66 @@ mod tests {
                     ],
                 ],
             )),
+        ];
+        script.extend(relation_script(database, schema));
+        script
+    }
+
+    /// The relation pass for a schema holding one base table: SHOW PRIMARY
+    /// KEYS (EVENTS keyed on ENTITY_ID, EVENT_DATE), then empty constraint,
+    /// stage and file-format listings. No view or external table, and tags
+    /// are opt-in, so nothing else is submitted.
+    fn relation_script(
+        database: &str,
+        schema: &str,
+    ) -> Vec<Result<CompletedStatement, SnowflakeError>> {
+        let pk = |column, sequence| {
+            vec![
+                Some("2026-09-01"),
+                Some(database),
+                Some(schema),
+                Some("EVENTS"),
+                Some(column),
+                Some(sequence),
+                None,
+                Some("PK_EVENTS"),
+            ]
+        };
+        let empty = |handle: &str, columns: &[(&str, &str)]| Ok(completed(handle, columns, &[]));
+        vec![
+            Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000cc03",
+                &[
+                    ("created_on", "TEXT"),
+                    ("database_name", "TEXT"),
+                    ("schema_name", "TEXT"),
+                    ("table_name", "TEXT"),
+                    ("column_name", "TEXT"),
+                    ("key_sequence", "FIXED"),
+                    ("comment", "TEXT"),
+                    ("constraint_name", "TEXT"),
+                ],
+                &[pk("EVENT_DATE", "2"), pk("ENTITY_ID", "1")],
+            )),
+            empty(
+                "01b2c3d4-0000-0000-0000-00000000cc04",
+                &[("CONSTRAINT_NAME", "TEXT"), ("CONSTRAINT_TYPE", "TEXT")],
+            ),
+            empty(
+                "01b2c3d4-0000-0000-0000-00000000cc05",
+                &[
+                    ("CONSTRAINT_NAME", "TEXT"),
+                    ("UNIQUE_CONSTRAINT_NAME", "TEXT"),
+                ],
+            ),
+            empty(
+                "01b2c3d4-0000-0000-0000-00000000cc06",
+                &[("STAGE_NAME", "TEXT")],
+            ),
+            empty(
+                "01b2c3d4-0000-0000-0000-00000000cc07",
+                &[("FILE_FORMAT_NAME", "TEXT")],
+            ),
         ]
     }
 
@@ -3701,6 +5660,11 @@ mod tests {
         assert_eq!(env["data"]["rows"].as_array().map(Vec::len), Some(2));
         assert_eq!(env["data"]["truncated"], true);
         assert_eq!(env["budget_consumed"]["polls"], 1);
+        // Beside the measured polls, the bounds the statement ran under: the
+        // profile's poll quota and this run's --statement-timeout 120 + 5 s.
+        assert_eq!(env["budget_consumed"]["poll_quota"], 10);
+        assert_eq!(env["budget_consumed"]["execution_timeout_ms"], 125_000);
+        assert!(env["budget_consumed"].get("deadline_ms").is_none(), "{env}");
         let hash = env["receipt_hash"].as_str().unwrap_or("").to_owned();
         assert_eq!(hash.len(), 64, "{hash}");
 
@@ -3803,8 +5767,10 @@ mod tests {
             "ANALYTICS".to_owned(),
             "PUBLIC".to_owned(),
             false,
+            RelationOptions::default(),
         ));
         assert_eq!(env["ok"], true, "{env}");
+        assert_eq!(env["outcome_kind"], "success", "{env}");
         assert_eq!(env["data_source"], "live");
         let datasets = env["data"]["datasets"]
             .as_array()
@@ -3838,12 +5804,33 @@ mod tests {
             "safe_next_commands should name the dataset: {safe_cmds:?}"
         );
 
+        // The relation pass: the primary key in key order, and the opt-in
+        // tag source reported as skipped rather than silently empty.
+        assert_eq!(
+            datasets[0]["primary_key"],
+            serde_json::json!(["ENTITY_ID", "EVENT_DATE"]),
+            "{env}"
+        );
+        let relations = &env["data"]["relations"];
+        assert_eq!(relations["discovered"], true, "{env}");
+        assert_eq!(relations["primary_key_count"], 1, "{env}");
+        assert!(
+            relations["gaps"].to_string().contains("tag_references"),
+            "{env}"
+        );
+
         // Discovery statements are bound, never interpolated, carry the
-        // session context, and always fetch every partition.
+        // session context, and always fetch every partition; SHOW takes no
+        // binds, so its scope is quoted.
         let submitted = script.submitted();
-        assert_eq!(submitted.len(), 2);
-        assert_eq!(script.row_caps(), vec![None, None]);
-        for request in &submitted {
+        assert_eq!(submitted.len(), 7);
+        assert_eq!(script.row_caps(), vec![None; 7]);
+        let show = request_json(&submitted[2]);
+        assert_eq!(
+            show["statement"], r#"SHOW PRIMARY KEYS IN SCHEMA "ANALYTICS"."PUBLIC""#,
+            "{show}"
+        );
+        for request in &submitted[..2] {
             let json = request_json(request);
             let statement = json["statement"].as_str().unwrap_or("");
             assert!(statement.contains("TABLE_CATALOG = ?"), "{statement}");
@@ -3869,6 +5856,11 @@ mod tests {
         assert!(
             inspect.to_string().contains("ENTITY_ID"),
             "column catalog missing: {inspect}"
+        );
+        assert_eq!(
+            inspect["data"]["relations"]["primary_key"],
+            serde_json::json!(["ENTITY_ID", "EVENT_DATE"]),
+            "{inspect}"
         );
         let graph = envelope(run_catalog_graph_outcome(
             OutputFormat::Json,
@@ -3969,6 +5961,7 @@ mod tests {
             "DRIFT_DB".to_owned(),
             "DRIFT_SCHEMA".to_owned(),
             false,
+            RelationOptions::default(),
         ));
         assert_eq!(env1["ok"], true);
         assert_eq!(env1["data"]["drift"]["summary"]["datasets_added"], 1);
@@ -3991,6 +5984,7 @@ mod tests {
             "DRIFT_DB".to_owned(),
             "DRIFT_SCHEMA".to_owned(),
             false,
+            RelationOptions::default(),
         ));
         assert_eq!(env2["ok"], true);
         assert_eq!(env2["data"]["drift"]["summary"]["is_identical"], true);
@@ -3998,6 +5992,363 @@ mod tests {
             env2["data"]["drift"]["base_snapshot_id"],
             env1["data"]["store"]["snapshot_id"]
         );
+    }
+
+    #[test]
+    fn a_refused_relation_source_is_partial_success_and_the_snapshot_is_kept() {
+        let mut script = information_schema_script_with_scope("GAP_DB", "GAP_SCHEMA");
+        // TABLES, COLUMNS, SHOW PRIMARY KEYS, then TABLE_CONSTRAINTS refused.
+        script[3] = Err(SnowflakeError::new(
+            SnowflakeErrorCode::StatementFailed,
+            "SQL access control error: Insufficient privileges to operate on schema 'GAP_SCHEMA'",
+        ));
+        install("gap_profile", None, None, script);
+        let outcome = run_catalog_scan_outcome(
+            OutputFormat::Json,
+            "req-scan-gap".to_owned(),
+            "gap_profile".to_owned(),
+            "GAP_DB".to_owned(),
+            "GAP_SCHEMA".to_owned(),
+            false,
+            RelationOptions::default(),
+        );
+        assert_eq!(outcome.status, CoreExitCode::Findings);
+        let env = envelope(outcome);
+        assert_eq!(env["ok"], true, "{env}");
+        assert_eq!(env["outcome_kind"], "partial_success", "{env}");
+        assert_eq!(env["data"]["store"]["persisted"], true, "{env}");
+        assert_eq!(env["data"]["datasets"][0]["column_count"], 3, "{env}");
+        let warnings = env["warnings"].to_string();
+        assert!(
+            warnings.contains("`table_constraints` was refused")
+                && warnings.contains("Insufficient privileges")
+                && warnings.contains("info-schema/table_constraints"),
+            "{env}"
+        );
+        assert!(
+            env["data"]["relations"]["gaps"]
+                .to_string()
+                .contains(r#""kind":"failed""#),
+            "{env}"
+        );
+    }
+
+    /// Reality-check bead oj0.35: a manifest overlay reassigns roles and limits
+    /// at read time (inspect and dataset planning), and a field naming a
+    /// column the dataset lacks is refused with suggestions, never ignored.
+    #[test]
+    fn a_manifest_overlay_reassigns_roles_at_read_time() {
+        let column = |name, ordinal, kind| {
+            vec![
+                Some("OVL_DB"),
+                Some("PUBLIC"),
+                Some("EVENTS"),
+                Some(name),
+                Some(ordinal),
+                Some(kind),
+                None,
+                None,
+                None,
+                Some("YES"),
+                None,
+            ]
+        };
+        let mut script = vec![
+            Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000cd01",
+                &[
+                    ("TABLE_CATALOG", "TEXT"),
+                    ("TABLE_SCHEMA", "TEXT"),
+                    ("TABLE_NAME", "TEXT"),
+                    ("TABLE_TYPE", "TEXT"),
+                    ("COMMENT", "TEXT"),
+                ],
+                &[vec![
+                    Some("OVL_DB"),
+                    Some("PUBLIC"),
+                    Some("EVENTS"),
+                    Some("BASE TABLE"),
+                    None,
+                ]],
+            )),
+            Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000cd02",
+                &[
+                    ("TABLE_CATALOG", "TEXT"),
+                    ("TABLE_SCHEMA", "TEXT"),
+                    ("TABLE_NAME", "TEXT"),
+                    ("COLUMN_NAME", "TEXT"),
+                    ("ORDINAL_POSITION", "FIXED"),
+                    ("DATA_TYPE", "TEXT"),
+                    ("NUMERIC_PRECISION", "FIXED"),
+                    ("NUMERIC_SCALE", "FIXED"),
+                    ("CHARACTER_MAXIMUM_LENGTH", "FIXED"),
+                    ("IS_NULLABLE", "TEXT"),
+                    ("COMMENT", "TEXT"),
+                ],
+                &[
+                    column("EVENT_DATE", "1", "DATE"),
+                    column("LOADED_AT", "2", "TIMESTAMP_NTZ"),
+                    column("ACCOUNT_REF", "3", "TEXT"),
+                    column("VALUE", "4", "NUMBER"),
+                ],
+            )),
+        ];
+        script.extend(relation_script("OVL_DB", "PUBLIC"));
+        install("overlay_profile", None, None, script);
+        let scan = envelope(run_catalog_scan_outcome(
+            OutputFormat::Json,
+            "req-scan-overlay".to_owned(),
+            "overlay_profile".to_owned(),
+            "OVL_DB".to_owned(),
+            "PUBLIC".to_owned(),
+            false,
+            RelationOptions::default(),
+        ));
+        let dataset_id = scan["data"]["datasets"][0]["dataset_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(!dataset_id.is_empty(), "{scan}");
+        let plan = || {
+            envelope(crate::dataset_mode::dataset_plan_outcome(
+                OutputFormat::Json,
+                "req-plan-overlay".to_owned(),
+                crate::dataset_mode::DatasetQuerySpec {
+                    dataset_id: dataset_id.clone(),
+                    from: Some("2024-01-01".to_owned()),
+                    to: Some("2024-02-01".to_owned()),
+                    ..Default::default()
+                },
+            ))
+        };
+        let before = plan();
+        let sql = before["data"]["sql"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            sql.contains(r#""EVENT_DATE" >= ?"#),
+            "discovery's time index: {before}"
+        );
+
+        let overlay_path = local_store::data_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("overlay-{:?}.toml", std::thread::current().id()));
+        let use_overlay = |text: &str| {
+            std::fs::create_dir_all(overlay_path.parent().unwrap_or(&overlay_path)).ok();
+            std::fs::write(&overlay_path, text).expect("write overlay");
+            catalog_surface::TEST_MANIFEST_OVERLAY
+                .with(|slot| *slot.borrow_mut() = Some(overlay_path.clone()));
+        };
+        use_overlay(
+            "[[datasets]]\ndatabase = \"ovl_db\"\nschema = \"public\"\nobject = \"events\"\ndefault_limit = 7\n\n[[datasets.fields]]\ncolumn = \"loaded_at\"\nrole = \"time_index\"\n\n[[datasets.fields]]\ncolumn = \"ACCOUNT_REF\"\nrole = \"entity_key\"\n",
+        );
+        let after = plan();
+        let sql = after["data"]["sql"].as_str().unwrap_or_default().to_owned();
+        assert!(
+            sql.contains(r#""LOADED_AT" >= ?"#) && !sql.contains(r#""EVENT_DATE" >= ?"#),
+            "the overlay's time index wins: {after}"
+        );
+        assert!(
+            after["data"]["bindings"]
+                .to_string()
+                .contains(r#""value":"7""#),
+            "the overlay's default limit binds the LIMIT: {after}"
+        );
+        let inspect = envelope(catalog_surface::dataset_inspect_outcome(
+            OutputFormat::Json,
+            "req-inspect-overlay".to_owned(),
+            dataset_id.clone(),
+        ));
+        assert_eq!(inspect["ok"], true, "{inspect}");
+        assert!(inspect["data"]["overlay"].as_str().is_some(), "{inspect}");
+        let fields = inspect["data"]["manifest"]["fields"].to_string();
+        assert!(
+            fields.contains(r#""column":"ACCOUNT_REF","role":"entity_key""#)
+                && fields.contains(r#""role_confidence":"overlay""#),
+            "{fields}"
+        );
+
+        // A column the dataset does not have: refused, with a suggestion.
+        use_overlay(
+            "[[datasets]]\nid = \"DATASET\"\n\n[[datasets.fields]]\ncolumn = \"LOADED\"\nrole = \"time_index\"\n"
+                .replace("DATASET", &dataset_id)
+                .as_str(),
+        );
+        let refused = envelope(catalog_surface::dataset_inspect_outcome(
+            OutputFormat::Json,
+            "req-inspect-overlay-bad".to_owned(),
+            dataset_id.clone(),
+        ));
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["error"]["code"], "FSNOW-1002", "{refused}");
+        assert!(
+            refused["did_you_mean"].to_string().contains("LOADED_AT"),
+            "{refused}"
+        );
+        let validated = envelope(catalog_surface::validate_manifest_outcome(
+            OutputFormat::Json,
+            "req-validate-overlay".to_owned(),
+        ));
+        assert_eq!(validated["ok"], false, "{validated}");
+        catalog_surface::TEST_MANIFEST_OVERLAY.with(|slot| *slot.borrow_mut() = None);
+        let _ = std::fs::remove_file(&overlay_path);
+    }
+
+    /// Reality-check bead oj0.39: the local-store adapter passes the same
+    /// conformance suite as the fixture adapter over artifacts a scripted scan,
+    /// query and export persisted; unknown ids are typed errors.
+    #[test]
+    fn the_local_store_adapter_passes_the_conformance_suite() {
+        use franken_snowflake_core::adapter::SnowflakeDataLakeAdapter;
+        use franken_snowflake_core::adapter::conformance::{
+            ConformanceProbe, check_adapter_conformance,
+        };
+        use franken_snowflake_core::ids::{DatasetId, ProfileName, ReceiptHash};
+        use franken_snowflake_core::outcome::DataSource;
+
+        install(
+            "adapter_profile",
+            None,
+            None,
+            information_schema_script_with_scope("ADP_DB", "PUBLIC"),
+        );
+        let scan = envelope(run_catalog_scan_outcome(
+            OutputFormat::Json,
+            "req-adapter-scan".to_owned(),
+            "adapter_profile".to_owned(),
+            "ADP_DB".to_owned(),
+            "PUBLIC".to_owned(),
+            false,
+            RelationOptions::default(),
+        ));
+        let dataset = scan["data"]["datasets"][0]["dataset_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        install(
+            "adapter_profile",
+            None,
+            None,
+            vec![Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000ad01",
+                &[("ID", "FIXED"), ("NAME", "TEXT")],
+                &[vec![Some("1"), Some("alpha")]],
+            ))],
+        );
+        let query = envelope(run_query_outcome(
+            OutputFormat::Json,
+            "req-adapter-query".to_owned(),
+            "adapter_profile".to_owned(),
+            "select id, name from events",
+            &crate::QueryRunOptions::default(),
+        ));
+        let receipt = query["receipt_hash"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        install(
+            "adapter_profile",
+            None,
+            None,
+            vec![Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000ad02",
+                &[("ID", "FIXED"), ("NAME", "TEXT")],
+                &[vec![Some("1"), Some("alpha")]],
+            ))],
+        );
+        let out = std::env::temp_dir().join(format!(
+            "fsnow-adapter-export-{}-{}.csv",
+            std::process::id(),
+            local_store::now_unix_ms()
+        ));
+        let export = envelope(export_run_outcome(
+            OutputFormat::Json,
+            "req-adapter-export".to_owned(),
+            ExportPlanSpec {
+                profile: Some("adapter_profile".to_owned()),
+                sql: Some("select id, name from events".to_owned()),
+                format: Some("csv".to_owned()),
+                ..Default::default()
+            },
+            Some(out.display().to_string()),
+            false,
+        ));
+        let _ = std::fs::remove_file(&out);
+        let export_id = export["data"]["export_receipt"]["export_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            !dataset.is_empty() && !receipt.is_empty() && !export_id.is_empty(),
+            "{scan}\n{query}\n{export}"
+        );
+
+        let adapter = crate::adapter::LocalStoreAdapter::open_with_env(Box::new(|name| {
+            let value = match name.strip_prefix("FRANKEN_SNOWFLAKE_ADAPTER_PROFILE_")? {
+                "ACCOUNT" => "xy12345.us-east-1",
+                "USER" => "SVC_ADAPTER",
+                "AUTH" => "pat",
+                "WAREHOUSE" => "WH_ADAPTER",
+                "PAT" => "set-but-never-read-by-diagnostics",
+                _ => return None,
+            };
+            Some(value.to_owned())
+        }))
+        .expect("open the local store");
+        let probe = ConformanceProbe {
+            profile: ProfileName::new("adapter_profile"),
+            dataset: DatasetId::new(dataset.clone()),
+            receipt: ReceiptHash::new(receipt),
+            export_id: Some(export_id),
+            frame_id: None,
+            expected_data_source: DataSource::Live,
+        };
+        assert_eq!(
+            check_adapter_conformance(&adapter, &probe),
+            Vec::<String>::new()
+        );
+        // The dataset contract carries the discovered fields and the
+        // snapshot's live provenance.
+        let manifest = adapter
+            .dataset_manifest(&DatasetId::new(dataset))
+            .expect("the scanned dataset");
+        assert_eq!(manifest.data.fields.len(), 3);
+        assert_eq!(manifest.data.provenance.data_source, DataSource::Live);
+        // A profile without handles is not found; one without a lane is invalid.
+        let missing = crate::adapter::LocalStoreAdapter::open_with_env(Box::new(|_| None))
+            .expect("open the local store");
+        assert_eq!(
+            missing
+                .profile_diagnostics(&ProfileName::new("adapter_profile"))
+                .map(|_| ())
+                .map_err(|error| error.code),
+            Err(SnowflakeErrorCode::ProfileNotFound)
+        );
+    }
+
+    #[test]
+    fn a_transport_error_in_the_relation_pass_fails_the_scan() {
+        let mut script = information_schema_script_with_scope("NET_DB", "NET_SCHEMA");
+        script[2] = Err(SnowflakeError::new(
+            SnowflakeErrorCode::NetworkError,
+            "connection reset",
+        ));
+        install("net_profile", None, None, script);
+        let outcome = run_catalog_scan_outcome(
+            OutputFormat::Json,
+            "req-scan-net".to_owned(),
+            "net_profile".to_owned(),
+            "NET_DB".to_owned(),
+            "NET_SCHEMA".to_owned(),
+            false,
+            RelationOptions::default(),
+        );
+        assert_ne!(outcome.status, CoreExitCode::Success);
+        assert_ne!(outcome.status, CoreExitCode::Findings);
+        let env = envelope(outcome);
+        assert_eq!(env["ok"], false, "{env}");
     }
 
     #[test]
@@ -4053,6 +6404,53 @@ mod tests {
             env["receipt_hash"].as_str().map(str::len),
             Some(64),
             "{env}"
+        );
+        Ok(())
+    }
+
+    /// Reality-check bead E5: --max-rows refuses an oversized streaming export
+    /// with FSNOW-3004 and leaves no file behind.
+    #[test]
+    fn scripted_export_run_refuses_past_max_rows_and_leaves_no_file() -> Result<(), String> {
+        install(
+            "demo",
+            None,
+            None,
+            vec![Ok(completed(
+                "01b2c3d4-0000-0000-0000-00000000ff02",
+                &[("ID", "FIXED"), ("NAME", "TEXT")],
+                &[vec![Some("1"), Some("alpha")], vec![Some("2"), None]],
+            ))],
+        );
+        let out = std::env::temp_dir().join(format!(
+            "fsnow-scripted-export-cap-{}-{}.csv",
+            std::process::id(),
+            local_store::now_unix_ms()
+        ));
+        let spec = ExportPlanSpec {
+            profile: Some("demo".to_owned()),
+            sql: Some("select id, name from events".to_owned()),
+            format: Some("csv".to_owned()),
+            max_rows: Some("1".to_owned()),
+            ..Default::default()
+        };
+        let env = envelope(export_run_outcome(
+            OutputFormat::Json,
+            "req-export-cap".to_owned(),
+            spec,
+            Some(out.display().to_string()),
+            false,
+        ));
+        assert_eq!(env["ok"], false, "{env}");
+        assert_eq!(env["error"]["code"], "FSNOW-3004", "{env}");
+        assert!(!out.exists(), "a refused export leaves no file");
+        assert_eq!(
+            export_max_rows(Some("0"), "demo").map_err(|e| e.code).err(),
+            Some(SnowflakeErrorCode::UsageError)
+        );
+        assert_eq!(
+            export_max_rows(None, "demo").ok(),
+            Some(DEFAULT_EXPORT_MAX_ROWS)
         );
         Ok(())
     }
@@ -4127,6 +6525,60 @@ mod tests {
                 .is_some_and(|e| e.message.contains("panicked: index out of bounds")),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn credit_settings_parse_as_exact_millionths() {
+        assert_eq!(parse_microcredits("0.05"), Some(50_000));
+        assert_eq!(parse_microcredits("1"), Some(1_000_000));
+        assert_eq!(parse_microcredits(".000001"), Some(1));
+        assert_eq!(parse_microcredits("2.5"), Some(2_500_000));
+        for bad in [
+            "0",
+            "0.0",
+            "-1",
+            "1e3",
+            "abc",
+            "0.0000001",
+            "",
+            ".",
+            "1.2.3",
+        ] {
+            assert_eq!(parse_microcredits(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn warehouse_rates_come_from_the_published_gen1_table_only() {
+        assert_eq!(
+            warehouse_row_rate(
+                Some("STANDARD"),
+                Some("X-Small"),
+                Some("1"),
+                Some("STARTED")
+            ),
+            Ok((1_000_000, false))
+        );
+        assert_eq!(
+            warehouse_row_rate(Some("STANDARD"), Some("6X-Large"), None, Some("SUSPENDED")),
+            Ok((512_000_000, true))
+        );
+        assert_eq!(
+            warehouse_row_rate(
+                Some("STANDARD"),
+                Some("Medium"),
+                Some("1"),
+                Some("RESIZING")
+            ),
+            Ok((4_000_000, false))
+        );
+        assert_eq!(gen1_microcredits_per_hour("X5LARGE"), Some(256_000_000));
+        // Negatives: no published rate is refused, never guessed.
+        assert!(warehouse_row_rate(Some("STANDARD"), Some("X-Small"), Some("2"), None).is_err());
+        assert!(
+            warehouse_row_rate(Some("SNOWPARK-OPTIMIZED"), Some("Medium"), None, None).is_err()
+        );
+        assert!(warehouse_row_rate(Some("STANDARD"), Some("Enormous"), Some("1"), None).is_err());
     }
 
     /// Reality-check bead C6: a cancelled statement is not an internal error at
@@ -4246,7 +6698,9 @@ mod tests {
         };
         let script = install("demo", None, None, vec![rows_inserted(), rows_inserted()]);
         let confirm_id = local_store::random_id().unwrap();
+        let grant = crate::tests::authorized_insert().unwrap();
         let write = |confirmed: Option<String>| AuthorizedWrite {
+            grant: &grant,
             sql: "insert into t values (1)",
             statement_kind: "insert",
             safety_class: "dml",
@@ -4290,10 +6744,12 @@ mod tests {
     /// untouched.
     #[test]
     fn a_pending_signal_cancels_the_statement_context() {
-        let run = |interrupt: bool, terminate: bool| {
+        let run = |interrupt: bool, terminate: bool, external: bool| {
             let runtime = RuntimeBuilder::current_thread().build().unwrap();
             let interrupt = AtomicBool::new(interrupt);
             let terminate = AtomicBool::new(terminate);
+            // An MCP request's cancel probe (reality-check bead E2).
+            let external = external.then(|| Arc::new(|| true) as CancelProbe);
             runtime.block_on(async move {
                 let cx = Cx::current().unwrap();
                 // Stands in for the driver's poll wait: runs until its context
@@ -4311,13 +6767,14 @@ mod tests {
                     }
                     None
                 };
-                cancel_on_flags(&cx, work, &interrupt, &terminate).await
+                cancel_on_flags(&cx, work, &interrupt, &terminate, external).await
             })
         };
-        assert_eq!(run(true, false), Some(CancelKind::User));
-        assert_eq!(run(false, true), Some(CancelKind::Shutdown));
+        assert_eq!(run(true, false, false), Some(CancelKind::User));
+        assert_eq!(run(false, true, false), Some(CancelKind::Shutdown));
+        assert_eq!(run(false, false, true), Some(CancelKind::User));
         assert_eq!(
-            run(false, false),
+            run(false, false, false),
             None,
             "nothing pending: the work is not cancelled"
         );
@@ -4495,6 +6952,378 @@ mod tests {
         let warning = crate::render_json(&degraded.warnings[0]);
         assert!(warning.contains("EVENT_DATE"), "{warning}");
         assert!(!warning.contains("not-a-day-count"), "{warning}");
+    }
+
+    /// Reality-check bead C1: typed rows match the published JSON Schema
+    /// (docs/protocol/typed_rows.v1.schema.json) cell by cell, every
+    /// representation is exercised, the published example is exactly what the
+    /// codec fixture projects to, and the shapes a naive decoder produces fail.
+    #[test]
+    fn typed_rows_match_the_published_schema_and_example() {
+        use franken_snowflake_sqlapi::lifecycle::{Progress, StatementMachine};
+        use franken_snowflake_sqlapi::status::ResponseClass;
+        use std::collections::BTreeSet;
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/protocol/typed_rows.v1.schema.json"
+        ))
+        .expect("the schema is JSON");
+        let example: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/protocol/typed_rows.v1.example.json"
+        ))
+        .expect("the example is JSON");
+        let project = |body: &[u8]| -> serde_json::Value {
+            let mut machine = StatementMachine::new(PollPlan::default());
+            let Ok(Progress::Complete(done)) = machine.on_submit(ResponseClass::Completed, body)
+            else {
+                panic!("a completed statement");
+            };
+            let rows = into_rows(done, DriverStats::default(), "req".to_owned());
+            let projected = project_rows(&rows, rows.rows.len(), RowEncoding::Typed);
+            let parse = |json: &Json| -> serde_json::Value {
+                serde_json::from_str(&crate::render_json(json)).unwrap_or_default()
+            };
+            serde_json::json!({
+                "row_encoding": RowEncoding::Typed.token(),
+                "columns": parse(&projected.columns),
+                "rows": parse(&projected.rows),
+            })
+        };
+        let fixture = project(include_bytes!(
+            "../../franken-snowflake-testkit/fixtures/sqlapi/jsonv2_codec_cells.json"
+        ));
+        assert_eq!(fixture, example, "docs/protocol/typed_rows.v1.example.json");
+        // The two representations the fixture lacks: a small exact integer
+        // and a type without a typed form.
+        let extra = project(
+            br#"{"code":"090001","statementHandle":"01b2c3d4-0000-0000-0000-00000000c1c1","resultSetMetaData":{"numRows":2,"format":"jsonv2","rowType":[{"name":"ID","type":"FIXED","precision":9,"scale":0,"nullable":false},{"name":"PLACE","type":"GEOGRAPHY","nullable":true}],"partitionInfo":[{"rowCount":2,"uncompressedSize":64}]},"data":[["-42","POINT(1 2)"],["7",null]]}"#,
+        );
+        let compile = |schema: &serde_json::Value| {
+            jsonschema::validator_for(schema).expect("the schema compiles")
+        };
+        let whole = compile(&schema);
+        let violations = |data: &serde_json::Value| -> Vec<String> {
+            let mut found: Vec<String> = whole
+                .iter_errors(data)
+                .map(|error| error.to_string())
+                .collect();
+            let columns = data["columns"].as_array().cloned().unwrap_or_default();
+            for (index, column) in columns.iter().enumerate() {
+                let repr = column["json_repr"].as_str().unwrap_or_default();
+                let cell = compile(&serde_json::json!({
+                    "$schema": schema["$schema"],
+                    "$defs": schema["$defs"],
+                    "$ref": format!("#/$defs/cell_{repr}"),
+                }));
+                for row in data["rows"].as_array().into_iter().flatten() {
+                    if !cell.is_valid(&row[index]) {
+                        found.push(format!("{}: {} is not {repr}", column["name"], row[index]));
+                    }
+                }
+            }
+            found
+        };
+        assert_eq!(violations(&fixture), Vec::<String>::new());
+        assert_eq!(violations(&extra), Vec::<String>::new());
+        let exercised: BTreeSet<String> = [&fixture, &extra]
+            .iter()
+            .flat_map(|data| data["columns"].as_array().cloned().unwrap_or_default())
+            .filter_map(|column| column["json_repr"].as_str().map(str::to_owned))
+            .collect();
+        let published: BTreeSet<String> =
+            schema["$defs"]["column"]["properties"]["json_repr"]["enum"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|repr| repr.as_str().map(str::to_owned))
+                .collect();
+        assert_eq!(exercised, published, "every representation is exercised");
+        // Shapes a naive decoder produces fail.
+        for (column, naive) in [
+            // FIXED(38,2) through a float.
+            (0, serde_json::json!(12_345_678_901_234_567.89)),
+            // BOOLEAN left as text.
+            (4, serde_json::json!("true")),
+            // DATE as the wire day count.
+            (5, serde_json::json!(18_262)),
+            // TIME without its nine fractional digits.
+            (6, serde_json::json!("23:01:59")),
+            // TIMESTAMP_TZ without its offset.
+            (9, serde_json::json!("2021-03-19T18:06:59.000000000")),
+            // Odd-length hex.
+            (10, serde_json::json!("DEADBEE")),
+        ] {
+            let mut broken = fixture.clone();
+            broken["rows"][0][column] = naive.clone();
+            assert!(
+                !violations(&broken).is_empty(),
+                "{naive} passed as column {column}"
+            );
+        }
+    }
+
+    /// Reality-check bead L5: only a completed receipt with a UUID-shaped
+    /// query id inside the ~24 h result retention can be refetched.
+    #[test]
+    fn refetch_needs_a_fresh_completed_receipt_with_a_query_id() {
+        let record =
+            |outcome: &str, query_id: Option<&str>, created_at_ms: u64| QueryReceiptRecord {
+                receipt_id: "r1".to_owned(),
+                plan_id: "p".to_owned(),
+                profile_id: "demo".to_owned(),
+                command_id: "query.run".to_owned(),
+                trace_id: "t".to_owned(),
+                outcome_kind: outcome.to_owned(),
+                receipt_state: "completed".to_owned(),
+                statement_handle: query_id.map(str::to_owned),
+                snowflake_query_id: query_id.map(str::to_owned),
+                request_id: None,
+                row_count: Some(1),
+                receipt: VerifiedPayload {
+                    canonical: "{}".to_owned(),
+                    address: CacheAddress::blake3(b"{}"),
+                },
+                created_at_ms,
+            };
+        let id = "01b2c3d4-0000-0000-0000-00000000ab21";
+        let now = 10 * RESULT_RETENTION_MS;
+        assert_eq!(
+            refetch_query_id(&record("ok", Some(id), now - 1_000), now).ok(),
+            Some(id.to_owned())
+        );
+        let failed = refetch_query_id(&record("error", Some(id), now), now)
+            .err()
+            .map(|e| e.code);
+        assert_eq!(failed, Some(SnowflakeErrorCode::MetadataError));
+        let missing = refetch_query_id(&record("ok", None, now), now)
+            .err()
+            .map(|e| e.code);
+        assert_eq!(missing, Some(SnowflakeErrorCode::MetadataError));
+        // Never interpolate anything but a UUID-shaped id into RESULT_SCAN.
+        for bad in [
+            "x'); drop table t; --",
+            "01b2c3d4-0000-0000-0000",
+            "01b2c3d4-0000-0000-0000-00000000ab2g",
+        ] {
+            let refused = refetch_query_id(&record("ok", Some(bad), now), now)
+                .err()
+                .map(|e| e.code);
+            assert_eq!(refused, Some(SnowflakeErrorCode::MetadataError), "{bad}");
+        }
+        let expired = refetch_query_id(&record("ok", Some(id), now - RESULT_RETENTION_MS - 1), now)
+            .err()
+            .map(|e| e.code);
+        assert_eq!(expired, Some(SnowflakeErrorCode::CacheError));
+    }
+
+    /// Reality-check bead oj0.25: the grant walk follows granted roles and
+    /// flags write-capable privileges with the role they come from.
+    #[test]
+    fn role_write_check_walks_granted_roles() {
+        let grants = |handle: &str, rows: &[[&str; 3]]| {
+            completed(
+                handle,
+                &[
+                    ("privilege", "TEXT"),
+                    ("granted_on", "TEXT"),
+                    ("name", "TEXT"),
+                ],
+                &rows
+                    .iter()
+                    .map(|row| row.iter().map(|cell| Some(*cell)).collect())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let script = install(
+            "demo",
+            None,
+            None,
+            vec![
+                Ok(completed(
+                    "01b2c3d4-0000-0000-0000-00000000ab31",
+                    &[("CURRENT_ROLE()", "TEXT")],
+                    &[vec![Some("ANALYST")]],
+                )),
+                Ok(grants(
+                    "01b2c3d4-0000-0000-0000-00000000ab32",
+                    &[
+                        ["USAGE", "WAREHOUSE", "WH"],
+                        ["SELECT", "TABLE", "DB.S.T"],
+                        ["USAGE", "ROLE", "LOADER"],
+                    ],
+                )),
+                Ok(grants(
+                    "01b2c3d4-0000-0000-0000-00000000ab33",
+                    &[
+                        ["INSERT", "TABLE", "DB.S.T"],
+                        ["CREATE TABLE", "SCHEMA", "DB.S"],
+                    ],
+                )),
+            ],
+        );
+        let conn = LiveConn::resolve("demo", &SessionOverrides::default()).unwrap();
+        let check = role_write_check(&conn);
+        assert_eq!(check.role.as_deref(), Some("ANALYST"));
+        assert_eq!(check.roles_checked, ["ANALYST", "LOADER"]);
+        assert_eq!(
+            check.write_grants,
+            [
+                "INSERT on TABLE DB.S.T (via LOADER)",
+                "CREATE TABLE on SCHEMA DB.S (via LOADER)"
+            ]
+        );
+        let statements: Vec<String> = script
+            .submitted()
+            .into_iter()
+            .map(|request| request.statement)
+            .collect();
+        assert_eq!(statements[1], r#"SHOW GRANTS TO ROLE "ANALYST""#);
+        assert_eq!(statements[2], r#"SHOW GRANTS TO ROLE "LOADER""#);
+    }
+
+    #[test]
+    fn role_verdict_warns_refuses_and_passes() {
+        let check = |write_grants: &[&str], error: Option<&str>| RoleCheck {
+            role: Some("R".to_owned()),
+            write_grants: write_grants
+                .iter()
+                .map(|grant| (*grant).to_owned())
+                .collect(),
+            roles_checked: vec!["R".to_owned()],
+            partial: false,
+            error: error.map(str::to_owned),
+        };
+        // Read-only grants: no warning, no refusal, write_capable false.
+        let (data, warnings, refusal) = role_verdict(&check(&[], None), true, true);
+        assert!(warnings.is_empty() && refusal.is_none());
+        assert!(crate::render_json(&data).contains(r#""write_capable":false"#));
+        // A write grant on a read profile warns.
+        let (_, warnings, refusal) =
+            role_verdict(&check(&["INSERT on TABLE T"], None), true, false);
+        assert_eq!(warnings.len(), 1);
+        assert!(refusal.is_none());
+        assert!(crate::render_json(&warnings[0]).contains("can mutate data (INSERT on TABLE T)"));
+        // READ_ONLY_EXPECTED turns it into a profile error (exit 3).
+        let (_, _, refusal) = role_verdict(&check(&["INSERT on TABLE T"], None), true, true);
+        assert_eq!(
+            refusal.map(|error| error.code),
+            Some(SnowflakeErrorCode::ProfileInvalid)
+        );
+        // A write profile is expected to write: no warning.
+        let (_, warnings, refusal) =
+            role_verdict(&check(&["INSERT on TABLE T"], None), false, false);
+        assert!(warnings.is_empty() && refusal.is_none());
+        // An unverifiable check fails closed only when read-only is expected.
+        let (data, warnings, refusal) =
+            role_verdict(&check(&[], Some("SHOW GRANTS failed")), true, false);
+        assert!(warnings.is_empty() && refusal.is_none());
+        assert!(crate::render_json(&data).contains(r#""write_capable":null"#));
+        let (_, _, refusal) = role_verdict(&check(&[], Some("SHOW GRANTS failed")), true, true);
+        assert!(refusal.is_some());
+        assert!(is_write_capable_privilege("apply masking policy"));
+        assert!(!is_write_capable_privilege("SELECT"));
+        assert!(!is_write_capable_privilege("USAGE"));
+        assert_eq!(quoted_identifier(r#"we"ird"#), r#""we""ird""#);
+    }
+
+    #[test]
+    fn progress_lines_are_one_json_object_per_event() {
+        let line = progress_line(
+            &DriverEvent::PartitionFetched {
+                index: 2,
+                rows: 10,
+                bytes: 512,
+            },
+            7,
+        );
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+        assert_eq!(value["event"], "partition_fetched");
+        assert_eq!(value["index"], 2);
+        assert_eq!(value["rows"], 10);
+        assert_eq!(value["bytes"], 512);
+        assert_eq!(value["elapsed_ms"], 7);
+        assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn the_run_observer_keeps_the_handle_and_the_cancel_answer() {
+        let mut observer = RunObserver::new(false);
+        observer.event(DriverEvent::Submitted {
+            statement_handle: Some("01b2-handle".to_owned()),
+            running: true,
+        });
+        observer.event(DriverEvent::Polled { polls: 1 });
+        observer.event(DriverEvent::RemoteCancel {
+            statement_handle: "01b2-handle".to_owned(),
+            acknowledged: true,
+            detail: "completed".to_owned(),
+        });
+        assert_eq!(
+            observer.facts,
+            RunFacts {
+                statement_handle: Some("01b2-handle".to_owned()),
+                remote_cancel: Some((true, "completed".to_owned())),
+            }
+        );
+        let extra = terminal_run_json(&observer.facts);
+        assert_eq!(extra["accepted_by_snowflake"], true);
+        assert_eq!(extra["remote_cancel"]["acknowledged"], true);
+        // Never accepted (cancelled while connecting): no handle, no cancel.
+        let never = terminal_run_json(&RunFacts::default());
+        assert_eq!(never["accepted_by_snowflake"], false);
+        assert!(never.get("remote_cancel").is_none());
+        let line = progress_line(
+            &DriverEvent::RemoteCancel {
+                statement_handle: "h".to_owned(),
+                acknowledged: false,
+                detail: "unexpected".to_owned(),
+            },
+            3,
+        );
+        assert!(line.contains(r#""event":"remote_cancel""#), "{line}");
+    }
+
+    /// Bead w0i.11: a run on a thread with a progress sink hands every driver
+    /// event to it; the sink is gone once the scope ends.
+    #[test]
+    fn the_run_observer_feeds_the_threads_progress_sink() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        with_progress_sink(
+            Arc::new(move |event: &DriverEvent| {
+                if let Ok(mut events) = recorded.lock() {
+                    events.push(progress_line(event, 0));
+                }
+            }),
+            || {
+                let mut observer = RunObserver::new(false);
+                observer.event(DriverEvent::Submitted {
+                    statement_handle: Some("01b2-handle".to_owned()),
+                    running: false,
+                });
+                observer.event(DriverEvent::Completed {
+                    rows: 3,
+                    partitions: 1,
+                });
+            },
+        );
+        let lines = seen.lock().map(|events| events.clone()).unwrap_or_default();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("01b2-handle"), "{lines:?}");
+        let mut after = RunObserver::new(false);
+        after.event(DriverEvent::Polled { polls: 1 });
+        assert_eq!(seen.lock().map(|events| events.len()).unwrap_or(0), 2);
+    }
+
+    #[test]
+    fn signal_cancelled_runs_exit_130_or_143() {
+        assert_eq!(signal_status(true, false), Some(130));
+        assert_eq!(signal_status(false, true), Some(143));
+        assert_eq!(
+            signal_status(true, true),
+            Some(130),
+            "SIGINT was the cancel"
+        );
+        assert_eq!(signal_status(false, false), None);
     }
 
     #[test]

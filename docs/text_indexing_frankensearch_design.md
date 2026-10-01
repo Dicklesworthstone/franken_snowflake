@@ -12,7 +12,8 @@ The first supported tiers are:
 
 - `hash`: deterministic Frankensearch hash embedder for cheap lexical-like
   retrieval and no model downloads.
-- `lexical`: Frankensearch's Tantivy BM25 backend.
+- `lexical`: Frankensearch's Tantivy BM25 backend (Frankensearch 0.6's
+  `lexical-tantivy` feature; its `lexical` feature is now the Quill engine).
 
 The lane must not enable `semantic`, `model2vec`, `fastembed`, `download`,
 `full`, `persistent`, `durable`, `ann`, `api`, or `fastembed-reranker`. Those
@@ -28,8 +29,8 @@ catalog-search path, never an initial retriever, and never enabled by default.
 | Feature | Default | Dependencies | Contract |
 |---|---:|---|---|
 | none | yes | `franken-snowflake-core`, `serde` | Stable text chunk, handle, rights, and reranker contracts only. |
-| `frankensearch` | no | `frankensearch` with `default-features = false`, `features = ["hash", "lexical"]` | Build/query adapters using `IndexBuilder::add_document` and `TwoTierSearcher` with a Tantivy lexical backend. |
-| `rerank` | no | none in this bead | Exposes the top-K policy seam. A future native reranker implementation may attach here after a separate forbidden-dependency proof. |
+| `frankensearch` | no | `frankensearch` 0.6 with `default-features = false`, `features = ["hash", "lexical-tantivy"]` | Build/query adapters: `IndexBuilder` for the hash vector tiers, a Tantivy lexical arm the adapter writes, and `TwoTierSearcher` over both. |
+| (no feature) | always | none | The top-K reranker seam (`TextReranker`, `NoopReranker`, `RerankPolicy`) is always compiled; a former empty `rerank` feature was removed (it compiled nothing). A future native reranker gets its own feature once it exists, after a separate forbidden-dependency proof. |
 
 The default workspace build excludes both Frankensearch and rerank. The
 feature-gated check lane is:
@@ -105,17 +106,31 @@ same stable handle.
    read-only rights policy.
 2. Build `TextChunk` values with stable handles, rights metadata, and redacted
    provenance.
-3. With the `frankensearch` feature enabled, call Frankensearch
-   `IndexBuilder::add_document(handle, text)` for each chunk. The adapter pins a
-   hash embedder stack and relies on Frankensearch to write the optional lexical
-   index under `index_dir/lexical`.
+3. With the `frankensearch` feature enabled, add each chunk to a Frankensearch
+   `IndexBuilder` (id = handle) with a pinned hash embedder stack, then write
+   the same documents to a Tantivy lexical index under `index_dir/lexical`.
 4. Query with `TwoTierSearcher::search_collect`, attaching the Tantivy lexical
    backend from `index_dir/lexical`.
 5. Map `doc_id` values back to `TextDocumentHandle` and then to receipt/source
    metadata maintained by the caller.
 
-The crate does not store the caller's source map. That belongs in the cache
-repository once the index location is durable.
+The crate does not store the caller's source map; the CLI does, next to each
+index.
+
+## CLI Surface
+
+`text index` runs one read statement (the `export run` guard, receipt and
+`--max-rows` bound), turns every non-null, non-blank cell of the `--column`s into
+a chunk (`chunks_from_rows`: ordinal = row, title = the `--id-column` value,
+rights class `restricted`), and writes a version under
+`<data dir>/text-indexes/<name>/<version>/`: `manifest.json` (receipt hash,
+statement handle, redacted SQL preview, columns, counts), `documents.jsonl` (the
+chunks, which map a `doc_id` back to its cell), and `index/` (Frankensearch).
+`current.json`, replaced by write-then-rename, names the version `text search`
+reads; a rebuild never deletes the older version and never answers from it.
+`text search` is offline and returns each hit's row, column, id, a snippet of at
+most 240 characters, and the manifest as provenance. Both are MCP tools
+(`text_index`, `text_search`).
 
 ## Reranker Seam
 

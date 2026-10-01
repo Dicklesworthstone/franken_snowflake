@@ -53,10 +53,10 @@ The script has a built-in parser self-test that injects the known bad
 Franken runtime package versions, then asserts that the gate catches them.
 
 The Windows build host (via `dsr`; this repository never uses GitHub Actions)
-has one explicit upstream prerequisite for the non-default cache feature:
-FrankenSQLite must re-gate the Unix-only `nix` dependency in `fsqlite-vfs` and
-`fsqlite-mvcc` from `cfg(not(target_arch = "wasm32"))` to `cfg(unix)`, then add
-its own full-workspace Windows build. Until that lands, run this gate on
-Windows with `FSNOW_SKIP_FSQLITE_WINDOWS_PREREQ=1` so only the cache crate's
-`frankensqlite` lane is skipped (it emits a structured `lane_skipped` event).
-The default cache crate and all other workspace lanes still run on Windows.
+used to need an upstream fix for the non-default cache feature: FrankenSQLite's
+`fsqlite-vfs`/`fsqlite-mvcc` gated the Unix-only `nix` dependency under
+`cfg(not(target_arch = "wasm32"))`. The FrankenSQLite 0.4.x crates this
+workspace pins (fsqlite 0.4.4) build on Windows: the cache crate's
+`frankensqlite` tests passed natively on the Windows host on 2026-09-25. The
+gate's former `FSNOW_SKIP_FSQLITE_WINDOWS_PREREQ` escape hatch is removed; every
+lane runs on every host.
