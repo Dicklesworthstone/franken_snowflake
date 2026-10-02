@@ -30,6 +30,7 @@ use franken_snowflake_core::error::{SnowflakeError, SnowflakeErrorCode};
 use franken_snowflake_core::ids::StatementHandle;
 use franken_snowflake_core::outcome::SnowflakeOutcome;
 use franken_snowflake_core::redact::redact;
+use franken_snowflake_core::sql_lexer;
 use franken_snowflake_http::{
     AuthorizationDescriptor, CancelHttpResponse, PartitionBody, PartitionHttpRequest,
     PollHttpRequest, PollHttpResponse, RawHttp, SnowflakeHttpClient, StatusClass,
@@ -752,15 +753,37 @@ async fn submit<T: StatementTransport, A: AuthProvider>(
             ));
         }
     };
+    // A read that carries the idempotency contract need not wait for its
+    // synchronous answer to learn what to cancel (bead bsrp): resubmitted with
+    // the same requestId, `retry=true` and `async=true`, Snowflake runs nothing
+    // again and answers at once with the running statement's handle (observed
+    // live 2026-09-29: 0.3 s, the original's handle, 4 s into a 25 s statement;
+    // https://docs.snowflake.com/en/developer-guide/sql-api/submitting-requests,
+    // consulted the same day). A write keeps waiting: should the first POST
+    // never have arrived, the resubmit would start it.
+    let answer_early = !params.asynchronous
+        && params.retry
+        && params.request_id.is_some()
+        && sql_lexer::is_side_effect_free_read(&request.statement);
+    let mut learn_handle = false;
     let submit_response = loop {
+        let route = if learn_handle {
+            submit_route(&SubmitQueryParams {
+                asynchronous: true,
+                ..params.clone()
+            })
+        } else {
+            submit_route(params)
+        };
         let submit = SubmitHttpRequest {
-            route: submit_route(params),
+            route,
             auth: auth.clone(),
             body: body.clone(),
             retry_resubmit: params.retry,
         };
-        // Nothing is sent once the caller has given up.
-        if cx.checkpoint().is_err() {
+        // Nothing is sent once the caller has given up, except the resubmit
+        // that asks which statement an abandoned POST started.
+        if !learn_handle && cx.checkpoint().is_err() {
             return SnowflakeOutcome::cancelled(local_cancel_reason(cx));
         }
         // Once the POST is on the wire Snowflake may accept the statement, and
@@ -769,8 +792,19 @@ async fn submit<T: StatementTransport, A: AuthProvider>(
         // that answer, bounded by the transport's deadline and attempt timeout,
         // and the poll loop's first checkpoint then cancels the statement.
         // Unmasked, the cancel would abandon the answer and orphan the
-        // statement until its server-side timeout.
-        match run_with_cancellation_mask(cx, client.submit_statement(cx, submit)).await {
+        // statement until its server-side timeout. A read abandons it instead
+        // and asks for the handle with the async resubmit.
+        let exchange = run_with_cancellation_mask(cx, client.submit_statement(cx, submit));
+        let answer = if answer_early && !learn_handle {
+            let Some(answer) = answered_before_cancel(cx, exchange).await else {
+                learn_handle = true;
+                continue;
+            };
+            answer
+        } else {
+            exchange.await
+        };
+        match answer {
             SnowflakeOutcome::Ok(response) if response.status == StatusClass::Unauthorized => {
                 // No handle was issued, so a resubmit with the same requestId
                 // is safe; nothing to cancel server-side.
@@ -1453,6 +1487,23 @@ async fn cancel_locally<T: StatementTransport>(
     SnowflakeOutcome::cancelled(reason)
 }
 
+/// Await `exchange`, or `None` once `cx` is asked to cancel while it is still
+/// unanswered. The exchange is dropped with the `None`.
+async fn answered_before_cancel<T>(cx: &Cx, exchange: impl Future<Output = T>) -> Option<T> {
+    let mut exchange = std::pin::pin!(exchange);
+    std::future::poll_fn(|task| {
+        if let Poll::Ready(answer) = exchange.as_mut().poll(task) {
+            return Poll::Ready(Some(answer));
+        }
+        if cx.is_cancel_requested() {
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
 fn local_cancel_reason(cx: &Cx) -> CancelReason {
     cx.cancel_reason()
         .unwrap_or_else(CancelReason::parent_cancelled)
@@ -1620,6 +1671,13 @@ mod tests {
         yield_once: Cell<bool>,
         /// Every statement whose driver future was dropped mid-flight.
         dropped_cancels: RefCell<Vec<StatementHandle>>,
+        /// The query pairs of every submit, in order.
+        submit_queries: RefCell<Vec<Vec<(&'static str, String)>>>,
+        /// When set, the caller's cancel lands while a synchronous submit is
+        /// unanswered; the answer comes one poll later, if anyone still waits.
+        cancel_mid_sync_submit: Cell<bool>,
+        /// Whether a synchronous submit's answer was waited for.
+        sync_submit_answered: Cell<bool>,
     }
 
     impl FakeTransport {
@@ -1639,6 +1697,9 @@ mod tests {
                 partition_events: RefCell::new(Vec::new()),
                 yield_once: Cell::new(false),
                 dropped_cancels: RefCell::new(Vec::new()),
+                submit_queries: RefCell::new(Vec::new()),
+                cancel_mid_sync_submit: Cell::new(false),
+                sync_submit_answered: Cell::new(false),
             }
         }
 
@@ -1667,12 +1728,32 @@ mod tests {
     impl StatementTransport for FakeTransport {
         async fn submit_statement(
             &self,
-            _cx: &Cx,
+            cx: &Cx,
             request: SubmitHttpRequest,
         ) -> TransportOutcome<SubmitHttpResponse> {
             self.auth_seen
                 .borrow_mut()
                 .push(request.auth.redacted_fingerprint().to_owned());
+            let query = match &request.route {
+                TransportRoute::SubmitWithQuery { query } => query.clone(),
+                _ => Vec::new(),
+            };
+            let asynchronous = query.iter().any(|(key, _)| *key == "async");
+            self.submit_queries.borrow_mut().push(query);
+            if self.cancel_mid_sync_submit.get() && !asynchronous {
+                let mut interrupted = false;
+                std::future::poll_fn(|task| {
+                    if interrupted {
+                        return Poll::Ready(());
+                    }
+                    interrupted = true;
+                    cx.set_cancel_requested(true);
+                    task.waker().wake_by_ref();
+                    Poll::Pending
+                })
+                .await;
+                self.sync_submit_answered.set(true);
+            }
             let scripted = self
                 .submit_first
                 .borrow_mut()
@@ -3754,6 +3835,99 @@ mod tests {
             assert!(transport.cancels_after_local.borrow().is_empty());
             assert!(transport.orphan_cancels.borrow().is_empty());
         });
+    }
+
+    fn idempotent_params() -> SubmitQueryParams {
+        SubmitQueryParams {
+            request_id: Some("0b5e7a9c-0000-4000-8000-000000000b5e".to_owned()),
+            retry: true,
+            ..SubmitQueryParams::default()
+        }
+    }
+
+    /// Run `sql` with the caller's cancel landing mid synchronous submit.
+    fn cancel_mid_submit(
+        sql: &str,
+        params: SubmitQueryParams,
+    ) -> (StatementOutcome, FakeTransport) {
+        let transport = FakeTransport::new(Scripted::Ok(StatusClass::Running, RESP_202.to_vec()));
+        transport.cancel_mid_sync_submit.set(true);
+        let mut slot = None;
+        let (fake, ended) = (&transport, &mut slot);
+        asupersync::test_utils::run_test(move || async move {
+            let cx = Cx::for_testing();
+            let (outcome, _) = run_statement_with_stats(
+                &cx,
+                fake,
+                fake_auth(),
+                SubmitStatementRequest::new(sql),
+                params,
+                PollPlan::default(),
+            )
+            .await;
+            *ended = Some(outcome);
+        });
+        let outcome = slot.expect("the statement ran to an outcome");
+        (outcome, transport)
+    }
+
+    /// Bead bsrp: a read cancelled while its synchronous submit is unanswered
+    /// does not wait up to 45 s for that answer. It abandons the POST, asks
+    /// for the handle with the same requestId (`retry=true`, `async=true`),
+    /// and cancels the statement that names.
+    #[test]
+    fn a_read_cancelled_mid_submit_learns_its_handle_at_once() {
+        let (outcome, transport) = cancel_mid_submit("select system$wait(60)", idempotent_params());
+        assert!(
+            matches!(outcome, SnowflakeOutcome::Cancelled(_)),
+            "{outcome:?}"
+        );
+        assert!(
+            !transport.sync_submit_answered.get(),
+            "the synchronous answer was not waited for"
+        );
+        let request_id = (
+            "requestId",
+            idempotent_params().request_id.unwrap_or_default(),
+        );
+        assert_eq!(
+            *transport.submit_queries.borrow(),
+            vec![
+                vec![request_id.clone(), ("retry", "true".to_owned())],
+                vec![
+                    request_id,
+                    ("retry", "true".to_owned()),
+                    ("async", "true".to_owned())
+                ],
+            ]
+        );
+        let cancels = transport.cancels_after_local.borrow();
+        assert_eq!(cancels.len(), 1);
+        assert_eq!(cancels[0].0, fixture_handle());
+        assert!(transport.orphan_cancels.borrow().is_empty());
+    }
+
+    /// The negative side of bead bsrp: a write, and a read without the
+    /// idempotency contract, keep waiting for the synchronous answer and then
+    /// cancel; nothing is resubmitted.
+    #[test]
+    fn a_write_or_a_non_idempotent_read_keeps_waiting_for_the_answer() {
+        for (sql, params) in [
+            ("insert into t values (1)", idempotent_params()),
+            ("select 1; delete from t", idempotent_params()),
+            ("select 1", SubmitQueryParams::default()),
+        ] {
+            let (outcome, transport) = cancel_mid_submit(sql, params);
+            assert!(
+                matches!(outcome, SnowflakeOutcome::Cancelled(_)),
+                "{sql}: {outcome:?}"
+            );
+            assert!(transport.sync_submit_answered.get(), "{sql}");
+            assert_eq!(transport.submit_queries.borrow().len(), 1, "{sql}");
+            let cancels = transport.cancels_after_local.borrow();
+            assert_eq!(cancels.len(), 1, "{sql}");
+            assert_eq!(cancels[0].0, fixture_handle(), "{sql}");
+        }
     }
 
     #[test]

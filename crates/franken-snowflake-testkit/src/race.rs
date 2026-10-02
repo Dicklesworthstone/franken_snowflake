@@ -182,6 +182,9 @@ pub struct RaceCaseReport {
     pub plain_submits: u32,
     /// Idempotent `POST /api/v2/statements?requestId=...&retry=true` attempts.
     pub retry_submits: u32,
+    /// The subset of submits with `async=true`: a driver asking which
+    /// statement an abandoned synchronous submit started (bead bsrp).
+    pub async_submits: u32,
     /// Poll GET attempts, including retryable failures.
     pub polls: u32,
     /// Partition GET attempts, including retryable failures.
@@ -756,6 +759,7 @@ fn run_production_driver(
         virtual_tcp_exchanges: counters.virtual_tcp_exchanges,
         plain_submits: counters.plain_submits,
         retry_submits: counters.retry_submits,
+        async_submits: counters.async_submits,
         polls: counters.polls,
         partitions: counters.partitions,
         cancels: counters.cancels,
@@ -1280,6 +1284,7 @@ impl<'a> RaceDriver<'a> {
             virtual_tcp_exchanges: counters.virtual_tcp_exchanges,
             plain_submits: counters.plain_submits,
             retry_submits: counters.retry_submits,
+            async_submits: counters.async_submits,
             polls: counters.polls,
             partitions: counters.partitions,
             cancels: counters.cancels,
@@ -1351,6 +1356,7 @@ struct RaceCounters {
     virtual_tcp_exchanges: u32,
     plain_submits: u32,
     retry_submits: u32,
+    async_submits: u32,
     polls: u32,
     partitions: u32,
     cancels: u32,
@@ -1515,6 +1521,9 @@ impl RaceServerState {
             }
             (MockMethod::Post, path) if path.starts_with("/api/v2/statements?") => {
                 self.counters.retry_submits = self.counters.retry_submits.saturating_add(1);
+                if path.contains("async=true") {
+                    self.counters.async_submits = self.counters.async_submits.saturating_add(1);
+                }
             }
             (MockMethod::Get, path) if path.contains("?partition=") => {
                 self.counters.partitions = self.counters.partitions.saturating_add(1);
@@ -1848,6 +1857,7 @@ fn failed_report(runtime: &LabRuntime, case: RaceCaseKind, error: RaceError) -> 
         virtual_tcp_exchanges: 0,
         plain_submits: 0,
         retry_submits: 0,
+        async_submits: 0,
         polls: 0,
         partitions: 0,
         cancels: 0,
@@ -1881,6 +1891,7 @@ fn poisoned_report(case: RaceCaseKind, seed: u64, name: &'static str) -> RaceCas
         virtual_tcp_exchanges: 0,
         plain_submits: 0,
         retry_submits: 0,
+        async_submits: 0,
         polls: 0,
         partitions: 0,
         cancels: 0,
@@ -1996,6 +2007,17 @@ mod tests {
             driver
                 .iter()
                 .any(|schedule| schedule.cancelled && schedule.cancels >= 1),
+            "{driver:#?}"
+        );
+        // Bead bsrp: DPOR also lands the cancel while the synchronous submit
+        // is unanswered. The driver (a read with requestId + retry=true) then
+        // asks for the handle with the async resubmit instead of waiting, and
+        // the statement still ran once and was cancelled.
+        assert!(
+            driver.iter().any(|schedule| schedule.async_submits >= 1
+                && schedule.cancelled
+                && schedule.cancels >= 1
+                && schedule.no_double_submit),
             "{driver:#?}"
         );
         // The partition window, raced: every conclusive schedule resolves its

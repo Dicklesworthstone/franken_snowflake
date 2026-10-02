@@ -442,6 +442,23 @@ pub fn read_side_effect(lexed: &SqlLex<'_>) -> Option<String> {
     })
 }
 
+/// True when running `sql` a second time would change nothing: it lexes
+/// reliably, it holds at least one statement, and every statement is a read
+/// with no [`read_side_effect`]. Fails closed (bead bsrp): anything the lexer
+/// cannot trust, or any statement that is not plainly a read, is `false`.
+#[must_use]
+pub fn is_side_effect_free_read(sql: &str) -> bool {
+    if lex(sql).is_unreliable() {
+        return false;
+    }
+    let statements = split_statements(sql);
+    !statements.is_empty()
+        && statements.iter().all(|statement| {
+            let lexed = lex(statement);
+            is_read_statement(&lexed) && read_side_effect(&lexed).is_none()
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,6 +479,37 @@ mod tests {
         assert!(lex("select 1;; select 2").has_empty_statement());
         assert!(lex("; select 1").has_empty_statement());
         assert!(lex("select 1; ;").has_empty_statement());
+    }
+
+    /// Bead bsrp: only a request whose every statement is a plain read may be
+    /// resubmitted to learn its handle; one write anywhere, a side-effecting
+    /// function, or untrustworthy SQL keeps the request off that path.
+    #[test]
+    fn side_effect_free_reads_are_whole_request_reads() {
+        for read in [
+            "select 1",
+            "SELECT SYSTEM$WAIT(60) AS W",
+            "select 1; select 2",
+            "with x as (select 1 as a) select a from x",
+            "show tables; describe table t",
+            "(select 1)",
+        ] {
+            assert!(is_side_effect_free_read(read), "{read}");
+        }
+        for not_read in [
+            "",
+            "  -- only a comment\n",
+            "insert into t values (1)",
+            "select 1; delete from t",
+            "with x as (select 1) delete from t",
+            "select system$cancel_all_queries(1)",
+            "select my_seq.nextval",
+            "call refresh_everything()",
+            "select 'unterminated",
+            "select 1 /* a /* b */ c */",
+        ] {
+            assert!(!is_side_effect_free_read(not_read), "{not_read}");
+        }
     }
 
     fn count(sql: &str) -> usize {
