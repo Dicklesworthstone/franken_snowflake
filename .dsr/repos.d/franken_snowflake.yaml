@@ -1,0 +1,97 @@
+# Portable six-target release authority. Set selected hosts and their host_paths
+# in private installed overrides, then align the registry and run dsr repos validate.
+{
+  "tool_name": "franken_snowflake",
+  "repo": "Dicklesworthstone/franken_snowflake",
+  "local_path": "/data/projects/franken_snowflake",
+  "language": "rust",
+  "binary_name": "franken-snowflake",
+  "main_package": "franken-snowflake-cli",
+  "workspace_binaries": [
+    "franken-snowflake",
+    "fsnow"
+  ],
+  "build_cmd": "export FSNOW_BUILD_SHA=\"$DSR_RELEASE_GIT_SHA\" FSNOW_BUILD_DIRTY=false; cargo build --locked --release -p franken-snowflake-cli --features live,mcp --bin franken-snowflake --bin fsnow",
+  "build_profile": "release",
+  "targets": [
+    "linux/amd64",
+    "linux/arm64",
+    "darwin/arm64",
+    "darwin/amd64",
+    "windows/amd64",
+    "windows/arm64"
+  ],
+  "act_job_map": {
+    "linux/amd64": null,
+    "linux/arm64": null,
+    "darwin/arm64": null,
+    "darwin/amd64": null,
+    "windows/amd64": null,
+    "windows/arm64": null
+  },
+  "target_triples": {
+    "linux/amd64": "x86_64-unknown-linux-gnu",
+    "linux/arm64": "aarch64-unknown-linux-gnu",
+    "darwin/arm64": "aarch64-apple-darwin",
+    "darwin/amd64": "x86_64-apple-darwin",
+    "windows/amd64": "x86_64-pc-windows-msvc",
+    "windows/arm64": "aarch64-pc-windows-msvc"
+  },
+  "cross_compile": {
+    "linux/amd64": {
+      "build_cmd": "export FSNOW_BUILD_SHA=\"$DSR_RELEASE_GIT_SHA\" FSNOW_BUILD_DIRTY=false; cargo zigbuild --locked --release -p franken-snowflake-cli --features live,mcp --bin franken-snowflake --bin fsnow --target \"$CARGO_BUILD_TARGET.2.28\""
+    },
+    "linux/arm64": {
+      "build_cmd": "export FSNOW_BUILD_SHA=\"$DSR_RELEASE_GIT_SHA\" FSNOW_BUILD_DIRTY=false; cargo zigbuild --locked --release -p franken-snowflake-cli --features live,mcp --bin franken-snowflake --bin fsnow --target \"$CARGO_BUILD_TARGET.2.28\""
+    },
+    "darwin/arm64": {},
+    "darwin/amd64": {},
+    "windows/amd64": {
+      "build_cmd": "call C:\\BuildTools\\VC\\Auxiliary\\Build\\vcvarsall.bat amd64 && set \"FSNOW_BUILD_SHA=%DSR_RELEASE_GIT_SHA%\" && set \"FSNOW_BUILD_DIRTY=false\" && cargo build --locked --release -p franken-snowflake-cli --features live,mcp --bin franken-snowflake --bin fsnow"
+    },
+    "windows/arm64": {
+      "build_cmd": "call C:\\BuildTools\\VC\\Auxiliary\\Build\\vcvarsall.bat amd64_arm64 && set \"FSNOW_BUILD_SHA=%DSR_RELEASE_GIT_SHA%\" && set \"FSNOW_BUILD_DIRTY=false\" && cargo build --locked --release -p franken-snowflake-cli --features live,mcp --bin franken-snowflake --bin fsnow"
+    }
+  },
+  "artifact_naming": "franken-snowflake-v${version}-${target_triple}",
+  "install_script_compat": "franken-snowflake-v${version}-${target_triple}",
+  "install_script_path": "install.sh",
+  "archive_format": {
+    "linux": "tar.gz",
+    "darwin": "tar.gz",
+    "windows": "zip"
+  },
+  "linux_glibc_floor": "2.28",
+  "release_contract": {
+    "checksum_sidecar": "sha256",
+    "minisign_public_key_file": "minisign.pub",
+    "exact_primary_assets": {
+      "linux/amd64": "franken-snowflake-v0.0.6-x86_64-unknown-linux-gnu.tar.gz",
+      "linux/arm64": "franken-snowflake-v0.0.6-aarch64-unknown-linux-gnu.tar.gz",
+      "darwin/arm64": "franken-snowflake-v0.0.6-aarch64-apple-darwin.tar.gz",
+      "darwin/amd64": "franken-snowflake-v0.0.6-x86_64-apple-darwin.tar.gz",
+      "windows/amd64": "franken-snowflake-v0.0.6-x86_64-pc-windows-msvc.zip",
+      "windows/arm64": "franken-snowflake-v0.0.6-aarch64-pc-windows-msvc.zip"
+    },
+    "exact_additional_assets": [
+      "SHA256SUMS",
+      "SHA256SUMS.minisig"
+    ]
+  },
+  "include_files": [
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "checks": [
+    "cargo fmt --all -- --check",
+    "RCH_REQUIRE_REMOTE=1 CARGO_BUILD_JOBS=2 rch exec -- cargo clippy --locked -j2 --workspace --all-targets --features live,mcp -- -D warnings",
+    "RCH_REQUIRE_REMOTE=1 CARGO_BUILD_JOBS=2 rch exec -- cargo test --locked -j2 --workspace --features live,mcp --no-fail-fast"
+  ],
+  "env": {
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_BUILD_JOBS": "2",
+    "CARGO_CACHE_AUTO_CLEAN_FREQUENCY": "never",
+    "CARGO_HTTP_USER_AGENT": "OpenAI File Downloader, XaiImageApiFetch/1.0"
+  }
+}

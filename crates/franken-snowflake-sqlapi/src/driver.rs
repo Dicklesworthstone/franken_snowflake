@@ -806,17 +806,38 @@ async fn submit<T: StatementTransport, A: AuthProvider>(
         };
         match answer {
             SnowflakeOutcome::Ok(response) if response.status == StatusClass::Unauthorized => {
-                // No handle was issued, so a resubmit with the same requestId
-                // is safe; nothing to cancel server-side.
+                // This response did not issue a handle. Retrying with the same
+                // requestId is safe, but a failed recovery does not establish
+                // whether the original submission was accepted.
                 match refresh_after_unauthorized(provider, reauth_left, "submit") {
                     Ok(fresh) => *auth = fresh,
-                    Err(error) => return SnowflakeOutcome::err(error),
+                    Err(error) => {
+                        return failed_submit_outcome(
+                            cx,
+                            learn_handle,
+                            SnowflakeOutcome::err(error),
+                        );
+                    }
                 }
             }
             SnowflakeOutcome::Ok(response) => break response,
-            SnowflakeOutcome::Err(error) => return SnowflakeOutcome::err(error),
-            SnowflakeOutcome::Cancelled(reason) => return SnowflakeOutcome::cancelled(reason),
-            SnowflakeOutcome::Panicked(payload) => return SnowflakeOutcome::panicked(payload),
+            SnowflakeOutcome::Err(error) => {
+                return failed_submit_outcome(cx, learn_handle, SnowflakeOutcome::err(error));
+            }
+            SnowflakeOutcome::Cancelled(reason) => {
+                return failed_submit_outcome(
+                    cx,
+                    learn_handle,
+                    SnowflakeOutcome::cancelled(reason),
+                );
+            }
+            SnowflakeOutcome::Panicked(payload) => {
+                return failed_submit_outcome(
+                    cx,
+                    learn_handle,
+                    SnowflakeOutcome::panicked(payload),
+                );
+            }
         }
     };
     *reauth_left = 1;
@@ -825,7 +846,11 @@ async fn submit<T: StatementTransport, A: AuthProvider>(
         &submit_response.body,
     ) {
         Ok(progress) => SnowflakeOutcome::ok(progress),
-        Err(error) => SnowflakeOutcome::err(error.into_snowflake_error()),
+        Err(error) => failed_submit_outcome(
+            cx,
+            learn_handle,
+            SnowflakeOutcome::err(error.into_snowflake_error()),
+        ),
     }
 }
 
@@ -1509,6 +1534,21 @@ fn local_cancel_reason(cx: &Cx) -> CancelReason {
         .unwrap_or_else(CancelReason::parent_cancelled)
 }
 
+/// An unsuccessful handle lookup must not turn the caller's cancellation
+/// into an error/panic outcome. This preserves local cancellation only:
+/// without a handle, the remote statement's status remains unknown.
+fn failed_submit_outcome<T>(
+    cx: &Cx,
+    learn_handle: bool,
+    failure: SnowflakeOutcome<T>,
+) -> SnowflakeOutcome<T> {
+    if learn_handle && cx.is_cancel_requested() {
+        SnowflakeOutcome::cancelled(local_cancel_reason(cx))
+    } else {
+        failure
+    }
+}
+
 fn terminal_failure_error(
     code: SnowflakeErrorCode,
     failure: crate::response::QueryFailureStatus,
@@ -1747,7 +1787,7 @@ mod tests {
                         return Poll::Ready(());
                     }
                     interrupted = true;
-                    cx.set_cancel_requested(true);
+                    cx.cancel_with(CancelKind::User, Some("the caller gave up"));
                     task.waker().wake_by_ref();
                     Poll::Pending
                 })
@@ -3905,6 +3945,101 @@ mod tests {
         assert_eq!(cancels.len(), 1);
         assert_eq!(cancels[0].0, fixture_handle());
         assert!(transport.orphan_cancels.borrow().is_empty());
+    }
+
+    #[test]
+    fn failed_handle_recovery_preserves_the_callers_cancel_outcome() {
+        for scripted in [
+            Scripted::Err,
+            Scripted::Panicked("recovery failed"),
+            Scripted::Ok(StatusClass::Unauthorized, Vec::new()),
+            Scripted::Ok(StatusClass::Completed, b"{}".to_vec()),
+        ] {
+            asupersync::test_utils::run_test(move || async move {
+                let transport = FakeTransport::new(scripted);
+                transport.cancel_mid_sync_submit.set(true);
+                let cx = Cx::for_testing();
+                let (outcome, _) = run_statement_with_stats(
+                    &cx,
+                    &transport,
+                    fake_auth(),
+                    SubmitStatementRequest::new("select 1"),
+                    idempotent_params(),
+                    PollPlan::default(),
+                )
+                .await;
+                assert!(
+                    matches!(&outcome, SnowflakeOutcome::Cancelled(reason) if reason.kind == CancelKind::User),
+                    "{outcome:?}"
+                );
+                assert!(!transport.sync_submit_answered.get());
+                let queries = transport.submit_queries.borrow();
+                assert_eq!(queries.len(), 2);
+                assert_eq!(queries[0][0], queries[1][0]);
+                assert!(queries[1].contains(&("retry", "true".to_owned())));
+                assert!(queries[1].contains(&("async", "true".to_owned())));
+                assert!(transport.cancels_after_local.borrow().is_empty());
+                assert!(transport.orphan_cancels.borrow().is_empty());
+                assert!(transport.dropped_cancels.borrow().is_empty());
+                assert!(transport.polled.borrow().is_empty());
+            });
+        }
+    }
+
+    #[test]
+    fn an_uncancelled_submit_preserves_its_failure_outcome() {
+        for (scripted, panicked) in [
+            (Scripted::Err, false),
+            (Scripted::Panicked("submit failed"), true),
+            (Scripted::Ok(StatusClass::Unauthorized, Vec::new()), false),
+            (Scripted::Ok(StatusClass::Completed, b"{}".to_vec()), false),
+        ] {
+            asupersync::test_utils::run_test(move || async move {
+                let transport = FakeTransport::new(scripted);
+                let (outcome, _) = run_statement_with_stats(
+                    &Cx::for_testing(),
+                    &transport,
+                    fake_auth(),
+                    SubmitStatementRequest::new("select 1"),
+                    idempotent_params(),
+                    PollPlan::default(),
+                )
+                .await;
+                assert!(
+                    if panicked {
+                        matches!(outcome, SnowflakeOutcome::Panicked(_))
+                    } else {
+                        matches!(outcome, SnowflakeOutcome::Err(_))
+                    },
+                    "{outcome:?}"
+                );
+                assert_eq!(transport.submit_queries.borrow().len(), 1);
+                assert!(transport.cancels_after_local.borrow().is_empty());
+                assert!(transport.orphan_cancels.borrow().is_empty());
+            });
+        }
+    }
+
+    #[test]
+    fn failed_handle_lookup_keeps_the_original_cancel_reason() {
+        let cx = Cx::for_testing();
+        cx.cancel_with(CancelKind::User, Some("the caller gave up"));
+        let outcome = failed_submit_outcome::<()>(
+            &cx,
+            true,
+            SnowflakeOutcome::cancelled(CancelReason::deadline()),
+        );
+        assert!(
+            matches!(outcome, SnowflakeOutcome::Cancelled(reason) if reason.kind == CancelKind::User)
+        );
+        let outcome = failed_submit_outcome::<()>(
+            &cx,
+            false,
+            SnowflakeOutcome::cancelled(CancelReason::deadline()),
+        );
+        assert!(
+            matches!(outcome, SnowflakeOutcome::Cancelled(reason) if reason.kind == CancelKind::Deadline)
+        );
     }
 
     /// The negative side of bead bsrp: a write, and a read without the

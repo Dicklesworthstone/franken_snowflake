@@ -288,14 +288,14 @@ The installer accepts these flags (pass after `bash -s --` for the curl form):
 | `--no-gum` | Plain output with no styled prompts |
 | `--force` | Overwrite an existing install |
 
-The `v0.0.5` release binaries are built with `--features live,mcp`: they report
+The `v0.0.6` release binaries are built with `--features live,mcp`: they report
 `feature_flags.live=true, mcp=true` in `capabilities`, so downloaded binaries
 run live reads and writes out of the box. Credentials are always runtime-gated:
 a live-capable binary refuses live operations cleanly (exit 3) when the
 selected profile or environment does not provide credential handles, so the
 offline surfaces still work with no credentials at all.
 
-This README tracks `main`. Surfaces added after `v0.0.5` need a source build
+This README tracks `main`. Surfaces added after `v0.0.6` need a source build
 until the next release.
 
 To build the live-capable binary from source in one shot, pass both

@@ -23,7 +23,7 @@ mcp = [
 workspace = true
 
 [dependencies]
-franken-snowflake-core = { path = "../franken-snowflake-core", version = "0.0.5" }
+franken-snowflake-core = { path = "../franken-snowflake-core", version = "0.0.6" }
 # The runtime whose `request_cx_with_budget` mints the server's request contexts
 # (the facade re-exports Asupersync only under its `testing-lab` feature).
 asupersync = { workspace = true, optional = true }

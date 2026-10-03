@@ -3,8 +3,24 @@
 All notable changes to `franken_snowflake` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at the
-workspace version (`0.0.5`). All 14 crates are published on crates.io (first
+workspace version (`0.0.6`). All 14 crates are published on crates.io (first
 published 2026-09-12).
+
+## [v0.0.6](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.6) — 2026-10-02
+
+- Preserve the caller's cancellation outcome if an asynchronous, idempotent
+  read resubmission fails while recovering its statement handle. The CLI keeps
+  the typed cancellation and no longer says a remote cancel was sent when that
+  cannot be established. Local cancellation does not confirm remote termination.
+- Known limitation ([#1](https://github.com/Dicklesworthstone/franken_snowflake/issues/1)):
+  a cancelled HTTP submission can lose the response naming an accepted statement.
+  If handle recovery also fails, its remote status remains unknown; the
+  server-side statement timeout remains the final bound. This transport
+  limitation predates v0.0.5. Socket-test and optional feature lint findings in
+  that issue remain open; they are not evidence of successful remote cancellation.
+- The client deadline is measured from submission, including queue and resume
+  time, rather than only time spent executing. The `budget_consumed.deadline_ms`
+  field has been removed.
 
 ## Scope and method
 
@@ -44,8 +60,8 @@ implementation first and the test/hardening pass follows in a later wave. The
 
 ## Version state
 
-- Package version: `0.0.5` across the workspace; all 14 crates published on
-  crates.io.
+- Package version: `0.0.6` across the workspace, prepared for release. The
+  latest published crates.io version remains `0.0.5` until publication.
 - Tags/releases: `v0.0.0` (tag only, 2026-06-29), `v0.0.1` (GitHub Release,
   2026-06-30), `v0.0.2` (GitHub Release, 2026-08-24), `v0.0.3`
   (GitHub Release, 2026-09-04), `v0.0.4` (GitHub Release, 2026-09-11), and
