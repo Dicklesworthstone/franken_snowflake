@@ -192,6 +192,7 @@ impl MockServer {
             let runtime = RuntimeBuilder::current_thread()
                 .build()
                 .expect("server runtime");
+            let tasks = runtime.handle();
             runtime.block_on(async move {
                 let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
                 let port = listener.local_addr().expect("local addr").port();
@@ -217,12 +218,23 @@ impl MockServer {
                         let mut log = log.lock().expect("request log");
                         let reply = script(&seen, &log);
                         log.push(seen);
-                        std::future::ready(to_response(reply))
+                        let mut response =
+                            (!reply.headers.iter().any(|(name, _)| name == UNANSWERED))
+                                .then(|| to_response(reply));
+                        std::future::poll_fn(move |_| {
+                            response
+                                .take()
+                                .map_or(std::task::Poll::Pending, std::task::Poll::Ready)
+                        })
                     };
                     let config = Http1Config::default()
                         .keep_alive(false)
                         .host_policy(HostPolicy::allow_list(hosts.clone()));
-                    let _ = Http1Server::with_config(handler, config).serve(tls).await;
+                    // Each connection is its own task, as on a real server: an
+                    // unanswered request holds only its own connection.
+                    tasks.spawn_local(async move {
+                        let _ = Http1Server::with_config(handler, config).serve(tls).await;
+                    });
                 }
             });
         });
@@ -258,6 +270,18 @@ fn to_response(reply: MockHttpResponse) -> Response {
 
 fn json(status: u16, value: &serde_json::Value) -> MockHttpResponse {
     MockHttpResponse::json(status, value.to_string().into_bytes())
+}
+
+/// A reply header the mock never sends: the request it answers stays
+/// unanswered until the client gives up on the connection.
+const UNANSWERED: &str = "x-fsnow-mock-unanswered";
+
+fn unanswered() -> MockHttpResponse {
+    MockHttpResponse {
+        status: 202,
+        headers: vec![(UNANSWERED.to_owned(), "1".to_owned())],
+        body: Vec::new(),
+    }
 }
 
 fn not_found() -> MockHttpResponse {
@@ -969,6 +993,91 @@ fn sigint_cancels_the_statement_in_flight() {
             && shown.contains(HANDLE),
         "{}",
         show.context()
+    );
+}
+
+/// Ctrl-C while a read's synchronous submit is still unanswered (bead bsrp;
+/// Snowflake answers one within 45 s, which the first live run waited out).
+/// The binary does not wait: it asks for the handle by resubmitting the same
+/// requestId with `retry=true&async=true`, cancels that statement, and exits.
+#[cfg(unix)]
+#[test]
+fn sigint_mid_submit_cancels_a_read_without_waiting_for_the_answer() {
+    const HANDLE: &str = "01b2c3d4-0000-0000-0000-00000000f1b5";
+    let cert = TestCert::mint();
+    let server = MockServer::start(&cert, |request, _| {
+        if request.is_submit() {
+            if request.query("async") == Some("true") {
+                return running(HANDLE);
+            }
+            return unanswered();
+        }
+        if request.method == "POST" && request.path() == format!("{SUBMIT_PATH}/{HANDLE}/cancel") {
+            return scenarios::cancel();
+        }
+        not_found()
+    });
+    let h = Harness::new("sigint-submit", &cert);
+    let args = [
+        "query",
+        "run",
+        "--profile",
+        "sock",
+        "--sql",
+        "select system$wait(600)",
+        "--json",
+    ];
+    let child = h
+        .command(server.port, &args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    server.wait_for("the synchronous submit", |seen| {
+        seen.iter().any(Seen::is_submit)
+    });
+    let interrupted = Instant::now();
+    let status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("send SIGINT");
+    assert!(status.success());
+    let output = child.wait_with_output().expect("binary exits after SIGINT");
+    let took = interrupted.elapsed();
+    let run = h.finish(&args, output);
+    assert!(
+        took < Duration::from_secs(10),
+        "exited {took:?} after SIGINT; {}",
+        run.context()
+    );
+    let seen = server.seen();
+    let submits: Vec<&Seen> = seen.iter().filter(|s| s.is_submit()).collect();
+    assert_eq!(submits.len(), 2, "{seen:?}");
+    assert_eq!(submits[0].query("async"), None, "{seen:?}");
+    assert_eq!(submits[1].query("async"), Some("true"), "{seen:?}");
+    assert_eq!(submits[1].query("retry"), Some("true"), "{seen:?}");
+    assert!(
+        submits[0].query("requestId").is_some()
+            && submits[0].query("requestId") == submits[1].query("requestId"),
+        "the resubmit names the same request: {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|s| s.method == "POST" && s.path() == format!("{SUBMIT_PATH}/{HANDLE}/cancel")),
+        "the statement the resubmit named was cancelled: {seen:?}"
+    );
+    assert_eq!(
+        run.envelope["outcome_kind"],
+        "cancelled",
+        "{}",
+        run.context()
+    );
+    assert_eq!(run.exit, 130, "{}", run.context());
+    assert_eq!(
+        run.envelope["statement_handle"],
+        HANDLE,
+        "{}",
+        run.context()
     );
 }
 
