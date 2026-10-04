@@ -109,11 +109,12 @@ cannot run is recorded as not run, with the reason; it is never skipped silently
    reports the release version and build sha.
 8. Artifacts executed on each target's platform; `aarch64-pc-windows-msvc`
    stays "linked, not executed" until an ARM Windows host exists.
-9. Signatures: the record states whether the artifacts are signed. They are
-   not yet: dsr signing (minisign, `dsr signing init`) needs an operator-held
-   key, and none exists. `install.sh` verifies a Sigstore bundle only when one
-   is published and `cosign` is installed, and otherwise says the signature
-   was not verified; `install.ps1` always says so.
+9. Signatures: the record states whether the artifacts are signed and cites
+   the independently trusted key and verification receipt. The v0.0.6 archives
+   and `SHA256SUMS` have detached Minisign signatures; use the downloaded bundle
+   verifier below. `install.sh` checks a Sigstore bundle when one is published
+   and `cosign` is installed; its `--verify` self-test does not check Minisign.
+   Record installer signature verification separately from this bundle gate.
 
 Release record template:
 
