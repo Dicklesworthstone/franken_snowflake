@@ -154,17 +154,20 @@ observations, and the project's own conformance fixtures.
 HTTP/TLS client and gzip carry the transport, and the statement driver returns
 Asupersync's four-valued `Outcome` (`Ok` / `Err` / `Cancelled` / `Panicked`),
 which reaches the CLI envelope intact (a cancellation reads `cancelled` or
-`timeout`, never an internal error) <!-- claim:outcome-intact -->. Once a statement is submitted, every error
-path and every deadline, budget, shutdown, or user cancellation fires a
-best-effort remote cancel. <!-- claim:remote-cancel-every-path --> A cancel that arrives while the submit itself is in
-flight waits for Snowflake's answer <!-- claim:masked-submit -->, which names the statement (a synchronous
-submit is answered within 45 s, with the result or the handle), then cancels it;
-a second Ctrl-C exits at once. The
-server-side `STATEMENT_TIMEOUT_IN_SECONDS` (60 s by default) is sent with every
-request as the backstop. Each HTTP exchange is bounded (300 s), so a stalled
-connection ends as a `timeout` with the remote cancel instead of hanging, and a
-statement still running 5 s past its statement timeout is cancelled by the client <!-- claim:client-deadline -->
-(outcome `timeout`, remote cancel sent). With `MAX_CREDITS` set, a statement whose
+`timeout`, never an internal error) <!-- claim:outcome-intact -->. Once a statement handle is known, errors and user, deadline, budget, or
+shutdown cancellation attempt a best-effort remote cancel. <!-- claim:remote-cancel-every-path -->
+Local cancellation does not confirm remote termination. For writes and reads
+without the idempotency contract, an in-flight synchronous submit keeps waiting
+for its answer after local cancellation. <!-- claim:masked-submit --> An idempotent
+read can instead retry asynchronously with the same request ID to recover its
+handle. If recovery fails, its remote status remains unknown; a second Ctrl-C
+exits at once. The server-side `STATEMENT_TIMEOUT_IN_SECONDS` (60 s by default)
+is sent with every request as the backstop. Each HTTP exchange is bounded
+(300 s), so a stalled connection ends as a `timeout` instead of hanging.
+With a nonzero statement timeout, the client deadline for a single statement
+is its timeout plus 5 s, measured from submission and including queue and resume
+time. <!-- claim:client-deadline --> (Outcome `timeout`; remote cancellation is
+best-effort and requires a known handle.) With `MAX_CREDITS` set, a statement whose
 estimated credits reach the cap is cancelled the same way <!-- claim:credit-cap --> (cancel kind
 `CostBudget`). The retry loop is the project's own, built on that
 client. While a statement runs, Ctrl-C (SIGINT) or SIGTERM cancels it the same
@@ -288,14 +291,14 @@ The installer accepts these flags (pass after `bash -s --` for the curl form):
 | `--no-gum` | Plain output with no styled prompts |
 | `--force` | Overwrite an existing install |
 
-The `v0.0.5` release binaries are built with `--features live,mcp`: they report
+The `v0.0.6` release binaries are built with `--features live,mcp`: they report
 `feature_flags.live=true, mcp=true` in `capabilities`, so downloaded binaries
 run live reads and writes out of the box. Credentials are always runtime-gated:
 a live-capable binary refuses live operations cleanly (exit 3) when the
 selected profile or environment does not provide credential handles, so the
 offline surfaces still work with no credentials at all.
 
-This README tracks `main`. Surfaces added after `v0.0.5` need a source build
+This README tracks `main`. Surfaces added after `v0.0.6` need a source build
 until the next release.
 
 To build the live-capable binary from source in one shot, pass both

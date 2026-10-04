@@ -3913,7 +3913,7 @@ fn outcome_into_result<T>(
             let remote = if !submitted_statement {
                 ""
             } else if attempts_remote_cancel(cancel_policy(reason.kind)) {
-                "; a best-effort remote cancel was sent for the submitted statement, if any"
+                "; local cancellation does not confirm remote termination"
             } else {
                 "; no remote cancel (the statement drains quietly)"
             };
@@ -6509,8 +6509,19 @@ mod tests {
         assert!(
             error
                 .as_ref()
-                .is_some_and(|e| e.message.contains("remote cancel was sent")),
+                .is_some_and(|e| e.message.contains("does not confirm remote termination")),
             "{error:?}"
+        );
+        let user_cancelled: Outcome<u8, SnowflakeError> =
+            Outcome::cancelled(CancelReason::user("the caller gave up"));
+        let user_error = outcome_into_result(user_cancelled, "the statement", true)
+            .expect_err("caller cancellation remains a typed cancellation");
+        assert_eq!(user_error.code, SnowflakeErrorCode::Cancelled);
+        assert_eq!(user_error.cancel_kind, Some(CancelKind::User));
+        assert!(
+            user_error
+                .message
+                .contains("does not confirm remote termination")
         );
         let panicked: Outcome<u8, SnowflakeError> =
             Outcome::panicked(PanicPayload::new("index out of bounds"));
@@ -6590,6 +6601,9 @@ mod tests {
             (CancelKind::Deadline, "timeout", 5),
             (CancelKind::PollQuota, "cancelled", 5),
             (CancelKind::CostBudget, "cancelled", 2),
+            // The generic user-cancel policy is success. A signal-caused
+            // cancelled envelope separately receives shell status 130/143.
+            (CancelKind::User, "cancelled", 0),
         ] {
             install(
                 "demo",

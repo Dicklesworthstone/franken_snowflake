@@ -12,7 +12,8 @@
 //!
 //! - only the path and query are kept (never the host), and the account host
 //!   and name are replaced wherever else they appear;
-//! - `Authorization`, cookie and token-named header values become `[REDACTED]`;
+//! - `Authorization`, cookie, token-named and `x-snowflake-fe-*` (deployment
+//!   cell / frontend build) header values become `[REDACTED]`;
 //! - statement handles and request ids become stable placeholders
 //!   (`00000000-0000-4000-8000-00000000000N`, in order of first appearance), so
 //!   a replay drives the driver down the same paths;
@@ -354,8 +355,11 @@ fn redact_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
         .iter()
         .map(|(name, value)| {
             let lower = name.to_ascii_lowercase();
+            // `x-snowflake-fe-*` values carry the serving deployment cell and
+            // frontend build id: deployment details, not public data.
             let secret = lower == "authorization"
                 || lower.contains("cookie")
+                || lower.starts_with("x-snowflake-fe-")
                 || (lower.contains("token") && lower != "x-snowflake-authorization-token-type");
             (
                 name.clone(),
@@ -819,6 +823,24 @@ mod tests {
             text.contains(r#""schema": "QA""#),
             "short names stay: {text}"
         );
+    }
+
+    /// Frontend headers name the serving deployment cell and build id, so
+    /// their values never reach a transcript; ordinary headers pass through.
+    #[test]
+    fn frontend_deployment_headers_are_redacted() {
+        let headers = vec![
+            (
+                "X-Snowflake-FE-Config".to_owned(),
+                "v1.0.0.cell-x.1".to_owned(),
+            ),
+            ("x-snowflake-fe-instance".to_owned(), "fe-7".to_owned()),
+            ("content-type".to_owned(), "application/json".to_owned()),
+        ];
+        let redacted = redact_headers(&headers);
+        assert_eq!(redacted[0].1, REDACTED);
+        assert_eq!(redacted[1].1, REDACTED);
+        assert_eq!(redacted[2].1, "application/json");
     }
 
     #[test]

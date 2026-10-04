@@ -84,7 +84,7 @@ evidence = ["test:franken-snowflake-cli::live::tests::scripted_cancellations_rea
 [[claim]]
 id = "remote-cancel-every-path"
 heading = "Design Philosophy"
-text = "Once a statement is submitted, every error path and every deadline, budget, shutdown, or user cancellation fires a best-effort remote cancel."
+text = "Once a statement handle is known, errors and user, deadline, budget, or shutdown cancellation attempt a best-effort remote cancel."
 evidence = [
   "test:franken-snowflake-sqlapi::driver::tests::deadline_during_poll_routes_through_the_policy_cancel_with_deadline_kind",
   "test:franken-snowflake-sqlapi::driver::tests::one_failed_fetch_in_a_window_abandons_the_statement_after_the_window_settles",
@@ -95,7 +95,7 @@ evidence = [
 [[claim]]
 id = "masked-submit"
 heading = "Design Philosophy"
-text = "A cancel that arrives while the submit itself is in flight waits for Snowflake's answer"
+text = "For writes and reads without the idempotency contract, an in-flight synchronous submit keeps waiting for its answer after local cancellation."
 evidence = [
   "test:franken-snowflake-testkit::race::tests::default_race_suite_proves_cancel_retry_invariants",
   "test:franken-snowflake-sqlapi::driver::tests::an_already_expired_deadline_submits_nothing",
@@ -104,7 +104,7 @@ evidence = [
 [[claim]]
 id = "client-deadline"
 heading = "Design Philosophy"
-text = "a statement still running 5 s past its statement timeout is cancelled by the client"
+text = "With a nonzero statement timeout, the client deadline for a single statement is its timeout plus 5 s, measured from submission and including queue and resume time."
 evidence = ["test:franken-snowflake-cli::a_statement_past_its_timeout_is_cancelled_by_the_client"]
 
 [[claim]]

@@ -1,0 +1,23 @@
+{
+  "tools": {
+    "franken_snowflake": {
+      "repo": "Dicklesworthstone/franken_snowflake",
+      "local_path": "/data/projects/franken_snowflake",
+      "language": "rust",
+      "binary_name": "franken-snowflake",
+      "targets": [
+        "linux/amd64",
+        "linux/arm64",
+        "darwin/arm64",
+        "darwin/amd64",
+        "windows/amd64",
+        "windows/arm64"
+      ],
+      "checks": [
+        "cargo fmt --all -- --check",
+        "RCH_REQUIRE_REMOTE=1 CARGO_BUILD_JOBS=2 rch exec -- cargo clippy --locked -j2 --workspace --all-targets --features live,mcp -- -D warnings",
+        "RCH_REQUIRE_REMOTE=1 CARGO_BUILD_JOBS=2 rch exec -- cargo test --locked -j2 --workspace --features live,mcp --no-fail-fast"
+      ]
+    }
+  }
+}
