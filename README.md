@@ -284,12 +284,17 @@ The installer accepts these flags (pass after `bash -s --` for the curl form):
 | `--dest <dir>` | Install into a chosen directory |
 | `--system` | Install system-wide rather than per-user |
 | `--easy-mode` | Guided, prompt-friendly install for newcomers |
-| `--verify` | Run a post-install self-test after checksum verification (no signatures are published) |
+| `--verify` | Run a post-install self-test after checksum verification |
 | `--from-source` | Developer-only: build from source instead of downloading a prepared release binary |
 | `--live` | Source-build option: compile the `live` feature when combined with `--from-source` |
 | `--quiet` | Suppress non-error output |
 | `--no-gum` | Plain output with no styled prompts |
 | `--force` | Overwrite an existing install |
+
+The `v0.0.6` archives also carry detached Minisign signatures. Verify them with
+the [downloaded bundle checker](docs/RELEASE.md#downloaded-published-bundle-verification)
+and an independently trusted public key. The installer's signature check uses
+Sigstore bundles when available; `--verify` does not verify Minisign signatures.
 
 The `v0.0.6` release binaries are built with `--features live,mcp`: they report
 `feature_flags.live=true, mcp=true` in `capabilities`, so downloaded binaries

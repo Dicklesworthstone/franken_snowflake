@@ -116,12 +116,21 @@ def archive_binaries(data, target):
                 require(kind in (0, stat.S_IFDIR if item.is_dir() else stat.S_IFREG),
                         "ZIP link or special member")
                 require(not item.flag_bits & 1, "encrypted ZIP member")
+                require(item.compress_type in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED),
+                        "unsupported ZIP compression method")
                 leaf = admit(item.filename, item.file_size)
+                require(not item.is_dir() or item.file_size == 0, "nonempty ZIP directory")
+                blob = archive.read(item)
                 if not item.is_dir():
                     # Read every entry to check CRCs, after the cumulative budget.
-                    take(leaf, mode, archive.read(item))
+                    take(leaf, mode, blob)
     else:
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+        # Validate the complete gzip stream, including CRC/trailing members,
+        # and bound hidden PAX/longname metadata before tarfile consumes it.
+        with gzip.GzipFile(fileobj=io.BytesIO(data), mode="rb") as compressed:
+            expanded = compressed.read(MAX_TOTAL + 1)
+        require(len(expanded) <= MAX_TOTAL, "decompressed tar exceeds size budget")
+        with tarfile.open(fileobj=io.BytesIO(expanded), mode="r:") as archive:
             for item in archive:
                 require(item.isdir() or item.isfile(), "tar link or special member")
                 leaf = admit(item.name, item.size)
@@ -262,6 +271,32 @@ class ArchiveChecks(unittest.TestCase):
         malformed = gzip.compress(item.tobuf() + bytes(1024))
         with self.assertRaisesRegex(ValueError, "budget"):
             archive_binaries(malformed, TARGETS[0])
+
+    def test_gzip_trailer_crc_is_verified(self):
+        blob = bytearray(self.tar([(n, 0o755, tarfile.REGTYPE, self.elf())
+                                   for n in ("franken-snowflake", "fsnow")]))
+        blob[-8] ^= 1
+        with self.assertRaisesRegex(gzip.BadGzipFile, "CRC"):
+            archive_binaries(bytes(blob), TARGETS[0])
+
+    def test_zip_refuses_compression_outside_stock_contract(self):
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w") as archive:
+            archive.writestr("fsnow.exe", b"payload")
+        for method in (14, 99):
+            blob = bytearray(stream.getvalue())
+            central = blob.index(b"PK\x01\x02")
+            blob[8:10] = method.to_bytes(2, "little")
+            blob[central + 10:central + 12] = method.to_bytes(2, "little")
+            with self.subTest(method=method), self.assertRaisesRegex(ValueError, "unsupported ZIP compression"):
+                archive_binaries(bytes(blob), TARGETS[4])
+
+    def test_zip_refuses_directory_payloads(self):
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w") as archive:
+            archive.writestr("metadata/", b"hidden body")
+        with self.assertRaisesRegex(ValueError, "nonempty ZIP directory"):
+            archive_binaries(stream.getvalue(), TARGETS[4])
 
 
 def main():

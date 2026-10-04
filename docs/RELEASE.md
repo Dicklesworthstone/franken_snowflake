@@ -150,7 +150,8 @@ python3 scripts/verify-published-bundle.py \
 The verifier authenticates the manifest and every archive, checks the exact
 20-asset contract and sidecar hashes, and checks both executable aliases and
 the ELF, Mach-O or PE architecture for each target. It reads archives in memory
-with bounded member counts and sizes, rejects links and unsafe member paths,
+with bounded member counts and sizes, checks the complete gzip stream, and
+rejects links, unsafe member paths and ZIP methods other than stored/deflated,
 and leaves downloaded files intact. The public key must come from an
 independent trust source; a key fetched from the release being checked does
 not establish trust.
