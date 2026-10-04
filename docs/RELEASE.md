@@ -134,6 +134,33 @@ Release record template:
 - Release: dsr release ... ; dsr release verify
 ```
 
+## Downloaded Published Bundle Verification
+
+After downloading the six archives, their checksum and minisign sidecars, and
+`SHA256SUMS` with its signature into an otherwise empty directory, run:
+
+```bash
+python3 scripts/verify-published-bundle.py --self-test
+python3 scripts/verify-published-bundle.py \
+  --bundle <download-directory> --version <X.Y.Z> \
+  --public-key <independently-trusted-minisign-key> \
+  --trusted-key-sha256 <independently-trusted-key-file-sha256>
+```
+
+The verifier authenticates the manifest and every archive, checks the exact
+20-asset contract and sidecar hashes, and checks both executable aliases and
+the ELF, Mach-O or PE architecture for each target. It reads archives in memory
+with bounded member counts and sizes, rejects links and unsafe member paths,
+and leaves downloaded files intact. The public key must come from an
+independent trust source; a key fetched from the release being checked does
+not establish trust.
+
+This gate prints a JSON receipt and exits nonzero on failure. Its evidence
+covers signed bytes and archive architecture. Installer behavior, runtime
+behavior, source identity and live Snowflake transport still need their
+separate proof lanes. These checks were recovered from the published-release
+consumer harness and made independent of release versions and worker paths.
+
 ## Required Local Proof
 
 Run these from the workspace root:
