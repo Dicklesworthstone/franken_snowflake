@@ -19,6 +19,7 @@ import subprocess
 import tarfile
 import unittest
 import zipfile
+import zlib
 
 
 TARGETS = (
@@ -278,7 +279,8 @@ def main():
         parser.error("--bundle, --version, --public-key and --trusted-key-sha256 are required")
     try:
         print(json.dumps(verify_bundle(args.bundle, args.version, args.public_key, args.trusted_key_sha256), indent=2))
-    except (ValueError, OSError, subprocess.SubprocessError, tarfile.TarError, zipfile.BadZipFile) as error:
+    except (ValueError, OSError, RuntimeError, zlib.error,
+            subprocess.SubprocessError, tarfile.TarError, zipfile.BadZipFile) as error:
         print(json.dumps({"status": "FAIL", "error": str(error)}))
         return 1
     return 0
