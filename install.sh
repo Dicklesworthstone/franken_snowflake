@@ -17,7 +17,7 @@
 #   --system           Install into /usr/local/bin (uses sudo)
 #   --easy-mode        Auto-update PATH in shell rc files
 #   --verify           Run a post-install self-test (selftest + capabilities)
-#   --from-source      Developer-only: build from source with cargo instead of
+#   --from-source      Developer-only: build with cargo (and Python 3) instead of
 #                      downloading a prepared release binary
 #   --live             Build the CLI with the `live` feature (real Snowflake SQL API
 #                      transport). Applies to every from-source build path.
@@ -203,7 +203,7 @@ Options:
   --system           Install into /usr/local/bin (uses sudo)
   --easy-mode        Auto-update PATH in shell rc files
   --verify           Run a post-install self-test (selftest + capabilities)
-  --from-source      Developer-only: build from source with cargo instead of
+  --from-source      Developer-only: build with cargo (and Python 3) instead of
                      downloading a prepared release binary
   --live             Build the CLI with the 'live' feature (real Snowflake transport)
   --offline TARBALL  Install locally; requires --version and --checksum
@@ -631,8 +631,69 @@ extract_archive() {
   esac
 }
 
+# Cargo owns target-dir/target/build-dir resolution. Read the executables from
+# this invocation instead of guessing paths or finding an older build. See
+# https://doc.rust-lang.org/cargo/reference/external-tools.html#json-messages
+select_cargo_binaries() {
+  python3 - "$@" <<'FSNOW_CARGO_ARTIFACTS_PY'
+import json
+import os
+import sys
+
+messages_path, manifest_path, *names = sys.argv[1:]
+expected_manifest = os.path.realpath(manifest_path)
+selected = {}
+finished = []
+try:
+    with open(messages_path, encoding="utf-8") as messages:
+        for number, line in enumerate(messages, 1):
+            message = json.loads(line)
+            if not isinstance(message, dict):
+                raise ValueError(f"Cargo message {number} is not an object")
+            reason = message.get("reason")
+            if reason == "build-finished":
+                finished.append(message.get("success") is True)
+            if reason != "compiler-artifact":
+                continue
+            manifest = message.get("manifest_path")
+            if not isinstance(manifest, str) or os.path.realpath(manifest) != expected_manifest:
+                continue
+            target = message.get("target", {})
+            name = target.get("name")
+            if name not in names or target.get("kind") != ["bin"]:
+                continue
+            if message.get("profile", {}).get("test") is not False:
+                continue
+            executable = message.get("executable")
+            if not isinstance(executable, str) or not os.path.isabs(executable):
+                raise ValueError(f"Cargo did not emit an absolute executable for {name}")
+            if any(char in executable for char in ("\n", "\r", "\0")):
+                raise ValueError(f"Cargo emitted an unsupported path for {name}")
+            if not os.path.isfile(executable) or not os.access(executable, os.X_OK):
+                raise ValueError(f"Cargo executable is missing or not executable: {executable}")
+            if name in selected:
+                raise ValueError(f"Cargo emitted more than one executable for {name}")
+            selected[name] = executable
+    if finished != [True]:
+        raise ValueError("Cargo did not emit exactly one successful build-finished message")
+    if set(selected) != set(names) or len(names) != len(set(names)):
+        raise ValueError("Cargo must emit both requested CLI binaries exactly once")
+    if len(set(selected.values())) != len(names):
+        raise ValueError("Cargo emitted the same path for different CLI binaries")
+    for name in names:
+        print(selected[name])
+except (OSError, ValueError, TypeError, AttributeError) as error:
+    print(f"Cannot select source-build executables: {error}", file=sys.stderr)
+    sys.exit(1)
+FSNOW_CARGO_ARTIFACTS_PY
+}
+
 # ── Build from source ───────────────────────────────────────────────────────
 build_from_source() {
+  command -v python3 >/dev/null 2>&1 || {
+    err "Python 3 is required to read Cargo's source-build executable messages."
+    exit 1
+  }
   ensure_cargo
 
   local src
@@ -666,12 +727,29 @@ build_from_source() {
 
   info "Compiling ${CLI_PACKAGE} (cargo build --release, ${feature_label})"
   info "This downloads crates and can take several minutes on first build..."
-  # Unset target redirection so binaries land where we expect.
-  (
+  # Preserve every caller Cargo target setting and invoke cargo through PATH,
+  # including the installed RCH shim. The outer DSR/RCH admission still has to
+  # prove a supported remote route; this environment request is not that proof.
+  local build_evidence build_messages build_paths build_errors build_code
+  build_evidence=$(mktemp -d "${TMPDIR:-/tmp}/fsnow-cargo-build.XXXXXXXX") || exit 1
+  build_messages="$build_evidence/cargo-messages.jsonl"
+  build_paths="$build_evidence/executables.txt"
+  build_errors="$build_evidence/cargo-stderr.txt"
+  info "Source-build evidence retained at $build_evidence"
+  if (
     cd "$src" \
-      && unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_BUILD_TARGET \
-      && cargo build --release -p "$CLI_PACKAGE" ${feature_args[@]+"${feature_args[@]}"}
-  ) || {
+      && RCH_REQUIRE_REMOTE=1 cargo build --locked --release \
+           --bin "$BINARY_NAME" --bin "$ALIAS_NAME" \
+           --message-format=json,json-render-diagnostics -p "$CLI_PACKAGE" \
+           ${feature_args[@]+"${feature_args[@]}"} > "$build_messages" 2> "$build_errors"
+  ); then
+    build_code=0
+  else
+    build_code=$?
+  fi
+  printf '%s\n' "$build_code" > "$build_evidence/returncode.txt" || exit 1
+  cat "$build_errors" >&2 || exit 1
+  if [ "$build_code" -ne 0 ]; then
     err "cargo build failed."
     if [ "$NO_RELEASE" -eq 1 ] && [ -z "$LOCAL_CHECKOUT" ]; then
       err "This pre-release tree pins sibling FrankenSuite crates by path (Asupersync,"
@@ -680,21 +758,20 @@ build_from_source() {
       err "or run this installer from within a franken_snowflake source tree."
     fi
     exit 1
-  }
-
-  local rel="$src/target/release"
-  local bin="$rel/$BINARY_NAME"
-  if [ ! -x "$bin" ]; then
-    bin=$(find "$src/target" -maxdepth 4 -type f -name "$BINARY_NAME" -perm -111 2>/dev/null | head -n1 || true)
   fi
-  if [ -z "$bin" ] || [ ! -x "$bin" ]; then
-    err "Build succeeded but ${BINARY_NAME} not found under $rel"
+
+  if ! select_cargo_binaries "$build_messages" "$src/crates/$CLI_PACKAGE/Cargo.toml" \
+      "$BINARY_NAME" "$ALIAS_NAME" > "$build_paths"; then
+    err "Refusing to install unbound source-build executables (evidence: $build_evidence)"
     exit 1
   fi
+  local bin alias_bin
+  { IFS= read -r bin && IFS= read -r alias_bin; } < "$build_paths" || exit 1
 
   install_file "$bin" "$BINARY_NAME"
   ok "Installed ${DEST}/${BINARY_NAME} (source build)"
-  install_alias "$rel"
+  install_file "$alias_bin" "$ALIAS_NAME"
+  ok "Installed ${DEST}/${ALIAS_NAME} (source build)"
 }
 
 # ── Download + install a prebuilt artifact ──────────────────────────────────

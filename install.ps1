@@ -462,6 +462,47 @@ function Get-Artifact {
     return $true
 }
 
+# Consume this build's structured artifact messages, preserving Cargo's own
+# resolution of target-dir, build-dir and target settings. Never search a tree
+# for a binary which may belong to an older invocation.
+function Get-CargoBuiltBinaries {
+    param([string]$MessagesPath, [string]$ManifestPath, [string[]]$Names)
+    $expectedManifest = [System.IO.Path]::GetFullPath($ManifestPath)
+    $selected = @{}
+    $finished = @()
+    foreach ($line in [System.IO.File]::ReadLines($MessagesPath)) {
+        $message = ConvertFrom-Json -InputObject $line -ErrorAction Stop
+        if ($null -eq $message -or -not ($message -is [pscustomobject])) { throw 'Cargo message is not an object' }
+        if ($message.reason -eq 'build-finished') {
+            $finished += ($message.success -is [bool] -and $message.success)
+        }
+        if ($message.reason -ne 'compiler-artifact') { continue }
+        if (-not [string]::Equals([System.IO.Path]::GetFullPath($message.manifest_path), $expectedManifest, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        $name = $message.target.name
+        if ($Names -cnotcontains $name -or $message.target.kind.Count -ne 1 -or $message.target.kind[0] -cne 'bin') { continue }
+        if (-not ($message.profile.test -is [bool]) -or $message.profile.test) { continue }
+        $exe = $message.executable
+        if (-not ($exe -is [string]) -or -not [System.IO.Path]::IsPathRooted($exe) -or $exe.IndexOfAny([char[]]@([char]10, [char]13, [char]0)) -ge 0) {
+            throw "Cargo did not emit a supported absolute executable for $name"
+        }
+        if (-not [string]::Equals([System.IO.Path]::GetFullPath($exe), $exe.Replace('/', '\'), [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Cargo did not emit a supported absolute executable for $name"
+        }
+        if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "Cargo executable is missing: $exe" }
+        if ($selected.ContainsKey($name)) { throw "Cargo emitted more than one executable for $name" }
+        $selected[$name] = $exe
+    }
+    if ($finished.Count -ne 1 -or -not $finished[0]) { throw 'Cargo did not emit exactly one successful build-finished message' }
+    if ($selected.Count -ne $Names.Count -or (@($Names | Select-Object -Unique)).Count -ne $Names.Count) {
+        throw 'Cargo must emit both requested CLI binaries exactly once'
+    }
+    foreach ($name in $Names) {
+        if (-not $selected.ContainsKey($name)) { throw "Cargo did not emit an executable for $name" }
+    }
+    if ((@($selected.Values | Select-Object -Unique)).Count -ne $Names.Count) { throw 'Cargo emitted the same path for different CLI binaries' }
+    return $selected
+}
+
 function Build-FromSource {
     Ensure-Cargo
 
@@ -487,7 +528,7 @@ function Build-FromSource {
 
     # Default build omits the live transport; -Live opts into the real Snowflake
     # SQL API transport via the 'live' cargo feature.
-    $cargoArgs = @('build', '--release', '-p', $CliPackage)
+    $cargoArgs = @('build', '--locked', '--release', '--bin', $BinaryName, '--bin', $AliasName, '--message-format=json,json-render-diagnostics', '-p', $CliPackage)
     $featureLabel = 'default features (no live transport)'
     if ($Live) {
         $cargoArgs += @('--features', 'live')
@@ -496,18 +537,26 @@ function Build-FromSource {
 
     Write-Info "Compiling $CliPackage (cargo build --release, $featureLabel)"
     Write-Info 'This downloads crates and can take several minutes on first build...'
+    $buildEvidence = Join-Path ([System.IO.Path]::GetTempPath()) ('fsnow-cargo-build-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $buildEvidence | Out-Null
+    $buildMessages = Join-Path $buildEvidence 'cargo-messages.jsonl'
+    $buildErrors = Join-Path $buildEvidence 'cargo-stderr.txt'
+    Write-Info "Source-build evidence retained at $buildEvidence"
     Push-Location $src
     $code = 1
+    $previousRemoteRequirement = [Environment]::GetEnvironmentVariable('RCH_REQUIRE_REMOTE', 'Process')
     try {
-        # Unset target redirection so the binaries land where we expect.
-        Remove-Item Env:\CARGO_TARGET_DIR       -ErrorAction SilentlyContinue
-        Remove-Item Env:\CARGO_BUILD_TARGET     -ErrorAction SilentlyContinue
-        Remove-Item Env:\CARGO_BUILD_TARGET_DIR -ErrorAction SilentlyContinue
-        & cargo @cargoArgs
+        # Caller target settings remain intact. The outer DSR/RCH admission must
+        # still prove a supported remote route before running this build.
+        $env:RCH_REQUIRE_REMOTE = '1'
+        & cargo @cargoArgs 2> $buildErrors | Set-Content -LiteralPath $buildMessages -Encoding UTF8
         $code = $LASTEXITCODE
     } finally {
+        [Environment]::SetEnvironmentVariable('RCH_REQUIRE_REMOTE', $previousRemoteRequirement, 'Process')
         Pop-Location
     }
+    Set-Content -LiteralPath (Join-Path $buildEvidence 'returncode.txt') -Value $code -Encoding UTF8
+    foreach ($line in [System.IO.File]::ReadLines($buildErrors)) { [Console]::Error.WriteLine($line) }
     if ($code -ne 0) {
         Write-Err 'cargo build failed.'
         if ($script:NoRelease -and -not $local) {
@@ -518,17 +567,13 @@ function Build-FromSource {
         throw 'build failed'
     }
 
-    $rel = Join-Path $src 'target\release'
-    $bin = Join-Path $rel "$BinaryName.exe"
-    if (-not (Test-Path $bin)) {
-        $found = Get-ChildItem -Path (Join-Path $src 'target') -Recurse -Filter "$BinaryName.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($found) { $bin = $found.FullName } else { $bin = $null }
-    }
-    if (-not $bin -or -not (Test-Path $bin)) { Write-Err "Build succeeded but $BinaryName.exe not found under $rel"; throw 'binary missing' }
+    $built = Get-CargoBuiltBinaries -MessagesPath $buildMessages -ManifestPath (Join-Path $src "crates\$CliPackage\Cargo.toml") -Names @($BinaryName, $AliasName)
+    $bin = $built[$BinaryName]
 
     Install-BinFile -Src $bin -Name "$BinaryName.exe"
     Write-Ok "Installed $Dest\$BinaryName.exe (source build)"
-    Install-Alias -StageDir (Split-Path -Parent $bin)
+    Install-BinFile -Src $built[$AliasName] -Name "$AliasName.exe"
+    Write-Ok "Installed $Dest\$AliasName.exe (source build)"
 }
 
 # ── PATH update (User scope) ────────────────────────────────────────────────
