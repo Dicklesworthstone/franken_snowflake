@@ -49,7 +49,7 @@
     feature set.
 
 .PARAMETER Offline
-    Install from a local artifact archive (.zip/.tar.*) instead of downloading.
+    Install from a local artifact archive (.zip/.tar.*); requires Version and Checksum.
 
 .PARAMETER ArtifactUrl
     Download the artifact from an explicit URL.
@@ -121,6 +121,7 @@ $Repo        = 'franken_snowflake'
 $BinaryName  = 'franken-snowflake'
 $AliasName   = 'fsnow'
 $CliPackage  = 'franken-snowflake-cli'
+$HttpUserAgent = 'OpenAI File Downloader, XaiImageApiFetch/1.0'
 
 $script:NoRelease  = $false
 $script:VersionBare = ''
@@ -165,7 +166,7 @@ function Invoke-Download {
     param([string]$Url, [string]$OutFile, [string]$Label = 'Downloading')
     Write-Info "$Label $(Split-Path -Leaf $Url)"
     $proxyArgs = Get-ProxyArgs
-    Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -TimeoutSec 1800 @proxyArgs
+    Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -UserAgent $HttpUserAgent -TimeoutSec 1800 @proxyArgs
 }
 
 # ── Platform detection ──────────────────────────────────────────────────────
@@ -188,12 +189,16 @@ function Resolve-Version {
         $Version = $script:Version
         return
     }
+    if ($Offline) {
+        Write-Err 'Offline installation requires -Version vX.Y.Z; no network lookup is performed.'
+        throw 'offline version required'
+    }
     Write-Info 'Resolving latest version...'
     $proxyArgs = Get-ProxyArgs
     $tag = $null
     try {
         $api = "https://api.github.com/repos/$Owner/$Repo/releases/latest"
-        $rel = Invoke-RestMethod -Uri $api -Headers @{ 'Accept' = 'application/vnd.github+json'; 'User-Agent' = 'franken-snowflake-installer' } -TimeoutSec 45 @proxyArgs
+        $rel = Invoke-RestMethod -Uri $api -Headers @{ 'Accept' = 'application/vnd.github+json' } -UserAgent $HttpUserAgent -TimeoutSec 45 @proxyArgs
         if ($rel -and $rel.tag_name) { $tag = $rel.tag_name }
     } catch { $tag = $null }
 
@@ -210,7 +215,7 @@ function Resolve-Version {
     try {
         $cb = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
         $raw = "https://raw.githubusercontent.com/$Owner/$Repo/main/Cargo.toml?$cb"
-        $body = Invoke-WebRequest -Uri $raw -UseBasicParsing -TimeoutSec 45 @proxyArgs
+        $body = Invoke-WebRequest -Uri $raw -UseBasicParsing -UserAgent $HttpUserAgent -TimeoutSec 45 @proxyArgs
         $m = [regex]::Match($body.Content, '(?m)^version = "([0-9][^"]*)"')
         if ($m.Success) { $cv = $m.Groups[1].Value }
     } catch { $cv = $null }
@@ -251,10 +256,11 @@ function Invoke-Preflight {
         try { New-Item -ItemType Directory -Path $Dest -Force | Out-Null }
         catch { Write-Err "Cannot create destination: $Dest"; throw }
     }
-    $probe = Join-Path $Dest '.fsnow_write_test'
+    $probe = Join-Path $Dest ('.fsnow_write_test.' + [Guid]::NewGuid().ToString('N'))
     try {
-        Set-Content -Path $probe -Value 'ok' -ErrorAction Stop
-        Remove-Item -Path $probe -Force -ErrorAction SilentlyContinue
+        $stream = [System.IO.File]::Open($probe, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+        $stream.Dispose()
+        Write-Info "Retained destination write probe: $probe"
     } catch {
         Write-Err "Destination not writable: $Dest (try -Dest DIR, or run elevated for -System)"
         throw
@@ -347,19 +353,42 @@ function Test-Checksum {
 
     $sum = $Checksum
     $proxyArgs = Get-ProxyArgs
+    if (-not $sum -and $Offline) {
+        Write-Err 'Offline installation requires -Checksum HEX (or explicit -NoVerify).'
+        throw 'offline checksum required'
+    }
     if (-not $sum) {
         $url = $ChecksumUrl
         if (-not $url) { $url = "https://github.com/$Owner/$Repo/releases/download/$Version/SHA256SUMS" }
         try {
-            $body = (Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 45 @proxyArgs).Content
-            foreach ($l in ($body -split "`n")) {
-                if ($l -match "([0-9a-fA-F]{64})\s+\*?$([regex]::Escape($TarName))\s*$") { $sum = $Matches[1]; break }
+            $body = (Invoke-WebRequest -Uri $url -UseBasicParsing -UserAgent $HttpUserAgent -TimeoutSec 45 @proxyArgs).Content
+        } catch {
+            Write-Err "Required checksum manifest could not be downloaded: $url"
+            throw
+        }
+        $count = 0
+        $invalid = $false
+        foreach ($l in ($body -split "`n")) {
+            $parts = $l.Trim() -split '\s+'
+            if ($parts.Count -lt 2) { continue }
+            if ([string]::Equals($parts[1], $TarName, [StringComparison]::Ordinal) -or
+                [string]::Equals($parts[1], "*$TarName", [StringComparison]::Ordinal)) {
+                $count++
+                if ($parts.Count -ne 2 -or $parts[0] -notmatch '\A[0-9a-fA-F]{64}\z') { $invalid = $true }
+                $sum = $parts[0]
             }
-        } catch { }
+        }
+        if ($count -ne 1 -or $invalid) {
+            Write-Err "Checksum manifest requires exactly one valid SHA256 entry for $TarName"
+            throw 'invalid checksum manifest'
+        }
     }
-    if (-not $sum) { Write-Warn "No checksum available for $TarName; skipping verification"; return }
+    if ($sum -notmatch '\A[0-9a-fA-F]{64}\z') {
+        Write-Err 'Expected checksum must contain exactly 64 hexadecimal characters'
+        throw 'invalid expected checksum'
+    }
 
-    $actual = (Get-FileHash -Path $File -Algorithm SHA256).Hash
+    $actual = (Get-FileHash -LiteralPath $File -Algorithm SHA256).Hash
     if ($actual.ToLower() -ne $sum.ToLower()) {
         Write-Err "Checksum mismatch for $TarName"
         Write-Err "  expected: $sum"
@@ -392,9 +421,7 @@ function Expand-Artifact {
 function Install-FromArtifact {
     param([string]$Archive, [string]$TarName)
     Test-Checksum -File $Archive -TarName $TarName
-    # Releases publish no signature yet, and this installer verifies none: say
-    # so rather than leave the checksum looking like a signature check.
-    Write-Warn 'Signature not verified: only the SHA-256 checksum was checked'
+    Write-Warn 'Minisign signatures are not verified by this installer'
     Expand-Artifact -Archive $Archive
 
     $bin = Join-Path $script:Tmp "$BinaryName.exe"
@@ -447,10 +474,13 @@ function Build-FromSource {
         $src = Join-Path $script:Tmp 'src'
         Write-Info "Cloning $Owner/$Repo"
         if (-not $script:NoRelease -and $Version) {
-            git clone --depth 1 --branch $Version "https://github.com/$Owner/$Repo.git" $src 2>$null
-            if ($LASTEXITCODE -ne 0) { git clone --depth 1 "https://github.com/$Owner/$Repo.git" $src }
+            git -c "http.userAgent=$HttpUserAgent" clone --depth 1 --branch $Version "https://github.com/$Owner/$Repo.git" $src
+            if ($LASTEXITCODE -ne 0) {
+                Write-Err "Unable to fetch requested source release $Version; refusing a default-branch fallback."
+                throw 'requested source release unavailable'
+            }
         } else {
-            git clone --depth 1 "https://github.com/$Owner/$Repo.git" $src
+            git -c "http.userAgent=$HttpUserAgent" clone --depth 1 "https://github.com/$Owner/$Repo.git" $src
         }
         if ($LASTEXITCODE -ne 0) { throw 'git clone failed' }
     }

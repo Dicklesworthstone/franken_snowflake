@@ -21,7 +21,7 @@
 #                      downloading a prepared release binary
 #   --live             Build the CLI with the `live` feature (real Snowflake SQL API
 #                      transport). Applies to every from-source build path.
-#   --offline TARBALL  Install from a local artifact tarball (airgapped, no network)
+#   --offline TARBALL  Install locally; requires --version and --checksum
 #   --artifact-url URL Download the artifact from an explicit URL
 #   --checksum HEX     Expected SHA256 of the artifact (overrides remote SHA256SUMS)
 #   --checksum-url URL URL of a SHA256SUMS file to verify against
@@ -52,6 +52,7 @@ REPO="${REPO:-franken_snowflake}"
 BINARY_NAME="franken-snowflake"        # canonical binary
 ALIAS_NAME="fsnow"                     # short agent-ergonomic alias
 CLI_PACKAGE="franken-snowflake-cli"    # cargo -p package that builds both bins
+HTTP_USER_AGENT="OpenAI File Downloader, XaiImageApiFetch/1.0"
 
 VERSION="${VERSION:-}"
 DEST_DEFAULT="$HOME/.local/bin"
@@ -125,9 +126,9 @@ warn() {
 
 err() {
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 196 -- "x  $*"
+    gum style --foreground 196 -- "x  $*" >&2
   else
-    echo -e "${C_RED}x${RESET}  $*"
+    printf '%sx%s  %s\n' "$C_RED" "$RESET" "$*" >&2
   fi
 }
 
@@ -205,7 +206,7 @@ Options:
   --from-source      Developer-only: build from source with cargo instead of
                      downloading a prepared release binary
   --live             Build the CLI with the 'live' feature (real Snowflake transport)
-  --offline TARBALL  Install from a local artifact tarball (airgapped)
+  --offline TARBALL  Install locally; requires --version and --checksum
   --artifact-url URL Download the artifact from an explicit URL
   --checksum HEX     Expected SHA256 of the artifact
   --checksum-url URL URL of a SHA256SUMS file to verify against
@@ -317,17 +318,22 @@ resolve_version() {
     return 0
   fi
 
+  if [ -n "$OFFLINE_TARBALL" ]; then
+    err "Offline installation requires --version vX.Y.Z; no network lookup is performed."
+    exit 1
+  fi
+
   info "Resolving latest version..."
   local tag=""
   local api="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
-  tag=$(curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 15 --max-time 45 \
+  tag=$(curl -fsSL --user-agent "$HTTP_USER_AGENT" "${PROXY_ARGS[@]}" --connect-timeout 15 --max-time 45 \
           -H "Accept: application/vnd.github+json" "$api" 2>/dev/null \
         | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)
 
   if [ -z "$tag" ]; then
     local redir="https://github.com/${OWNER}/${REPO}/releases/latest"
     local eff
-    eff=$(curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 15 --max-time 45 \
+    eff=$(curl -fsSL --user-agent "$HTTP_USER_AGENT" "${PROXY_ARGS[@]}" --connect-timeout 15 --max-time 45 \
             -o /dev/null -w '%{url_effective}' "$redir" 2>/dev/null || true)
     case "$eff" in
       */tag/*) tag="${eff##*/tag/}" ;;
@@ -346,7 +352,7 @@ resolve_version() {
   local cb raw cv
   cb=$(date +%s)
   raw="https://raw.githubusercontent.com/${OWNER}/${REPO}/main/Cargo.toml?${cb}"
-  cv=$(curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 15 --max-time 45 "$raw" 2>/dev/null \
+  cv=$(curl -fsSL --user-agent "$HTTP_USER_AGENT" "${PROXY_ARGS[@]}" --connect-timeout 15 --max-time 45 "$raw" 2>/dev/null \
         | sed -nE 's/^version = "([0-9][^"]*)".*/\1/p' | head -n1 || true)
   if [ "$FROM_SOURCE" -eq 1 ] || [ -n "$ARTIFACT_URL" ] || [ -n "$OFFLINE_TARBALL" ]; then
     VERSION="${cv:-0.0.0}"
@@ -397,10 +403,11 @@ preflight_checks() {
     if ! mkdir -p "$DEST" 2>/dev/null; then
       err "Cannot create destination directory: $DEST"; exit 1
     fi
-    if ! ( : > "$DEST/.fsnow_write_test" ) 2>/dev/null; then
+    local write_probe
+    if ! write_probe=$(mktemp "$DEST/.fsnow_write_test.XXXXXXXX") 2>/dev/null; then
       err "Destination not writable: $DEST (use --system or --dest DIR)"; exit 1
     fi
-    rm -f "$DEST/.fsnow_write_test"
+    info "Retained destination write probe: $write_probe"
   fi
 
   # Existing install.
@@ -410,7 +417,7 @@ preflight_checks() {
 
   # Network (best-effort; never blocks).
   if [ -z "$OFFLINE_TARBALL" ]; then
-    if ! curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 5 --max-time 10 \
+    if ! curl -fsSL --user-agent "$HTTP_USER_AGENT" "${PROXY_ARGS[@]}" --connect-timeout 5 --max-time 10 \
           -o /dev/null "https://github.com" 2>/dev/null; then
       warn "Network check to github.com failed; downloads may not work"
     fi
@@ -472,7 +479,7 @@ ensure_cargo() {
   fi
   if [ "$do_install" -eq 1 ]; then
     info "Installing rustup..."
-    curl -fsSL "${PROXY_ARGS[@]}" --proto '=https' --tlsv1.2 --connect-timeout 30 --max-time 300 \
+    curl -fsSL --user-agent "$HTTP_USER_AGENT" "${PROXY_ARGS[@]}" --proto '=https' --tlsv1.2 --connect-timeout 30 --max-time 300 \
       https://sh.rustup.rs | sh -s -- -y --profile minimal
     # shellcheck disable=SC1091
     [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
@@ -526,59 +533,76 @@ verify_checksum() {
     return 0
   fi
 
+  if [ -z "$CHECKSUM" ] && [ -n "$OFFLINE_TARBALL" ]; then
+    err "Offline installation requires --checksum HEX (or explicit --no-verify)."
+    exit 1
+  fi
+
   if [ -z "$CHECKSUM" ]; then
     local cksum_url="$CHECKSUM_URL"
     [ -z "$cksum_url" ] && cksum_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/SHA256SUMS"
     local cf="$TMP/SHA256SUMS"
     info "Fetching checksums from ${cksum_url}"
-    if curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 15 --max-time 45 "$cksum_url" -o "$cf" 2>/dev/null; then
-      CHECKSUM=$(grep -E "[[:space:]]\*?${tarname}\$" "$cf" 2>/dev/null | awk '{print $1}' | head -n1)
+    if ! curl -fsSL --user-agent "$HTTP_USER_AGENT" "${PROXY_ARGS[@]}" --connect-timeout 15 --max-time 45 "$cksum_url" -o "$cf"; then
+      err "Required checksum manifest could not be downloaded: ${cksum_url}"
+      exit 1
     fi
-    if [ -z "$CHECKSUM" ]; then
-      local side="${URL}.sha256"
-      if curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 15 --max-time 45 "$side" -o "$cf" 2>/dev/null; then
-        CHECKSUM=$(awk 'NF>=1 && $1 ~ /^[0-9a-fA-F]{64}$/ {print $1; exit}' "$cf")
-      fi
+    if ! CHECKSUM=$(awk -v name="$tarname" '
+      { sub(/\r$/, "") }
+      $2 == name || $2 == "*" name {
+        count++
+        if (NF != 2 || length($1) != 64 || $1 !~ /^[0-9a-fA-F]+$/) invalid = 1
+        digest = $1
+      }
+      END {
+        if (count != 1 || invalid) exit 1
+        print digest
+      }
+    ' "$cf"); then
+      err "Checksum manifest requires exactly one valid SHA256 entry for ${tarname}"
+      exit 1
     fi
   fi
 
-  if [ -z "$CHECKSUM" ]; then
-    warn "No checksum available for ${tarname}; skipping verification"
-    return 0
+  if ! [[ "$CHECKSUM" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    err "Expected checksum must contain exactly 64 hexadecimal characters"
+    exit 1
   fi
 
+  local actual
   if command -v sha256sum >/dev/null 2>&1; then
-    if echo "${CHECKSUM}  ${file}" | sha256sum -c - >/dev/null 2>&1; then
-      ok "Checksum verified"
-      return 0
-    fi
-    err "Checksum mismatch for ${tarname}"
-    exit 1
+    actual=$(sha256sum < "$file") || { err "Could not hash ${tarname}"; exit 1; }
   elif command -v shasum >/dev/null 2>&1; then
-    if echo "${CHECKSUM}  ${file}" | shasum -a 256 -c - >/dev/null 2>&1; then
-      ok "Checksum verified"
-      return 0
-    fi
+    actual=$(shasum -a 256 < "$file") || { err "Could not hash ${tarname}"; exit 1; }
+  else
+    err "Checksum verification requires sha256sum or shasum"
+    exit 1
+  fi
+  actual="${actual%% *}"
+  if [ "$(printf '%s' "$CHECKSUM" | tr 'A-F' 'a-f')" != "$actual" ]; then
     err "Checksum mismatch for ${tarname}"
     exit 1
-  else
-    warn "Neither sha256sum nor shasum found; skipping checksum verification"
   fi
+  ok "Checksum verified"
 }
 
 # ── Signature verification (Sigstore bundle, when one is published) ─────────
-# Always say what was verified: a release without a published signature, or a
-# host without cosign, leaves only the SHA-256 checksum verified.
+# Sigstore verification is independent of the checksum and self-test switches.
+# Published Minisign signatures require the independently trusted-key verifier.
 verify_sigstore() {
   local file="$1" tarname="$2"
+  if [ -n "$OFFLINE_TARBALL" ]; then
+    warn "Signature not verified: offline installation does not fetch signatures"
+    return 0
+  fi
   if [ -z "$VERSION" ]; then
     warn "Signature not verified: no release version to fetch a signature for"
     return 0
   fi
   local bundle="$TMP/${tarname}.sigstore"
   local bundle_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${tarname}.sigstore"
-  if ! curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 15 --max-time 45 "$bundle_url" -o "$bundle" 2>/dev/null; then
-    warn "Signature not verified: ${VERSION} publishes no signature (only the SHA-256 checksum was checked)"
+  if ! curl -fsSL --user-agent "$HTTP_USER_AGENT" "${PROXY_ARGS[@]}" --connect-timeout 15 --max-time 45 "$bundle_url" -o "$bundle" 2>/dev/null; then
+    warn "Sigstore bundle unavailable; this installer does not verify Minisign signatures"
     return 0
   fi
   if ! command -v cosign >/dev/null 2>&1; then
@@ -620,11 +644,13 @@ build_from_source() {
     src="$TMP/src"
     info "Cloning ${OWNER}/${REPO}"
     if [ "$NO_RELEASE" -eq 0 ] && [ -n "$VERSION" ]; then
-      git clone --depth 1 --branch "$VERSION" \
-        "https://github.com/${OWNER}/${REPO}.git" "$src" 2>/dev/null \
-        || git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$src"
+      git -c http.userAgent="$HTTP_USER_AGENT" clone --depth 1 --branch "$VERSION" \
+        "https://github.com/${OWNER}/${REPO}.git" "$src" || {
+          err "Unable to fetch requested source release ${VERSION}; refusing a default-branch fallback."
+          exit 1
+        }
     else
-      git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$src"
+      git -c http.userAgent="$HTTP_USER_AGENT" clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$src"
     fi
   fi
 
@@ -676,10 +702,10 @@ download_with_progress() {
   local url="$1" dest="$2" label="${3:-Downloading}"
   if [ -t 1 ] && [ "$QUIET" -eq 0 ]; then
     printf '%s↓%s %s %s%s%s\n' "$C_CYAN" "$RESET" "$label" "$C_DIM" "$(basename "$url")" "$RESET"
-    curl -fL "${PROXY_ARGS[@]}" --progress-bar --connect-timeout 30 --max-time 1800 "$url" -o "$dest"
+    curl -fL --user-agent "$HTTP_USER_AGENT" "${PROXY_ARGS[@]}" --progress-bar --connect-timeout 30 --max-time 1800 "$url" -o "$dest"
   else
     info "$label"
-    curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 30 --max-time 1800 "$url" -o "$dest"
+    curl -fsSL --user-agent "$HTTP_USER_AGENT" "${PROXY_ARGS[@]}" --connect-timeout 30 --max-time 1800 "$url" -o "$dest"
   fi
 }
 
