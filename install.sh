@@ -738,7 +738,7 @@ build_from_source() {
   info "Source-build evidence retained at $build_evidence"
   if (
     cd "$src" \
-      && RCH_REQUIRE_REMOTE=1 cargo build --locked --release \
+      && RCH_REQUIRE_REMOTE=1 RCH_CARGO_JSON_STDOUT=1 cargo build --locked --release \
            --bin "$BINARY_NAME" --bin "$ALIAS_NAME" \
            --message-format=json,json-render-diagnostics -p "$CLI_PACKAGE" \
            ${feature_args[@]+"${feature_args[@]}"} > "$build_messages" 2> "$build_errors"

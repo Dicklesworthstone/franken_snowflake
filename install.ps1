@@ -545,14 +545,17 @@ function Build-FromSource {
     Push-Location $src
     $code = 1
     $previousRemoteRequirement = [Environment]::GetEnvironmentVariable('RCH_REQUIRE_REMOTE', 'Process')
+    $previousCargoJsonStdout = [Environment]::GetEnvironmentVariable('RCH_CARGO_JSON_STDOUT', 'Process')
     try {
         # Caller target settings remain intact. The outer DSR/RCH admission must
         # still prove a supported remote route before running this build.
         $env:RCH_REQUIRE_REMOTE = '1'
+        $env:RCH_CARGO_JSON_STDOUT = '1'
         & cargo @cargoArgs 2> $buildErrors | Set-Content -LiteralPath $buildMessages -Encoding UTF8
         $code = $LASTEXITCODE
     } finally {
         [Environment]::SetEnvironmentVariable('RCH_REQUIRE_REMOTE', $previousRemoteRequirement, 'Process')
+        [Environment]::SetEnvironmentVariable('RCH_CARGO_JSON_STDOUT', $previousCargoJsonStdout, 'Process')
         Pop-Location
     }
     Set-Content -LiteralPath (Join-Path $buildEvidence 'returncode.txt') -Value $code -Encoding UTF8
