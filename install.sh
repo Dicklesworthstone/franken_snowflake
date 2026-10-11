@@ -150,14 +150,14 @@ draw_box() {
   local color="$1"; shift
   local -a lines=("$@")
   local width=0 line plain
-  for line in "${lines[@]}"; do
+  for line in ${lines[@]+"${lines[@]}"}; do
     plain=$(printf '%s' "$line" | strip_ansi)
     [ "${#plain}" -gt "$width" ] && width=${#plain}
   done
   local bar="" i
   for (( i = 0; i < width + 2; i++ )); do bar+="═"; done
   printf '%s╔%s╗%s\n' "$color" "$bar" "$RESET"
-  for line in "${lines[@]}"; do
+  for line in ${lines[@]+"${lines[@]}"}; do
     plain=$(printf '%s' "$line" | strip_ansi)
     local pad=$(( width - ${#plain} ))
     [ "$pad" -lt 0 ] && pad=0
@@ -326,14 +326,14 @@ resolve_version() {
   info "Resolving latest version..."
   local tag=""
   local api="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
-  tag=$(curl -fsSL --user-agent "$HTTP_USER_AGENT" "${PROXY_ARGS[@]}" --connect-timeout 15 --max-time 45 \
+  tag=$(curl -fsSL --user-agent "$HTTP_USER_AGENT" ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 15 --max-time 45 \
           -H "Accept: application/vnd.github+json" "$api" 2>/dev/null \
         | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)
 
   if [ -z "$tag" ]; then
     local redir="https://github.com/${OWNER}/${REPO}/releases/latest"
     local eff
-    eff=$(curl -fsSL --user-agent "$HTTP_USER_AGENT" "${PROXY_ARGS[@]}" --connect-timeout 15 --max-time 45 \
+    eff=$(curl -fsSL --user-agent "$HTTP_USER_AGENT" ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 15 --max-time 45 \
             -o /dev/null -w '%{url_effective}' "$redir" 2>/dev/null || true)
     case "$eff" in
       */tag/*) tag="${eff##*/tag/}" ;;
@@ -352,7 +352,7 @@ resolve_version() {
   local cb raw cv
   cb=$(date +%s)
   raw="https://raw.githubusercontent.com/${OWNER}/${REPO}/main/Cargo.toml?${cb}"
-  cv=$(curl -fsSL --user-agent "$HTTP_USER_AGENT" "${PROXY_ARGS[@]}" --connect-timeout 15 --max-time 45 "$raw" 2>/dev/null \
+  cv=$(curl -fsSL --user-agent "$HTTP_USER_AGENT" ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 15 --max-time 45 "$raw" 2>/dev/null \
         | sed -nE 's/^version = "([0-9][^"]*)".*/\1/p' | head -n1 || true)
   if [ "$FROM_SOURCE" -eq 1 ] || [ -n "$ARTIFACT_URL" ] || [ -n "$OFFLINE_TARBALL" ]; then
     VERSION="${cv:-0.0.0}"
@@ -417,7 +417,7 @@ preflight_checks() {
 
   # Network (best-effort; never blocks).
   if [ -z "$OFFLINE_TARBALL" ]; then
-    if ! curl -fsSL --user-agent "$HTTP_USER_AGENT" "${PROXY_ARGS[@]}" --connect-timeout 5 --max-time 10 \
+    if ! curl -fsSL --user-agent "$HTTP_USER_AGENT" ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 5 --max-time 10 \
           -o /dev/null "https://github.com" 2>/dev/null; then
       warn "Network check to github.com failed; downloads may not work"
     fi
@@ -479,7 +479,7 @@ ensure_cargo() {
   fi
   if [ "$do_install" -eq 1 ]; then
     info "Installing rustup..."
-    curl -fsSL --user-agent "$HTTP_USER_AGENT" "${PROXY_ARGS[@]}" --proto '=https' --tlsv1.2 --connect-timeout 30 --max-time 300 \
+    curl -fsSL --user-agent "$HTTP_USER_AGENT" ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --proto '=https' --tlsv1.2 --connect-timeout 30 --max-time 300 \
       https://sh.rustup.rs | sh -s -- -y --profile minimal
     # shellcheck disable=SC1091
     [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
@@ -543,7 +543,7 @@ verify_checksum() {
     [ -z "$cksum_url" ] && cksum_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/SHA256SUMS"
     local cf="$TMP/SHA256SUMS"
     info "Fetching checksums from ${cksum_url}"
-    if ! curl -fsSL --user-agent "$HTTP_USER_AGENT" "${PROXY_ARGS[@]}" --connect-timeout 15 --max-time 45 "$cksum_url" -o "$cf"; then
+    if ! curl -fsSL --user-agent "$HTTP_USER_AGENT" ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 15 --max-time 45 "$cksum_url" -o "$cf"; then
       err "Required checksum manifest could not be downloaded: ${cksum_url}"
       exit 1
     fi
@@ -601,7 +601,7 @@ verify_sigstore() {
   fi
   local bundle="$TMP/${tarname}.sigstore"
   local bundle_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${tarname}.sigstore"
-  if ! curl -fsSL --user-agent "$HTTP_USER_AGENT" "${PROXY_ARGS[@]}" --connect-timeout 15 --max-time 45 "$bundle_url" -o "$bundle" 2>/dev/null; then
+  if ! curl -fsSL --user-agent "$HTTP_USER_AGENT" ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 15 --max-time 45 "$bundle_url" -o "$bundle" 2>/dev/null; then
     warn "Sigstore bundle unavailable; this installer does not verify Minisign signatures"
     return 0
   fi
@@ -779,10 +779,10 @@ download_with_progress() {
   local url="$1" dest="$2" label="${3:-Downloading}"
   if [ -t 1 ] && [ "$QUIET" -eq 0 ]; then
     printf '%s↓%s %s %s%s%s\n' "$C_CYAN" "$RESET" "$label" "$C_DIM" "$(basename "$url")" "$RESET"
-    curl -fL --user-agent "$HTTP_USER_AGENT" "${PROXY_ARGS[@]}" --progress-bar --connect-timeout 30 --max-time 1800 "$url" -o "$dest"
+    curl -fL --user-agent "$HTTP_USER_AGENT" ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --progress-bar --connect-timeout 30 --max-time 1800 "$url" -o "$dest"
   else
     info "$label"
-    curl -fsSL --user-agent "$HTTP_USER_AGENT" "${PROXY_ARGS[@]}" --connect-timeout 30 --max-time 1800 "$url" -o "$dest"
+    curl -fsSL --user-agent "$HTTP_USER_AGENT" ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 30 --max-time 1800 "$url" -o "$dest"
   fi
 }
 
