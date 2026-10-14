@@ -15,7 +15,7 @@ import time
 import urllib.request
 import urllib.error
 
-USER_AGENT = "OpenAI File Downloader, XaiImageApiFetch/1.0"
+USER_AGENT = "franken_snowflake-publish (+https://github.com/Dicklesworthstone/franken_snowflake)"
 
 # Topological order of publishing
 CRATES = [
