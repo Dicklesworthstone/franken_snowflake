@@ -328,7 +328,8 @@ resolve_version() {
   local api="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
   tag=$(curl -fsSL --user-agent "$HTTP_USER_AGENT" ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 15 --max-time 45 \
           -H "Accept: application/vnd.github+json" "$api" 2>/dev/null \
-        | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)
+        | grep -o '"tag_name": *"[^"]*"' | head -n 1 | sed -E 's/.*"([^"]*)"$/\1/' || true)
+  case "$tag" in v[0-9]*|[0-9]*) ;; *) tag="" ;; esac
 
   if [ -z "$tag" ]; then
     local redir="https://github.com/${OWNER}/${REPO}/releases/latest"
