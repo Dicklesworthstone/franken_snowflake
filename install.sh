@@ -52,7 +52,7 @@ REPO="${REPO:-franken_snowflake}"
 BINARY_NAME="franken-snowflake"        # canonical binary
 ALIAS_NAME="fsnow"                     # short agent-ergonomic alias
 CLI_PACKAGE="franken-snowflake-cli"    # cargo -p package that builds both bins
-HTTP_USER_AGENT="OpenAI File Downloader, XaiImageApiFetch/1.0"
+HTTP_USER_AGENT="fsnow-installer (+https://github.com/Dicklesworthstone/franken_snowflake)"
 
 VERSION="${VERSION:-}"
 DEST_DEFAULT="$HOME/.local/bin"
