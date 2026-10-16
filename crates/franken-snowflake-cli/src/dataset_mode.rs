@@ -9,7 +9,7 @@
 //! plan for the envelope; the live module executes it with the same bindings.
 
 use franken_snowflake_catalog::planner::{
-    DatasetQueryRequest, PlanRefusal, QueryPlan, plan_dataset_query,
+    DatasetQueryRequest, PlanRefusal, QueryPlan, plan_dataset_query_with_cx,
 };
 use franken_snowflake_catalog::predicate::PredicateAst;
 use franken_snowflake_core::error::SnowflakeErrorCode;
@@ -225,7 +225,9 @@ pub fn plan_dataset(
         .into_iter()
         .cloned()
         .collect();
-    let plan = plan_dataset_query(
+    let planner_cx = franken_snowflake_core::capabilities::current_planner_cx();
+    let plan = plan_dataset_query_with_cx(
+        &planner_cx,
         &dataset.manifest,
         &columns,
         &dataset.snapshot.operators,

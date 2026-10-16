@@ -21,7 +21,7 @@ pub const MAX_SEARCH_LIMIT: usize = 100;
 pub enum SearchField {
     /// The object name.
     Object,
-    /// A column name.
+    /// A column name or alias.
     Column,
     /// A tag (name or value) on the object or a column.
     Tag,
@@ -29,6 +29,8 @@ pub enum SearchField {
     Description,
     /// A column comment.
     ColumnComment,
+    /// A relation (foreign key, stage, file format, or primary key constraint).
+    Relation,
     /// The database or schema name.
     Location,
 }
@@ -40,7 +42,7 @@ impl SearchField {
             Self::Object => 50,
             Self::Column => 30,
             Self::Tag | Self::Description => 20,
-            Self::ColumnComment => 15,
+            Self::ColumnComment | Self::Relation => 15,
             Self::Location => 10,
         }
     }
@@ -108,11 +110,53 @@ pub fn search_snapshot(snapshot: &CatalogSnapshot, query: &str, limit: usize) ->
     hits
 }
 
-fn score_dataset(
+/// True when `query_word` and `candidate_word` are at least 5 characters, share
+/// their leading character, and have Damerau-Levenshtein distance 1 (one
+/// insertion, deletion, substitution, or adjacent transposition).
+fn is_typo_match(query_word: &str, candidate_word: &str) -> bool {
+    let q: Vec<char> = query_word.chars().collect();
+    let c: Vec<char> = candidate_word.chars().collect();
+    if q.len() < 5 || c.len() < 5 || q[0] != c[0] {
+        return false;
+    }
+    let diff = q.len().abs_diff(c.len());
+    if diff > 1 {
+        return false;
+    }
+    if q.len() == c.len() {
+        let mismatches: Vec<usize> = (0..q.len()).filter(|&i| q[i] != c[i]).collect();
+        return match mismatches.as_slice() {
+            [_] => true,
+            [i, j] if *j == *i + 1 && q[*i] == c[*j] && q[*j] == c[*i] => true,
+            _ => false,
+        };
+    }
+    let (shorter, longer) = if q.len() < c.len() {
+        (&q, &c)
+    } else {
+        (&c, &q)
+    };
+    let mut i = 0;
+    let mut j = 0;
+    let mut skipped = false;
+    while i < shorter.len() && j < longer.len() {
+        if shorter[i] == longer[j] {
+            i += 1;
+            j += 1;
+        } else if !skipped {
+            skipped = true;
+            j += 1;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+fn collect_dataset_texts(
     snapshot: &CatalogSnapshot,
     dataset: &DatasetManifest,
-    words: &[String],
-) -> Option<SearchHit> {
+) -> Vec<(SearchField, String)> {
     let mut texts: Vec<(SearchField, String)> = vec![
         (SearchField::Object, dataset.object.clone()),
         (SearchField::Location, dataset.database.clone()),
@@ -123,6 +167,9 @@ fn score_dataset(
     }
     for column in snapshot.columns_for_dataset(&dataset.id) {
         texts.push((SearchField::Column, column.column.clone()));
+        for alias in &column.aliases {
+            texts.push((SearchField::Column, alias.clone()));
+        }
         if let Some(comment) = &column.comment {
             texts.push((SearchField::ColumnComment, comment.clone()));
         }
@@ -139,6 +186,101 @@ fn score_dataset(
             texts.push((SearchField::Tag, tag.label()));
         }
     }
+    let matches_dataset = |obj: &crate::model::ObjectRef| {
+        obj.database == dataset.database
+            && obj.schema == dataset.schema
+            && obj.name == dataset.object
+    };
+    for pk in &snapshot.primary_keys {
+        if matches_dataset(&pk.object)
+            && let Some(constraint) = &pk.constraint
+        {
+            texts.push((SearchField::Relation, constraint.clone()));
+        }
+    }
+    for relation in &snapshot.relations {
+        match relation {
+            crate::model::CatalogRelation::ForeignKey {
+                from,
+                to,
+                constraint,
+            } if matches_dataset(from) => {
+                texts.push((
+                    SearchField::Relation,
+                    format!("{constraint} {}", to.qualified()),
+                ));
+            }
+            crate::model::CatalogRelation::UsesStage { object, stage }
+                if matches_dataset(object) =>
+            {
+                let mut label = stage.qualified();
+                if let Some(entry) = snapshot.stages.iter().find(|s| &s.stage == stage) {
+                    if let Some(url) = &entry.url {
+                        label.push(' ');
+                        label.push_str(url);
+                    }
+                    if let Some(comment) = &entry.comment {
+                        label.push(' ');
+                        label.push_str(comment);
+                    }
+                }
+                for stage_rel in &snapshot.relations {
+                    if let crate::model::CatalogRelation::StageUsesFileFormat {
+                        stage: rel_stage,
+                        file_format,
+                    } = stage_rel
+                        && rel_stage == stage
+                    {
+                        label.push(' ');
+                        label.push_str(&file_format.qualified());
+                    }
+                }
+                texts.push((SearchField::Relation, label));
+            }
+            crate::model::CatalogRelation::UsesFileFormat {
+                object,
+                file_format,
+            } if matches_dataset(object) => {
+                let mut label = file_format.qualified();
+                if let Some(entry) = snapshot
+                    .file_formats
+                    .iter()
+                    .find(|f| &f.file_format == file_format)
+                {
+                    if let Some(kind) = &entry.format_type {
+                        label.push(' ');
+                        label.push_str(kind);
+                    }
+                    if let Some(comment) = &entry.comment {
+                        label.push(' ');
+                        label.push_str(comment);
+                    }
+                }
+                texts.push((SearchField::Relation, label));
+            }
+            _ => {}
+        }
+    }
+    texts
+}
+
+/// Concatenate all searchable metadata text of `dataset` within `snapshot` for
+/// lexical/hash indexing.
+#[must_use]
+pub fn dataset_search_document(snapshot: &CatalogSnapshot, dataset: &DatasetManifest) -> String {
+    collect_dataset_texts(snapshot, dataset)
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn score_dataset(
+    snapshot: &CatalogSnapshot,
+    dataset: &DatasetManifest,
+    words: &[String],
+) -> Option<SearchHit> {
+    let texts = collect_dataset_texts(snapshot, dataset);
 
     // Best (score, field, text) per query word.
     let mut best: BTreeMap<&str, (u32, SearchField, String)> = BTreeMap::new();
@@ -153,6 +295,11 @@ fn score_dataset(
                     .any(|candidate| candidate.starts_with(word.as_str()))
             {
                 field.weight()
+            } else if text_words
+                .iter()
+                .any(|candidate| is_typo_match(word.as_str(), candidate.as_str()))
+            {
+                (field.weight() / 2).max(1)
             } else {
                 continue;
             };
@@ -198,8 +345,9 @@ fn score_dataset(
 mod tests {
     use super::*;
     use crate::model::{
-        ColumnCatalogEntry, DataSourceClass, DatasetKind, DtypeClass, ObjectRef, Provenance,
-        ProvenanceSource, RightsClass, TagAssignment,
+        CatalogRelation, ColumnCatalogEntry, DataSourceClass, DatasetKind, DtypeClass,
+        FileFormatEntry, ObjectRef, Provenance, ProvenanceSource, RightsClass, StageEntry,
+        TagAssignment,
     };
 
     fn provenance() -> Provenance {
@@ -328,5 +476,67 @@ mod tests {
             search_words("NET_REVENUE-usd 2024"),
             vec!["net", "revenue", "usd", "2024"]
         );
+    }
+
+    #[test]
+    fn typos_and_relations_and_aliases_match_with_principled_ranking() {
+        let mut snap = snapshot();
+        snap.columns[0].aliases = vec!["PURCHASE_IDENTIFIER".to_owned()];
+        snap.stages.push(StageEntry {
+            stage: ObjectRef::new("DB", "PUBLIC", "PARQUET_LANDING_STAGE"),
+            stage_type: Some("External Named".to_owned()),
+            url: Some("s3://acme-lakehouse/shipments/".to_owned()),
+            region: Some("us-east-1".to_owned()),
+            comment: Some("landing bucket for carrier manifests".to_owned()),
+        });
+        snap.file_formats.push(FileFormatEntry {
+            file_format: ObjectRef::new("DB", "PUBLIC", "SHIPMENT_PARQUET_FMT"),
+            format_type: Some("PARQUET".to_owned()),
+            comment: Some("snappy parquet".to_owned()),
+        });
+        snap.relations.push(CatalogRelation::UsesStage {
+            object: ObjectRef::new("DB", "PUBLIC", "SHIPMENTS"),
+            stage: ObjectRef::new("DB", "PUBLIC", "PARQUET_LANDING_STAGE"),
+        });
+        snap.relations.push(CatalogRelation::UsesFileFormat {
+            object: ObjectRef::new("DB", "PUBLIC", "SHIPMENTS"),
+            file_format: ObjectRef::new("DB", "PUBLIC", "SHIPMENT_PARQUET_FMT"),
+        });
+        snap.relations.push(CatalogRelation::ForeignKey {
+            from: ObjectRef::new("DB", "PUBLIC", "ORDERS"),
+            to: ObjectRef::new("DB", "PUBLIC", "CUSTOMERS"),
+            constraint: "FK_ORDERS_CUSTOMER".to_owned(),
+        });
+
+        // 1. Typo tolerance (adjacent transposition "reveneu" -> "revenue"):
+        // finds the exact same 3 revenue datasets in the exact same field order!
+        let typo_hits = search_snapshot(&snap, "reveneu", DEFAULT_SEARCH_LIMIT);
+        let order: Vec<&str> = typo_hits
+            .iter()
+            .map(|hit| hit.qualified_name.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "DB.PUBLIC.DAILY_REVENUE",
+                "DB.PUBLIC.ORDERS",
+                "DB.PUBLIC.SHIPMENTS"
+            ]
+        );
+        // Exact match outranks typo score:
+        let exact_hits = search_snapshot(&snap, "revenue", DEFAULT_SEARCH_LIMIT);
+        assert!(exact_hits[0].score > typo_hits[0].score);
+
+        // 2. Column alias search:
+        let alias_hits = search_snapshot(&snap, "purchase", DEFAULT_SEARCH_LIMIT);
+        assert_eq!(alias_hits.len(), 1);
+        assert_eq!(alias_hits[0].qualified_name, "DB.PUBLIC.ORDERS");
+        assert_eq!(alias_hits[0].matches[0].field, SearchField::Column);
+
+        // 3. Stage URL / comment / relation search:
+        let stage_hits = search_snapshot(&snap, "lakehouse manifests", DEFAULT_SEARCH_LIMIT);
+        assert_eq!(stage_hits.len(), 1);
+        assert_eq!(stage_hits[0].qualified_name, "DB.PUBLIC.SHIPMENTS");
+        assert_eq!(stage_hits[0].matches[0].field, SearchField::Relation);
     }
 }

@@ -486,6 +486,8 @@ pub fn catalog_search_outcome(
         Err(outcome) => return outcome,
     };
     let hits = search_snapshot(&snapshot, &query, limit);
+    #[cfg(feature = "frankensearch")]
+    let _ = sync_and_query_catalog_frankensearch_index(&profile, &snapshot, &query, limit);
     let top = hits.first().map(|hit| hit.dataset_id.clone());
     let mut envelope = base_envelope(
         true,
@@ -521,6 +523,147 @@ pub fn catalog_search_outcome(
         status: CoreExitCode::Success,
         body: Body::Envelope { envelope, format },
     }
+}
+
+#[cfg(feature = "frankensearch")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CatalogIndexCurrent {
+    snapshot_id: String,
+    version_dir: String,
+}
+
+#[cfg(feature = "frankensearch")]
+fn sanitize_slug(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().max(1));
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') {
+            out.push(char::from(byte));
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() || out.starts_with('-') {
+        out.insert(0, 's');
+    }
+    out.truncate(64);
+    out
+}
+
+/// Synchronize the per-profile Frankensearch hash+lexical catalog index to
+/// `snapshot.provenance.snapshot_id` (rebuilding when a newer snapshot
+/// supersedes `current.json`) and query the active snapshot index.
+#[cfg(feature = "frankensearch")]
+pub fn sync_and_query_catalog_frankensearch_index(
+    profile: &str,
+    snapshot: &CatalogSnapshot,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<(String, f32)>, String> {
+    use franken_snowflake_catalog::search::dataset_search_document;
+    use franken_snowflake_core::guardrails::RightsClass as CoreRightsClass;
+    use franken_snowflake_text_indexing::{TextChunk, TextSourceRef};
+
+    let root = local_store::data_dir()
+        .map(|dir| dir.join("catalog-indexes").join(sanitize_slug(profile)))
+        .ok_or_else(|| "no data directory".to_owned())?;
+    let snapshot_id = &snapshot.provenance.snapshot_id;
+    let version_dir = sanitize_slug(snapshot_id);
+    let directory = root.join(&version_dir);
+    let current_path = root.join("current.json");
+    let current_matches = std::fs::read(&current_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<CatalogIndexCurrent>(&bytes).ok())
+        .is_some_and(|cur| cur.snapshot_id == *snapshot_id && cur.version_dir == version_dir);
+
+    let mut chunks = Vec::with_capacity(snapshot.datasets.len());
+    let mut handle_to_dataset = std::collections::BTreeMap::new();
+    for (idx, dataset) in snapshot.datasets.iter().enumerate() {
+        let doc_text = dataset_search_document(snapshot, dataset);
+        if doc_text.trim().is_empty() {
+            continue;
+        }
+        let source = TextSourceRef::StagedDocument {
+            receipt_hash: None,
+            dataset_id: Some(franken_snowflake_core::ids::DatasetId::new(
+                dataset.id.clone(),
+            )),
+            stage_uri_redacted: format!("catalog://{snapshot_id}"),
+            object_fingerprint: dataset.id.clone(),
+        };
+        let chunk = TextChunk::new(
+            source,
+            format!("{}.{}.{}", dataset.database, dataset.schema, dataset.object),
+            u32::try_from(idx).unwrap_or(0),
+            doc_text,
+            CoreRightsClass::Restricted,
+        )
+        .with_title(dataset.id.clone());
+        handle_to_dataset.insert(chunk.handle.as_str().to_owned(), dataset.id.clone());
+        chunks.push(chunk);
+    }
+
+    let index_dir = directory.join("index");
+    if !current_matches || (!chunks.is_empty() && !index_dir.exists()) {
+        if directory.exists() {
+            let _ = std::fs::remove_dir_all(&directory);
+        }
+        std::fs::create_dir_all(&directory)
+            .map_err(|e| format!("could not create {}: {e}", directory.display()))?;
+        if !chunks.is_empty() {
+            let chunks_ref = &chunks;
+            let index_dir_ref = &index_dir;
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .map_err(|e| format!("runtime error: {e}"))?;
+            runtime.block_on(async move {
+                let cx = asupersync::Cx::current().ok_or_else(|| "missing Cx".to_owned())?;
+                franken_snowflake_text_indexing::frankensearch_adapter::build_hash_lexical_index(
+                    &cx,
+                    index_dir_ref,
+                    chunks_ref,
+                )
+                .await
+                .map_err(|e| format!("catalog index build failed: {e}"))
+            })?;
+        }
+        let pointer = serde_json::to_vec(&CatalogIndexCurrent {
+            snapshot_id: snapshot_id.clone(),
+            version_dir: version_dir.clone(),
+        })
+        .map_err(|e| e.to_string())?;
+        let staged = root.join(format!("current.json.{version_dir}.tmp"));
+        std::fs::write(&staged, &pointer).map_err(|e| e.to_string())?;
+        std::fs::rename(&staged, &current_path).map_err(|e| e.to_string())?;
+    }
+
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let owned_query = query.to_owned();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|e| format!("runtime error: {e}"))?;
+    let (results, _metrics) = runtime.block_on(async move {
+        let cx = asupersync::Cx::current().ok_or_else(|| "missing Cx".to_owned())?;
+        franken_snowflake_text_indexing::frankensearch_adapter::query_hash_lexical_index(
+            &cx,
+            &index_dir,
+            &owned_query,
+            limit,
+        )
+        .await
+        .map_err(|e| format!("catalog index query failed: {e}"))
+    })?;
+
+    Ok(results
+        .into_iter()
+        .filter_map(|r| {
+            handle_to_dataset
+                .get(r.doc_id.as_str())
+                .map(|dataset_id| (dataset_id.clone(), r.score))
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -1520,6 +1663,9 @@ fn object_relations_json(snapshot: &CatalogSnapshot, object: &ObjectRef) -> Json
         CatalogRelation::ForeignKey { from, to, .. } => from == object || to == object,
         CatalogRelation::UsesStage { object: user, .. }
         | CatalogRelation::UsesFileFormat { object: user, .. } => user == object,
+        CatalogRelation::StageUsesFileFormat { stage, file_format } => {
+            stage == object || file_format == object
+        }
     };
     json_object(vec![
         ("discovered", Json::Bool(snapshot.relations_discovered)),
@@ -1565,7 +1711,8 @@ fn relations_summary_json(snapshot: &CatalogSnapshot) -> Json {
                 CatalogRelation::ViewDependsOn { .. } => kind == "view_depends_on",
                 CatalogRelation::ForeignKey { .. } => kind == "foreign_key",
                 CatalogRelation::UsesStage { .. } => kind == "uses_stage",
-                CatalogRelation::UsesFileFormat { .. } => kind == "uses_file_format",
+                CatalogRelation::UsesFileFormat { .. }
+                | CatalogRelation::StageUsesFileFormat { .. } => kind == "uses_file_format",
             })
             .count() as i64
     };
@@ -2496,5 +2643,67 @@ pub fn receipt_show_outcome(
     Outcome {
         status: CoreExitCode::Success,
         body: Body::Envelope { envelope, format },
+    }
+}
+
+#[cfg(all(test, feature = "frankensearch"))]
+mod frankensearch_catalog_tests {
+    use super::*;
+    use franken_snowflake_catalog::model::{
+        DataSourceClass, DatasetKind, Provenance, ProvenanceSource, RightsClass,
+    };
+
+    fn snapshot_with_comment(snapshot_id: &str, comment: &str) -> CatalogSnapshot {
+        let prov = Provenance {
+            source: ProvenanceSource::Fixture,
+            data_source: DataSourceClass::Fixture,
+            snapshot_id: snapshot_id.to_owned(),
+            discovered_at: "2026-10-14T00:00:00Z".to_owned(),
+            profile_fingerprint: "profile:demo".to_owned(),
+            object_fingerprint: "snowflake-scope:DB.PUBLIC.*".to_owned(),
+            command_id: "catalog.scan".to_owned(),
+            trace_id: "trace".to_owned(),
+            redactions_applied: Vec::new(),
+        };
+        let mut snap = CatalogSnapshot::empty(prov.clone());
+        snap.datasets.push(DatasetManifest {
+            id: "db_public_events".to_owned(),
+            profile: "demo".to_owned(),
+            database: "DB".to_owned(),
+            schema: "PUBLIC".to_owned(),
+            object: "EVENTS".to_owned(),
+            kind: DatasetKind::Table,
+            rights_class: RightsClass::Restricted,
+            default_limit: 1_000,
+            max_rows_without_export: 50_000,
+            approx_row_count: None,
+            bytes: None,
+            description: Some(comment.to_owned()),
+            provenance: prov,
+            fields: Vec::new(),
+        });
+        snap
+    }
+
+    #[test]
+    fn frankensearch_catalog_index_rebuilds_on_superseded_snapshot() {
+        let profile = format!("cat-idx-{}", local_store::now_unix_ms());
+        let snap1 = snapshot_with_comment("snap-one", "daily ledger reconciliation");
+        let hits1 =
+            sync_and_query_catalog_frankensearch_index(&profile, &snap1, "ledger", 5).expect("v1");
+        assert_eq!(hits1.len(), 1);
+        assert_eq!(hits1[0].0, "db_public_events");
+
+        let snap2 = snapshot_with_comment("snap-two", "daily archive warehouse");
+        let stale =
+            sync_and_query_catalog_frankensearch_index(&profile, &snap2, "ledger", 5).expect("v2");
+        assert!(
+            stale.is_empty(),
+            "superseded snapshot index must not answer: {stale:?}"
+        );
+        let fresh =
+            sync_and_query_catalog_frankensearch_index(&profile, &snap2, "archive", 5).expect("v2");
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].0, "db_public_events");
     }
 }

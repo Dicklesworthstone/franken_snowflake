@@ -51,7 +51,8 @@ pub mod prelude {
     pub use crate::planner::{
         DatasetQueryRequest, PlanGuardrails, PlanMode, PlanRefusal, PlanWarning, PlannerLogLine,
         PredicatePushdownPlan, QueryPlan, RawSqlPlanRequest, TypedBinding, plan_dataset_query,
-        plan_raw_sql_dry_run, plan_refusal_log_line, plan_success_log_line,
+        plan_dataset_query_with_cx, plan_raw_sql_dry_run, plan_raw_sql_dry_run_with_cx,
+        plan_refusal_log_line, plan_success_log_line,
     };
     pub use crate::predicate::{
         LeafPredicate, PredicateAst, PredicateRefusal, PredicateRefusalCode,

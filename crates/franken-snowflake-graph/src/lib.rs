@@ -481,60 +481,375 @@ impl CatalogGraph {
         output
     }
 
-    /// Deterministic lightweight SVG rendering of the same graph model.
+    /// Compute a deterministic Sugiyama layered DAG layout:
+    /// 1. Cycle breaking via DFS feedback-arc identification (`reversed_edges`),
+    /// 2. Longest-path topological layer assignment (`layers`),
+    /// 3. Two-sided barycentric crossing minimization within layers,
+    /// 4. Non-overlapping horizontal coordinate assignment (`placements`).
+    #[must_use]
+    pub fn compute_sugiyama_layout(&self) -> SugiyamaLayout {
+        const BOX_WIDTH: u32 = 220;
+        const BOX_HEIGHT: u32 = 44;
+        const LAYER_STRIDE_X: u32 = 300;
+        const ROW_STRIDE_Y: u32 = 76;
+        const MARGIN_X: u32 = 60;
+        const MARGIN_Y: u32 = 60;
+
+        if self.nodes.is_empty() {
+            return SugiyamaLayout {
+                width: 960,
+                height: 160,
+                layers: Vec::new(),
+                placements: BTreeMap::new(),
+                reversed_edges: BTreeSet::new(),
+            };
+        }
+
+        let sorted_edges = self.sorted_edges();
+        // Phase 1: Deterministic DFS feedback-arc cycle breaking.
+        let mut start_order: Vec<&NodeKey> = self.nodes.keys().collect();
+        start_order.sort_by_key(|key| {
+            let tier = self.nodes.get(*key).map_or(99_u8, |n| kind_tier(n.kind));
+            (tier, *key)
+        });
+
+        let mut adj: BTreeMap<NodeKey, Vec<(usize, NodeKey)>> = BTreeMap::new();
+        for key in self.nodes.keys() {
+            adj.insert(key.clone(), Vec::new());
+        }
+        for (edge_idx, edge) in sorted_edges.iter().enumerate() {
+            if self.nodes.contains_key(&edge.source) && self.nodes.contains_key(&edge.target) {
+                adj.entry(edge.source.clone())
+                    .or_default()
+                    .push((edge_idx, edge.target.clone()));
+            }
+        }
+
+        let mut visited = BTreeSet::<NodeKey>::new();
+        let mut on_stack = BTreeSet::<NodeKey>::new();
+        let mut reversed_edges = BTreeSet::<usize>::new();
+
+        for root in start_order {
+            if visited.contains(root) {
+                continue;
+            }
+            let mut stack: Vec<(NodeKey, usize)> = vec![(root.clone(), 0)];
+            visited.insert(root.clone());
+            on_stack.insert(root.clone());
+            while let Some((curr, next_i)) = stack.last_mut() {
+                let neighbors = adj.get(curr).cloned().unwrap_or_default();
+                if *next_i < neighbors.len() {
+                    let (edge_idx, target) = neighbors[*next_i].clone();
+                    *next_i += 1;
+                    if on_stack.contains(&target) {
+                        reversed_edges.insert(edge_idx);
+                    } else if !visited.contains(&target) {
+                        visited.insert(target.clone());
+                        on_stack.insert(target.clone());
+                        stack.push((target, 0));
+                    }
+                } else {
+                    let finished = curr.clone();
+                    on_stack.remove(&finished);
+                    stack.pop();
+                }
+            }
+        }
+
+        // Phase 2: Longest-path topological layer assignment on the acyclic orientation.
+        let mut dag_out: BTreeMap<NodeKey, Vec<NodeKey>> = BTreeMap::new();
+        let mut indegree: BTreeMap<NodeKey, usize> = BTreeMap::new();
+        for key in self.nodes.keys() {
+            dag_out.insert(key.clone(), Vec::new());
+            indegree.insert(key.clone(), 0);
+        }
+        for (edge_idx, edge) in sorted_edges.iter().enumerate() {
+            if !self.nodes.contains_key(&edge.source) || !self.nodes.contains_key(&edge.target) {
+                continue;
+            }
+            if edge.source == edge.target {
+                continue;
+            }
+            let (u, v) = if reversed_edges.contains(&edge_idx) {
+                (&edge.target, &edge.source)
+            } else {
+                (&edge.source, &edge.target)
+            };
+            dag_out.entry(u.clone()).or_default().push(v.clone());
+            *indegree.entry(v.clone()).or_insert(0) += 1;
+        }
+
+        let mut rank: BTreeMap<NodeKey, usize> =
+            self.nodes.keys().map(|k| (k.clone(), 0_usize)).collect();
+        let mut ready: BTreeSet<NodeKey> = indegree
+            .iter()
+            .filter(|&(_, &deg)| deg == 0)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut processed = BTreeSet::<NodeKey>::new();
+
+        while processed.len() < self.nodes.len() {
+            let next_node = if let Some(first) = ready.iter().next().cloned() {
+                ready.remove(&first);
+                first
+            } else {
+                // Fallback if a multi-path cycle remained: pick minimum unvisited key.
+                self.nodes
+                    .keys()
+                    .find(|k| !processed.contains(*k))
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            if !processed.insert(next_node.clone()) {
+                continue;
+            }
+            let u_rank = rank.get(&next_node).copied().unwrap_or(0);
+            if let Some(targets) = dag_out.get(&next_node) {
+                for v in targets {
+                    if processed.contains(v) {
+                        continue;
+                    }
+                    let entry = rank.entry(v.clone()).or_insert(0);
+                    *entry = (*entry).max(u_rank.saturating_add(1));
+                    if let Some(deg) = indegree.get_mut(v) {
+                        *deg = deg.saturating_sub(1);
+                        if *deg == 0 {
+                            ready.insert(v.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Group into compact non-empty layers.
+        let mut by_rank: BTreeMap<usize, Vec<NodeKey>> = BTreeMap::new();
+        for (key, r) in &rank {
+            by_rank.entry(*r).or_default().push(key.clone());
+        }
+        let mut layers: Vec<Vec<NodeKey>> = by_rank.into_values().collect();
+        for layer in &mut layers {
+            layer.sort_by_key(|key| {
+                let tier = self.nodes.get(key).map_or(99_u8, |n| kind_tier(n.kind));
+                (tier, key.clone())
+            });
+        }
+
+        // Build DAG incoming adjacency for barycentric sweeps.
+        let mut dag_in: BTreeMap<NodeKey, Vec<NodeKey>> = BTreeMap::new();
+        for (u, targets) in &dag_out {
+            for v in targets {
+                dag_in.entry(v.clone()).or_default().push(u.clone());
+            }
+        }
+
+        // Phase 3: Two-sided barycentric crossing reduction (integer x1000 arithmetic).
+        for _sweep in 0..4 {
+            // Forward sweep (1..layers.len())
+            for layer_idx in 1..layers.len() {
+                let prev_positions: BTreeMap<NodeKey, u64> = layers[layer_idx - 1]
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, k)| (k.clone(), idx as u64))
+                    .collect();
+                let current_layer = layers[layer_idx].clone();
+                let mut scored: Vec<(u64, usize, NodeKey)> = current_layer
+                    .into_iter()
+                    .enumerate()
+                    .map(|(cur_idx, key)| {
+                        let preds: Vec<u64> = dag_in
+                            .get(&key)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|p| prev_positions.get(p).copied())
+                            .collect();
+                        let bary = if preds.is_empty() {
+                            (cur_idx as u64).saturating_mul(1_000)
+                        } else {
+                            let sum: u64 = preds.iter().sum();
+                            sum.saturating_mul(1_000) / (preds.len() as u64)
+                        };
+                        (bary, cur_idx, key)
+                    })
+                    .collect();
+                scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+                layers[layer_idx] = scored.into_iter().map(|(_, _, k)| k).collect();
+            }
+
+            // Backward sweep
+            if layers.len() >= 2 {
+                for layer_idx in (0..layers.len() - 1).rev() {
+                    let next_positions: BTreeMap<NodeKey, u64> = layers[layer_idx + 1]
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, k)| (k.clone(), idx as u64))
+                        .collect();
+                    let current_layer = layers[layer_idx].clone();
+                    let mut scored: Vec<(u64, usize, NodeKey)> = current_layer
+                        .into_iter()
+                        .enumerate()
+                        .map(|(cur_idx, key)| {
+                            let succs: Vec<u64> = dag_out
+                                .get(&key)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|s| next_positions.get(s).copied())
+                                .collect();
+                            let bary = if succs.is_empty() {
+                                (cur_idx as u64).saturating_mul(1_000)
+                            } else {
+                                let sum: u64 = succs.iter().sum();
+                                sum.saturating_mul(1_000) / (succs.len() as u64)
+                            };
+                            (bary, cur_idx, key)
+                        })
+                        .collect();
+                    scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+                    layers[layer_idx] = scored.into_iter().map(|(_, _, k)| k).collect();
+                }
+            }
+        }
+
+        // Phase 4: Non-overlapping coordinate assignment centered vertically per layer.
+        let max_rows = layers.iter().map(Vec::len).max().unwrap_or(1).max(1) as u32;
+        let num_layers = layers.len().max(1) as u32;
+        let width = MARGIN_X
+            .saturating_mul(2)
+            .saturating_add(num_layers.saturating_sub(1).saturating_mul(LAYER_STRIDE_X))
+            .saturating_add(BOX_WIDTH)
+            .max(960);
+        let content_height = max_rows
+            .saturating_sub(1)
+            .saturating_mul(ROW_STRIDE_Y)
+            .saturating_add(BOX_HEIGHT);
+        let height = MARGIN_Y
+            .saturating_mul(2)
+            .saturating_add(content_height)
+            .max(180);
+
+        let mut placements = BTreeMap::new();
+        for (layer_idx, layer) in layers.iter().enumerate() {
+            let layer_rows = layer.len().max(1) as u32;
+            let layer_height = layer_rows
+                .saturating_sub(1)
+                .saturating_mul(ROW_STRIDE_Y)
+                .saturating_add(BOX_HEIGHT);
+            let y_offset = MARGIN_Y.saturating_add(content_height.saturating_sub(layer_height) / 2);
+            let x = MARGIN_X.saturating_add((layer_idx as u32).saturating_mul(LAYER_STRIDE_X));
+            for (row_idx, key) in layer.iter().enumerate() {
+                let y = y_offset.saturating_add((row_idx as u32).saturating_mul(ROW_STRIDE_Y));
+                placements.insert(
+                    key.clone(),
+                    SugiyamaNodePlacement {
+                        layer: layer_idx,
+                        row: row_idx,
+                        x,
+                        y,
+                        width: BOX_WIDTH,
+                        height: BOX_HEIGHT,
+                    },
+                );
+            }
+        }
+
+        SugiyamaLayout {
+            width,
+            height,
+            layers,
+            placements,
+            reversed_edges,
+        }
+    }
+
+    /// Deterministic layered Sugiyama SVG rendering of the catalog graph model.
     #[must_use]
     pub fn to_svg(&self) -> String {
-        let width = 960_u32;
-        let row_height = 72_u32;
-        let height = (self.nodes.len().max(1) as u32)
-            .saturating_mul(row_height)
-            .saturating_add(80);
-        let positions = self
-            .nodes
-            .keys()
-            .enumerate()
-            .map(|(index, key)| {
-                (
-                    key.clone(),
-                    (
-                        80_u32.saturating_add(((index % 3) as u32).saturating_mul(300)),
-                        60_u32.saturating_add((index as u32).saturating_mul(row_height)),
-                    ),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
+        let layout = self.compute_sugiyama_layout();
+        let width = layout.width;
+        let height = layout.height;
 
         let mut svg = format!(
-            "<svg xmlns=\"http://www.w3.org/2000/svg\" role=\"img\" viewBox=\"0 0 {width} {height}\">\n"
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" role=\"img\" viewBox=\"0 0 {width} {height}\" data-layout=\"sugiyama\" data-layers=\"{}\">\n",
+            layout.layers.len()
         );
         svg.push_str("  <title>Catalog lineage graph</title>\n");
-        svg.push_str("  <defs><marker id=\"arrow\" markerWidth=\"10\" markerHeight=\"10\" refX=\"8\" refY=\"3\" orient=\"auto\"><path d=\"M0,0 L0,6 L9,3 z\" fill=\"#475569\"/></marker></defs>\n");
+        svg.push_str("  <defs>\n");
+        svg.push_str("    <marker id=\"arrow-dependency\" markerWidth=\"10\" markerHeight=\"10\" refX=\"8\" refY=\"3\" orient=\"auto\"><path d=\"M0,0 L0,6 L9,3 z\" fill=\"#2563eb\"/></marker>\n");
+        svg.push_str("    <marker id=\"arrow-contains\" markerWidth=\"10\" markerHeight=\"10\" refX=\"8\" refY=\"3\" orient=\"auto\"><path d=\"M0,0 L0,6 L9,3 z\" fill=\"#64748b\"/></marker>\n");
+        svg.push_str("    <marker id=\"arrow-tag\" markerWidth=\"10\" markerHeight=\"10\" refX=\"8\" refY=\"3\" orient=\"auto\"><path d=\"M0,0 L0,6 L9,3 z\" fill=\"#0d9488\"/></marker>\n");
+        svg.push_str("    <marker id=\"arrow-cycle\" markerWidth=\"10\" markerHeight=\"10\" refX=\"8\" refY=\"3\" orient=\"auto\"><path d=\"M0,0 L0,6 L9,3 z\" fill=\"#dc2626\"/></marker>\n");
+        svg.push_str("  </defs>\n");
         svg.push_str("  <rect width=\"100%\" height=\"100%\" fill=\"#ffffff\"/>\n");
-        for edge in self.sorted_edges() {
-            let Some((source_x, source_y)) = positions.get(&edge.source) else {
+
+        for (edge_idx, edge) in self.sorted_edges().into_iter().enumerate() {
+            let Some(src) = layout.placements.get(&edge.source) else {
                 continue;
             };
-            let Some((target_x, target_y)) = positions.get(&edge.target) else {
+            let Some(dst) = layout.placements.get(&edge.target) else {
                 continue;
+            };
+            let is_cycle = layout.reversed_edges.contains(&edge_idx);
+            let (stroke, dash, marker) = edge_svg_style(edge.kind, is_cycle);
+            let dash_attr = if dash.is_empty() {
+                String::new()
+            } else {
+                format!(" stroke-dasharray=\"{dash}\"")
+            };
+            let cycle_attr = if is_cycle { " data-cycle=\"true\"" } else { "" };
+            let (path_d, label_x, label_y) = if !is_cycle && src.x < dst.x {
+                let x1 = src.x.saturating_add(src.width);
+                let y1 = src.y.saturating_add(src.height / 2);
+                let x2 = dst.x;
+                let y2 = dst.y.saturating_add(dst.height / 2);
+                let dx = x2.saturating_sub(x1) / 2;
+                let cx1 = x1.saturating_add(dx.max(24));
+                let cx2 = x2.saturating_sub(dx.max(24));
+                (
+                    format!("M {x1} {y1} C {cx1} {y1}, {cx2} {y2}, {x2} {y2}"),
+                    (x1 + x2) / 2,
+                    y1.midpoint(y2).saturating_sub(6),
+                )
+            } else {
+                // Feedback arc or intra-layer arc: curve cleanly above/below node boxes.
+                let x1 = src.x.saturating_add(src.width / 2);
+                let y1 = src.y;
+                let x2 = dst.x.saturating_add(dst.width / 2);
+                let y2 = dst.y;
+                let arch_y = y1.min(y2).saturating_sub(36).max(12);
+                (
+                    format!("M {x1} {y1} C {x1} {arch_y}, {x2} {arch_y}, {x2} {y2}"),
+                    x1.midpoint(x2),
+                    arch_y.saturating_sub(4).max(10),
+                )
+            };
+            let badge_text = match &edge.detail {
+                Some(detail) => format!("{} ({detail})", edge.kind.as_str()),
+                None => edge.kind.as_str().to_owned(),
             };
             svg.push_str(&format!(
-                "  <line x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" stroke=\"#475569\" stroke-width=\"1.5\" marker-end=\"url(#arrow)\"><title>{}</title></line>\n",
-                source_x.saturating_add(210),
-                source_y.saturating_add(18),
-                target_x.saturating_add(8),
-                target_y.saturating_add(18),
-                escape_xml(edge.kind.as_str())
+                "  <g class=\"edge\" data-kind=\"{}\"{cycle_attr}><path d=\"{path_d}\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"1.75\"{dash_attr} marker-end=\"url(#{marker})\"><title>{}</title></path><text x=\"{label_x}\" y=\"{label_y}\" text-anchor=\"middle\" font-family=\"Inter,Arial,sans-serif\" font-size=\"10\" fill=\"{stroke}\">{}</text></g>\n",
+                escape_xml(edge.kind.as_str()),
+                escape_xml(&badge_text),
+                escape_xml(&truncate_label(&badge_text, 28))
             ));
         }
+
         for node in self.nodes.values() {
-            let Some((x, y)) = positions.get(&node.key) else {
+            let Some(p) = layout.placements.get(&node.key) else {
                 continue;
             };
             svg.push_str(&format!(
-                "  <g><rect x=\"{x}\" y=\"{y}\" width=\"220\" height=\"40\" rx=\"6\" fill=\"{}\" stroke=\"#334155\"/><text x=\"{}\" y=\"{}\" font-family=\"Inter,Arial,sans-serif\" font-size=\"13\" fill=\"#0f172a\">{}</text></g>\n",
+                "  <g class=\"node\" data-key=\"{}\" data-kind=\"{}\" data-layer=\"{}\" data-row=\"{}\"><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"6\" fill=\"{}\" stroke=\"#334155\" stroke-width=\"1.25\"/><text x=\"{}\" y=\"{}\" font-family=\"Inter,Arial,sans-serif\" font-size=\"13\" fill=\"#0f172a\">{}</text></g>\n",
+                escape_xml(&node.key),
+                escape_xml(node.kind.as_str()),
+                p.layer,
+                p.row,
+                p.x,
+                p.y,
+                p.width,
+                p.height,
                 node_fill(node.kind),
-                x.saturating_add(12),
-                y.saturating_add(25),
+                p.x.saturating_add(12),
+                p.y.saturating_add(27),
                 escape_xml(&truncate_label(&node.label, 30))
             ));
         }
@@ -773,6 +1088,17 @@ impl CatalogGraph {
                     file_format,
                 } => (
                     self.ensure_object(profile, object, provenance),
+                    CatalogEdgeKind::UsesFileFormat,
+                    self.ensure_named(
+                        profile,
+                        file_format,
+                        CatalogNodeKind::FileFormat,
+                        provenance,
+                    ),
+                    None,
+                ),
+                CatalogRelation::StageUsesFileFormat { stage, file_format } => (
+                    self.ensure_named(profile, stage, CatalogNodeKind::Stage, provenance),
                     CatalogEdgeKind::UsesFileFormat,
                     self.ensure_named(
                         profile,
@@ -1295,6 +1621,73 @@ fn truncate_label(value: &str, max_chars: usize) -> String {
     output
 }
 
+/// Placed node coordinates and topological rank in a [`SugiyamaLayout`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SugiyamaNodePlacement {
+    /// Zero-based topological layer index (left to right).
+    pub layer: usize,
+    /// Zero-based vertical rank within `layer` after barycentric crossing reduction.
+    pub row: usize,
+    /// Top-left X coordinate in SVG user units.
+    pub x: u32,
+    /// Top-left Y coordinate in SVG user units.
+    pub y: u32,
+    /// Box width in SVG user units.
+    pub width: u32,
+    /// Box height in SVG user units.
+    pub height: u32,
+}
+
+/// Deterministic Sugiyama layered DAG layout computed for a [`CatalogGraph`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SugiyamaLayout {
+    /// Total SVG viewport width.
+    pub width: u32,
+    /// Total SVG viewport height.
+    pub height: u32,
+    /// Ordered node keys per topological layer (`0..layers.len()`).
+    pub layers: Vec<Vec<NodeKey>>,
+    /// Per-node coordinates and layer/row assignments.
+    pub placements: BTreeMap<NodeKey, SugiyamaNodePlacement>,
+    /// Indices into `sorted_edges()` that were reversed during feedback-arc cycle breaking.
+    pub reversed_edges: BTreeSet<usize>,
+}
+
+const fn kind_tier(kind: CatalogNodeKind) -> u8 {
+    match kind {
+        CatalogNodeKind::Profile => 0,
+        CatalogNodeKind::Database => 1,
+        CatalogNodeKind::Schema => 2,
+        CatalogNodeKind::Dataset => 3,
+        CatalogNodeKind::Object => 4,
+        CatalogNodeKind::Stage | CatalogNodeKind::FileFormat => 5,
+        CatalogNodeKind::Column => 6,
+        CatalogNodeKind::Tag => 7,
+    }
+}
+
+const fn edge_svg_style(
+    kind: CatalogEdgeKind,
+    is_cycle: bool,
+) -> (&'static str, &'static str, &'static str) {
+    if is_cycle {
+        return ("#dc2626", "6,3", "arrow-cycle");
+    }
+    match kind {
+        CatalogEdgeKind::Contains => ("#64748b", "3,3", "arrow-contains"),
+        CatalogEdgeKind::Tagged => ("#0d9488", "4,2", "arrow-tag"),
+        CatalogEdgeKind::ForeignKey
+        | CatalogEdgeKind::ViewDependsOn
+        | CatalogEdgeKind::LineageReads => ("#2563eb", "", "arrow-dependency"),
+        CatalogEdgeKind::UsesStage | CatalogEdgeKind::UsesFileFormat => {
+            ("#7c3aed", "5,2", "arrow-dependency")
+        }
+        CatalogEdgeKind::DatasetObject | CatalogEdgeKind::FieldColumn => {
+            ("#475569", "", "arrow-contains")
+        }
+    }
+}
+
 fn node_fill(kind: CatalogNodeKind) -> &'static str {
     match kind {
         CatalogNodeKind::Profile => "#e0f2fe",
@@ -1313,9 +1706,9 @@ fn node_fill(kind: CatalogNodeKind) -> &'static str {
 pub mod prelude {
     pub use crate::{
         CatalogEdge, CatalogEdgeKind, CatalogGraph, CatalogNode, CatalogNodeKind,
-        FnxAlgorithmEvidence, LineageDirection, LineageStep, RelatedNode, VERSION, column_key,
-        database_key, dataset_key, graph_from_snapshot, object_key, profile_key, schema_key,
-        tag_key,
+        FnxAlgorithmEvidence, LineageDirection, LineageStep, RelatedNode, SugiyamaLayout,
+        SugiyamaNodePlacement, VERSION, column_key, database_key, dataset_key, graph_from_snapshot,
+        object_key, profile_key, schema_key, tag_key,
     };
 }
 
@@ -1818,5 +2211,158 @@ mod tests {
         assert_eq!(truncate_label("hello", 5), "hello");
         assert_eq!(truncate_label("hello", 3), "hel");
         assert_eq!(truncate_label("hello", 0), "");
+    }
+
+    #[test]
+    fn sugiyama_layout_enforces_topological_layers_non_overlapping_boxes_and_typed_svg_badges() {
+        let graph = CatalogGraph::from_snapshot(&related_snapshot());
+        let layout = graph.compute_sugiyama_layout();
+        assert!(
+            layout.reversed_edges.is_empty(),
+            "acyclic related_snapshot must have 0 reversed edges"
+        );
+        assert!(layout.layers.len() >= 5, "expected multi-layer DAG");
+
+        // Every directed edge strictly advances from a lower layer to a higher layer.
+        for edge in graph.sorted_edges() {
+            let src = layout.placements.get(&edge.source).expect("src placement");
+            let dst = layout.placements.get(&edge.target).expect("dst placement");
+            assert!(
+                src.layer < dst.layer,
+                "edge {} -> {} ({:?}) did not advance layer: {} >= {}",
+                edge.source,
+                edge.target,
+                edge.kind,
+                src.layer,
+                dst.layer
+            );
+            assert!(src.x < dst.x);
+        }
+
+        // No two node boxes overlap.
+        let boxes: Vec<(&String, &SugiyamaNodePlacement)> = layout.placements.iter().collect();
+        for i in 0..boxes.len() {
+            for j in (i + 1)..boxes.len() {
+                let (k1, b1) = boxes[i];
+                let (k2, b2) = boxes[j];
+                let x_overlap = b1.x < b2.x + b2.width && b2.x < b1.x + b1.width;
+                let y_overlap = b1.y < b2.y + b2.height && b2.y < b1.y + b1.height;
+                assert!(
+                    !(x_overlap && y_overlap),
+                    "node boxes for {k1} ({b1:?}) and {k2} ({b2:?}) overlap"
+                );
+            }
+        }
+
+        let svg = graph.to_svg();
+        assert!(svg.contains("data-layout=\"sugiyama\""));
+        assert!(svg.contains("data-kind=\"view_depends_on\""));
+        assert!(svg.contains("foreign_key (FK_EVENTS_ENTITY)"));
+        assert!(svg.contains("data-kind=\"uses_stage\""));
+        assert!(svg.contains("data-kind=\"uses_file_format\""));
+        assert!(svg.contains("tagged (id)"));
+    }
+
+    #[test]
+    fn sugiyama_barycentric_sweep_eliminates_two_layer_crossing_and_handles_cycles() {
+        let prov = provenance();
+        let mut g = CatalogGraph::new();
+        for k in ["src_a", "src_b", "dst_x", "dst_y"] {
+            g.add_node(node(
+                k.to_owned(),
+                CatalogNodeKind::Object,
+                k.to_owned(),
+                None,
+                &prov,
+            ));
+        }
+        // Without crossing reduction, alphabetical order puts [src_a, src_b] -> [dst_x, dst_y],
+        // so src_a -> dst_y and src_b -> dst_x cross!
+        g.add_edge(edge(
+            "src_a",
+            CatalogEdgeKind::ForeignKey,
+            "dst_y",
+            None,
+            &prov,
+        ));
+        g.add_edge(edge(
+            "src_b",
+            CatalogEdgeKind::ForeignKey,
+            "dst_x",
+            None,
+            &prov,
+        ));
+
+        let layout = g.compute_sugiyama_layout();
+        let sa = layout.placements.get("src_a").unwrap();
+        let sb = layout.placements.get("src_b").unwrap();
+        let dx = layout.placements.get("dst_x").unwrap();
+        let dy = layout.placements.get("dst_y").unwrap();
+        assert_eq!(sa.layer, 0);
+        assert_eq!(sb.layer, 0);
+        assert_eq!(dx.layer, 1);
+        assert_eq!(dy.layer, 1);
+        // After barycentric ordering, (sa.row < sb.row) iff (dy.row < dx.row), i.e. 0 crossings!
+        assert_eq!(
+            sa.row < sb.row,
+            dy.row < dx.row,
+            "barycentric sweep must untangle crossing: sa={} sb={} dx={} dy={}",
+            sa.row,
+            sb.row,
+            dx.row,
+            dy.row
+        );
+
+        // Now add a cycle back from dst_y -> src_a and verify feedback-arc reversal & SVG rendering.
+        g.add_edge(edge(
+            "dst_y",
+            CatalogEdgeKind::ViewDependsOn,
+            "src_a",
+            None,
+            &prov,
+        ));
+        let cyclic_layout = g.compute_sugiyama_layout();
+        assert_eq!(cyclic_layout.reversed_edges.len(), 1);
+        let cyclic_svg = g.to_svg();
+        assert!(cyclic_svg.contains("data-cycle=\"true\""));
+        assert!(cyclic_svg.contains("marker-end=\"url(#arrow-cycle)\""));
+    }
+
+    #[test]
+    fn stage_file_format_edge_connects_external_table_to_format_transitively() {
+        let mut snap = related_snapshot();
+        // Remove the direct EXT -> PARQUET_FMT edge and instead attach PARQUET_FMT to stage RAW.
+        snap.relations.retain(|rel| {
+            !matches!(rel, CatalogRelation::UsesFileFormat { object, .. } if object.name == "EXT")
+        });
+        snap.relations.push(CatalogRelation::StageUsesFileFormat {
+            stage: analytics("RAW"),
+            file_format: analytics("PARQUET_FMT"),
+        });
+
+        let graph = CatalogGraph::from_snapshot(&snap);
+        let ext_node = object_key("demo", "ANALYTICS", "PUBLIC", "EXT");
+        let schema = schema_key("demo", "ANALYTICS", "PUBLIC");
+        let stage_node = format!("{schema}/stage:RAW");
+        let fmt_node = format!("{schema}/file_format:PARQUET_FMT");
+
+        let upstream = graph.lineage(&ext_node, LineageDirection::Upstream);
+        assert_eq!(
+            upstream,
+            vec![
+                LineageStep {
+                    node: stage_node.clone(),
+                    depth: 1,
+                    via: CatalogEdgeKind::UsesStage,
+                    from: ext_node,
+                },
+                LineageStep {
+                    node: fmt_node,
+                    depth: 2,
+                    via: CatalogEdgeKind::UsesFileFormat,
+                    from: stage_node,
+                },
+            ]
+        );
     }
 }

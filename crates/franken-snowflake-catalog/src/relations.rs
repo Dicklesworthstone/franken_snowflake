@@ -424,6 +424,11 @@ pub fn apply_relation_results(
             });
         }
     }
+    for row in source_rows(RelationSource::Stages) {
+        if let Some(rel) = stage_relation(row) {
+            relations.insert(rel);
+        }
+    }
     for row in source_rows(RelationSource::ExternalTables) {
         relations.extend(external_table_relations(row, &snapshot.stages));
     }
@@ -537,6 +542,14 @@ fn stage_entry(row: &InformationSchemaRow) -> Option<StageEntry> {
         region: non_empty(row.get("STAGE_REGION")).map(str::to_owned),
         comment: non_empty(row.get("COMMENT")).map(str::to_owned),
     })
+}
+
+fn stage_relation(row: &InformationSchemaRow) -> Option<CatalogRelation> {
+    let stage = object_at(row, "STAGE_CATALOG", "STAGE_SCHEMA", "STAGE_NAME")?;
+    let format_name = non_empty(row.get("FILE_FORMAT_NAME"))
+        .or_else(|| non_empty(row.get("STAGE_FILE_FORMAT")))?;
+    let file_format = parse_object_path(format_name, &stage.database, &stage.schema)?;
+    Some(CatalogRelation::StageUsesFileFormat { stage, file_format })
 }
 
 fn file_format_entry(row: &InformationSchemaRow) -> Option<FileFormatEntry> {
@@ -850,6 +863,7 @@ mod tests {
                 stats: None,
             },
             rows,
+            raw_partitions: Vec::new(),
             fetched_partitions: 1,
             total_partitions: 1,
         }

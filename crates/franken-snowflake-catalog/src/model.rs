@@ -177,6 +177,13 @@ pub enum CatalogRelation {
         /// The named file format.
         file_format: ObjectRef,
     },
+    /// A named stage is configured with a default named `file_format`.
+    StageUsesFileFormat {
+        /// The named stage.
+        stage: ObjectRef,
+        /// The named file format.
+        file_format: ObjectRef,
+    },
 }
 
 /// A table's primary key.

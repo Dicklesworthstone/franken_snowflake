@@ -252,6 +252,20 @@ pub fn plan_refusal_log_line(
     }
 }
 
+/// Plan a dataset-mode query under a narrowed [`franken_snowflake_core::capabilities::PlannerCx`].
+///
+/// The type signature enforces at compile time that planning has no access to
+/// `CapIo` or `CapSpawn`.
+pub fn plan_dataset_query_with_cx(
+    _cx: &franken_snowflake_core::capabilities::PlannerCx,
+    manifest: &DatasetManifest,
+    columns: &[ColumnCatalogEntry],
+    operators: &[OperatorCatalogEntry],
+    request: &DatasetQueryRequest,
+) -> Result<QueryPlan, Vec<PlanRefusal>> {
+    plan_dataset_query(manifest, columns, operators, request)
+}
+
 /// Plan a dataset-mode query.
 pub fn plan_dataset_query(
     manifest: &DatasetManifest,
@@ -383,6 +397,14 @@ pub fn plan_dataset_query(
         },
         warnings,
     })
+}
+
+/// Plan a raw SQL dry-run under a narrowed [`franken_snowflake_core::capabilities::PlannerCx`].
+pub fn plan_raw_sql_dry_run_with_cx(
+    _cx: &franken_snowflake_core::capabilities::PlannerCx,
+    request: &RawSqlPlanRequest,
+) -> Result<QueryPlan, Vec<PlanRefusal>> {
+    plan_raw_sql_dry_run(request)
 }
 
 /// Plan a raw SQL dry-run. Raw mode accepts one conservative read-only `SELECT`
