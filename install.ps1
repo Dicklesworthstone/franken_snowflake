@@ -121,7 +121,7 @@ $Repo        = 'franken_snowflake'
 $BinaryName  = 'franken-snowflake'
 $AliasName   = 'fsnow'
 $CliPackage  = 'franken-snowflake-cli'
-$HttpUserAgent = 'OpenAI File Downloader, XaiImageApiFetch/1.0'
+$HttpUserAgent = 'fsnow-installer (+https://github.com/Dicklesworthstone/franken_snowflake)'
 
 $script:NoRelease  = $false
 $script:VersionBare = ''

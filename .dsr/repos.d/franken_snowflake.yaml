@@ -92,6 +92,6 @@
     "CARGO_INCREMENTAL": "0",
     "CARGO_BUILD_JOBS": "2",
     "CARGO_CACHE_AUTO_CLEAN_FREQUENCY": "never",
-    "CARGO_HTTP_USER_AGENT": "OpenAI File Downloader, XaiImageApiFetch/1.0"
+    "CARGO_HTTP_USER_AGENT": "franken_snowflake-build (+https://github.com/Dicklesworthstone/franken_snowflake)"
   }
 }
