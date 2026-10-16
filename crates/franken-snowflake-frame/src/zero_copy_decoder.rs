@@ -102,17 +102,9 @@ pub fn extract_jsonv2_data_array(bytes: &[u8]) -> FrameResult<&[u8]> {
                         })?;
                         let str_end = after_quote - 1;
                         let key_bytes = &bytes[str_start..str_end];
-                        curr = after_quote;
+                        curr = skip_whitespace(bytes, after_quote);
 
-                        if depth == 1 && key_bytes == b"data" {
-                            curr = skip_whitespace(bytes, curr);
-                            if curr >= len || bytes[curr] != b':' {
-                                return Err(FrameError::Decode {
-                                    column: String::new(),
-                                    snowflake_type: String::new(),
-                                    reason: "expected ':' after 'data' key in envelope",
-                                });
-                            }
+                        if depth == 1 && key_bytes == b"data" && curr < len && bytes[curr] == b':' {
                             curr += 1;
                             curr = skip_whitespace(bytes, curr);
                             if curr >= len || bytes[curr] != b'[' {
@@ -359,16 +351,9 @@ impl ZeroCopyJsonv2Scanner {
                         }
                     };
 
-                    if col_index >= expected_columns {
-                        return Err(FrameError::RowWidthMismatch {
-                            partition_index,
-                            row_index,
-                            expected: expected_columns,
-                            actual: col_index + 1,
-                        });
+                    if col_index < expected_columns {
+                        visit_cell(row_index, col_index, cell)?;
                     }
-
-                    visit_cell(row_index, col_index, cell)?;
                     col_index += 1;
 
                     pos = skip_whitespace(bytes, pos);

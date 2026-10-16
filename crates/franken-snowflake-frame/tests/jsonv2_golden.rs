@@ -50,6 +50,38 @@ fn required_dtype(snowflake_type: &str) -> Option<DType> {
     }
 }
 
+fn assert_frames_identical(
+    left: &franken_snowflake_frame::FrankenPandasFrame,
+    right: &franken_snowflake_frame::FrankenPandasFrame,
+) {
+    assert_eq!(left.row_count, right.row_count);
+    assert_eq!(left.columns.len(), right.columns.len());
+    for (left_col, right_col) in left.columns.iter().zip(right.columns.iter()) {
+        assert_eq!(left_col.metadata, right_col.metadata);
+        assert_eq!(left_col.missing_kinds, right_col.missing_kinds);
+        assert_eq!(
+            left_col.timestamp_tz_offsets_minutes,
+            right_col.timestamp_tz_offsets_minutes
+        );
+        assert_eq!(left_col.column.dtype(), right_col.column.dtype());
+        assert_eq!(left_col.column.len(), right_col.column.len());
+        for row_idx in 0..left_col.column.len() {
+            match (
+                left_col.column.value(row_idx),
+                right_col.column.value(row_idx),
+            ) {
+                (Some(Scalar::Float64(a)), Some(Scalar::Float64(b)))
+                    if a.is_nan() && b.is_nan() => {}
+                (a, b) => assert_eq!(
+                    a, b,
+                    "column {} row {row_idx} mismatch",
+                    left_col.metadata.name
+                ),
+            }
+        }
+    }
+}
+
 #[test]
 fn captured_wire_golden_decodes_through_the_frame_codec() -> Result<(), String> {
     let Some(path) = golden_path() else {
@@ -133,6 +165,16 @@ fn captured_wire_golden_decodes_through_the_frame_codec() -> Result<(), String> 
                  the codec's encoding assumptions disagree with the wire"
             )
         })?;
+    let raw_rows_bytes =
+        serde_json::to_vec(rows).map_err(|e| format!("serialize rows failed: {e}"))?;
+    let raw_frame = franken_snowflake_frame::materialize_raw_partitions(
+        &snowflake_columns,
+        [(0_u32, raw_rows_bytes.as_slice())],
+    )
+    .map_err(|error| {
+        format!("FINDING: materialize_raw_partitions rejected the empirical capture ({error})")
+    })?;
+    assert_frames_identical(&raw_frame, &frame);
     assert_eq!(frame.row_count, rows.len(), "all captured rows materialize");
 
     for column in &snowflake_columns {
@@ -222,6 +264,15 @@ fn canonical_codec_cells_fixture_decodes_through_the_frame_codec() -> Result<(),
     let partitions = vec![ResultPartition::new(0, row_data)];
     let frame = franken_snowflake_frame::materialize_partitions(&snowflake_columns, partitions)
         .map_err(|e| format!("materialization failed: {e}"))?;
+    let raw_frame = franken_snowflake_frame::materialize_raw_partitions(
+        &snowflake_columns,
+        [(0_u32, RAW.as_bytes())],
+    )
+    .map_err(|e| format!("raw materialization failed: {e}"))?;
+    assert_eq!(
+        raw_frame, frame,
+        "materialize_raw_partitions must match materialize_partitions on jsonv2_codec_cells.json"
+    );
 
     assert_eq!(frame.row_count, 1);
     assert_eq!(frame.columns.len(), 15);

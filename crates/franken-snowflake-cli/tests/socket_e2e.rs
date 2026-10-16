@@ -182,10 +182,12 @@ impl MockServer {
         let script: Arc<Script> = Arc::new(script);
         let chain = CertificateChain::from_pem(cert.cert_pem.as_bytes()).expect("cert chain");
         let key = PrivateKey::from_pem(cert.key_pem.as_bytes()).expect("private key");
-        let acceptor = TlsAcceptorBuilder::new(chain, key)
-            .alpn_protocols(vec![b"http/1.1".to_vec()])
-            .build()
-            .expect("TLS acceptor");
+        let acceptor = Arc::new(
+            TlsAcceptorBuilder::new(chain, key)
+                .alpn_protocols(vec![b"http/1.1".to_vec()])
+                .build()
+                .expect("TLS acceptor"),
+        );
         let (port_tx, port_rx) = std::sync::mpsc::channel();
         let log = Arc::clone(&seen);
         std::thread::spawn(move || {
@@ -206,35 +208,38 @@ impl MockServer {
                     let Ok((tcp, _)) = listener.accept().await else {
                         break;
                     };
-                    // A client that rejects our certificate fails here, before
-                    // any request is read.
-                    let Ok(tls) = acceptor.accept(tcp).await else {
-                        continue;
-                    };
+                    let acceptor = Arc::clone(&acceptor);
                     let script = Arc::clone(&script);
                     let log = Arc::clone(&log);
-                    let handler = move |request: Request| {
-                        let seen = Seen::from_request(request);
-                        let mut log = log.lock().expect("request log");
-                        let reply = script(&seen, &log);
-                        log.push(seen);
-                        let mut response =
-                            (!reply.headers.iter().any(|(name, _)| name == UNANSWERED))
-                                .then(|| to_response(reply));
-                        std::future::poll_fn(move |_| {
-                            response
-                                .take()
-                                .map_or(std::task::Poll::Pending, std::task::Poll::Ready)
-                        })
-                    };
-                    let config = Http1Config::default()
-                        .keep_alive(false)
-                        .host_policy(HostPolicy::allow_list(hosts.clone()));
+                    let hosts = hosts.clone();
                     // Each connection is its own task, as on a real server: an
-                    // unanswered request holds only its own connection.
-                    tasks.spawn_local(async move {
+                    // unanswered request or slow TLS handshake holds only its
+                    // own connection.
+                    drop(tasks.spawn_local(async move {
+                        // A client that rejects our certificate fails here,
+                        // before any request is read.
+                        let Ok(tls) = acceptor.accept(tcp).await else {
+                            return;
+                        };
+                        let handler = move |request: Request| {
+                            let seen = Seen::from_request(request);
+                            let mut log = log.lock().expect("request log");
+                            let reply = script(&seen, &log);
+                            log.push(seen);
+                            let mut response =
+                                (!reply.headers.iter().any(|(name, _)| name == UNANSWERED))
+                                    .then(|| to_response(reply));
+                            std::future::poll_fn(move |_| {
+                                response
+                                    .take()
+                                    .map_or(std::task::Poll::Pending, std::task::Poll::Ready)
+                            })
+                        };
+                        let config = Http1Config::default()
+                            .keep_alive(false)
+                            .host_policy(HostPolicy::allow_list(hosts));
                         let _ = Http1Server::with_config(handler, config).serve(tls).await;
-                    });
+                    }));
                 }
             });
         });
@@ -478,8 +483,10 @@ impl Drop for Harness {
 /// A spawned `mcp serve` killed and reaped however its test ends: a failing
 /// assertion otherwise orphaned `mcp serve --http` (on Windows the orphan held
 /// the test's pipes open and locked the binary against the next link).
+#[cfg(feature = "mcp")]
 struct KillOnDrop(std::process::Child);
 
+#[cfg(feature = "mcp")]
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -487,6 +494,7 @@ impl Drop for KillOnDrop {
     }
 }
 
+#[cfg(feature = "mcp")]
 impl std::ops::Deref for KillOnDrop {
     type Target = std::process::Child;
     fn deref(&self) -> &Self::Target {
@@ -494,6 +502,7 @@ impl std::ops::Deref for KillOnDrop {
     }
 }
 
+#[cfg(feature = "mcp")]
 impl std::ops::DerefMut for KillOnDrop {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0

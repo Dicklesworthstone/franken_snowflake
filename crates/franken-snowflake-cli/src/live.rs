@@ -71,7 +71,8 @@ use franken_snowflake_http::{
 };
 use franken_snowflake_sqlapi::driver::{
     AuthProvider, DriverEvent, DriverObserver, DriverStats, RowSink, StatementHooks,
-    run_multi_statement_hooked, run_statement_hooked,
+    run_multi_statement_hooked, run_read_statement_with_transport_cx,
+    run_write_statement_with_write_cx,
 };
 use franken_snowflake_sqlapi::lifecycle::{
     CompletedStatement, CostQuota, DEFAULT_PARTITION_CONCURRENCY, MAX_PARTITION_CONCURRENCY,
@@ -937,7 +938,7 @@ pub fn run_write_outcome(
         sql_api_request_id: write.confirmed_request_id.clone(),
         ..QueryRequestOptions::default()
     };
-    match execute(&conn, write.sql, options) {
+    match execute_authorized_write(&conn, write.grant, write.sql, options) {
         Ok(rows) => {
             let (receipt_hash, mut warnings) = record_receipt(
                 "query.write",
@@ -2011,13 +2012,28 @@ pub fn export_run_outcome(
             compression: parquet_compression,
             ..Default::default()
         };
+        let has_complete_raw_partitions = !rows.completed.raw_partitions.is_empty()
+            && rows.completed.raw_partitions.len()
+                == usize::try_from(rows.completed.fetched_partitions).unwrap_or(0);
         let artifact = match export_format {
-            "parquet" => franken_snowflake_export::export_parquet(
-                &input,
-                target_label.clone(),
-                created_at_ms,
-                Some(parquet_opts),
-            ),
+            "parquet" => {
+                if has_complete_raw_partitions {
+                    franken_snowflake_export::export_parquet_raw(
+                        &input.columns,
+                        rows.completed.raw_partition_slices(),
+                        target_label.clone(),
+                        created_at_ms,
+                        Some(parquet_opts),
+                    )
+                } else {
+                    franken_snowflake_export::export_parquet(
+                        &input,
+                        target_label.clone(),
+                        created_at_ms,
+                        Some(parquet_opts),
+                    )
+                }
+            }
             "frame" => {
                 #[cfg(feature = "frankenpandas")]
                 {
@@ -2025,21 +2041,38 @@ pub fn export_run_outcome(
                         .columns
                         .iter()
                         .map(|column| {
-                            franken_snowflake_frame::SnowflakeColumn::new(
+                            let mut col = franken_snowflake_frame::SnowflakeColumn::new(
                                 column.name.clone(),
                                 column.type_name.clone(),
                             )
-                            .nullable(column.nullable)
+                            .nullable(column.nullable);
+                            col.precision = column.precision.and_then(|p| i32::try_from(p).ok());
+                            col.scale = column.scale.and_then(|s| i32::try_from(s).ok());
+                            col
                         })
                         .collect();
-                    let frame_partitions = vec![franken_snowflake_frame::ResultPartition::new(
-                        0,
-                        rows.rows.clone(),
-                    )];
-                    match franken_snowflake_frame::materialize_partitions(
-                        &frame_cols,
-                        frame_partitions,
-                    ) {
+                    let materialized = if has_complete_raw_partitions {
+                        franken_snowflake_frame::materialize_raw_partitions(
+                            &frame_cols,
+                            rows.completed
+                                .raw_partitions
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, bytes)| {
+                                    (u32::try_from(idx).unwrap_or(u32::MAX), bytes.as_slice())
+                                }),
+                        )
+                    } else {
+                        let frame_partitions = vec![franken_snowflake_frame::ResultPartition::new(
+                            0,
+                            rows.rows.clone(),
+                        )];
+                        franken_snowflake_frame::materialize_partitions(
+                            &frame_cols,
+                            frame_partitions,
+                        )
+                    };
+                    match materialized {
                         Ok(frame) => match serde_json::to_vec_pretty(&frame) {
                             Ok(bytes) => {
                                 let content_address =
@@ -2451,12 +2484,11 @@ struct ExportSink {
     max_rows: usize,
 }
 
-impl RowSink for ExportSink {
-    fn accept(
+impl ExportSink {
+    fn ensure_writer(
         &mut self,
         result_set: &ResultSet,
-        rows: Vec<Vec<Option<String>>>,
-    ) -> Result<(), SnowflakeError> {
+    ) -> Result<&mut StreamingTextExport<crate::export_path::ArtifactFile>, SnowflakeError> {
         let export_error = |error: franken_snowflake_export::ExportError| {
             SnowflakeError::new(
                 SnowflakeErrorCode::UsageError,
@@ -2486,17 +2518,56 @@ impl RowSink for ExportSink {
             self.writer =
                 Some(StreamingTextExport::new(self.format, columns, file).map_err(export_error)?);
         }
-        let Some(writer) = self.writer.as_mut() else {
-            return Err(SnowflakeError::new(
-                SnowflakeErrorCode::Internal,
-                "the export writer is missing",
-            ));
+        self.writer.as_mut().ok_or_else(|| {
+            SnowflakeError::new(SnowflakeErrorCode::Internal, "the export writer is missing")
+        })
+    }
+}
+
+impl RowSink for ExportSink {
+    fn accept(
+        &mut self,
+        result_set: &ResultSet,
+        rows: Vec<Vec<Option<String>>>,
+    ) -> Result<(), SnowflakeError> {
+        let max_rows = self.max_rows;
+        let writer = self.ensure_writer(result_set)?;
+        let written = usize::try_from(writer.rows_written()).unwrap_or(usize::MAX);
+        if written.saturating_add(rows.len()) > max_rows {
+            return Err(max_rows_error(max_rows));
+        }
+        writer.write_rows(&rows).map_err(|error| {
+            SnowflakeError::new(
+                SnowflakeErrorCode::UsageError,
+                format!("local export failed: {error}"),
+            )
+        })
+    }
+
+    fn accept_raw_partitions(
+        &mut self,
+        result_set: &ResultSet,
+        raw_partitions: &[Vec<u8>],
+        row_count: usize,
+    ) -> Option<Result<(), SnowflakeError>> {
+        let max_rows = self.max_rows;
+        let writer = match self.ensure_writer(result_set) {
+            Ok(writer) => writer,
+            Err(error) => return Some(Err(error)),
         };
         let written = usize::try_from(writer.rows_written()).unwrap_or(usize::MAX);
-        if written.saturating_add(rows.len()) > self.max_rows {
-            return Err(max_rows_error(self.max_rows));
+        if written.saturating_add(row_count) > max_rows {
+            return Some(Err(max_rows_error(max_rows)));
         }
-        writer.write_rows(&rows).map_err(export_error)
+        for partition_bytes in raw_partitions {
+            if let Err(error) = writer.write_raw_partition(partition_bytes) {
+                return Some(Err(SnowflakeError::new(
+                    SnowflakeErrorCode::UsageError,
+                    format!("local export failed: {error}"),
+                )));
+            }
+        }
+        Some(Ok(()))
     }
 }
 
@@ -2525,8 +2596,14 @@ fn execute_streaming<S: RowSink + 'static>(
             .with_execution_timeout(conn.execution_timeout())
             .with_cost_quota(conn.cost_quota()?);
         let (mut done, stats, id) = script.execute(request, plan, &sql_api_request_id)?;
+        let raw_partitions = std::mem::take(&mut done.raw_partitions);
         let rows = std::mem::take(&mut done.rows);
-        sink.accept(&done.result_set, rows)?;
+        let delivered = if !raw_partitions.is_empty() {
+            sink.accept_raw_partitions(&done.result_set, &raw_partitions, rows.len())
+        } else {
+            None
+        };
+        delivered.unwrap_or_else(|| sink.accept(&done.result_set, rows))?;
         let mut live = into_rows(done, stats, id);
         live.query_tag = query_tag;
         return Ok((live, sink));
@@ -2544,14 +2621,23 @@ fn execute_streaming<S: RowSink + 'static>(
     let progress = conn.progress;
     let (outcome, stats, sink, facts) = with_runtime(conn, move |cx, client, auth| {
         Box::pin(async move {
+            let transport_cx = franken_snowflake_core::capabilities::narrow_to_transport(cx);
             let mut sink = sink;
             let mut observer = RunObserver::new(progress);
             let hooks = StatementHooks {
                 sink: Some(&mut sink),
                 observer: Some(&mut observer),
             };
-            let (outcome, stats) =
-                run_statement_hooked(cx, client, auth, request, params, poll_plan, hooks).await;
+            let (outcome, stats) = run_read_statement_with_transport_cx(
+                &transport_cx,
+                client,
+                auth,
+                request,
+                params,
+                poll_plan,
+                hooks,
+            )
+            .await;
             Ok((outcome, stats, sink, observer.facts))
         })
     })?;
@@ -3882,13 +3968,22 @@ fn drive_request(
     let progress = conn.progress;
     let (outcome, stats, facts) = with_runtime(conn, move |cx, client, auth| {
         Box::pin(async move {
+            let transport_cx = franken_snowflake_core::capabilities::narrow_to_transport(cx);
             let mut observer = RunObserver::new(progress);
             let hooks = StatementHooks {
                 sink: None,
                 observer: Some(&mut observer),
             };
-            let (outcome, stats) =
-                run_statement_hooked(cx, client, auth, request, params, poll_plan, hooks).await;
+            let (outcome, stats) = run_read_statement_with_transport_cx(
+                &transport_cx,
+                client,
+                auth,
+                request,
+                params,
+                poll_plan,
+                hooks,
+            )
+            .await;
             Ok((outcome, stats, observer.facts))
         })
     })?;
@@ -3948,6 +4043,74 @@ fn execute(
         .cloned();
     let (done, stats, sql_api_request_id) =
         execute_request(conn, request, row_cap, fixed_request_id)?;
+    let mut rows = into_rows(done, stats, sql_api_request_id);
+    rows.query_tag = query_tag;
+    Ok(rows)
+}
+
+/// Execute an authorized write statement under [`franken_snowflake_core::capabilities::WriteCx`]
+/// minted from `grant.enter_write_cx(cx)`.
+fn execute_authorized_write(
+    conn: &LiveConn,
+    grant: &franken_snowflake_core::write_intent::WriteAuthorization,
+    sql: &str,
+    options: QueryRequestOptions,
+) -> Result<LiveRows, SnowflakeError> {
+    let row_cap = options.row_cap;
+    let fixed_request_id = options.sql_api_request_id.clone();
+    let request = build_request(conn, sql, options);
+    let query_tag = request
+        .parameters
+        .as_ref()
+        .and_then(|parameters| parameters.get("QUERY_TAG"))
+        .cloned();
+    let cost_quota = conn.cost_quota()?;
+    let sql_api_request_id = fixed_request_id.unwrap_or_else(unique_request_id);
+    LAST_RUN.with(RefCell::take);
+    let poll_plan = PollPlan::with_max_polls(conn.max_polls)
+        .with_partition_concurrency(conn.partition_concurrency)
+        .with_row_cap(row_cap)
+        .with_execution_timeout(conn.execution_timeout())
+        .with_cost_quota(cost_quota);
+    #[cfg(test)]
+    if let Some(script) = &conn.script {
+        let (done, stats, id) = script.execute(request, poll_plan, &sql_api_request_id)?;
+        let mut rows = into_rows(done, stats, id);
+        rows.query_tag = query_tag;
+        return Ok(rows);
+    }
+    let params = SubmitQueryParams {
+        request_id: Some(sql_api_request_id.clone()),
+        retry: true,
+        asynchronous: false,
+        nullable: None,
+    };
+    let progress = conn.progress;
+    let grant_clone = grant.clone();
+    let (outcome, stats, facts) = with_runtime(conn, move |cx, client, auth| {
+        Box::pin(async move {
+            let write_cx = grant_clone.enter_write_cx(cx);
+            let mut observer = RunObserver::new(progress);
+            let hooks = StatementHooks {
+                sink: None,
+                observer: Some(&mut observer),
+            };
+            let (outcome, stats) = run_write_statement_with_write_cx(
+                &write_cx,
+                &grant_clone,
+                client,
+                auth,
+                request,
+                params,
+                poll_plan,
+                hooks,
+            )
+            .await;
+            Ok((outcome, stats, observer.facts))
+        })
+    })?;
+    LAST_RUN.with(|slot| *slot.borrow_mut() = facts);
+    let done = outcome_into_result(outcome, "the statement", true)?;
     let mut rows = into_rows(done, stats, sql_api_request_id);
     rows.query_tag = query_tag;
     Ok(rows)
@@ -5279,6 +5442,7 @@ mod test_support {
             statement_handle: StatementHandle::new(handle),
             result_set,
             rows: string_rows,
+            raw_partitions: Vec::new(),
             total_partitions: 1,
             fetched_partitions: 1,
         }

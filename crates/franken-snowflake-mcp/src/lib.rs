@@ -1427,10 +1427,15 @@ mod fastmcp_surface {
         fn call(&self, ctx: &McpContext, arguments: Value) -> McpResult<Vec<Content>> {
             ctx.checkpoint()?;
             let args = self.verb.cli_args(&arguments)?;
+            // Narrow the request Cx to TransportCx (CapIo + CapTime + CapSpawn,
+            // never CapRemote) and install the restricted capability mask on the
+            // ambient thread-local stack for the duration of the tool call.
+            let transport_cx = franken_snowflake_core::capabilities::narrow_to_transport(ctx.cx());
+            let _restricted_guard = transport_cx.clone().set_current_restricted();
             // A cancellation arrives on the watched stdin or, over HTTP, on
             // another connection; both land in CANCELLATIONS. A cancelled
             // request Cx counts too.
-            let request_cx = ctx.cx().clone();
+            let request_cx = transport_cx;
             let request_id = ctx.request_id();
             let cancellations = std::sync::Arc::clone(&CANCELLATIONS);
             let cancel: CancelProbe = std::sync::Arc::new(move || {

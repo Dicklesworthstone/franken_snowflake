@@ -607,3 +607,91 @@ print("DuckDB validation PASSED")
     }
     eprintln!("{stdout}");
 }
+
+#[test]
+fn test_zero_copy_raw_partition_equivalence_across_golden_fixtures() {
+    use franken_snowflake_export::{
+        RawResultPartition, export_csv, export_csv_raw, export_jsonl, export_jsonl_raw,
+        export_parquet_raw,
+    };
+    use serde_json::Value;
+
+    const CODEC_CELLS_RAW: &str =
+        include_str!("../../franken-snowflake-sqlapi/tests/fixtures/jsonv2_codec_cells.json");
+    let fixture: Value = serde_json::from_str(CODEC_CELLS_RAW).expect("parse jsonv2_codec_cells");
+    let row_type = fixture["resultSetMetaData"]["rowType"]
+        .as_array()
+        .expect("rowType array");
+    let columns: Vec<ExportColumn> = row_type
+        .iter()
+        .map(|col| {
+            ExportColumn::new(
+                col["name"].as_str().unwrap_or_default(),
+                col["type"].as_str().unwrap_or_default(),
+            )
+            .nullable(col["nullable"].as_bool().unwrap_or(true))
+            .precision_scale(
+                col["precision"]
+                    .as_i64()
+                    .and_then(|p| u32::try_from(p).ok()),
+                col["scale"].as_i64().and_then(|s| u32::try_from(s).ok()),
+            )
+        })
+        .collect();
+    let rows: Vec<Vec<Option<String>>> = fixture["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .map(|row| {
+            row.as_array()
+                .expect("row array")
+                .iter()
+                .map(|cell| cell.as_str().map(str::to_owned))
+                .collect()
+        })
+        .collect();
+    let input = LocalExportInput::new(columns.clone(), vec![ResultPartition::new(0, rows)]);
+    let raw_partitions = [RawResultPartition::new(0, CODEC_CELLS_RAW.as_bytes())];
+
+    let csv_std = export_csv(&input, "@tests/codec.csv", 1_700_000_000_000).expect("export_csv");
+    let csv_raw = export_csv_raw(
+        &columns,
+        raw_partitions,
+        "@tests/codec.csv",
+        1_700_000_000_000,
+    )
+    .expect("export_csv_raw");
+    assert_eq!(
+        csv_raw, csv_std,
+        "CSV raw export must equal standard export"
+    );
+
+    let jsonl_std =
+        export_jsonl(&input, "@tests/codec.jsonl", 1_700_000_000_000).expect("export_jsonl");
+    let jsonl_raw = export_jsonl_raw(
+        &columns,
+        raw_partitions,
+        "@tests/codec.jsonl",
+        1_700_000_000_000,
+    )
+    .expect("export_jsonl_raw");
+    assert_eq!(
+        jsonl_raw, jsonl_std,
+        "JSONL raw export must equal standard export"
+    );
+
+    let pq_std = export_parquet(&input, "@tests/codec.parquet", 1_700_000_000_000, None)
+        .expect("export_parquet");
+    let pq_raw = export_parquet_raw(
+        &columns,
+        raw_partitions,
+        "@tests/codec.parquet",
+        1_700_000_000_000,
+        None,
+    )
+    .expect("export_parquet_raw");
+    assert_eq!(
+        pq_raw, pq_std,
+        "Parquet raw export must equal standard export"
+    );
+}

@@ -800,6 +800,36 @@ mod local {
             Ok(())
         }
 
+        /// Append the next rows from a raw uncompressed `jsonv2` partition slice
+        /// (`[[...]]` or `{"data": [[...]]}`) without materializing intermediate
+        /// per-row `Vec<Option<String>>` buffers.
+        ///
+        /// # Errors
+        /// Malformed `jsonv2` structure, row width mismatch, malformed temporal
+        /// cell, or sink failure.
+        pub fn write_raw_partition(&mut self, partition_bytes: &[u8]) -> ExportResult<()> {
+            let quoted_keys = if self.format == TextFormat::Jsonl {
+                prequote_column_keys(&self.columns)?
+            } else {
+                Vec::new()
+            };
+            let mut scanner = franken_snowflake_core::jsonv2_scanner::ZeroCopyJsonv2Scanner::new();
+            let mut row_buf = String::with_capacity(256);
+            let written = stream_raw_partition_text(
+                self.format,
+                &self.columns,
+                self.batches,
+                partition_bytes,
+                &mut scanner,
+                &quoted_keys,
+                &mut row_buf,
+                &mut self.sink,
+            )?;
+            self.rows = self.rows.saturating_add(written);
+            self.batches = self.batches.saturating_add(1);
+            Ok(())
+        }
+
         /// Rows written so far.
         #[must_use]
         pub const fn rows_written(&self) -> u64 {
@@ -868,6 +898,23 @@ mod local {
         })
     }
 
+    /// Stream CSV bytes directly from raw `jsonv2` partition byte slices without
+    /// materializing intermediate `Vec<Vec<Option<String>>>` rows.
+    pub fn write_csv_raw_stream<'a, I, S>(
+        columns: &[ExportColumn],
+        partitions: I,
+        sink: &mut S,
+    ) -> ExportResult<u64>
+    where
+        I: IntoIterator<Item = franken_snowflake_core::jsonv2_scanner::RawResultPartition<'a>>,
+        S: ExportByteSink,
+    {
+        validate_columns(columns)?;
+        let header = csv_record(columns.iter().map(|column| Some(column.name.as_str())));
+        sink.write_chunk(header.as_bytes())?;
+        stream_raw_partitions_text(TextFormat::Csv, columns, partitions, sink)
+    }
+
     /// Stream JSONL bytes to a caller-provided sink.
     pub fn write_jsonl_stream<'a, I, S>(
         columns: &[ExportColumn],
@@ -883,6 +930,21 @@ mod local {
             let line = jsonl_record(columns, row)?;
             sink.write_chunk(line.as_bytes())
         })
+    }
+
+    /// Stream JSONL bytes directly from raw `jsonv2` partition byte slices without
+    /// materializing intermediate `Vec<Vec<Option<String>>>` rows.
+    pub fn write_jsonl_raw_stream<'a, I, S>(
+        columns: &[ExportColumn],
+        partitions: I,
+        sink: &mut S,
+    ) -> ExportResult<u64>
+    where
+        I: IntoIterator<Item = franken_snowflake_core::jsonv2_scanner::RawResultPartition<'a>>,
+        S: ExportByteSink,
+    {
+        validate_columns(columns)?;
+        stream_raw_partitions_text(TextFormat::Jsonl, columns, partitions, sink)
     }
 
     /// Build an in-memory CSV artifact and receipt.
@@ -907,6 +969,32 @@ mod local {
         )
     }
 
+    /// Build an in-memory CSV artifact and receipt directly from raw `jsonv2` partition slices.
+    pub fn export_csv_raw<'a, I>(
+        columns: &[ExportColumn],
+        partitions: I,
+        target_uri_redacted: impl Into<String>,
+        created_at_ms: u64,
+    ) -> ExportResult<LocalExportArtifact>
+    where
+        I: IntoIterator<Item = franken_snowflake_core::jsonv2_scanner::RawResultPartition<'a>>,
+    {
+        let mut sink = AddressingSink::new(Vec::new());
+        let row_count = write_csv_raw_stream(columns, partitions, &mut sink)?;
+        let (bytes, address) = sink.finish();
+        address.verify(&bytes)?;
+        local_artifact(
+            bytes,
+            address,
+            ExportReceiptKind::LocalCsv,
+            ExportFormat::Csv,
+            target_uri_redacted,
+            Some(row_count),
+            Some(schema_hash(columns)?),
+            created_at_ms,
+        )
+    }
+
     /// Build an in-memory JSONL artifact and receipt.
     pub fn export_jsonl(
         input: &LocalExportInput,
@@ -925,6 +1013,32 @@ mod local {
             target_uri_redacted,
             Some(row_count),
             Some(schema_hash(&input.columns)?),
+            created_at_ms,
+        )
+    }
+
+    /// Build an in-memory JSONL artifact and receipt directly from raw `jsonv2` partition slices.
+    pub fn export_jsonl_raw<'a, I>(
+        columns: &[ExportColumn],
+        partitions: I,
+        target_uri_redacted: impl Into<String>,
+        created_at_ms: u64,
+    ) -> ExportResult<LocalExportArtifact>
+    where
+        I: IntoIterator<Item = franken_snowflake_core::jsonv2_scanner::RawResultPartition<'a>>,
+    {
+        let mut sink = AddressingSink::new(Vec::new());
+        let row_count = write_jsonl_raw_stream(columns, partitions, &mut sink)?;
+        let (bytes, address) = sink.finish();
+        address.verify(&bytes)?;
+        local_artifact(
+            bytes,
+            address,
+            ExportReceiptKind::LocalJsonl,
+            ExportFormat::Jsonl,
+            target_uri_redacted,
+            Some(row_count),
+            Some(schema_hash(columns)?),
             created_at_ms,
         )
     }
@@ -958,6 +1072,150 @@ mod local {
             receipt,
             log_line,
         })
+    }
+
+    pub(super) fn scan_error_to_export(
+        err: franken_snowflake_core::jsonv2_scanner::Jsonv2ScanError,
+    ) -> ExportError {
+        use franken_snowflake_core::jsonv2_scanner::Jsonv2ScanError;
+        match err {
+            Jsonv2ScanError::RowWidthMismatch {
+                partition_index,
+                row_index,
+                expected,
+                actual,
+            } => ExportError::RowWidthMismatch {
+                partition_index,
+                row_index,
+                expected,
+                actual,
+            },
+            Jsonv2ScanError::RowCountOverflow => ExportError::Json {
+                message: "row count overflowed usize".to_owned(),
+            },
+            Jsonv2ScanError::Decode { reason } => ExportError::Json {
+                message: reason.to_owned(),
+            },
+        }
+    }
+
+    fn prequote_column_keys(columns: &[ExportColumn]) -> ExportResult<Vec<String>> {
+        columns
+            .iter()
+            .map(|col| {
+                let mut key = serde_json::to_string(&col.name)?;
+                key.push(':');
+                Ok(key)
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stream_raw_partition_text<S: ExportByteSink>(
+        format: TextFormat,
+        columns: &[ExportColumn],
+        partition_index: u32,
+        partition_bytes: &[u8],
+        scanner: &mut franken_snowflake_core::jsonv2_scanner::ZeroCopyJsonv2Scanner,
+        quoted_keys: &[String],
+        row_buf: &mut String,
+        sink: &mut S,
+    ) -> ExportResult<u64> {
+        row_buf.clear();
+        let rows_in_partition = scanner.scan_rows_with(
+            partition_bytes,
+            partition_index,
+            columns.len(),
+            scan_error_to_export,
+            |row_index, col_index, cell| {
+                if col_index == 0 {
+                    if row_index > 0 {
+                        sink.write_chunk(row_buf.as_bytes())?;
+                        row_buf.clear();
+                    }
+                    if format == TextFormat::Jsonl {
+                        row_buf.push('{');
+                    }
+                } else {
+                    row_buf.push(',');
+                }
+                let column = &columns[col_index];
+                match format {
+                    TextFormat::Csv => {
+                        if let Some(value) = cell.as_str() {
+                            match temporal_text(column, value)? {
+                                Some(typed_text) => push_csv_field(row_buf, &typed_text),
+                                None => push_csv_field(row_buf, value),
+                            }
+                        }
+                    }
+                    TextFormat::Jsonl => {
+                        row_buf.push_str(&quoted_keys[col_index]);
+                        match cell.as_str() {
+                            Some(value) => row_buf.push_str(&json_cell_value(column, value)?),
+                            None => row_buf.push_str("null"),
+                        }
+                    }
+                }
+                if col_index + 1 == columns.len() {
+                    if format == TextFormat::Jsonl {
+                        row_buf.push('}');
+                    }
+                    row_buf.push('\n');
+                }
+                Ok(())
+            },
+        )?;
+        if rows_in_partition > 0 {
+            sink.write_chunk(row_buf.as_bytes())?;
+            row_buf.clear();
+        }
+        Ok(usize_to_u64(rows_in_partition))
+    }
+
+    fn stream_raw_partitions_text<'a, I, S>(
+        format: TextFormat,
+        columns: &[ExportColumn],
+        partitions: I,
+        sink: &mut S,
+    ) -> ExportResult<u64>
+    where
+        I: IntoIterator<Item = franken_snowflake_core::jsonv2_scanner::RawResultPartition<'a>>,
+        S: ExportByteSink,
+    {
+        let quoted_keys = if format == TextFormat::Jsonl {
+            prequote_column_keys(columns)?
+        } else {
+            Vec::new()
+        };
+        let mut scanner = franken_snowflake_core::jsonv2_scanner::ZeroCopyJsonv2Scanner::new();
+        let mut row_buf = String::with_capacity(256);
+        let mut previous_partition = None;
+        let mut row_count = 0_u64;
+
+        for partition in partitions {
+            if let Some(previous) = previous_partition
+                && partition.index <= previous
+            {
+                return Err(ExportError::PartitionOrder {
+                    previous,
+                    next: partition.index,
+                });
+            }
+            previous_partition = Some(partition.index);
+            let rows_in_partition = stream_raw_partition_text(
+                format,
+                columns,
+                partition.index,
+                partition.bytes,
+                &mut scanner,
+                &quoted_keys,
+                &mut row_buf,
+                sink,
+            )?;
+            row_count = row_count.saturating_add(rows_in_partition);
+        }
+        Ok(row_count)
     }
 
     fn stream_rows<'a, I, S, F>(
@@ -1159,6 +1417,9 @@ mod local {
 }
 
 #[cfg(any(feature = "export", feature = "parquet"))]
+pub use franken_snowflake_core::jsonv2_scanner::RawResultPartition;
+
+#[cfg(any(feature = "export", feature = "parquet"))]
 pub use local::{
     AddressingSink, ExportByteSink, ExportColumn, LocalExportArtifact, LocalExportInput,
     ResultPartition,
@@ -1166,7 +1427,8 @@ pub use local::{
 
 #[cfg(feature = "export")]
 pub use local::{
-    StreamingTextExport, TextFormat, export_csv, export_jsonl, write_csv_stream, write_jsonl_stream,
+    StreamingTextExport, TextFormat, export_csv, export_csv_raw, export_jsonl, export_jsonl_raw,
+    write_csv_raw_stream, write_csv_stream, write_jsonl_raw_stream, write_jsonl_stream,
 };
 
 #[cfg(feature = "parquet")]
@@ -1178,8 +1440,9 @@ pub use parquet::{
     ParquetInspection, ParquetLogicalType, ParquetType, ParquetWriterOptions, TZ_OFFSET_SUFFIX,
     ThriftCompactReader, ThriftCompactWriter, TimeUnit, decimal_byte_width,
     decode_definition_levels, encode_column_plain, encode_definition_levels, export_parquet,
-    gzip_compress, gzip_decompress, plan_parquet_columns, read_parquet_records, snappy_compress,
-    snappy_decompress, validate_parquet, write_parquet_stream,
+    export_parquet_raw, gzip_compress, gzip_decompress, plan_parquet_columns, read_parquet_records,
+    snappy_compress, snappy_decompress, validate_parquet, write_parquet_raw_stream,
+    write_parquet_stream,
 };
 
 /// Convenient re-exports for callers.
@@ -1194,17 +1457,20 @@ pub mod prelude {
     #[cfg(any(feature = "export", feature = "parquet"))]
     pub use super::{
         AddressingSink, ExportByteSink, ExportColumn, LocalExportArtifact, LocalExportInput,
-        ResultPartition,
+        RawResultPartition, ResultPartition,
     };
 
     #[cfg(feature = "export")]
-    pub use super::{export_csv, export_jsonl, write_csv_stream, write_jsonl_stream};
+    pub use super::{
+        export_csv, export_csv_raw, export_jsonl, export_jsonl_raw, write_csv_raw_stream,
+        write_csv_stream, write_jsonl_raw_stream, write_jsonl_stream,
+    };
 
     #[cfg(feature = "parquet")]
     pub use super::{
         PARQUET_MAGIC, ParquetCompression, ParquetInspection, ParquetWriterOptions,
-        decode_definition_levels, encode_definition_levels, export_parquet, read_parquet_records,
-        validate_parquet, write_parquet_stream,
+        decode_definition_levels, encode_definition_levels, export_parquet, export_parquet_raw,
+        read_parquet_records, validate_parquet, write_parquet_raw_stream, write_parquet_stream,
     };
 }
 

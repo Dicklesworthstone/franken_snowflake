@@ -1189,76 +1189,107 @@ impl ColumnStats {
     }
 }
 
+/// Incremental PLAIN column page encoder that accepts borrowed `&str` cells directly.
+#[derive(Debug)]
+struct ParquetColumnBuilder {
+    desc: ParquetColumnDescriptor,
+    stats: ColumnStats,
+    defs: Vec<u8>,
+    values: Vec<u8>,
+    bool_bits: Vec<bool>,
+}
+
+impl ParquetColumnBuilder {
+    fn with_capacity(desc: ParquetColumnDescriptor, expected_rows: usize) -> Self {
+        Self {
+            desc,
+            stats: ColumnStats::default(),
+            defs: Vec::with_capacity(expected_rows),
+            values: Vec::new(),
+            bool_bits: Vec::new(),
+        }
+    }
+
+    fn push_cell(&mut self, cell: Option<&str>) -> ExportResult<()> {
+        match cell {
+            None => {
+                self.defs.push(0_u8);
+                self.stats.null_count = self.stats.null_count.saturating_add(1);
+            }
+            Some(s) => {
+                self.defs.push(1_u8);
+                if self.desc.codec == CellCodec::Text {
+                    self.stats.update_str(s);
+                    let bytes = s.as_bytes();
+                    let len_u32 = u32::try_from(bytes.len())
+                        .map_err(|_| cell_error(s, "a Parquet BYTE_ARRAY", "longer than 4 GiB"))?;
+                    self.values.extend_from_slice(&len_u32.to_le_bytes());
+                    self.values.extend_from_slice(bytes);
+                    return Ok(());
+                }
+                match encode_cell(&self.desc, s)? {
+                    PlainValue::I64(val) => {
+                        self.stats.update_i64(val);
+                        self.values.extend_from_slice(&val.to_le_bytes());
+                    }
+                    PlainValue::I32(val) => {
+                        self.stats.update_i32(val);
+                        self.values.extend_from_slice(&val.to_le_bytes());
+                    }
+                    PlainValue::F64(val) => {
+                        self.stats.update_f64(val);
+                        self.values.extend_from_slice(&val.to_bits().to_le_bytes());
+                    }
+                    PlainValue::Bool(val) => self.bool_bits.push(val),
+                    PlainValue::Bytes(bytes) => {
+                        let len_u32 = u32::try_from(bytes.len()).map_err(|_| {
+                            cell_error(s, "a Parquet BYTE_ARRAY", "longer than 4 GiB")
+                        })?;
+                        self.values.extend_from_slice(&len_u32.to_le_bytes());
+                        self.values.extend_from_slice(&bytes);
+                    }
+                    PlainValue::Fixed(bytes) => self.values.extend_from_slice(&bytes),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> (Vec<u8>, ColumnStats) {
+        if self.desc.physical == ParquetType::Boolean && !self.bool_bits.is_empty() {
+            // PLAIN boolean encoding: 1 bit per value, packed LSB-first
+            let num_bytes = (self.bool_bits.len().saturating_add(7)) / 8;
+            let mut packed = vec![0_u8; num_bytes];
+            for (idx, bit) in self.bool_bits.iter().enumerate() {
+                if *bit {
+                    let byte_idx = idx / 8;
+                    let bit_idx = idx % 8;
+                    packed[byte_idx] |= 1 << bit_idx;
+                }
+            }
+            self.values.extend_from_slice(&packed);
+        }
+
+        let mut page_data = Vec::new();
+        if self.desc.nullable {
+            let def_bytes = encode_definition_levels(&self.defs);
+            page_data.extend_from_slice(&def_bytes);
+        }
+        page_data.extend_from_slice(&self.values);
+        (page_data, self.stats)
+    }
+}
+
 /// Encode scalar values into a DataPage payload according to Parquet PLAIN format.
 pub fn encode_column_plain(
     desc: &ParquetColumnDescriptor,
     cells: &[Option<String>],
 ) -> ExportResult<(Vec<u8>, ColumnStats)> {
-    let mut stats = ColumnStats::default();
-    let mut defs = Vec::with_capacity(cells.len());
-    let mut values = Vec::new();
-    let mut bool_bits = Vec::new();
-
+    let mut builder = ParquetColumnBuilder::with_capacity(*desc, cells.len());
     for cell in cells {
-        match cell {
-            None => {
-                defs.push(0_u8);
-                stats.null_count = stats.null_count.saturating_add(1);
-            }
-            Some(s) => {
-                defs.push(1_u8);
-                match encode_cell(desc, s)? {
-                    PlainValue::I64(val) => {
-                        stats.update_i64(val);
-                        values.extend_from_slice(&val.to_le_bytes());
-                    }
-                    PlainValue::I32(val) => {
-                        stats.update_i32(val);
-                        values.extend_from_slice(&val.to_le_bytes());
-                    }
-                    PlainValue::F64(val) => {
-                        stats.update_f64(val);
-                        values.extend_from_slice(&val.to_bits().to_le_bytes());
-                    }
-                    PlainValue::Bool(val) => bool_bits.push(val),
-                    PlainValue::Bytes(bytes) => {
-                        if desc.codec == CellCodec::Text {
-                            stats.update_str(s);
-                        }
-                        let len_u32 = u32::try_from(bytes.len()).map_err(|_| {
-                            cell_error(s, "a Parquet BYTE_ARRAY", "longer than 4 GiB")
-                        })?;
-                        values.extend_from_slice(&len_u32.to_le_bytes());
-                        values.extend_from_slice(&bytes);
-                    }
-                    PlainValue::Fixed(bytes) => values.extend_from_slice(&bytes),
-                }
-            }
-        }
+        builder.push_cell(cell.as_deref())?;
     }
-
-    if desc.physical == ParquetType::Boolean && !bool_bits.is_empty() {
-        // PLAIN boolean encoding: 1 bit per value, packed LSB-first
-        let num_bytes = (bool_bits.len().saturating_add(7)) / 8;
-        let mut packed = vec![0_u8; num_bytes];
-        for (idx, bit) in bool_bits.iter().enumerate() {
-            if *bit {
-                let byte_idx = idx / 8;
-                let bit_idx = idx % 8;
-                packed[byte_idx] |= 1 << bit_idx;
-            }
-        }
-        values.extend_from_slice(&packed);
-    }
-
-    let mut page_data = Vec::new();
-    if desc.nullable {
-        let def_bytes = encode_definition_levels(&defs);
-        page_data.extend_from_slice(&def_bytes);
-    }
-    page_data.extend_from_slice(&values);
-
-    Ok((page_data, stats))
+    Ok(builder.finish())
 }
 
 /// One encoded PLAIN value.
@@ -1814,16 +1845,100 @@ where
         }
     }
 
+    let mut builders = Vec::with_capacity(plans.len());
+    for plan in &plans {
+        let mut builder =
+            ParquetColumnBuilder::with_capacity(plan.desc, column_cells[plan.source].len());
+        for cell in &column_cells[plan.source] {
+            builder.push_cell(cell.as_deref())?;
+        }
+        builders.push(builder);
+    }
+
+    write_encoded_parquet_chunks(&plans, builders, total_rows, sink, options)
+}
+
+/// Stream Parquet file bytes directly from raw uncompressed `jsonv2` partition
+/// byte slices without materializing intermediate per-row `Vec<Option<String>>`.
+pub fn write_parquet_raw_stream<'a, I, S>(
+    columns: &[ExportColumn],
+    partitions: I,
+    sink: &mut S,
+    options: &ParquetWriterOptions,
+) -> ExportResult<u64>
+where
+    I: IntoIterator<Item = franken_snowflake_core::jsonv2_scanner::RawResultPartition<'a>>,
+    S: ExportByteSink,
+{
+    if columns.is_empty() {
+        return Err(ExportError::EmptySchema);
+    }
+
+    let plans = plan_parquet_columns(columns);
+    let mut seen = std::collections::BTreeSet::new();
+    for plan in &plans {
+        if !seen.insert(plan.name.as_str()) {
+            return Err(ExportError::DuplicateColumn {
+                name: plan.name.clone(),
+            });
+        }
+    }
+
+    let mut builders: Vec<ParquetColumnBuilder> = plans
+        .iter()
+        .map(|plan| ParquetColumnBuilder::with_capacity(plan.desc, 0))
+        .collect();
+    let mut scanner = franken_snowflake_core::jsonv2_scanner::ZeroCopyJsonv2Scanner::new();
+    let mut total_rows = 0_u64;
+    let mut previous_partition = None;
+
+    for partition in partitions {
+        if let Some(prev) = previous_partition.filter(|&prev| partition.index <= prev) {
+            return Err(ExportError::PartitionOrder {
+                previous: prev,
+                next: partition.index,
+            });
+        }
+        previous_partition = Some(partition.index);
+
+        let rows_in_partition = scanner.scan_rows_with(
+            partition.bytes,
+            partition.index,
+            columns.len(),
+            crate::local::scan_error_to_export,
+            |_row_idx, col_idx, cell| {
+                let cell_str = cell.as_str();
+                for (plan, builder) in plans.iter().zip(builders.iter_mut()) {
+                    if plan.source == col_idx {
+                        builder.push_cell(cell_str)?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        total_rows = total_rows.saturating_add(rows_in_partition as u64);
+    }
+
+    write_encoded_parquet_chunks(&plans, builders, total_rows, sink, options)
+}
+
+fn write_encoded_parquet_chunks<S: ExportByteSink>(
+    plans: &[ParquetColumnPlan],
+    builders: Vec<ParquetColumnBuilder>,
+    total_rows: u64,
+    sink: &mut S,
+    options: &ParquetWriterOptions,
+) -> ExportResult<u64> {
     // 1. Write PAR1 magic header
     sink.write_chunk(PARQUET_MAGIC)?;
     let mut current_offset = 4_i64;
 
     let mut written_chunks = Vec::with_capacity(plans.len());
 
-    // 2. Encode and write ColumnChunks
-    for plan in &plans {
+    // 2. Compress and write ColumnChunks
+    for (plan, builder) in plans.iter().zip(builders) {
         let desc = &plan.desc;
-        let (page_uncompressed, stats) = encode_column_plain(desc, &column_cells[plan.source])?;
+        let (page_uncompressed, stats) = builder.finish();
 
         let page_compressed = match options.compression {
             ParquetCompression::Uncompressed => page_uncompressed.clone(),
@@ -1887,8 +2002,57 @@ pub fn export_parquet(
     let (bytes, address) = sink.finish();
     address.verify(&bytes)?;
 
+    parquet_artifact(
+        &input.columns,
+        bytes,
+        address,
+        row_count,
+        target_uri_redacted,
+        created_at_ms,
+        &opts,
+    )
+}
+
+/// Export raw `jsonv2` result partition slices to an in-memory Parquet artifact
+/// and content-addressed receipt without intermediate `Vec<Vec<Option<String>>>` rows.
+pub fn export_parquet_raw<'a, I>(
+    columns: &[ExportColumn],
+    partitions: I,
+    target_uri_redacted: impl Into<String>,
+    created_at_ms: u64,
+    options: Option<ParquetWriterOptions>,
+) -> ExportResult<LocalExportArtifact>
+where
+    I: IntoIterator<Item = franken_snowflake_core::jsonv2_scanner::RawResultPartition<'a>>,
+{
+    let opts = options.unwrap_or_default();
+    let mut sink = crate::local::AddressingSink::new(Vec::new());
+    let row_count = write_parquet_raw_stream(columns, partitions, &mut sink, &opts)?;
+    let (bytes, address) = sink.finish();
+    address.verify(&bytes)?;
+
+    parquet_artifact(
+        columns,
+        bytes,
+        address,
+        row_count,
+        target_uri_redacted,
+        created_at_ms,
+        &opts,
+    )
+}
+
+fn parquet_artifact(
+    columns: &[ExportColumn],
+    bytes: Vec<u8>,
+    address: crate::ContentAddress,
+    row_count: u64,
+    target_uri_redacted: impl Into<String>,
+    created_at_ms: u64,
+    opts: &ParquetWriterOptions,
+) -> ExportResult<LocalExportArtifact> {
     let target = target_uri_redacted.into();
-    let schema_digest = blake3::hash(serde_json::to_string(&input.columns)?.as_bytes())
+    let schema_digest = blake3::hash(serde_json::to_string(columns)?.as_bytes())
         .to_hex()
         .to_string();
 

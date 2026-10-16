@@ -198,6 +198,21 @@ impl PollPlan {
         self.partition_concurrency
             .clamp(1, MAX_PARTITION_CONCURRENCY)
     }
+
+    /// Build a [`franken_snowflake_core::budget::Budget`] from this poll plan's
+    /// poll quota and optional credit cap (`CostQuota::max_microcredits`).
+    #[must_use]
+    pub fn to_query_budget(
+        &self,
+        deadline: Option<asupersync::Time>,
+    ) -> franken_snowflake_core::budget::Budget {
+        franken_snowflake_core::budget::query_budget(
+            deadline,
+            self.max_polls,
+            self.cost_quota.map(|quota| quota.max_microcredits),
+            128,
+        )
+    }
 }
 
 /// The fully-assembled result of a completed statement: the parsed terminal
@@ -211,6 +226,10 @@ pub struct CompletedStatement {
     pub result_set: ResultSet,
     /// All rows across every fetched partition (`data` ++ each fetched partition).
     pub rows: Vec<Vec<Option<String>>>,
+    /// Raw decompressed `jsonv2` 2D-array byte slices for each fetched partition
+    /// (`0..fetched_partitions`), preserving exact wire bytes for zero-copy
+    /// SWAR consumers (`franken-snowflake-frame` and `franken-snowflake-export`).
+    pub raw_partitions: Vec<Vec<u8>>,
     /// Partitions whose rows are in `rows`, counting the inline partition 0.
     pub fetched_partitions: u32,
     /// Partitions the result set has in total (`partitionInfo` length, min 1).
@@ -224,6 +243,23 @@ impl CompletedStatement {
     #[must_use]
     pub fn is_partial(&self) -> bool {
         self.fetched_partitions < self.total_partitions
+    }
+
+    /// Borrow the raw `jsonv2` 2D-array slices of each fetched partition in order.
+    #[must_use]
+    pub fn raw_partition_slices(
+        &self,
+    ) -> Vec<franken_snowflake_core::jsonv2_scanner::RawResultPartition<'_>> {
+        self.raw_partitions
+            .iter()
+            .enumerate()
+            .map(|(idx, bytes)| {
+                franken_snowflake_core::jsonv2_scanner::RawResultPartition::new(
+                    u32::try_from(idx).unwrap_or(u32::MAX),
+                    bytes.as_slice(),
+                )
+            })
+            .collect()
     }
 }
 
@@ -327,6 +363,7 @@ enum Phase {
         total: u32,
         next: u32,
         rows: Vec<Vec<Option<String>>>,
+        raw_partitions: Vec<Vec<u8>>,
     },
     /// Terminal (completed, failed, timed out, or errored).
     Done,
@@ -364,11 +401,25 @@ impl StatementMachine {
     /// completed statement then holds only the rows not yet drained.
     pub fn drain_rows(&mut self) -> Vec<Vec<Option<String>>> {
         match &mut self.phase {
-            Phase::Assembling { rows, .. } => {
+            Phase::Assembling {
+                rows,
+                raw_partitions,
+                ..
+            } => {
+                raw_partitions.clear();
                 let drained = std::mem::take(rows);
                 self.drained_rows = self.drained_rows.saturating_add(drained.len());
                 drained
             }
+            Phase::Pending | Phase::Done => Vec::new(),
+        }
+    }
+
+    /// Streaming zero-copy: take the raw `jsonv2` 2D-array partition slices
+    /// assembled so far, in partition order. Call before [`Self::drain_rows`].
+    pub fn drain_raw_partitions(&mut self) -> Vec<Vec<u8>> {
+        match &mut self.phase {
+            Phase::Assembling { raw_partitions, .. } => std::mem::take(raw_partitions),
             Phase::Pending | Phase::Done => Vec::new(),
         }
     }
@@ -418,6 +469,7 @@ impl StatementMachine {
             total,
             next,
             rows,
+            raw_partitions,
         } = std::mem::replace(&mut self.phase, Phase::Done)
         else {
             return Err(LifecycleError::new(
@@ -429,6 +481,7 @@ impl StatementMachine {
             statement_handle: handle,
             result_set,
             rows,
+            raw_partitions,
             fetched_partitions: next,
             total_partitions: total,
         })
@@ -446,7 +499,14 @@ impl StatementMachine {
     ) -> Result<Progress, LifecycleError> {
         self.ensure_not_terminal()?;
         match class {
-            ResponseClass::Completed => self.enter_terminal_result(parse_result_set(body)?),
+            ResponseClass::Completed => {
+                let result_set = parse_result_set(body)?;
+                let inline_raw =
+                    franken_snowflake_core::jsonv2_scanner::extract_jsonv2_data_array(body)
+                        .map(<[u8]>::to_vec)
+                        .unwrap_or_default();
+                self.enter_terminal_result(result_set, inline_raw)
+            }
             ResponseClass::Running => {
                 let status = parse_query_status(body)?;
                 Ok(Progress::PollAgain(status.statement_handle))
@@ -473,7 +533,14 @@ impl StatementMachine {
         self.ensure_not_terminal()?;
         self.polls_done = self.polls_done.saturating_add(1);
         match class {
-            ResponseClass::Completed => self.enter_terminal_result(parse_result_set(body)?),
+            ResponseClass::Completed => {
+                let result_set = parse_result_set(body)?;
+                let inline_raw =
+                    franken_snowflake_core::jsonv2_scanner::extract_jsonv2_data_array(body)
+                        .map(<[u8]>::to_vec)
+                        .unwrap_or_default();
+                self.enter_terminal_result(result_set, inline_raw)
+            }
             ResponseClass::StatementTimeout => self.enter_terminal_timeout(parse_failure(body)?),
             ResponseClass::StatementFailed => self.enter_terminal_failure(parse_failure(body)?),
             // Still running, or a transient 429 the transport will have backed off
@@ -525,6 +592,7 @@ impl StatementMachine {
             total,
             next,
             mut rows,
+            mut raw_partitions,
         } = std::mem::replace(&mut self.phase, Phase::Done)
         else {
             return Err(LifecycleError::new(
@@ -539,6 +607,7 @@ impl StatementMachine {
                 total,
                 next,
                 rows,
+                raw_partitions,
             };
             return Err(LifecycleError::new(
                 LifecycleErrorCode::UnexpectedStatus,
@@ -546,8 +615,13 @@ impl StatementMachine {
             ));
         }
 
-        let mut partition_rows = parse_partition_rows(body)?;
+        let raw_slice = franken_snowflake_core::jsonv2_scanner::extract_jsonv2_data_array(body)
+            .map_err(|error| {
+                LifecycleError::new(LifecycleErrorCode::DecodeFailed, error.to_string())
+            })?;
+        let mut partition_rows = parse_partition_rows(raw_slice)?;
         validate_partition_row_count(&result_set, partition, partition_rows.len())?;
+        raw_partitions.push(raw_slice.to_vec());
         rows.append(&mut partition_rows);
         let upcoming = next.saturating_add(1);
         if upcoming >= total {
@@ -559,6 +633,7 @@ impl StatementMachine {
                 statement_handle: handle,
                 result_set,
                 rows,
+                raw_partitions,
                 fetched_partitions: total,
                 total_partitions: total,
             }))
@@ -570,6 +645,7 @@ impl StatementMachine {
                 total,
                 next: upcoming,
                 rows,
+                raw_partitions,
             };
             Ok(Progress::FetchPartition {
                 handle: resume,
@@ -611,7 +687,11 @@ impl StatementMachine {
     }
 
     /// Enter partition assembly (or finish immediately for a single partition).
-    fn enter_terminal_result(&mut self, result_set: ResultSet) -> Result<Progress, LifecycleError> {
+    fn enter_terminal_result(
+        &mut self,
+        result_set: ResultSet,
+        inline_raw_partition: Vec<u8>,
+    ) -> Result<Progress, LifecycleError> {
         // "If the `code` field in the response is set to `391908`, the result
         // set is too large, and the response does not include the entire
         // result set" (SQL API reference, POST /api/v2/statements, 200;
@@ -626,6 +706,11 @@ impl StatementMachine {
             ));
         }
         let handle = result_set.statement_handle.clone();
+        let raw_partitions = if inline_raw_partition.is_empty() {
+            Vec::new()
+        } else {
+            vec![inline_raw_partition]
+        };
         // A multi-statement parent's rows are only a status message ("Multiple
         // statements executed successfully."); the results are its children's,
         // fetched by the handles it lists. Nothing to assemble or reconcile.
@@ -636,6 +721,7 @@ impl StatementMachine {
                 statement_handle: handle,
                 result_set,
                 rows,
+                raw_partitions,
                 fetched_partitions: 1,
                 total_partitions: 1,
             }));
@@ -652,6 +738,7 @@ impl StatementMachine {
                 statement_handle: handle,
                 result_set,
                 rows,
+                raw_partitions,
                 fetched_partitions: 1,
                 total_partitions: 1,
             }))
@@ -663,6 +750,7 @@ impl StatementMachine {
                 total,
                 next: 1,
                 rows,
+                raw_partitions,
             };
             Ok(Progress::FetchPartition {
                 handle: resume,
@@ -694,26 +782,16 @@ fn parse_failure(body: &[u8]) -> Result<QueryFailureStatus, LifecycleError> {
         .map_err(|error| LifecycleError::new(LifecycleErrorCode::DecodeFailed, error.to_string()))
 }
 
-/// Decode a non-inline partition body: a bare JSON array of rows.
+/// Decode a non-inline partition body: either a `{"data": [[...]]}` object
+/// (live Snowflake wire) or a bare JSON 2D array `[[...]]` (fixtures/replays),
+/// using the single-pass SWAR `ZeroCopyJsonv2Scanner`.
 ///
 /// # Errors
-/// [`LifecycleErrorCode::DecodeFailed`] if the body is not a JSON row array.
+/// [`LifecycleErrorCode::DecodeFailed`] if the body is not a valid `jsonv2` row array.
 pub fn parse_partition_rows(body: &[u8]) -> Result<Vec<Vec<Option<String>>>, LifecycleError> {
-    // The live SQL API returns a non-inline partition as a JSON **object**
-    // `{"data": [[...]]}` (observed against a real account, 2026-06-25 — a
-    // `GET ...?partition=N` over a 13-partition result yielded `{"data":[...]}`,
-    // gzip-encoded, decoded by the transport). The original bare-top-level-array
-    // assumption (carried by replay/mock fixtures) made every live partition
-    // fetch fail with `invalid type: map, expected a sequence`. Accept the object
-    // form first, then fall back to the bare-array form for fixtures/replays.
-    #[derive(serde::Deserialize)]
-    struct PartitionEnvelope {
-        data: Vec<Vec<Option<String>>>,
-    }
-    if let Ok(envelope) = serde_json::from_slice::<PartitionEnvelope>(body) {
-        return Ok(envelope.data);
-    }
-    serde_json::from_slice(body)
+    let mut scanner = franken_snowflake_core::jsonv2_scanner::ZeroCopyJsonv2Scanner::new();
+    scanner
+        .decode_partition_rows(body)
         .map_err(|error| LifecycleError::new(LifecycleErrorCode::DecodeFailed, error.to_string()))
 }
 

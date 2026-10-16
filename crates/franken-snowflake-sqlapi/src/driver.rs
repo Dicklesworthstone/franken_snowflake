@@ -320,6 +320,19 @@ pub trait RowSink: Send {
         result_set: &ResultSet,
         rows: Vec<Vec<Option<String>>>,
     ) -> Result<(), SnowflakeError>;
+
+    /// Zero-copy fast path: accept raw `jsonv2` 2D-array partition byte slices
+    /// directly without materializing per-row `Vec<Option<String>>`.
+    ///
+    /// Return `Some(result)` when handled, or `None` to fall back to [`Self::accept`].
+    fn accept_raw_partitions(
+        &mut self,
+        _result_set: &ResultSet,
+        _raw_partitions: &[Vec<u8>],
+        _row_count: usize,
+    ) -> Option<Result<(), SnowflakeError>> {
+        None
+    }
 }
 
 /// What happened during a statement run, for progress reporting
@@ -424,6 +437,79 @@ pub async fn run_statement_hooked<T: StatementTransport, A: AuthProvider>(
     )
     .await;
     (outcome, stats)
+}
+
+/// Convert a capability-narrowed `Cx<Caps>` into an owned `Cx` whose runtime
+/// capability mask is intersected with `Caps::MASK` (without holding a `!Send`
+/// thread-local guard across `.await`).
+fn runtime_masked_cx<Caps: asupersync::cx::cap::CapSetRuntimeMask>(cx: &Cx<Caps>) -> Option<Cx> {
+    let _guard = cx.clone().set_current_restricted();
+    Cx::current()
+}
+
+/// Execute a read-only statement under a narrowed [`franken_snowflake_core::capabilities::TransportCx`].
+///
+/// Refuses any statement that [`sql_lexer::is_side_effect_free_read`] classifies
+/// as mutating before touching the transport.
+pub async fn run_read_statement_with_transport_cx<T: StatementTransport, A: AuthProvider>(
+    cx: &franken_snowflake_core::capabilities::TransportCx,
+    client: &T,
+    auth: &mut A,
+    request: SubmitStatementRequest,
+    params: SubmitQueryParams,
+    poll_plan: PollPlan,
+    hooks: StatementHooks<'_>,
+) -> (StatementOutcome, DriverStats) {
+    if !sql_lexer::is_side_effect_free_read(&request.statement) {
+        return (
+            SnowflakeOutcome::err(SnowflakeError::new(
+                SnowflakeErrorCode::MutationRefused,
+                "mutating SQL is refused on a read-only TransportCx",
+            )),
+            DriverStats::default(),
+        );
+    }
+    let Some(masked) = runtime_masked_cx(cx) else {
+        return (
+            SnowflakeOutcome::cancelled(CancelReason::shutdown()),
+            DriverStats::default(),
+        );
+    };
+    run_statement_hooked(&masked, client, auth, request, params, poll_plan, hooks).await
+}
+
+/// Execute a mutating statement under a narrowed [`franken_snowflake_core::capabilities::WriteCx`]
+/// and an unforgeable [`franken_snowflake_core::write_intent::WriteAuthorization`] grant.
+///
+/// Refuses the statement before touching the transport if `grant.covers(&request.statement)`
+/// does not hold.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_write_statement_with_write_cx<T: StatementTransport, A: AuthProvider>(
+    cx: &franken_snowflake_core::capabilities::WriteCx,
+    grant: &franken_snowflake_core::write_intent::WriteAuthorization,
+    client: &T,
+    auth: &mut A,
+    request: SubmitStatementRequest,
+    params: SubmitQueryParams,
+    poll_plan: PollPlan,
+    hooks: StatementHooks<'_>,
+) -> (StatementOutcome, DriverStats) {
+    if !grant.covers(&request.statement) {
+        return (
+            SnowflakeOutcome::err(SnowflakeError::new(
+                SnowflakeErrorCode::MutationRefused,
+                "write authorization grant does not cover the submitted SQL statement",
+            )),
+            DriverStats::default(),
+        );
+    }
+    let Some(masked) = runtime_masked_cx(cx) else {
+        return (
+            SnowflakeOutcome::cancelled(CancelReason::shutdown()),
+            DriverStats::default(),
+        );
+    };
+    run_statement_hooked(&masked, client, auth, request, params, poll_plan, hooks).await
 }
 
 /// The results of a multi-statement request (reality-check bead L1).
@@ -902,13 +988,7 @@ async fn drive_guarded<T: StatementTransport, A: AuthProvider>(
     stats.execution_timeout = poll_plan.execution_timeout;
     stats.cost_quota = poll_plan.cost_quota;
     let started = asupersync::time::wall_now();
-    let bounds = ExecutionBounds {
-        deadline: poll_plan.execution_timeout.map(|timeout| started + timeout),
-        cost: poll_plan
-            .cost_quota
-            .and_then(|quota| quota.time_bound())
-            .map(|bound| started + bound),
-    };
+    let mut bounds = ExecutionBounds::new(started, &poll_plan);
     let cost_quota = poll_plan.cost_quota;
     let mut machine = StatementMachine::new(poll_plan);
     // A statement resumed by its handle has already run: poll it at once.
@@ -982,8 +1062,20 @@ async fn drive_guarded<T: StatementTransport, A: AuthProvider>(
                 // The statement is finished server-side: a sink error needs no
                 // remote cancel.
                 if let Some(sink) = sink.as_mut() {
+                    let raw_partitions = std::mem::take(&mut completed.raw_partitions);
                     let rows = std::mem::take(&mut completed.rows);
-                    if let Err(error) = sink.accept(&completed.result_set, rows) {
+                    let delivered = if !raw_partitions.is_empty() {
+                        sink.accept_raw_partitions(
+                            &completed.result_set,
+                            &raw_partitions,
+                            rows.len(),
+                        )
+                    } else {
+                        None
+                    };
+                    if let Err(error) =
+                        delivered.unwrap_or_else(|| sink.accept(&completed.result_set, rows))
+                    {
                         return SnowflakeOutcome::err(error);
                     }
                 }
@@ -1101,12 +1193,21 @@ async fn drive_guarded<T: StatementTransport, A: AuthProvider>(
                 // Streaming: hand over what is assembled (the inline rows, then
                 // the previous window) before fetching more.
                 if let Some(sink) = sink.as_mut() {
+                    let raw_partitions = machine.drain_raw_partitions();
                     let rows = machine.drain_rows();
                     if !rows.is_empty()
                         && let Some(result_set) = machine.result_set()
-                        && let Err(error) = sink.accept(result_set, rows)
                     {
-                        return abandon_with_error(cx, client, &auth, &handle, error).await;
+                        let delivered = if !raw_partitions.is_empty() {
+                            sink.accept_raw_partitions(result_set, &raw_partitions, rows.len())
+                        } else {
+                            None
+                        };
+                        if let Err(error) =
+                            delivered.unwrap_or_else(|| sink.accept(result_set, rows))
+                        {
+                            return abandon_with_error(cx, client, &auth, &handle, error).await;
+                        }
                     }
                 }
                 let (next, total) = machine
@@ -1128,8 +1229,20 @@ async fn drive_guarded<T: StatementTransport, A: AuthProvider>(
                                 },
                             );
                             if let Some(sink) = sink.as_mut() {
+                                let raw_partitions = std::mem::take(&mut done.raw_partitions);
                                 let rows = std::mem::take(&mut done.rows);
-                                if let Err(error) = sink.accept(&done.result_set, rows) {
+                                let delivered = if !raw_partitions.is_empty() {
+                                    sink.accept_raw_partitions(
+                                        &done.result_set,
+                                        &raw_partitions,
+                                        rows.len(),
+                                    )
+                                } else {
+                                    None
+                                };
+                                if let Err(error) =
+                                    delivered.unwrap_or_else(|| sink.accept(&done.result_set, rows))
+                                {
                                     return SnowflakeOutcome::err(error);
                                 }
                             }
@@ -1562,18 +1675,55 @@ fn elapsed_since(started: asupersync::Time) -> Duration {
 }
 
 /// The client-side bounds on one statement's execution: the deadline
-/// ([`PollPlan::execution_timeout`]) and the credit cap's time bound
-/// ([`PollPlan::cost_quota`]).
+/// ([`PollPlan::execution_timeout`]), the credit cap's time bound
+/// ([`PollPlan::cost_quota`]), and the Asupersync query [`franken_snowflake_core::budget::Budget`]
+/// whose `cost_quota` is incrementally debited via `consume_cost`.
 #[derive(Clone, Copy)]
 struct ExecutionBounds {
+    started: asupersync::Time,
     deadline: Option<asupersync::Time>,
     cost: Option<asupersync::Time>,
+    cost_quota: Option<CostQuota>,
+    budget: franken_snowflake_core::budget::Budget,
+    consumed_microcredits: u64,
 }
 
 impl ExecutionBounds {
+    fn new(started: asupersync::Time, poll_plan: &PollPlan) -> Self {
+        let deadline = poll_plan.execution_timeout.map(|timeout| started + timeout);
+        let cost = poll_plan
+            .cost_quota
+            .and_then(|quota| quota.time_bound())
+            .map(|bound| started + bound);
+        Self {
+            started,
+            deadline,
+            cost,
+            cost_quota: poll_plan.cost_quota,
+            budget: poll_plan.to_query_budget(deadline),
+            consumed_microcredits: 0,
+        }
+    }
+
     /// The cancel reason of a bound that has passed (the cost bound first).
-    fn passed(&self) -> Option<CancelReason> {
+    fn passed(&mut self) -> Option<CancelReason> {
         let now = asupersync::time::wall_now();
+        if let Some(quota) = self.cost_quota {
+            let elapsed = Duration::from_nanos(now.duration_since(self.started));
+            let estimated = quota.estimate(elapsed);
+            let target = if self.cost.is_some_and(|cost| now >= cost) {
+                estimated.max(quota.max_microcredits.saturating_add(1))
+            } else {
+                estimated
+            };
+            let delta = target.saturating_sub(self.consumed_microcredits);
+            if delta > 0 {
+                if !self.budget.consume_cost(delta) {
+                    return Some(CancelReason::cost_budget());
+                }
+                self.consumed_microcredits = target;
+            }
+        }
         if self.cost.is_some_and(|cost| now >= cost) {
             Some(CancelReason::cost_budget())
         } else if self.deadline.is_some_and(|deadline| now >= deadline) {
@@ -4238,5 +4388,144 @@ mod tests {
         assert_eq!(error.code, SnowflakeErrorCode::StatementFailed);
         assert!(error.message.contains("[REDACTED]"));
         assert!(!error.message.contains(raw_token));
+    }
+
+    #[test]
+    fn read_statement_with_transport_cx_executes_select_and_refuses_mutation() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::for_testing();
+            let transport_cx = franken_snowflake_core::capabilities::narrow_to_transport(&cx);
+            let client = FakeTransport::new(Scripted::Ok(
+                StatusClass::Completed,
+                RESP_200_SINGLE.to_vec(),
+            ));
+            let mut auth = fake_auth();
+
+            let (read_outcome, _) = run_read_statement_with_transport_cx(
+                &transport_cx,
+                &client,
+                &mut auth,
+                SubmitStatementRequest::new("SELECT 1"),
+                SubmitQueryParams::default(),
+                PollPlan::default(),
+                StatementHooks::default(),
+            )
+            .await;
+            assert!(matches!(read_outcome, SnowflakeOutcome::Ok(_)));
+
+            let (mutating_outcome, _) = run_read_statement_with_transport_cx(
+                &transport_cx,
+                &client,
+                &mut auth,
+                SubmitStatementRequest::new("DELETE FROM analytics.public.orders"),
+                SubmitQueryParams::default(),
+                PollPlan::default(),
+                StatementHooks::default(),
+            )
+            .await;
+            match mutating_outcome {
+                SnowflakeOutcome::Err(err) => {
+                    assert_eq!(err.code, SnowflakeErrorCode::MutationRefused);
+                }
+                other => panic!("expected MutationRefused, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn write_statement_with_write_cx_enforces_grant_coverage() {
+        use franken_snowflake_core::ids::RequestId;
+        use franken_snowflake_core::write_intent::{
+            AppendOnlyAuditIntent, ConfirmationToken, StatementAllowlistEntry, WriteIntentDecision,
+            WriteIntentMode, WriteIntentPolicy, WriteIntentRequest, WriteStatementKind,
+            evaluate_write_intent,
+        };
+
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::for_testing();
+            let request_id = RequestId::new("01960f9c-7f7c-7d22-8f62-75d6d6e61001");
+            let sql = "INSERT INTO analytics.public.events VALUES (1)";
+            let token = ConfirmationToken::for_request(&request_id, WriteStatementKind::Insert);
+            let decision = evaluate_write_intent(
+                &WriteIntentRequest {
+                    mode: WriteIntentMode::PrepareExecution,
+                    redacted_sql_preview: sql.to_owned(),
+                    dry_run: true,
+                    allowlist_id: Some("events_insert".to_owned()),
+                    request_id: Some(request_id),
+                    confirmation_token: Some(token),
+                    audit_intent: Some(AppendOnlyAuditIntent::append_only("local.write_audit")),
+                },
+                &WriteIntentPolicy {
+                    enabled: true,
+                    allow_ddl: false,
+                    require_dry_run: true,
+                    require_exact_confirmation: true,
+                    require_idempotency_request_id: true,
+                    require_append_only_audit: true,
+                    statement_allowlist: vec![StatementAllowlistEntry::new(
+                        "events_insert",
+                        WriteStatementKind::Insert,
+                    )],
+                    allow_procedures: false,
+                    allow_external_unload: false,
+                    allowed_kinds: None,
+                },
+            );
+            let WriteIntentDecision::ExecutionAuthorized { grant } = decision else {
+                panic!("expected ExecutionAuthorized, got {decision:?}");
+            };
+
+            let write_cx = grant.enter_write_cx(&cx);
+            let client = FakeTransport::new(Scripted::Ok(
+                StatusClass::Completed,
+                RESP_200_SINGLE.to_vec(),
+            ));
+            let mut auth = fake_auth();
+
+            let (covered, _) = run_write_statement_with_write_cx(
+                &write_cx,
+                &grant,
+                &client,
+                &mut auth,
+                SubmitStatementRequest::new(sql),
+                SubmitQueryParams::default(),
+                PollPlan::default(),
+                StatementHooks::default(),
+            )
+            .await;
+            assert!(matches!(covered, SnowflakeOutcome::Ok(_)));
+
+            let (uncovered, _) = run_write_statement_with_write_cx(
+                &write_cx,
+                &grant,
+                &client,
+                &mut auth,
+                SubmitStatementRequest::new("DELETE FROM analytics.public.events"),
+                SubmitQueryParams::default(),
+                PollPlan::default(),
+                StatementHooks::default(),
+            )
+            .await;
+            match uncovered {
+                SnowflakeOutcome::Err(err) => {
+                    assert_eq!(err.code, SnowflakeErrorCode::MutationRefused);
+                }
+                other => panic!("expected MutationRefused, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn poll_plan_to_query_budget_wires_cost_quota_into_execution_bounds() {
+        let plan = PollPlan::with_max_polls(25).with_cost_quota(Some(CostQuota {
+            microcredits_per_hour: 3_600_000,
+            max_microcredits: 500,
+            resumes_warehouse: false,
+        }));
+        let budget = plan.to_query_budget(Some(Time::from_secs(30)));
+        assert_eq!(budget.poll_quota, 25);
+        assert_eq!(budget.cost_quota, Some(500));
+        assert_eq!(budget.deadline, Some(Time::from_secs(30)));
     }
 }
