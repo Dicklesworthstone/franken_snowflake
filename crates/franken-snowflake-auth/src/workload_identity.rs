@@ -773,3 +773,304 @@ impl fmt::Display for WorkloadIdentityAuth {
         )
     }
 }
+
+// ---------------------------------------------------------------------------
+// Documented Snowflake SQL API Workload Identity Federation (`oj0.19`)
+//
+// Official Snowflake SQL API authentication reference:
+// https://docs.snowflake.com/en/developer-guide/sql-api/authenticating
+// ("Using workload identity federation", consulted 2026-09-23 / 2026-10-14):
+//
+// - Header: `Authorization: Bearer WIF.{AWS|AZURE|GCP|OIDC}.{token}`
+// - Header: `X-Snowflake-Authorization-Token-Type: WORKLOAD_IDENTITY_FEDERATION`
+// - No `/oauth/token-request` token exchange occurs on the wire; the provider
+//   token is sent directly with the `WIF.<PROVIDER>.` prefix.
+// ---------------------------------------------------------------------------
+
+/// Token-type header value for Snowflake SQL API Workload Identity Federation.
+pub const WORKLOAD_IDENTITY_FEDERATION_TOKEN_TYPE: &str = "WORKLOAD_IDENTITY_FEDERATION";
+
+/// Default audience required by Snowflake for AWS STS and GCP ID tokens.
+pub const SNOWFLAKE_WIF_AUDIENCE: &str = "snowflakecomputing.com";
+
+/// Default Entra ID resource URI required by Snowflake for Azure Managed Identity tokens.
+pub const AZURE_WIF_DEFAULT_RESOURCE: &str = "api://fd3f753b-eed3-462c-b6a7-a4b5bb650aad";
+
+/// Cloud/identity provider subtype for Snowflake Workload Identity Federation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WifProvider {
+    Aws,
+    Azure,
+    Gcp,
+    Oidc,
+}
+
+impl WifProvider {
+    /// Wire prefix segment in `WIF.<PROVIDER>.<token>`.
+    #[must_use]
+    pub const fn as_wire_prefix(self) -> &'static str {
+        match self {
+            Self::Aws => "AWS",
+            Self::Azure => "AZURE",
+            Self::Gcp => "GCP",
+            Self::Oidc => "OIDC",
+        }
+    }
+
+    /// Documented audience or resource identifier expected for this provider.
+    #[must_use]
+    pub const fn expected_audience_or_resource(self) -> Option<&'static str> {
+        match self {
+            Self::Aws | Self::Gcp => Some(SNOWFLAKE_WIF_AUDIENCE),
+            Self::Azure => Some(AZURE_WIF_DEFAULT_RESOURCE),
+            Self::Oidc => None,
+        }
+    }
+
+    /// Parse a provider name case-insensitively (`aws`, `azure`, `gcp`, `oidc`).
+    pub fn parse(input: &str) -> Result<Self, AuthError> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "aws" => Ok(Self::Aws),
+            "azure" => Ok(Self::Azure),
+            "gcp" => Ok(Self::Gcp),
+            "oidc" => Ok(Self::Oidc),
+            other => Err(AuthError::OidcAssertionMalformed {
+                reason: format!(
+                    "unsupported WIF provider `{other}`; expected one of aws, azure, gcp, or oidc"
+                ),
+                remediation: "set <PREFIX>_WIF_PROVIDER to aws, azure, gcp, or oidc".to_string(),
+            }),
+        }
+    }
+}
+
+impl fmt::Display for WifProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_wire_prefix())
+    }
+}
+
+/// Format the documented Snowflake WIF bearer token (`WIF.{AWS|AZURE|GCP|OIDC}.{token}`).
+pub fn format_wif_bearer_token(
+    provider: WifProvider,
+    raw_token: &str,
+) -> Result<String, AuthError> {
+    let trimmed = raw_token.trim();
+    if trimmed.is_empty() {
+        return Err(AuthError::EmptySecretValue);
+    }
+    if trimmed
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return Err(AuthError::OidcAssertionMalformed {
+            reason: "workload identity token contains whitespace or control characters".to_string(),
+            remediation: "ensure the provider attestation token is a single token string"
+                .to_string(),
+        });
+    }
+    Ok(format!("WIF.{}.{trimmed}", provider.as_wire_prefix()))
+}
+
+/// Construct the documented Snowflake SQL API headers for Workload Identity Federation:
+/// - `Authorization: Bearer WIF.{AWS|AZURE|GCP|OIDC}.{token}`
+/// - `X-Snowflake-Authorization-Token-Type: WORKLOAD_IDENTITY_FEDERATION`
+pub fn build_wif_auth_headers(
+    provider: WifProvider,
+    raw_token: &str,
+) -> Result<AuthHeaders, AuthError> {
+    let formatted = format_wif_bearer_token(provider, raw_token)?;
+    Ok(AuthHeaders::bearer(
+        &formatted,
+        WORKLOAD_IDENTITY_FEDERATION_TOKEN_TYPE,
+    ))
+}
+
+/// Stateful Workload Identity Federation authenticator implementing Snowflake's
+/// documented `WIF.{AWS|AZURE|GCP|OIDC}.{token}` SQL API protocol with zero
+/// `/oauth/token-request` token exchange, pre-expiry JWT `exp` refresh, and
+/// single-retry re-acquisition on mid-flight HTTP `401`.
+#[derive(Clone)]
+pub struct DocumentedWifAuth {
+    provider: WifProvider,
+    assertion_source: OidcTokenSource,
+    refresh_before_expiry_seconds: u64,
+    credential_handle: Option<String>,
+    cached_credential: Option<SecretValue>,
+    cached_issued_at_unix_seconds: Option<i64>,
+    cached_expires_at_unix_seconds: Option<i64>,
+}
+
+impl DocumentedWifAuth {
+    #[must_use]
+    pub fn new(
+        provider: WifProvider,
+        assertion_source: OidcTokenSource,
+        refresh_before_expiry_seconds: Option<u64>,
+    ) -> Self {
+        let credential_handle = Some(assertion_source.credential_handle());
+        Self {
+            provider,
+            assertion_source,
+            refresh_before_expiry_seconds: refresh_before_expiry_seconds
+                .unwrap_or(DEFAULT_PRE_EXPIRY_REFRESH_SECONDS),
+            credential_handle,
+            cached_credential: None,
+            cached_issued_at_unix_seconds: None,
+            cached_expires_at_unix_seconds: None,
+        }
+    }
+
+    #[must_use]
+    pub fn provider(&self) -> WifProvider {
+        self.provider
+    }
+
+    #[must_use]
+    pub fn assertion_source(&self) -> &OidcTokenSource {
+        &self.assertion_source
+    }
+
+    #[must_use]
+    pub fn refresh_before_expiry_seconds(&self) -> u64 {
+        self.refresh_before_expiry_seconds
+    }
+
+    /// Resolve or refresh the provider token using `resolver` at `now_unix_seconds`
+    /// and build the `WIF.<PROVIDER>.<token>` `AuthHeaders`.
+    pub fn headers_with_resolver_at<R: SecretResolver>(
+        &mut self,
+        resolver: &R,
+        now_unix_seconds: i64,
+    ) -> Result<AuthHeaders, AuthError> {
+        let should_refresh = match (&self.cached_credential, self.cached_expires_at_unix_seconds) {
+            (None, _) => true,
+            (Some(_), Some(exp)) => {
+                exp.saturating_sub(now_unix_seconds) <= self.refresh_before_expiry_seconds as i64
+            }
+            (Some(_), None) => false,
+        };
+
+        if should_refresh {
+            self.force_reacquire_with_resolver_at(resolver, now_unix_seconds)?;
+        }
+
+        let Some(secret) = &self.cached_credential else {
+            return Err(AuthError::EmptySecretValue);
+        };
+        build_wif_auth_headers(self.provider, secret.expose_secret())
+    }
+
+    /// Discard any cached provider token and acquire a fresh one from `assertion_source`.
+    pub fn force_reacquire_with_resolver_at<R: SecretResolver>(
+        &mut self,
+        resolver: &R,
+        now_unix_seconds: i64,
+    ) -> Result<(), AuthError> {
+        let resolved = self.assertion_source.resolve(resolver)?;
+        let raw = resolved.expose_secret().trim();
+        // When the provider token is a 3-segment JWT (AWS STS web-identity JWT,
+        // GCP ID token, Azure JWT, or OIDC JWT), validate `exp > now_unix_seconds`
+        // before sending any request.
+        if raw.split('.').count() == 3 {
+            let claims = parse_and_validate_oidc_assertion(raw, now_unix_seconds)?;
+            self.cached_issued_at_unix_seconds = claims.iat.or(Some(now_unix_seconds));
+            self.cached_expires_at_unix_seconds = Some(claims.exp);
+        } else {
+            self.cached_issued_at_unix_seconds = Some(now_unix_seconds);
+            self.cached_expires_at_unix_seconds = None;
+        }
+        // Validate wire formatting early so control characters fail closed.
+        let _ = format_wif_bearer_token(self.provider, raw)?;
+        self.cached_credential = Some(resolved);
+        Ok(())
+    }
+}
+
+impl SnowflakeAuth for DocumentedWifAuth {
+    fn lane(&self) -> AuthLane {
+        AuthLane::WorkloadIdentityFederation
+    }
+
+    fn credential_handle(&self) -> Option<&str> {
+        self.credential_handle.as_deref()
+    }
+
+    fn headers_at(&mut self, now_unix_seconds: i64) -> Result<AuthHeaders, AuthError> {
+        self.headers_with_resolver_at(&crate::ProcessSecretResolver, now_unix_seconds)
+    }
+
+    fn lifetime(&self) -> CredentialLifetime {
+        let expected_validity_seconds = match (
+            self.cached_issued_at_unix_seconds,
+            self.cached_expires_at_unix_seconds,
+        ) {
+            (Some(iat), Some(exp)) => Some(exp.saturating_sub(iat).max(0) as u64),
+            _ => None,
+        };
+        CredentialLifetime {
+            lane: AuthLane::WorkloadIdentityFederation,
+            issued_at_unix_seconds: self.cached_issued_at_unix_seconds,
+            expires_at_unix_seconds: self.cached_expires_at_unix_seconds,
+            expected_validity_seconds,
+            max_validity_seconds: Some(3600),
+            refresh_before_expiry_seconds: Some(self.refresh_before_expiry_seconds),
+        }
+    }
+
+    fn on_unauthorized_mid_poll(&mut self, now_unix_seconds: i64) -> crate::ReauthDecision {
+        self.cached_credential = None;
+        match self.force_reacquire_with_resolver_at(&crate::ProcessSecretResolver, now_unix_seconds)
+        {
+            Ok(()) => crate::ReauthDecision::ResignJwt {
+                reason: format!(
+                    "workload identity ({}) returned 401 mid-poll; re-acquired provider token before retrying",
+                    self.provider
+                ),
+            },
+            Err(error) => crate::ReauthDecision::ReauthRequired {
+                lane: AuthLane::WorkloadIdentityFederation,
+                credential_handle: self.credential_handle.clone(),
+                reason: format!(
+                    "workload identity ({}) returned 401 and provider token re-acquisition failed: {error}",
+                    self.provider
+                ),
+            },
+        }
+    }
+}
+
+impl fmt::Debug for DocumentedWifAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DocumentedWifAuth")
+            .field("provider", &self.provider)
+            .field("assertion_source", &self.assertion_source)
+            .field(
+                "refresh_before_expiry_seconds",
+                &self.refresh_before_expiry_seconds,
+            )
+            .field("credential_handle", &self.credential_handle)
+            .field("cached_credential", &REDACTED)
+            .field(
+                "cached_issued_at_unix_seconds",
+                &self.cached_issued_at_unix_seconds,
+            )
+            .field(
+                "cached_expires_at_unix_seconds",
+                &self.cached_expires_at_unix_seconds,
+            )
+            .finish()
+    }
+}
+
+impl fmt::Display for DocumentedWifAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "DocumentedWifAuth(provider={}, handle={})",
+            self.provider,
+            self.credential_handle.as_deref().unwrap_or(REDACTED)
+        )
+    }
+}

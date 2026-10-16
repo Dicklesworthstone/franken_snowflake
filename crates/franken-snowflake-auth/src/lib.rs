@@ -44,10 +44,12 @@ pub use redaction_policy::{
 
 pub mod workload_identity;
 pub use workload_identity::{
-    DEFAULT_OIDC_SCOPE, DEFAULT_PRE_EXPIRY_REFRESH_SECONDS, OidcAssertionClaims, OidcHttpExchange,
-    OidcTokenSource, RFC7523_JWT_BEARER_GRANT_TYPE, SNOWFLAKE_OAUTH_TOKEN_REQUEST_PATH,
-    SnowflakeSessionToken, WorkloadIdentityAuth, format_rfc7523_form_body,
-    parse_and_validate_oidc_assertion, parse_rfc7523_token_response,
+    AZURE_WIF_DEFAULT_RESOURCE, DEFAULT_OIDC_SCOPE, DEFAULT_PRE_EXPIRY_REFRESH_SECONDS,
+    DocumentedWifAuth, OidcAssertionClaims, OidcHttpExchange, OidcTokenSource,
+    RFC7523_JWT_BEARER_GRANT_TYPE, SNOWFLAKE_OAUTH_TOKEN_REQUEST_PATH, SNOWFLAKE_WIF_AUDIENCE,
+    SnowflakeSessionToken, WORKLOAD_IDENTITY_FEDERATION_TOKEN_TYPE, WifProvider,
+    WorkloadIdentityAuth, build_wif_auth_headers, format_rfc7523_form_body,
+    format_wif_bearer_token, parse_and_validate_oidc_assertion, parse_rfc7523_token_response,
 };
 
 /// Crate version string.

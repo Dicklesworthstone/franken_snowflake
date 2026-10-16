@@ -578,3 +578,166 @@ fn test_cleartext_token_endpoint_is_refused() {
         .is_ok()
     );
 }
+
+#[test]
+fn documented_wif_header_goldens_for_all_four_providers() {
+    use franken_snowflake_auth::{
+        AZURE_WIF_DEFAULT_RESOURCE, DocumentedWifAuth, SNOWFLAKE_WIF_AUDIENCE,
+        WORKLOAD_IDENTITY_FEDERATION_TOKEN_TYPE, WifProvider, build_wif_auth_headers,
+        redact_with_policy,
+    };
+
+    let cases = [
+        (
+            "aws",
+            WifProvider::Aws,
+            "AWS",
+            Some(SNOWFLAKE_WIF_AUDIENCE),
+            "aws_sts_token_abc",
+        ),
+        (
+            "azure",
+            WifProvider::Azure,
+            "AZURE",
+            Some(AZURE_WIF_DEFAULT_RESOURCE),
+            "azure_msi_token_xyz",
+        ),
+        (
+            "gcp",
+            WifProvider::Gcp,
+            "GCP",
+            Some(SNOWFLAKE_WIF_AUDIENCE),
+            "gcp_id_token_123",
+        ),
+        ("oidc", WifProvider::Oidc, "OIDC", None, "k8s_sa_token_789"),
+    ];
+
+    for (raw_name, expected_provider, wire_prefix, expected_aud, token) in cases {
+        let parsed = WifProvider::parse(raw_name).expect("valid provider");
+        assert_eq!(parsed, expected_provider);
+        assert_eq!(parsed.as_wire_prefix(), wire_prefix);
+        assert_eq!(parsed.expected_audience_or_resource(), expected_aud);
+
+        let headers = build_wif_auth_headers(parsed, token).expect("valid WIF headers");
+        assert_eq!(headers.authorization_header_name(), "Authorization");
+        assert_eq!(
+            headers.authorization_value(),
+            format!("Bearer WIF.{wire_prefix}.{token}")
+        );
+        assert_eq!(
+            headers.token_type_header_name(),
+            "X-Snowflake-Authorization-Token-Type"
+        );
+        assert_eq!(
+            headers.token_type_value(),
+            WORKLOAD_IDENTITY_FEDERATION_TOKEN_TYPE
+        );
+
+        // Secret redaction covers `WIF.<PROVIDER>.<token>` even for opaque non-JWT tokens.
+        let diagnostic = format!("sent header {}", headers.authorization_value());
+        let redacted = redact_with_policy(&diagnostic, &[]);
+        assert!(
+            !redacted.contains(token),
+            "raw WIF token leaked in redacted string: {redacted}"
+        );
+
+        let mut auth = DocumentedWifAuth::new(
+            parsed,
+            OidcTokenSource::env_var("TEST_WIF_PROVIDER_TOKEN"),
+            Some(60),
+        );
+        let resolver = StaticSecretResolver {
+            secret: Some(token.to_string()),
+        };
+        let derived = auth
+            .headers_with_resolver_at(&resolver, 1_700_000_000)
+            .expect("headers derived without token exchange");
+        assert_eq!(
+            derived.authorization_value(),
+            format!("Bearer WIF.{wire_prefix}.{token}")
+        );
+        assert_eq!(
+            derived.token_type_value(),
+            WORKLOAD_IDENTITY_FEDERATION_TOKEN_TYPE
+        );
+        let debug_text = format!("{auth:?}");
+        assert!(!debug_text.contains(token));
+        assert!(debug_text.contains("[REDACTED]"));
+    }
+}
+
+#[test]
+fn documented_wif_refreshes_before_jwt_expiry_and_reacquires_on_401() {
+    use franken_snowflake_auth::{DocumentedWifAuth, ReauthDecision, WifProvider};
+
+    let now = 1_700_000_000;
+    let first_jwt = create_test_jwt(now + 120, now, "https://sts.amazonaws.com", "role-a");
+    let second_jwt = create_test_jwt(now + 600, now + 70, "https://sts.amazonaws.com", "role-a");
+
+    let mut auth = DocumentedWifAuth::new(
+        WifProvider::Aws,
+        OidcTokenSource::env_var("AWS_WEB_IDENTITY_TOKEN"),
+        Some(60),
+    );
+    let resolver_first = StaticSecretResolver {
+        secret: Some(first_jwt.clone()),
+    };
+    let h1 = auth
+        .headers_with_resolver_at(&resolver_first, now)
+        .expect("initial WIF header");
+    assert_eq!(
+        h1.authorization_value(),
+        format!("Bearer WIF.AWS.{first_jwt}")
+    );
+
+    // At now + 30 (90s remaining > 60s refresh window), cached token is kept even if resolver has second_jwt.
+    let resolver_second = StaticSecretResolver {
+        secret: Some(second_jwt.clone()),
+    };
+    let h_cached = auth
+        .headers_with_resolver_at(&resolver_second, now + 30)
+        .expect("cached WIF header");
+    assert_eq!(
+        h_cached.authorization_value(),
+        format!("Bearer WIF.AWS.{first_jwt}")
+    );
+
+    // At now + 70 (50s remaining <= 60s refresh window), provider token is re-acquired automatically.
+    let h_refreshed = auth
+        .headers_with_resolver_at(&resolver_second, now + 70)
+        .expect("refreshed WIF header");
+    assert_eq!(
+        h_refreshed.authorization_value(),
+        format!("Bearer WIF.AWS.{second_jwt}")
+    );
+
+    // Simulate a 401 mid-poll when using a file-backed OIDC token source.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let token_path = dir.path().join("projected-token");
+    std::fs::write(&token_path, &first_jwt).expect("write first token");
+    let mut file_auth = DocumentedWifAuth::new(
+        WifProvider::Oidc,
+        OidcTokenSource::file(token_path.to_string_lossy().into_owned()),
+        Some(60),
+    );
+    let initial = file_auth.headers_at(now).expect("file token initial");
+    assert_eq!(
+        initial.authorization_value(),
+        format!("Bearer WIF.OIDC.{first_jwt}")
+    );
+
+    // Rotate the projected file on disk and trigger 401 mid-poll.
+    std::fs::write(&token_path, &second_jwt).expect("write rotated token");
+    let decision = file_auth.on_unauthorized_mid_poll(now + 10);
+    assert!(
+        matches!(decision, ReauthDecision::ResignJwt { .. }),
+        "expected ResignJwt after 401 re-acquisition, got {decision:?}"
+    );
+    let after_401 = file_auth
+        .headers_at(now + 10)
+        .expect("file token after 401");
+    assert_eq!(
+        after_401.authorization_value(),
+        format!("Bearer WIF.OIDC.{second_jwt}")
+    );
+}

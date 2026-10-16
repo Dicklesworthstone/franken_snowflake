@@ -25,6 +25,10 @@ pub const SECRET_VALUE_NEEDLE_PREFIXES: &[&str] = &[
     "sk-",
     "xoxb-",
     "xoxp-",
+    "WIF.AWS.",
+    "WIF.AZURE.",
+    "WIF.GCP.",
+    "WIF.OIDC.",
 ];
 
 /// Field-name markers that require hand-written redacting `Debug`.
