@@ -1,0 +1,184 @@
+{
+ "schema": "franken_snowflake.differential_python_connector.v1",
+ "captured_at": "2026-09-28",
+ "connector_version": "4.7.5",
+ "fsnow_build": {
+  "git_sha": "bcc10fe",
+  "source_digest": "3edc59aa68fa70058e200253ba9d65d5316dc42d265dc263dc61da3bf01fa50a",
+  "dirty": false
+ },
+ "fsnow_receipt_hash": "REDACTED_LIVE_RECEIPT_2026_09_28",
+ "precision": "time and timestamps compared to the microsecond (Python datetime); Parquet export verified at nanosecond precision (27/27)",
+ "parquet_readback_verdict": {
+  "checked": true,
+  "precision": "nanosecond",
+  "columns": 27,
+  "mismatches": 0
+ },
+ "columns": 27,
+ "mismatches": 0,
+ "verdicts": [
+  {
+   "column": "NUM_INT",
+   "type": "fixed",
+   "json_repr": "integer",
+   "verdict": "match"
+  },
+  {
+   "column": "NUM_MAX",
+   "type": "fixed",
+   "json_repr": "decimal_string",
+   "verdict": "match"
+  },
+  {
+   "column": "NUM_SCALE2",
+   "type": "fixed",
+   "json_repr": "decimal_string",
+   "verdict": "match"
+  },
+  {
+   "column": "NUM_SCALE37",
+   "type": "fixed",
+   "json_repr": "decimal_string",
+   "verdict": "match"
+  },
+  {
+   "column": "NUM_NULL",
+   "type": "fixed",
+   "json_repr": "decimal_string",
+   "verdict": "match"
+  },
+  {
+   "column": "FLOAT_VAL",
+   "type": "real",
+   "json_repr": "float",
+   "verdict": "match"
+  },
+  {
+   "column": "FLOAT_NAN",
+   "type": "real",
+   "json_repr": "float",
+   "verdict": "match"
+  },
+  {
+   "column": "FLOAT_INF",
+   "type": "real",
+   "json_repr": "float",
+   "verdict": "match"
+  },
+  {
+   "column": "FLOAT_NINF",
+   "type": "real",
+   "json_repr": "float",
+   "verdict": "match"
+  },
+  {
+   "column": "DECFLOAT_VAL",
+   "type": "decfloat",
+   "json_repr": "decimal_string",
+   "verdict": "match"
+  },
+  {
+   "column": "BOOL_TRUE",
+   "type": "boolean",
+   "json_repr": "bool",
+   "verdict": "match"
+  },
+  {
+   "column": "BOOL_NULL",
+   "type": "boolean",
+   "json_repr": "bool",
+   "verdict": "match"
+  },
+  {
+   "column": "TEXT_VAL",
+   "type": "text",
+   "json_repr": "string",
+   "verdict": "match"
+  },
+  {
+   "column": "DATE_VAL",
+   "type": "date",
+   "json_repr": "date",
+   "verdict": "match"
+  },
+  {
+   "column": "DATE_PRE_EPOCH",
+   "type": "date",
+   "json_repr": "date",
+   "verdict": "match"
+  },
+  {
+   "column": "TIME_NS",
+   "type": "time",
+   "json_repr": "time",
+   "verdict": "match"
+  },
+  {
+   "column": "TS_NTZ",
+   "type": "timestamp_ntz",
+   "json_repr": "timestamp_ntz",
+   "verdict": "match"
+  },
+  {
+   "column": "TS_NTZ_PRE_EPOCH",
+   "type": "timestamp_ntz",
+   "json_repr": "timestamp_ntz",
+   "verdict": "match"
+  },
+  {
+   "column": "TS_LTZ",
+   "type": "timestamp_ltz",
+   "json_repr": "timestamp_utc",
+   "verdict": "match"
+  },
+  {
+   "column": "TS_TZ_EAST",
+   "type": "timestamp_tz",
+   "json_repr": "timestamp_offset",
+   "verdict": "match"
+  },
+  {
+   "column": "TS_TZ_WEST",
+   "type": "timestamp_tz",
+   "json_repr": "timestamp_offset",
+   "verdict": "match"
+  },
+  {
+   "column": "TS_TZ_UTC",
+   "type": "timestamp_tz",
+   "json_repr": "timestamp_offset",
+   "verdict": "match"
+  },
+  {
+   "column": "TS_NULL",
+   "type": "timestamp_tz",
+   "json_repr": "timestamp_offset",
+   "verdict": "match"
+  },
+  {
+   "column": "BINARY_VAL",
+   "type": "binary",
+   "json_repr": "hex",
+   "verdict": "match"
+  },
+  {
+   "column": "VARIANT_VAL",
+   "type": "variant",
+   "json_repr": "json",
+   "verdict": "match"
+  },
+  {
+   "column": "OBJECT_VAL",
+   "type": "object",
+   "json_repr": "json",
+   "verdict": "match"
+  },
+  {
+   "column": "ARRAY_VAL",
+   "type": "array",
+   "json_repr": "json",
+   "verdict": "match"
+  }
+ ]
+}

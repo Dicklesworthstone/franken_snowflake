@@ -159,6 +159,82 @@ def canonical_python(value: Any, column: dict) -> Any:
     return ("text", value)
 
 
+def cut_nanosecond_fraction(text: str) -> str:
+    """Normalize an ISO time/timestamp fraction to nanoseconds (nine digits)."""
+    if "." not in text:
+        if text.endswith("Z"):
+            return text[:-1] + ".000000000Z"
+        return f"{text}.000000000"
+    head, rest = text.split(".", 1)
+    digits = ""
+    for char in rest:
+        if not char.isdigit():
+            break
+        digits += char
+    tail = rest[len(digits):]
+    nano = (digits + "000000000")[:9]
+    return f"{head}.{nano}{tail}"
+
+
+def canonical_fsnow_nanosecond(value: Any, column: dict) -> Any:
+    """A typed.v1 cell in canonical form at nanosecond precision for Parquet comparison."""
+    if value is None:
+        return None
+    repr_ = column.get("json_repr")
+    if repr_ in ("time", "timestamp_ntz", "timestamp_utc", "timestamp_offset"):
+        text = cut_nanosecond_fraction(str(value))
+        if repr_ == "timestamp_utc" and text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        return (repr_, text)
+    return canonical_fsnow(value, column)
+
+
+def canonical_parquet_cell(value: Any, column: dict) -> Any:
+    """A Parquet cell (read via pyarrow or arrow-compatible dict/row) at nanosecond precision."""
+    if value is None:
+        return None
+    repr_ = column.get("json_repr")
+    if repr_ in ("time", "timestamp_ntz", "timestamp_utc", "timestamp_offset") and isinstance(value, str):
+        text = cut_nanosecond_fraction(value)
+        if repr_ == "timestamp_utc" and text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        return (repr_, text)
+    if isinstance(value, (bytes, bytearray)):
+        return ("hex", bytes(value).hex())
+    if repr_ == "json":
+        return ("json", json.loads(value) if isinstance(value, str) else value)
+    return canonical_fsnow_nanosecond(value, column)
+
+
+def compare_parquet_rows(columns: list[dict], fsnow_row: list, parquet_row: list | dict) -> list[dict]:
+    """Compare typed.v1 cells against a Parquet row at nanosecond precision (Design 3)."""
+    verdicts = []
+    for index, column in enumerate(columns):
+        name = column.get("name")
+        left = fsnow_row[index] if index < len(fsnow_row) else MISSING
+        if isinstance(parquet_row, dict):
+            right = parquet_row.get(name, MISSING)
+        else:
+            right = parquet_row[index] if index < len(parquet_row) else MISSING
+        if left is MISSING or right is MISSING:
+            verdicts.append({"column": name, "verdict": "missing"})
+            continue
+        ours = canonical_fsnow_nanosecond(left, column)
+        theirs = canonical_parquet_cell(right, column)
+        verdict = {
+            "column": name,
+            "type": column.get("type"),
+            "json_repr": column.get("json_repr"),
+            "precision": "nanosecond",
+            "verdict": "match" if ours == theirs else "mismatch",
+        }
+        if ours != theirs:
+            verdict["fsnow"] = str(ours)
+            verdict["parquet"] = str(theirs)
+        verdicts.append(verdict)
+    return verdicts
+
+
 def compare(columns: list[dict], fsnow_row: list, python_row: list) -> list[dict]:
     """Per-column verdicts: match, or a mismatch with both canonical values."""
     verdicts = []
@@ -178,6 +254,73 @@ def compare(columns: list[dict], fsnow_row: list, python_row: list) -> list[dict
             verdict["python_connector"] = str(theirs)
         verdicts.append(verdict)
     return verdicts
+
+
+# ---------------------------------------------------------------- benchmark (Design 5)
+
+BENCHMARK_SQL = (
+    "SELECT SEQ4() AS N, UNIFORM(1, 1000000, RANDOM(42)) AS V, "
+    "MD5(TO_VARCHAR(SEQ4())) AS H FROM TABLE(GENERATOR(ROWCOUNT => 50000))"
+)
+
+
+def percentile(sorted_values: list[float], fraction: float) -> float:
+    if not sorted_values:
+        return 0.0
+    pos = max(0, min(len(sorted_values) - 1, int(math.ceil(fraction * len(sorted_values))) - 1))
+    return float(sorted_values[pos])
+
+
+def summarize_benchmark_trials(
+    aa_arm_a: list[dict],
+    aa_arm_b: list[dict],
+    ab_fsnow: list[dict],
+    ab_python: list[dict],
+) -> dict:
+    """Summarize A/A null calibration and A/B throughput + RSS trials (Design 5)."""
+    def arm_stats(trials: list[dict]) -> dict:
+        ms_vals = sorted(float(t["ms"]) for t in trials)
+        rss_vals = sorted(float(t.get("peak_rss_kib", 0.0)) for t in trials)
+        return {
+            "trials": len(trials),
+            "median_ms": round(percentile(ms_vals, 0.50), 3),
+            "p95_ms": round(percentile(ms_vals, 0.95), 3),
+            "median_peak_rss_kib": round(percentile(rss_vals, 0.50), 1),
+        }
+
+    stats_aa_a = arm_stats(aa_arm_a)
+    stats_aa_b = arm_stats(aa_arm_b)
+    stats_fsnow = arm_stats(ab_fsnow)
+    stats_py = arm_stats(ab_python)
+    aa_ratio = (
+        round(stats_aa_b["median_ms"] / stats_aa_a["median_ms"], 4)
+        if stats_aa_a["median_ms"] > 0
+        else 1.0
+    )
+    speedup = (
+        round(stats_py["median_ms"] / stats_fsnow["median_ms"], 4)
+        if stats_fsnow["median_ms"] > 0
+        else 0.0
+    )
+    rss_ratio = (
+        round(stats_py["median_peak_rss_kib"] / stats_fsnow["median_peak_rss_kib"], 4)
+        if stats_fsnow["median_peak_rss_kib"] > 0
+        else 0.0
+    )
+    return {
+        "schema": "franken_snowflake.differential_benchmark.v1",
+        "aa_null_calibration": {
+            "arm_a": stats_aa_a,
+            "arm_b": stats_aa_b,
+            "median_ms_ratio": aa_ratio,
+        },
+        "ab_comparison": {
+            "fsnow": stats_fsnow,
+            "python_connector": stats_py,
+            "speedup_python_over_fsnow": speedup,
+            "rss_ratio_python_over_fsnow": rss_ratio,
+        },
+    }
 
 
 # ---------------------------------------------------------------- live arms
@@ -261,6 +404,62 @@ def run_fsnow_arm(binary: str, profile: str, sql: str) -> dict:
         raise SystemExit(f"fsnow arm printed no envelope (exit {done.returncode}): {error}") from error
 
 
+def run_parquet_readback(binary: str, profile: str, sql: str, columns: list[dict], fsnow_row: list) -> dict:
+    """Export `sql` via `fsnow export run --format parquet` and compare via pyarrow if installed."""
+    try:
+        import pyarrow.parquet as pq  # type: ignore[import-not-found]
+    except ImportError:
+        return {"checked": False, "reason": "pyarrow not installed"}
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        parquet_path = os.path.join(tmp_dir, "type_matrix.parquet")
+        done = subprocess.run(
+            [binary, "export", "run", "--profile", profile, "--sql", sql,
+             "--format", "parquet", "--out", parquet_path, "--json"],
+            capture_output=True, text=True, check=False,
+        )
+        if done.returncode != 0 or not os.path.exists(parquet_path):
+            return {"checked": False, "reason": f"export run failed (exit {done.returncode})"}
+        table = pq.read_table(parquet_path)
+        pylist = table.to_pylist()
+        row = pylist[0] if pylist else {}
+        verdicts = compare_parquet_rows(columns, fsnow_row, row)
+        mismatches = [v for v in verdicts if v["verdict"] != "match"]
+        return {
+            "checked": True,
+            "precision": "nanosecond",
+            "columns": len(verdicts),
+            "mismatches": len(mismatches),
+            "verdicts": verdicts,
+        }
+
+
+def run_benchmark_battery(binary: str, profile: str, env: dict, trials: int = 3) -> dict:
+    """Run A/A (fsnow vs fsnow) and A/B (fsnow vs snowflake-connector-python) timing trials."""
+    import resource
+    import time
+
+    def time_cmd(cmd: list[str]) -> dict:
+        t0 = time.perf_counter_ns()
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        elapsed_ms = (time.perf_counter_ns() - t0) / 1_000_000.0
+        rss_kib = float(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)
+        return {"ms": elapsed_ms, "peak_rss_kib": rss_kib}
+
+    fsnow_cmd = [binary, "query", "run", "--profile", profile, "--sql", BENCHMARK_SQL, "--limit", "1000", "--json"]
+    aa_a = [time_cmd(fsnow_cmd) for _ in range(trials)]
+    aa_b = [time_cmd(fsnow_cmd) for _ in range(trials)]
+    ab_fsnow = [time_cmd(fsnow_cmd) for _ in range(trials)]
+    ab_python = []
+    with tempfile.TemporaryDirectory() as key_dir:
+        for _ in range(trials):
+            t0 = time.perf_counter_ns()
+            run_python_arm(env, BENCHMARK_SQL, os.path.join(key_dir, f"t{len(ab_python)}"))
+            elapsed_ms = (time.perf_counter_ns() - t0) / 1_000_000.0
+            rss_kib = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+            ab_python.append({"ms": elapsed_ms, "peak_rss_kib": rss_kib})
+    return summarize_benchmark_trials(aa_a, aa_b, ab_fsnow, ab_python)
+
+
 # ---------------------------------------------------------------- self-test
 
 def self_test() -> int:
@@ -302,6 +501,62 @@ def self_test() -> int:
         caught = compare(columns, fsnow_row, row)[index]["verdict"] == "mismatch"
         ok = ok and caught
         print(json.dumps({"case": label, "ok": caught}))
+    # Design 3: Parquet nanosecond comparison and planted 1ns mismatch.
+    parquet_dict = {
+        "N": 12345,
+        "D": "-123.45",
+        "F": 1.5,
+        "NAN": "NaN",
+        "B": True,
+        "DT": "1969-07-20",
+        "T": "12:34:56.123456789",
+        "NTZ": "2026-09-04T12:34:56.123456789",
+        "LTZ": "2026-09-04T12:34:56.123456789+00:00",
+        "TZ": "2026-09-04T12:34:56.123456789+05:30",
+        "BIN": b"golden",
+        "V": '{"k":[1,{"nested":true}]}',
+        "S": "text",
+        "NUL": None,
+    }
+    pq_verdicts = compare_parquet_rows(columns, fsnow_row, parquet_dict)
+    pq_ok = all(v["verdict"] == "match" for v in pq_verdicts)
+    ok = ok and pq_ok
+    print(json.dumps({"case": "parquet nanosecond readback matches typed.v1", "ok": pq_ok}))
+    bad_pq = dict(parquet_dict, NTZ="2026-09-04T12:34:56.123456788")
+    pq_caught = compare_parquet_rows(columns, fsnow_row, bad_pq)[7]["verdict"] == "mismatch"
+    ok = ok and pq_caught
+    print(json.dumps({"case": "parquet 1ns difference is caught as a mismatch", "ok": pq_caught}))
+    # Design 5: A/A + A/B benchmark summary statistics.
+    bench = summarize_benchmark_trials(
+        [{"ms": 100.0, "peak_rss_kib": 24000.0}, {"ms": 102.0, "peak_rss_kib": 24100.0}],
+        [{"ms": 101.0, "peak_rss_kib": 24050.0}, {"ms": 99.0, "peak_rss_kib": 24000.0}],
+        [{"ms": 120.0, "peak_rss_kib": 26000.0}, {"ms": 125.0, "peak_rss_kib": 26200.0}],
+        [{"ms": 480.0, "peak_rss_kib": 130000.0}, {"ms": 510.0, "peak_rss_kib": 132000.0}],
+    )
+    bench_ok = (
+        bench["aa_null_calibration"]["median_ms_ratio"] == 0.99
+        and bench["ab_comparison"]["speedup_python_over_fsnow"] == 4.0
+        and bench["ab_comparison"]["rss_ratio_python_over_fsnow"] == 5.0
+    )
+    ok = ok and bench_ok
+    print(json.dumps({"case": "A/A null and A/B benchmark summary math", "ok": bench_ok}))
+    # Verify the committed 2026-09-28 differential report artifact.
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    artifact_path = os.path.join(repo_root, "docs", "differential_2026_09_28.json")
+    artifact_ok = False
+    if os.path.exists(artifact_path):
+        with open(artifact_path, encoding="utf-8") as handle:
+            artifact = json.load(handle)
+        artifact_ok = (
+            artifact.get("schema") == "franken_snowflake.differential_python_connector.v1"
+            and artifact.get("columns") == 27
+            and artifact.get("mismatches") == 0
+            and len(artifact.get("verdicts", [])) == 27
+            and all(v.get("verdict") == "match" for v in artifact.get("verdicts", []))
+            and artifact.get("parquet_readback_verdict", {}).get("mismatches") == 0
+        )
+    ok = ok and artifact_ok
+    print(json.dumps({"case": "committed docs/differential_2026_09_28.json is valid (27/27)", "ok": artifact_ok}))
     accounts = {"https://myorg-acct.snowflakecomputing.com": "myorg-acct",
                 "myorg-acct": "myorg-acct", "xy12345.cn-northwest-1.snowflakecomputing.cn": "xy12345.cn-northwest-1"}
     for raw, want in accounts.items():
@@ -337,6 +592,7 @@ def main() -> int:
     parser.add_argument("--bin", help="the franken-snowflake binary")
     parser.add_argument("--profile", help="the live profile both arms use")
     parser.add_argument("--out", help="write the verdicts here")
+    parser.add_argument("--benchmark", action="store_true", help="also run A/A + A/B timing & RSS trials")
     args = parser.parse_args()
     if args.self_test:
         return self_test()
@@ -352,18 +608,23 @@ def main() -> int:
         names, python_rows, version = run_python_arm(env, TYPE_MATRIX_SQL, key_dir)
     if [c.get("name") for c in columns] != names:
         raise SystemExit(f"column lists differ: fsnow {[c.get('name') for c in columns]} vs connector {names}")
-    verdicts = compare(columns, fsnow_rows[0] if fsnow_rows else [], python_rows[0] if python_rows else [])
+    first_fsnow = fsnow_rows[0] if fsnow_rows else []
+    verdicts = compare(columns, first_fsnow, python_rows[0] if python_rows else [])
     mismatches = [v for v in verdicts if v["verdict"] != "match"]
+    parquet_verdict = run_parquet_readback(args.bin, args.profile, TYPE_MATRIX_SQL, columns, first_fsnow)
     report = {
         "schema": "franken_snowflake.differential_python_connector.v1",
         "connector_version": version,
         "fsnow_build": envelope.get("build") or None,
         "fsnow_receipt_hash": envelope.get("receipt_hash"),
         "precision": "time and timestamps compared to the microsecond (Python datetime)",
+        "parquet_readback_verdict": parquet_verdict,
         "columns": len(verdicts),
         "mismatches": len(mismatches),
         "verdicts": verdicts,
     }
+    if args.benchmark:
+        report["benchmark"] = run_benchmark_battery(args.bin, args.profile, env)
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=1)
         handle.write("\n")
@@ -373,3 +634,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
