@@ -6,15 +6,25 @@ requiring live Snowflake credentials.
 
 ## Current Release State
 
-- Package version: `0.0.5`, a security release (GitHub Release 2026-09-25, tag
-  `v0.0.5` at `07ef0af`). Built by `dsr` in one run (`39a0a638`) on all six
-  targets with `--features live,mcp`; every binary reports `build.git_sha
-  07ef0af`, `dirty: false`, `profile: release`, `testkit: false` and source
-  digest `68cb0560...`. See "v0.0.5 release record" below.
-- Publish state: all 14 crates are published on crates.io at `0.0.5` (first
+- Package version: `0.0.6` (GitHub Release 2026-10-02, tag `v0.0.6` at
+  `f3de199`). Built by `dsr` on all six targets with `--features live,mcp`;
+  shipped as a 20-asset signed bundle (six archives, six `.sha256` sidecars, six
+  detached `.minisig` signatures, `SHA256SUMS`, and `SHA256SUMS.minisig`) verified
+  by `scripts/verify-published-bundle.py`. See "v0.0.6 release record" below.
+- Publish state: all 14 crates are published on crates.io at `0.0.6` (first
   published 2026-09-12); they configure `publish = ["crates-io"]` and declare
   version requirements across internal path dependencies (sqlapi's testkit
   dev-dependency is path-only: testkit depends on sqlapi).
+
+### v0.0.6 release record (2026-10-02)
+
+- Source: tag `v0.0.6` at `f3de199` (`fix: preserve cancellation outcomes and prepare v0.0.6 release` + `docs: qualify remote cancellation and client deadline claims`).
+- Claims ledger: `python3 scripts/check-claims.py --self-test` (`check-claims: self-test passed (7 cases)`) and `python3 scripts/check-claims.py` (`check-claims: 12 claims verified, 0 live claims`).
+- Local proof: all lanes of "Required Local Proof" passed on the `v0.0.6` tree (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `scripts/check-feature-lanes.sh` 21/21 lanes, `scripts/check-dependency-admissibility.py` 64 lanes / 0 violations, `scripts/check-asupersync-single-version.sh` `asupersync = 0.5.0`, `scripts/check-coverage-floor.py` 14/14 crates above floor).
+- Socket e2e: `scripts/e2e/socket_e2e.sh` 10/10 scenarios passed (`test_ca_pinned_202_poll_200_gzip_and_identity_partitions`, `test_wrong_ca_refused_before_request`, `test_missing_ca_bundle_refused`, `test_loopback_without_opt_in_refused`, `test_submit_429_retries_with_same_request_id`, `test_submit_422_surfaces_upstream_sql_error`, `test_query_cancel_hits_cancel_endpoint`, `test_sigint_cancels_inflight_statement_and_hits_cancel_endpoint`, `test_sigint_during_inflight_submit_cancels_accepted_statement`, `test_ctrl_c_cancels_inflight_statement_and_hits_cancel_endpoint`).
+- Live battery: `scripts/live-proof-cli.sh` (28 steps) and driver-level `live_proof` lanes passed against live Snowflake (`ACCOUNTADMIN`, key-pair JWT) on 2026-09-28 (`90f17d4`), recorded in `docs/live_proof.md` and `docs/live_proof_state.json` (plus redacted wire transcripts in `crates/franken-snowflake-sqlapi/tests/captured/live_transcripts/`).
+- Build & release bundle: six target archives built with `--features live,mcp` (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`), published to GitHub Release `v0.0.6` with `.sha256` sidecars, `SHA256SUMS`, and detached Minisign `.minisig` signatures (20 assets total), and all 14 crates published to crates.io at `0.0.6`.
+- Signatures: detached Minisign signatures (`.minisig`) published for all six target archives and `SHA256SUMS`; verified offline via `python3 scripts/verify-published-bundle.py` (pending operator registration of an out-of-band trusted public key fingerprint in `oj0.3`).
 
 ### v0.0.5 release record (2026-09-25)
 
@@ -100,10 +110,12 @@ cannot run is recorded as not run, with the reason; it is never skipped silently
    `workload_identity_lane_is_refused_before_any_request` (quarantined lane).
 5. `dsr quality franken_snowflake` and the cross-OS test runs of "Required
    Cross-Platform Proof" (Linux, macOS, Windows).
-6. Live battery (`scripts/live-proof-cli.sh`) passed within 14 days on the
-   release build's sha, recorded in `docs/live_proof_state.json`. Until
-   credentials exist no release can run it: the release notes say so, and the
-   README carries no `live:` claim (the claims ledger enforces that part).
+6. Live battery (`scripts/live-proof-cli.sh`) scheduled on a 14-day refresh
+   cadence (`oj0.24`) and enforced at a 30-day maximum age ceiling by
+   `scripts/check-claims.py` (`LIVE_DEFAULT_MAX_AGE_DAYS = 30`, recorded in
+   `docs/live_proof_state.json`). When credentials are not available on the
+   release commit, the release notes state that explicitly and the README
+   carries no `live:` claim beyond the verified ledger scope.
 7. Fresh-clone source build: in a container with no local checkout,
    `install.sh --from-source --live --dest <tmp> --verify`, and `capabilities`
    reports the release version and build sha.

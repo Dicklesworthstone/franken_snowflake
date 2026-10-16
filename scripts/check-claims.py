@@ -175,6 +175,50 @@ def check(readme: str, ledger: dict, tests: dict[str, set[str]] | None,
     return results
 
 
+RELEASE_PKG_VERSION = re.compile(r"-\s+Package version:\s+`([^`]+)`")
+CHANGELOG_HEADING = re.compile(r"^##\s+\[([^\]]+)\]", re.MULTILINE)
+
+
+def check_release_docs_consistency(
+    cargo_toml: dict, release_md: str, changelog_md: str
+) -> dict:
+    """Ensure Cargo.toml workspace version, docs/RELEASE.md, and CHANGELOG.md agree."""
+    reasons: list[str] = []
+    workspace_ver = (
+        cargo_toml.get("workspace", {}).get("package", {}).get("version", "")
+    )
+    if not workspace_ver:
+        reasons.append("Cargo.toml missing [workspace.package].version")
+    match = RELEASE_PKG_VERSION.search(release_md)
+    release_ver = match.group(1) if match else None
+    if release_ver != workspace_ver:
+        reasons.append(
+            f"docs/RELEASE.md Package version {release_ver!r} != Cargo.toml {workspace_ver!r}"
+        )
+    record_heading = f"### v{workspace_ver} release record"
+    if workspace_ver and record_heading not in release_md:
+        reasons.append(f"docs/RELEASE.md missing {record_heading!r}")
+    headings = CHANGELOG_HEADING.findall(changelog_md)
+    released_headings = [h for h in headings if h.startswith("v")]
+    latest_changelog_ver = (
+        released_headings[0].removeprefix("v") if released_headings else None
+    )
+    if latest_changelog_ver != workspace_ver:
+        reasons.append(
+            f"CHANGELOG.md latest release heading v{latest_changelog_ver} != Cargo.toml {workspace_ver!r}"
+        )
+    if "Unreleased" in headings and headings[0] != "Unreleased":
+        reasons.append(
+            f"CHANGELOG.md ## [Unreleased] must precede ## [v{latest_changelog_ver}], found order {headings[:3]!r}"
+        )
+    return {
+        "id": "release-docs-consistency",
+        "verdict": "fail" if reasons else "pass",
+        "evidence": ["Cargo.toml", "docs/RELEASE.md", "CHANGELOG.md"],
+        "reasons": reasons,
+    }
+
+
 def self_test() -> int:
     """The negative cases the gate must catch, plus the baseline that passes."""
     today = dt.date(2026, 9, 26)
@@ -190,6 +234,9 @@ def self_test() -> int:
     ]}
     tests = {"franken-snowflake-sqlapi": {"driver::tests::drop_cancels"}}
     live = {"steps": {"read": {"date": "2026-09-20", "sha": "abc"}}}
+    cargo_toml = {"workspace": {"package": {"version": "0.0.6"}}}
+    release_md = "- Package version: `0.0.6`\n### v0.0.6 release record (2026-10-02)\n"
+    changelog_md = "# Changelog\n\n## [Unreleased]\n\n## [v0.0.6] — 2026-10-02\n"
 
     def failed(results: list[dict]) -> set[str]:
         return {result["id"] for result in results if result["verdict"] == "fail"}
@@ -211,6 +258,23 @@ def self_test() -> int:
             tests, live, today, None)),
         "live evidence for another release sha fails": "fresh" in failed(check(
             readme, ledger, tests, live, today, "def")),
+        "release docs consistency passes when versions match": (
+            check_release_docs_consistency(cargo_toml, release_md, changelog_md)["verdict"] == "pass"
+        ),
+        "release docs version drift fails": (
+            check_release_docs_consistency(
+                cargo_toml,
+                "- Package version: `0.0.5`\n### v0.0.5 release record\n",
+                changelog_md,
+            )["verdict"] == "fail"
+        ),
+        "misplaced Unreleased below release heading fails": (
+            check_release_docs_consistency(
+                cargo_toml,
+                release_md,
+                "# Changelog\n\n## [v0.0.6] — 2026-10-02\n\n## [Unreleased]\n",
+            )["verdict"] == "fail"
+        ),
     }
     for name, behaved in cases.items():
         print(json.dumps({"self_test": name, "behaved": behaved}))
@@ -231,6 +295,9 @@ def main() -> int:
     root = Path(args.root)
     try:
         ledger = tomllib.loads((root / "docs/claims.toml").read_text(encoding="utf-8"))
+        cargo_toml = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+        release_md = (root / "docs/RELEASE.md").read_text(encoding="utf-8")
+        changelog_md = (root / "CHANGELOG.md").read_text(encoding="utf-8")
     except (OSError, tomllib.TOMLDecodeError) as error:
         print(json.dumps({"ledger": "unusable", "reason": str(error)}))
         return 2
@@ -257,6 +324,7 @@ def main() -> int:
         return 2
     today = dt.date.fromisoformat(args.today) if args.today else dt.date.today()
     results = check(readme, ledger, parse_listing(listing), live_state, today, args.release_sha)
+    results.append(check_release_docs_consistency(cargo_toml, release_md, changelog_md))
     for result in results:
         print(json.dumps(result, sort_keys=True))
     failed = [result for result in results if result["verdict"] == "fail"]

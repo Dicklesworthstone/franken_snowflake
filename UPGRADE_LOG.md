@@ -1,13 +1,41 @@
 # Dependency Upgrade Log
 
-**Date:** 2026-09-11
-**Project:** franken_snowflake
-**Language:** Rust
+**Date:** 2026-10-14 (most recent audit; migrated to Asupersync `=0.5.0` on 2026-09-27 in `cc4da01`)
+**Project:** franken_snowflake (`0.0.6`)
+**Language:** Rust (edition 2024, `rust-version = "1.95"`)
 **Manifest:** Cargo.toml / Cargo.lock
 
 ---
 
-## Summary
+## 2026-09-27 → 2026-10-14 Currency State (`v0.0.6` + `Unreleased`)
+
+### Summary
+
+| Metric | Count |
+|--------|-------|
+| **Workspace crates** | 14 |
+| **Pinned runtime** | 1 (`asupersync = "=0.5.0"` + `asupersync-macros = "0.5.0"`) |
+| **Production admissibility lanes scanned** | 64 (`0` forbidden crates, `0` single-version violations) |
+
+### FrankenSuite & Core Dependency Versions in `Cargo.lock`
+
+- **asupersync** / **asupersync-macros**: `=0.3.5` → `=0.5.0` (`cc4da01`)
+- **fastmcp** / **fastmcp-core** / **fastmcp-derive** / **fastmcp-protocol** / **fastmcp-server** / **fastmcp-transport**: `0.2.1` → `0.10.0`
+- **frankensqlite (`fsqlite*` family)**: `0.1.16` → `0.1.24` (uniform across all `fsqlite*` crates; builds cleanly on Windows and Unix)
+- **sqlmodel** / **sqlmodel-core** / **sqlmodel-frankensqlite** / **sqlmodel-macros** / **sqlmodel-query** / **sqlmodel-schema** / **sqlmodel-session**: `0.1.8` → `0.1.16`
+- **frankensearch** / **frankensearch-core** / **frankensearch-index** / **frankensearch-lexical**: `0.1.8` → `0.1.14` (`hash` + `lexical` tiers only; no ML/vector crates)
+- **frankenpandas (`fp-columnar`, `fp-types`)**: `0.1.6` → `0.1.7` (focused columnar/types crates only; `fp-io` excluded)
+- **frankentui (`ftui*` family)**: `0.1.6` → `0.2.0`
+- **tru (`toon` CLI/library)**: `0.2.3` → `0.2.4`
+
+### Architecture Constraints Verified (2026-10-14)
+
+- **asupersync single-version gate**: `scripts/check-asupersync-single-version.sh` verified `asupersync = "=0.5.0"` (single resolved version in `Cargo.lock`).
+- **Dependency admissibility**: `python3 scripts/check-dependency-admissibility.py` scanned 64 lanes (`lanes_scanned: 64, lanes_skipped: 0, violation_count: 0`).
+
+---
+
+## 2026-09-11 Upgrade Wave (`v0.0.4`)
 
 | Metric | Count |
 |--------|-------|

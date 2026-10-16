@@ -298,6 +298,57 @@ class ArchiveChecks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "nonempty ZIP directory"):
             archive_binaries(stream.getvalue(), TARGETS[4])
 
+    def test_release_docs_consistency(self):
+        repo_root = Path(__file__).resolve().parent.parent
+        result = check_release_docs(repo_root)
+        self.assertEqual(result["status"], "PASS", result)
+        with self.assertRaisesRegex(ValueError, "Package version"):
+            check_release_docs_texts(
+                '[workspace.package]\nversion = "0.0.6"\n',
+                "- Package version: `0.0.5`\n### v0.0.5 release record\n",
+                "# Changelog\n\n## [Unreleased]\n\n## [v0.0.6] — 2026-10-02\n",
+                None,
+            )
+        with self.assertRaisesRegex(ValueError, "Unreleased"):
+            check_release_docs_texts(
+                '[workspace.package]\nversion = "0.0.6"\n',
+                "- Package version: `0.0.6`\n### v0.0.6 release record\n",
+                "# Changelog\n\n## [v0.0.6] — 2026-10-02\n\n## [Unreleased]\n",
+                "0.0.6",
+            )
+
+
+def check_release_docs_texts(cargo_toml_text, release_md_text, changelog_md_text, expected_version=None):
+    ver_match = re.search(r'\[workspace\.package\][^\[]*?version\s*=\s*"([^"]+)"', cargo_toml_text, re.DOTALL)
+    require(ver_match is not None, "Cargo.toml missing [workspace.package].version")
+    workspace_ver = ver_match.group(1)
+    if expected_version is not None:
+        require(workspace_ver == expected_version,
+                f"Cargo.toml version {workspace_ver!r} != bundle version {expected_version!r}")
+    rel_match = re.search(r"-\s+Package version:\s+`([^`]+)`", release_md_text)
+    rel_ver = rel_match.group(1) if rel_match else None
+    require(rel_ver == workspace_ver,
+            f"docs/RELEASE.md Package version {rel_ver!r} != Cargo.toml {workspace_ver!r}")
+    require(f"### v{workspace_ver} release record" in release_md_text,
+            f"docs/RELEASE.md missing '### v{workspace_ver} release record'")
+    headings = re.findall(r"^##\s+\[([^\]]+)\]", changelog_md_text, re.MULTILINE)
+    released = [h for h in headings if h.startswith("v")]
+    latest_changelog = released[0][1:] if released else None
+    require(latest_changelog == workspace_ver,
+            f"CHANGELOG.md latest release heading v{latest_changelog} != Cargo.toml {workspace_ver!r}")
+    require("Unreleased" not in headings or headings[0] == "Unreleased",
+            "CHANGELOG.md ## [Unreleased] must precede the latest release heading")
+    return {"status": "PASS", "version": workspace_ver}
+
+
+def check_release_docs(repo_root, expected_version=None):
+    return check_release_docs_texts(
+        (repo_root / "Cargo.toml").read_text(encoding="utf-8"),
+        (repo_root / "docs/RELEASE.md").read_text(encoding="utf-8"),
+        (repo_root / "CHANGELOG.md").read_text(encoding="utf-8"),
+        expected_version,
+    )
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -313,6 +364,9 @@ def main():
     if not all((args.bundle, args.version, args.public_key, args.trusted_key_sha256)):
         parser.error("--bundle, --version, --public-key and --trusted-key-sha256 are required")
     try:
+        repo_root = Path(__file__).resolve().parent.parent
+        if (repo_root / "Cargo.toml").is_file():
+            check_release_docs(repo_root, args.version)
         print(json.dumps(verify_bundle(args.bundle, args.version, args.public_key, args.trusted_key_sha256), indent=2))
     except (ValueError, OSError, RuntimeError, zlib.error,
             subprocess.SubprocessError, tarfile.TarError, zipfile.BadZipFile) as error:
@@ -323,3 +377,4 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

@@ -6,7 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at the
 workspace version (`0.0.6`). All 14 crates are published on crates.io (first
 published 2026-09-12).
 
+## [Unreleased]
+
+### Added
+
+- **Zero-copy SWAR `jsonv2` partition scanner (`franken-snowflake-core`, `franken-snowflake-sqlapi`, `franken-snowflake-frame`, `franken-snowflake-export`, `franken-snowflake-cli`):**
+  - Promoted the `#![forbid(unsafe_code)]` 64-bit word-wise SWAR `ZeroCopyJsonv2Scanner` (`CellSlice`, `RowRange`, `ScanError`) into `franken-snowflake-core::jsonv2_scanner` and wired it into `decode_partition_rows_for_frame` (`sqlapi`), `decode_jsonv2_rows` (`frame`), `parse_jsonv2_partition_rows` (`export`), and `decode_partition_rows` (`cli`).
+  - Simple string cells (`Cow::Borrowed(&str)`) avoid heap allocation during partition scanning while escaped cells unescape into `Cow::Owned(String)`.
+- **Frankensearch lexical + hash catalog search (`franken-snowflake-catalog`, `franken-snowflake-cli`):**
+  - Wired `sync_and_query_catalog_frankensearch_index` into `catalog search` and MCP `catalog_search` when built with `--features frankensearch`, maintaining a deterministic `frankensearch` `TwoTierIndex` (`hash` + `lexical` tiers) under `<data_dir>/catalog_search_index/<profile>/` with snapshot-supersession pruning and field-level match attribution.
+- **Sugiyama layered DAG layout for `catalog graph --svg` (`franken-snowflake-graph`):**
+  - Upgraded `CatalogGraph::to_svg` from a fixed 4-column grid to a deterministic Sugiyama layered DAG layout (`SugiyamaLayout`, `SugiyamaNodePlacement`, `compute_sugiyama_layout`) with cycle-safe longest-path layer assignment, 4-pass barycenter crossing minimization, adaptive column/row geometry, and cubic Bezier edge routing.
+- **Scalable `FileCache` lazy table loading, atomic upsert compaction, and retention pruning (`franken-snowflake-cache`, `franken-snowflake-cli`):**
+  - Refactored `FileCache` to lazy-load only the touched JSONL table files per operation ($O(1)$ table loads) while preserving full startup corruption tallying (`FileCache::open`).
+  - Added `FileCache::compact_upsert_tables` (`CompactionReport`) and `FileCache::apply_retention` (`RetentionPolicy`), exposed via `franken-snowflake cache compact [--prune-audit-days <N>] --json`.
+- **Narrowed Asupersync capability contexts, poll-round `Budget::with_cost_quota`, and failure `CrashPack` forensics (`franken-snowflake-core`, `franken-snowflake-catalog`, `franken-snowflake-sqlapi`, `franken-snowflake-mcp`, `franken-snowflake-cli`):**
+  - Added narrowed capability context aliases (`PlannerCx`, `TransportCx`, `WriteCx`) and narrowing constructors (`narrow_to_planner`, `narrow_to_transport`, `narrow_to_write`, `WriteAuthorization::enter_write_cx`), threading them into `enforce_query_safety_with_cx`, `plan_dataset_query_with_cx`, `plan_raw_sql_dry_run_with_cx`, `run_read_statement_with_transport_cx`, `run_write_statement_with_write_cx`, and `execute_authorized_write`.
+  - Wired `PollPlan::to_query_budget` into `ExecutionBounds` (`Budget::with_cost_quota(max_polls)`), calling `poll_budget.consume_cost(1)` on every poll round in `driver.rs`.
+  - Added `build_and_write_failure_crashpack` (`FailureCrashPackPointer`) using `asupersync::trace::crashpack::{CrashPack, FileCrashPackWriter}` to emit deterministic `crashpack.v1` forensics and `replay_bundles.jsonl` entries whenever a live statement ends in `failed`, `cancelled`, or `timed_out`.
+- **Socket E2E TLS concurrency & release-record consistency gates (`franken-snowflake-testkit`, `franken-snowflake-cli`, `scripts/`):**
+  - Spawned per-connection TLS handshakes concurrently in `MockServer::start` (`testkit`) to eliminate head-of-line blocking when a client opens a second connection before completing TLS on the first, and added a `KillOnDrop` process guard in `socket_e2e.rs`.
+  - Added automated release-version consistency checks across `Cargo.toml`, `docs/RELEASE.md`, and `CHANGELOG.md` in `scripts/check-claims.py` and `scripts/verify-published-bundle.py`.
+- **Documented Snowflake `WORKLOAD_IDENTITY_FEDERATION` protocol in `franken-snowflake-auth` (`oj0.19` library foundation):**
+  - Added `WifProvider` (`Aws`, `Azure`, `Gcp`, `Oidc`), `WORKLOAD_IDENTITY_FEDERATION_TOKEN_TYPE`, `format_wif_bearer_token` (`WIF.{AWS|AZURE|GCP|OIDC}.{token}`), `build_wif_auth_headers`, and stateful `DocumentedWifAuth` with pre-expiry JWT `exp` refresh, single-retry re-acquisition on mid-poll `401`, and `WIF.<PROVIDER>.` secret-needle redaction across `franken-snowflake-core` and `franken-snowflake-auth` (CLI lane remains quarantined behind `oj0.3` and `bvf`).
+- **Live proof freshness state & `doctor --json` `live_proof` check (`oj0.24` offline scope):**
+  - Added `docs/live_proof_state.json` seeded from the verified 2026-09-28 credentialed run (`bcc10fe`), updated `scripts/live-proof-cli.sh` (`write_live_proof_state`) to refresh step pass records on clean live runs, and added the `live_proof` check (`evaluate_live_proof_state`) to `doctor --json` enforcing the 14-day freshness window and running-binary `git_sha` agreement when `FRANKEN_SNOWFLAKE_LIVE_PROOF_STATE` or `<data_dir>/live_proof_state.json` is present.
+- **Stage-to-file-format (`StageUsesFileFormat`) catalog relation and transitive lineage (`oj0.33` offline scope):**
+  - Added `CatalogRelation::StageUsesFileFormat` in `franken-snowflake-catalog` (`model.rs`, `relations.rs`, `search.rs`) and wired `Stage -> FileFormat` (`CatalogEdgeKind::UsesFileFormat`) edges into `CatalogGraph::add_relations` (`franken-snowflake-graph`) and `franken-snowflake-cli` (`catalog_surface.rs`), enabling transitive `ExternalTable -> Stage -> FileFormat` upstream/downstream lineage traversal.
+
+---
+
+
 ## [v0.0.6](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.6) — 2026-10-02
+
+### Fixed
 
 - Preserve the caller's cancellation outcome if an asynchronous, idempotent
   read resubmission fails while recovering its statement handle. The CLI keeps
@@ -21,116 +54,6 @@ published 2026-09-12).
 - The client deadline is measured from submission, including queue and resume
   time, rather than only time spent executing. The `budget_consumed.deadline_ms`
   field has been removed.
-
-## Scope and method
-
-Scope window: 2026-06-24 through HEAD
-[`096d726`](https://github.com/Dicklesworthstone/franken_snowflake/commit/096d72644357994f4c5684444fc37409a579e593)
-(2026-08-19). The original synthesis covered 166 non-merge commits from
-2026-06-24 to 2026-06-29. A GitHub Release and a tag-only predecessor landed
-immediately after that window, then 17 more non-merge commits through the
-2026-08-19 janitor docs-reorg.
-
-**Release vs tag:**
-- [`v0.0.0`](https://github.com/Dicklesworthstone/franken_snowflake/tree/v0.0.0)
-  is a **git tag only** (2026-06-29,
-  [`6eb608c`](https://github.com/Dicklesworthstone/franken_snowflake/commit/6eb608c44612feddef8bb19bd09d5a6b4508833e)).
-  There is no GitHub Release at that tag. Do not invent one.
-- [`v0.0.1`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.1)
-  is a **published GitHub Release** (2026-06-30, tag
-  [`fae8bed`](https://github.com/Dicklesworthstone/franken_snowflake/commit/fae8bed20bda3353edf1beb46ea3cedb86885cf4)).
-  It was the only GitHub Release when this synthesis was written; v0.0.2
-  through v0.0.5 followed (see "Version state").
-
-The record is organized by landed capability wave rather than raw commit order,
-with representative commit links so another agent can navigate from a theme to
-the evidence. Chronology is preserved through the timeline table below and the
-dates noted in each section. The sources used to build this changelog are:
-
-- the git history (`git log --reverse --no-merges`)
-- the design documents ([`docs/planning/COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md`](docs/planning/COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md),
-  `docs/asupersync_leverage.md`, and the rest of `docs/`)
-- the executable task graph in `.beads/issues.jsonl`, tracked with Beads (`br`)
-- the release-readiness checklist in `docs/RELEASE.md`
-
-A note on commit subjects: many early commits are tagged "code-first, batch-test
-pending." That reflects the project's working style, where a swarm lands the
-implementation first and the test/hardening pass follows in a later wave. The
-"Hardening and fresh-eyes review" section captures that follow-up.
-
-## Version state
-
-- Package version: `0.0.6` across the workspace, prepared for release. The
-  latest published crates.io version remains `0.0.5` until publication.
-- Tags/releases: `v0.0.0` (tag only, 2026-06-29), `v0.0.1` (GitHub Release,
-  2026-06-30), `v0.0.2` (GitHub Release, 2026-08-24), `v0.0.3`
-  (GitHub Release, 2026-09-04), `v0.0.4` (GitHub Release, 2026-09-11), and
-  `v0.0.5` (GitHub Release, 2026-09-25).
-- Live Snowflake transport is enabled with the `live` feature (default-off) and
-  is gated at runtime by credential availability. Reads (`query run`,
-  `catalog scan`, `profile doctor --online`) and writes (`query write`) both run
-  through it. The release binaries are built with `--features live,mcp`. The
-  CLI's reads first ran against a live account on 2026-09-28 (see
-  `docs/live_proof.md`); writes have not run live yet.
-
-## Version Timeline
-
-| Window | Theme |
-|---|---|
-| 2026-06-24 | Architecture plan, workspace scaffold, lint policy, and the first pass at core, auth, http, sqlapi, catalog, cache, frame, export, graph, testkit, and CLI |
-| 2026-06-25 | Hardening wave: MCP serve adapter, optional TUI, redaction and safety fixes across every crate, write-intent ladder types, cross-platform CI |
-| 2026-06-26 | Live proof lanes, opt-in live transport wired into `query run` / `catalog scan` / `profile doctor --online`, and the agent-ergonomics CLI pass (`onboard`, `fsnow` alias) |
-| 2026-06-29 | Hero illustration and GitHub social preview image |
-| 2026-06-29 | Live writes: write-intent ladder executor (frictionless-by-default), `query write`/`write`, default-profile env + installer `--live` |
-| 2026-06-29 | Tag-only `v0.0.0` ([`6eb608c`](https://github.com/Dicklesworthstone/franken_snowflake/commit/6eb608c44612feddef8bb19bd09d5a6b4508833e)) — installer requires release binaries. Not a GitHub Release. |
-| 2026-06-30 | GitHub Release [`v0.0.1`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.1) ([`fae8bed`](https://github.com/Dicklesworthstone/franken_snowflake/commit/fae8bed20bda3353edf1beb46ea3cedb86885cf4)) |
-| 2026-06-30 → 2026-08-19 | Unreleased since `v0.0.1`: crates.io sibling resolution, typed query options, janitor docs-reorg (`RELEASE.md` → `docs/RELEASE.md`, plan → `docs/planning/`) |
-| 2026-08-24 | GitHub Release [`v0.0.2`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.2) — standalone buildability, Windows x64 via cargo-xwin, but default-feature binaries (no `live`/`mcp`) and no Windows-installer coverage |
-| 2026-09-02 → 2026-09-04 | Reality-check remediation wave: every CLI surface wired to real implementations, safe live writes, receipts + audit trail, in-flight-cancel DPOR race case, `--require-live` gate, TUI executor bridge — shipped as [`v0.0.3`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.3) (2026-09-04, six native dsr targets with `live,mcp`) |
-| 2026-09-04 → 2026-09-11 | Hardening, dependency currency, and release readiness: TUI executor typed bindings, jsonv2 golden validation loop, feature-lane clippy cleanups, library upgrades, and crates.io publishing enablement — shipped as [`v0.0.4`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.4) (2026-09-11) |
-| 2026-09-23 → 2026-09-25 | Reality-check bridge work: security fixes (MCP HTTP auth and origin checks, export path confinement, secret redaction in stored SQL, one shared SQL lexer), typed result rows, socket-level e2e over real TLS, cancellation on signals and MCP requests, streaming exports, catalog relations and search, query batches, a downstream adapter, native macOS/Windows test runs — shipped as [`v0.0.5`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.5) (2026-09-25) |
-
----
-
-## [v0.0.2](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.2) — 2026-08-24
-
-13 commits since [v0.0.1](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.1) (2026-06-30). Patch bump: standalone buildability, one connector fix, repository hygiene, and dependency currency. No API changes. Crates remain `publish = false`; this ships as a GitHub Release only.
-
-### Standalone buildability
-
-- FrankenSuite dependencies now resolve from crates.io rather than local paths, so the workspace builds outside the development fleet ([`aa26f37`](https://github.com/Dicklesworthstone/franken_snowflake/commit/aa26f37)).
-- Installer and docs updated for that path; the build preflight is no longer needed ([`2dc54fc`](https://github.com/Dicklesworthstone/franken_snowflake/commit/2dc54fc)).
-
-### Fixed
-
-- Snowflake connector accepts typed query options ([`8e1d162`](https://github.com/Dicklesworthstone/franken_snowflake/commit/8e1d162)).
-
-### Dependencies
-
-- Refreshed the resolver graph to latest semver-compatible versions.
-- Two pinned families were held uniform on purpose. A bare `cargo update` floats them off-pin:
-  - `asupersync` is pinned `=0.3.5`, but `asupersync-macros` drifts to 0.3.10 — held at 0.3.5.
-  - the `fsqlite` family moved 0.1.13 -> 0.1.16, but `fsqlite-error` drifts to 0.1.19 — held at 0.1.16, so all 20 family members share one version.
-
-### Repository hygiene
-
-- Planning docs moved under `docs/planning/`, `RELEASE.md` moved into `docs/`, skill-loop scratch untracked, agent-identity leaks and root scratch artifacts dropped, and gitignore rules added for multi-repo agent/runtime ephemera.
-
-### Release engineering
-
-- Built through `dsr` (not GitHub Actions). Every artifact was checked with `file(1)` for architecture and, on Linux, with `objdump -T` for its glibc floor before upload.
-
-### Gate
-
-- `cargo clippy --workspace --all-targets -- -D warnings`: clean
-- `cargo test --workspace`: 420 passed, 0 failed across 32 targets
-
----
-
-## [Unreleased]
-
-### Fixed
-
 - A cancel that landed while the submit request was in flight (Ctrl-C,
   SIGTERM, a deadline, the credit cap, an MCP cancel) could leave the statement
   running on Snowflake until its server-side timeout: the driver dropped the
@@ -169,6 +92,8 @@ implementation first and the test/hardening pass follows in a later wave. The
 - A result that Snowflake marks too large (code `391908`: "the response does
   not include the entire result set") is a typed error naming the fix, never
   returned as a complete result.
+- The driver-level live-proof test overflowed its thread stack in a debug
+  build; its lanes now run on a thread with a 32 MiB stack.
 
 ### Verified live
 
@@ -185,11 +110,6 @@ implementation first and the test/hardening pass follows in a later wave. The
   epoch seconds, not nanoseconds. It is now a checked-in golden that the tests
   decode cell by cell. Snowflake's statement count matched the lexer's on every
   probed shape.
-
-### Fixed
-
-- The driver-level live-proof test overflowed its thread stack in a debug
-  build; its lanes now run on a thread with a 32 MiB stack.
 
 ### Added
 
@@ -209,8 +129,77 @@ implementation first and the test/hardening pass follows in a later wave. The
   (`scripts/check-claims.py`, `docs/claims.toml`), a per-crate coverage floor
   (`scripts/check-coverage-floor.py`), and the release gates in
   `docs/RELEASE.md` (`467ff03`, `5f5fa5a`, `8969ca7`).
-- The installers say when a signature was not verified (no release is signed
-  yet) instead of staying silent (`8969ca7`).
+- The installers say when a signature was not verified instead of staying
+  silent (`8969ca7`), and `scripts/verify-published-bundle.py` verifies
+  detached Minisign sidecars and `SHA256SUMS` across all 20 release assets.
+
+---
+
+## Scope and method
+
+Scope window: 2026-06-24 through `v0.0.6`
+([`f3de199`](https://github.com/Dicklesworthstone/franken_snowflake/commit/f3de199),
+2026-10-02) and ongoing `Unreleased` work on `main`. The original synthesis
+covered 166 non-merge commits from 2026-06-24 to 2026-06-29, followed by
+published releases `v0.0.1` through `v0.0.6`.
+
+**Release vs tag:**
+- [`v0.0.0`](https://github.com/Dicklesworthstone/franken_snowflake/tree/v0.0.0)
+  is a **git tag only** (2026-06-29,
+  [`6eb608c`](https://github.com/Dicklesworthstone/franken_snowflake/commit/6eb608c44612feddef8bb19bd09d5a6b4508833e)).
+  There is no GitHub Release at that tag. Do not invent one.
+- [`v0.0.1`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.1)
+  through [`v0.0.6`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.6)
+  are **published GitHub Releases** (see "Version state").
+
+The record is organized by landed capability wave rather than raw commit order,
+with representative commit links so another agent can navigate from a theme to
+the evidence. Chronology is preserved through the timeline table below and the
+dates noted in each section. The sources used to build this changelog are:
+
+- the git history (`git log --reverse --no-merges`)
+- the design documents ([`docs/planning/COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md`](docs/planning/COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md),
+  `docs/asupersync_leverage.md`, and the rest of `docs/`)
+- the executable task graph in `.beads/issues.jsonl`, tracked with Beads (`br`)
+- the release-readiness checklist in `docs/RELEASE.md`
+
+A note on commit subjects: many early commits are tagged "code-first, batch-test
+pending." That reflects the project's working style, where a swarm lands the
+implementation first and the test/hardening pass follows in a later wave. The
+"Hardening and fresh-eyes review" section captures that follow-up.
+
+## Version state
+
+- Package version: `0.0.6` across the workspace; all 14 crates are published on
+  crates.io at `0.0.6`.
+- Tags/releases: `v0.0.0` (tag only, 2026-06-29), `v0.0.1` (GitHub Release,
+  2026-06-30), `v0.0.2` (GitHub Release, 2026-08-24), `v0.0.3`
+  (GitHub Release, 2026-09-04), `v0.0.4` (GitHub Release, 2026-09-11), `v0.0.5`
+  (GitHub Release, 2026-09-25), and `v0.0.6` (GitHub Release, 2026-10-02).
+- Live Snowflake transport is enabled with the `live` feature (default-off) and
+  is gated at runtime by credential availability. Reads (`query run`,
+  `catalog scan`, `profile doctor --online`) and writes (`query write`) both run
+  through it. The release binaries are built with `--features live,mcp`. The
+  CLI's reads first ran against a live account on 2026-09-28 (see
+  `docs/live_proof.md`); writes have not run live yet.
+
+## Version Timeline
+
+| Window | Theme |
+|---|---|
+| 2026-06-24 | Architecture plan, workspace scaffold, lint policy, and the first pass at core, auth, http, sqlapi, catalog, cache, frame, export, graph, testkit, and CLI |
+| 2026-06-25 | Hardening wave: MCP serve adapter, optional TUI, redaction and safety fixes across every crate, write-intent ladder types, cross-platform CI |
+| 2026-06-26 | Live proof lanes, opt-in live transport wired into `query run` / `catalog scan` / `profile doctor --online`, and the agent-ergonomics CLI pass (`onboard`, `fsnow` alias) |
+| 2026-06-29 | Hero illustration and GitHub social preview image |
+| 2026-06-29 | Live writes: write-intent ladder executor (frictionless-by-default), `query write`/`write`, default-profile env + installer `--live` |
+| 2026-06-29 | Tag-only `v0.0.0` ([`6eb608c`](https://github.com/Dicklesworthstone/franken_snowflake/commit/6eb608c44612feddef8bb19bd09d5a6b4508833e)) — installer requires release binaries. Not a GitHub Release. |
+| 2026-06-30 | GitHub Release [`v0.0.1`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.1) ([`fae8bed`](https://github.com/Dicklesworthstone/franken_snowflake/commit/fae8bed20bda3353edf1beb46ea3cedb86885cf4)) |
+| 2026-06-30 → 2026-08-19 | Unreleased since `v0.0.1`: crates.io sibling resolution, typed query options, janitor docs-reorg (`RELEASE.md` → `docs/RELEASE.md`, plan → `docs/planning/`) |
+| 2026-08-24 | GitHub Release [`v0.0.2`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.2) — standalone buildability, Windows x64 via cargo-xwin, but default-feature binaries (no `live`/`mcp`) and no Windows-installer coverage |
+| 2026-09-02 → 2026-09-04 | Reality-check remediation wave: every CLI surface wired to real implementations, safe live writes, receipts + audit trail, in-flight-cancel DPOR race case, `--require-live` gate, TUI executor bridge — shipped as [`v0.0.3`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.3) (2026-09-04, six native dsr targets with `live,mcp`) |
+| 2026-09-04 → 2026-09-11 | Hardening, dependency currency, and release readiness: TUI executor typed bindings, jsonv2 golden validation loop, feature-lane clippy cleanups, library upgrades, and crates.io publishing enablement — shipped as [`v0.0.4`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.4) (2026-09-11) |
+| 2026-09-23 → 2026-09-25 | Reality-check bridge work: security fixes (MCP HTTP auth and origin checks, export path confinement, secret redaction in stored SQL, one shared SQL lexer), typed result rows, socket-level e2e over real TLS, cancellation on signals and MCP requests, streaming exports, catalog relations and search, query batches, a downstream adapter, native macOS/Windows test runs — shipped as [`v0.0.5`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.5) (2026-09-25) |
+| 2026-09-25 → 2026-10-02 | First live Snowflake proof run (28-step CLI battery, 27/27 Python parity, Parquet readback, SIGINT cancel, redacted wire transcripts), Asupersync 0.5 migration, `Lease` obligations, `text index`/`text search`, `check-claims.py` + `check-coverage-floor.py` + `verify-published-bundle.py` with detached Minisign signatures — shipped as [`v0.0.6`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.6) (2026-10-02) |
 
 ---
 
@@ -689,49 +678,40 @@ fetching, and the empirical jsonv2 golden capture
 (`fsnow-native-snowflake-connector-w0i.13`, reopened because its fixture is
 document-derived).
 
-Current window after the [`v0.0.1`](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.1)
-GitHub Release (2026-06-30,
-[`fae8bed`](https://github.com/Dicklesworthstone/franken_snowflake/commit/fae8bed20bda3353edf1beb46ea3cedb86885cf4))
-through HEAD
-[`096d726`](https://github.com/Dicklesworthstone/franken_snowflake/commit/096d72644357994f4c5684444fc37409a579e593)
-(2026-08-19): 17 non-merge commits. Cargo is `0.0.1` with `publish = false`.
+---
 
-### Delivered capability
+## [v0.0.2](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.2) — 2026-08-24
 
-- External clones resolve FrankenSuite deps from crates.io (no `/dp` sibling tree).
-- Plan and `RELEASE.md` now live under `docs/planning/` and `docs/RELEASE.md`.
+13 commits since [v0.0.1](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.1) (2026-06-30). Patch bump: standalone buildability, one connector fix, repository hygiene, and dependency currency. No API changes. Crates remain `publish = false`; this ships as a GitHub Release only.
 
-### Closed workstreams
+### Standalone buildability
 
-- Tracker: [`.beads/issues.jsonl`](https://github.com/Dicklesworthstone/franken_snowflake/blob/main/.beads/issues.jsonl).
+- FrankenSuite dependencies now resolve from crates.io rather than local paths, so the workspace builds outside the development fleet ([`aa26f37`](https://github.com/Dicklesworthstone/franken_snowflake/commit/aa26f37)).
+- Installer and docs updated for that path; the build preflight is no longer needed ([`2dc54fc`](https://github.com/Dicklesworthstone/franken_snowflake/commit/2dc54fc)).
 
-### Crates.io standalone sibling resolution
+### Fixed
 
-External clones no longer need a `/dp` FrankenSuite checkout. Workspace
-dependencies resolve from crates.io; the installer dropped the sibling-tree
-preflight. Typed query options were accepted on the live path
-(a downstream integration request). Parallel rustc front-end
-threads (`-Z threads=4`) and multi-repo gitignore patterns landed as build
-hygiene.
+- Snowflake connector accepts typed query options ([`8e1d162`](https://github.com/Dicklesworthstone/franken_snowflake/commit/8e1d162)).
 
-**Representative commits**
-- [`aa26f37`](https://github.com/Dicklesworthstone/franken_snowflake/commit/aa26f371046f555c7a445d2c65bac9600eda859f) — `deps: resolve FrankenSuite deps from crates.io (standalone buildability)`
-- [`2dc54fc`](https://github.com/Dicklesworthstone/franken_snowflake/commit/2dc54fca945c66a0befbac06883078792a1b493f) — `installer+docs: external builds now work via crates.io; drop preflight`
-- [`8e1d162`](https://github.com/Dicklesworthstone/franken_snowflake/commit/8e1d1626f6b9740d89f71f2ab8463d0862941c26) — `fix(snowflake): accept typed query options`, subject abbreviated
+### Dependencies
 
-### Janitor docs-reorg (2026-08-19)
+- Refreshed the resolver graph to latest semver-compatible versions.
+- Two pinned families were held uniform on purpose. A bare `cargo update` floats them off-pin:
+  - `asupersync` is pinned `=0.3.5`, but `asupersync-macros` drifts to 0.3.10 — held at 0.3.5.
+  - the `fsqlite` family moved 0.1.13 -> 0.1.16, but `fsqlite-error` drifts to 0.1.19 — held at 0.1.16, so all 20 family members share one version.
 
-The architecture plan moved to
-[`docs/planning/COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md`](docs/planning/COMPREHENSIVE_PLAN_FOR_FRANKEN_SNOWFLAKE.md)
-(along with the fsnow CC-skill background research). The release-readiness
-checklist moved from the repository root to [`docs/RELEASE.md`](docs/RELEASE.md).
-The unused `franken_snowflake_illustration.png` was dropped; the README hero
-remains `franken_snowflake_illustration.webp`. Skill-loop scratch is untracked.
+### Repository hygiene
 
-**Representative commits**
-- [`d04951b`](https://github.com/Dicklesworthstone/franken_snowflake/commit/d04951bfedbdb19f41cf025879245001eb6274b5) — `chore(janitor): untrack skill-loop scratch; move root planning docs into docs/planning/`
-- [`76e5159`](https://github.com/Dicklesworthstone/franken_snowflake/commit/76e5159d7f20c89f0b4b1c9f4969bfc9b8a62cc1) — `chore(janitor): drop agent-identity leaks and root scratch artifacts`
-- [`096d726`](https://github.com/Dicklesworthstone/franken_snowflake/commit/096d72644357994f4c5684444fc37409a579e593) — `chore(janitor): move RELEASE.md into docs/`
+- Planning docs moved under `docs/planning/`, `RELEASE.md` moved into `docs/`, skill-loop scratch untracked, agent-identity leaks and root scratch artifacts dropped, and gitignore rules added for multi-repo agent/runtime ephemera.
+
+### Release engineering
+
+- Built through `dsr` (not GitHub Actions). Every artifact was checked with `file(1)` for architecture and, on Linux, with `objdump -T` for its glibc floor before upload.
+
+### Gate
+
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean
+- `cargo test --workspace`: 420 passed, 0 failed across 32 targets
 
 ---
 
