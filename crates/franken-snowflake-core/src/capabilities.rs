@@ -32,6 +32,53 @@ pub type TransportCx = Cx<TransportCaps>;
 /// Execution context for the write-intent ladder.
 pub type WriteCx = Cx<WriteCaps>;
 
+/// Narrow any capability context `Cx<Caps>` to the zero-capability [`PlannerCx`]
+/// (`CapSet<false, false, false, false, false>`).
+#[inline]
+#[must_use]
+pub fn narrow_to_planner<Caps>(cx: &Cx<Caps>) -> PlannerCx
+where
+    PlannerCaps: SubsetOf<Caps>,
+{
+    cx.restrict::<PlannerCaps>()
+}
+
+/// Narrow a full or write-capable context to [`TransportCx`] (`SPAWN + TIME + IO`,
+/// stripping `RANDOM` and `REMOTE` at the type level).
+#[inline]
+#[must_use]
+pub fn narrow_to_transport<Caps>(cx: &Cx<Caps>) -> TransportCx
+where
+    TransportCaps: SubsetOf<Caps>,
+{
+    cx.restrict::<TransportCaps>()
+}
+
+/// Narrow a full context to [`WriteCx`] only when presented with a valid
+/// [`crate::write_intent::WriteAuthorization`] minted by
+/// [`crate::write_intent::evaluate_write_intent`].
+#[inline]
+#[must_use]
+pub fn narrow_to_write<Caps>(
+    cx: &Cx<Caps>,
+    _grant: &crate::write_intent::WriteAuthorization,
+) -> WriteCx
+where
+    WriteCaps: SubsetOf<Caps>,
+{
+    cx.restrict::<WriteCaps>()
+}
+
+/// Obtain a zero-capability [`PlannerCx`] narrowed from the ambient runtime
+/// context when one is installed, or a standalone read-only context otherwise.
+#[inline]
+#[must_use]
+pub fn current_planner_cx() -> PlannerCx {
+    Cx::current().map_or_else(PlannerCx::detached_cancel_context, |cx| {
+        narrow_to_planner(&cx)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Compile-time layering proofs. Each `const _: fn()` coerces a generic fn item
 // to a function pointer, which forces the `SubsetOf` bound to be checked now.
@@ -50,3 +97,22 @@ const _: fn() = assert_subset::<TransportCaps, CapSet<true, true, true, true, fa
 
 /// The planner layer can never hold `IO` (⊆ the all-but-`IO` row).
 const _: fn() = assert_subset::<PlannerCaps, CapSet<true, true, true, false, true>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_contexts_narrow_monotonically() {
+        let detached = PlannerCx::detached_cancel_context();
+        let planner_from_detached: PlannerCx = narrow_to_planner(&detached);
+        let planner_from_current: PlannerCx = current_planner_cx();
+        assert_eq!(
+            planner_from_detached.is_cancel_requested(),
+            planner_from_current.is_cancel_requested()
+        );
+        let _narrow_transport_fn: fn(&Cx) -> TransportCx =
+            narrow_to_transport::<asupersync::cx::cap::All>;
+        let _narrow_planner_fn: fn(&TransportCx) -> PlannerCx = narrow_to_planner::<TransportCaps>;
+    }
+}

@@ -523,6 +523,16 @@ impl WriteAuthorization {
     pub fn covers(&self, sql: &str) -> bool {
         redact(sql) == self.plan.redacted_sql_preview
     }
+
+    /// Narrow an execution context into the write-intent capability row
+    /// (`WriteCx`) using this unforgeable authorization grant.
+    #[must_use]
+    pub fn enter_write_cx<Caps>(&self, cx: &asupersync::Cx<Caps>) -> crate::capabilities::WriteCx
+    where
+        crate::capabilities::WriteCaps: asupersync::cx::SubsetOf<Caps>,
+    {
+        crate::capabilities::narrow_to_write(cx, self)
+    }
 }
 
 /// Evaluate a request against the deferred write-intent ladder.

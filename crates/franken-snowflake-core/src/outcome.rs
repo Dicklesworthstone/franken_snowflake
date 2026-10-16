@@ -117,6 +117,141 @@ impl<T> SnowflakeOutcomeExt for SnowflakeOutcome<T> {
     }
 }
 
+/// Deterministic Asupersync [`asupersync::trace::crashpack::CrashPack`] pointer
+/// recorded alongside terminal failure receipts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureCrashPackPointer {
+    /// Crash pack schema version (`crashpack-v1`).
+    pub schema_version: u32,
+    /// Stable equivalence-class fingerprint (`format!("{:016x}", fingerprint)`).
+    pub fingerprint: String,
+    /// Replay command lines embedded in the crash pack.
+    pub replay_command: Vec<String>,
+    /// Filesystem path where the crash pack JSON was persisted, if written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+}
+
+fn fnv1a_u64(chunks: &[&[u8]]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for chunk in chunks {
+        for &byte in *chunk {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    hash
+}
+
+fn parse_cancel_kind(name: Option<&str>, outcome_kind: &str) -> asupersync::CancelKind {
+    use asupersync::CancelKind;
+    match name {
+        Some("User") => CancelKind::User,
+        Some("Timeout") => CancelKind::Timeout,
+        Some("Deadline") => CancelKind::Deadline,
+        Some("PollQuota") => CancelKind::PollQuota,
+        Some("CostBudget") => CancelKind::CostBudget,
+        Some("FailFast") => CancelKind::FailFast,
+        Some("RaceLost") => CancelKind::RaceLost,
+        Some("ParentCancelled") => CancelKind::ParentCancelled,
+        Some("Shutdown") => CancelKind::Shutdown,
+        _ if outcome_kind == "timeout" => CancelKind::Deadline,
+        _ => CancelKind::User,
+    }
+}
+
+/// Build and optionally persist an Asupersync [`asupersync::trace::crashpack::CrashPack`]
+/// for a terminal statement failure (`error`, `timeout`, or `cancelled`).
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn build_and_write_failure_crashpack(
+    crashpack_dir: Option<&std::path::Path>,
+    command_id: &str,
+    profile_id: &str,
+    trace_id: &str,
+    outcome_kind: &str,
+    error_code: &str,
+    message: &str,
+    cancel_kind: Option<&str>,
+    created_at_ms: u64,
+    replay_args: Vec<String>,
+) -> FailureCrashPackPointer {
+    use asupersync::trace::crashpack::{
+        CRASHPACK_SCHEMA_VERSION, CrashPack, CrashPackConfig, CrashPackWriter, FailureInfo,
+        FailureOutcome, FileCrashPackWriter, ReplayCommand,
+    };
+    use asupersync::types::{RegionId, TaskId, Time};
+
+    let seed = fnv1a_u64(&[trace_id.as_bytes()]);
+    let config_hash = fnv1a_u64(&[profile_id.as_bytes(), b"|", command_id.as_bytes()]);
+    let fingerprint_u64 = fnv1a_u64(&[
+        command_id.as_bytes(),
+        b"|",
+        outcome_kind.as_bytes(),
+        b"|",
+        error_code.as_bytes(),
+        b"|",
+        cancel_kind.unwrap_or("").as_bytes(),
+    ]);
+    let config = CrashPackConfig {
+        seed,
+        config_hash,
+        worker_count: 1,
+        max_steps: None,
+        test_name: Some(command_id.to_owned()),
+        commit_hash: None,
+    };
+    let failure_outcome = match outcome_kind {
+        "cancelled" | "timeout" => FailureOutcome::Cancelled {
+            cancel_kind: parse_cancel_kind(cancel_kind, outcome_kind),
+        },
+        _ => FailureOutcome::Err,
+    };
+    let failure = FailureInfo {
+        task: TaskId::testing_default(),
+        region: RegionId::testing_default(),
+        outcome: failure_outcome,
+        virtual_time: Time::from_millis(created_at_ms),
+    };
+    let replay_command_vec: Vec<String> = std::iter::once("franken-snowflake".to_owned())
+        .chain(replay_args.clone())
+        .collect();
+    let replay = ReplayCommand {
+        program: "franken-snowflake".to_owned(),
+        args: replay_args,
+        env: Vec::new(),
+        command_line: replay_command_vec.join(" "),
+    };
+    let Ok(pack) = CrashPack::builder(config)
+        .failure(failure)
+        .fingerprint(fingerprint_u64)
+        .created_at(created_at_ms.saturating_mul(1_000_000))
+        .oracle_violations(vec![format!("{command_id}:{error_code}:{message}")])
+        .replay(replay)
+        .build()
+    else {
+        return FailureCrashPackPointer {
+            schema_version: CRASHPACK_SCHEMA_VERSION,
+            fingerprint: format!("{fingerprint_u64:016x}"),
+            replay_command: replay_command_vec,
+            artifact_path: None,
+        };
+    };
+    let fingerprint = format!("{:016x}", pack.fingerprint());
+    let artifact_path = crashpack_dir.and_then(|dir| {
+        std::fs::create_dir_all(dir).ok()?;
+        let writer = FileCrashPackWriter::new(dir.to_path_buf());
+        let id = writer.write(&pack).ok()?;
+        Some(id.path().to_owned())
+    });
+    FailureCrashPackPointer {
+        schema_version: CRASHPACK_SCHEMA_VERSION,
+        fingerprint,
+        replay_command: replay_command_vec,
+        artifact_path,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

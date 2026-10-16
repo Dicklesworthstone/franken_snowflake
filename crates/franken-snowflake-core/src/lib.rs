@@ -55,6 +55,7 @@ pub mod error;
 pub mod exit;
 pub mod guardrails;
 pub mod ids;
+pub mod jsonv2_scanner;
 pub mod outcome;
 pub mod redact;
 pub mod sql_lexer;
@@ -73,23 +74,29 @@ pub mod prelude {
     };
     pub use crate::budget::Budget;
     pub use crate::cancel::{CancelKind, CancelPolicy, CancelReason};
-    pub use crate::capabilities::{PlannerCaps, TransportCaps, WriteCaps};
+    pub use crate::capabilities::{
+        PlannerCaps, PlannerCx, TransportCaps, TransportCx, WriteCaps, WriteCx, current_planner_cx,
+        narrow_to_planner, narrow_to_transport, narrow_to_write,
+    };
     pub use crate::envelope::{BudgetConsumed, EnvelopeMeta, SCHEMA_VERSION};
     pub use crate::error::{SnowflakeError, SnowflakeErrorCode};
     pub use crate::exit::ExitCode;
     pub use crate::guardrails::{
         BoundedQueryPlan, CostVector, MutationPolicy, QueryPlanGuard, QuerySafetyLimits,
-        RightsClass, RightsEntitlement,
+        RightsClass, RightsEntitlement, enforce_query_safety_with_cx,
     };
     pub use crate::ids::{
         AccountIdentifier, DatabaseName, DatasetId, ProfileName, QueryId, ReceiptHash, RequestId,
         RoleName, SchemaName, StatementHandle, WarehouseName,
     };
-    pub use crate::outcome::{DataSource, OutcomeKind, SnowflakeOutcome, SnowflakeOutcomeExt};
+    pub use crate::outcome::{
+        DataSource, FailureCrashPackPointer, OutcomeKind, SnowflakeOutcome, SnowflakeOutcomeExt,
+        build_and_write_failure_crashpack,
+    };
     pub use crate::write_intent::{
-        AppendOnlyAuditIntent, ConfirmationToken, StatementAllowlistEntry, WriteIntentDecision,
-        WriteIntentMode, WriteIntentPlan, WriteIntentPolicy, WriteIntentReceipt,
-        WriteIntentRefusal, WriteIntentRefusalCode, WriteIntentRequest, WriteIntentStage,
-        WriteSafetyClass, WriteStatementKind,
+        AppendOnlyAuditIntent, ConfirmationToken, StatementAllowlistEntry, WriteAuthorization,
+        WriteIntentDecision, WriteIntentMode, WriteIntentPlan, WriteIntentPolicy,
+        WriteIntentReceipt, WriteIntentRefusal, WriteIntentRefusalCode, WriteIntentRequest,
+        WriteIntentStage, WriteSafetyClass, WriteStatementKind,
     };
 }

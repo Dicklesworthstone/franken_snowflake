@@ -310,6 +310,18 @@ pub fn enforce_data_source_stamped(data_source: DataSource) -> Result<(), Snowfl
     }
 }
 
+/// Apply all query safety defaults and refusals under a narrowed [`crate::capabilities::PlannerCx`].
+///
+/// The type signature enforces at compile time that planning has no access to
+/// `CapIo` or `CapSpawn`.
+pub fn enforce_query_safety_with_cx(
+    _cx: &crate::capabilities::PlannerCx,
+    plan: QueryPlanGuard,
+    limits: &QuerySafetyLimits,
+) -> Result<BoundedQueryPlan, SnowflakeError> {
+    enforce_query_safety(plan, limits)
+}
+
 /// Apply all query safety defaults and refusals.
 pub fn enforce_query_safety(
     plan: QueryPlanGuard,

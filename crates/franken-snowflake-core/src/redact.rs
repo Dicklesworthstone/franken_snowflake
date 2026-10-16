@@ -29,6 +29,10 @@ pub const SECRET_PREFIXES: &[&str] = &[
     "xoxp-",  // Slack user token
     "glpat-", // GitLab personal access token
     "AIza",   // Google API key
+    "WIF.AWS.",
+    "WIF.AZURE.",
+    "WIF.GCP.",
+    "WIF.OIDC.",
 ];
 
 /// Field-name suffixes that mark a struct field as credential-shaped. The
