@@ -191,6 +191,32 @@ write_summary() {
     "$EVENTS" >"$RUN_DIR/summary.json"
 }
 
+write_live_proof_state() {
+  local target="${1:-${FRANKEN_SNOWFLAKE_LIVE_PROOF_STATE:-$REPO_ROOT/docs/live_proof_state.json}}"
+  local today="${2:-$(date -u +%Y-%m-%d)}"
+  local prior="{}"
+  if [ -f "$target" ]; then
+    prior=$(cat "$target" 2>/dev/null || printf '{}')
+  fi
+  mkdir -p "$(dirname "$target")"
+  local tmp="${target}.tmp.$$"
+  jq -s --argjson prior "$prior" --arg today "$today" --arg git_sha "$BIN_GIT_SHA" \
+    --arg src "$BIN_SOURCE_DIGEST" '
+    (reduce (.[] | select(.status == "pass")) as $ev (
+      ($prior.steps // {});
+      .[$ev.step] = {date: $today, sha: $git_sha, status: "pass"}
+    )) as $steps
+    | {
+        schema: "franken_snowflake.live_proof_state.v1",
+        last_pass_date: $today,
+        last_pass_sha: $git_sha,
+        source_digest: $src,
+        max_age_days: 14,
+        steps: $steps
+      }' "$EVENTS" >"$tmp"
+  mv "$tmp" "$target"
+}
+
 # ---------------------------------------------------------------- runner
 # run_step <step> <hard|soft> <jq-assertion> -- <args...>
 # Captures stdout to <step>.json, stderr to <step>.stderr, records the event.
@@ -282,6 +308,7 @@ if [ "$SELFTEST" -eq 1 ]; then
   fi
   run_step selftest_capabilities hard '.ok == true and .command_id == "capabilities"' -- capabilities --json
   run_step selftest_offline_refusal hard '.ok == false and (.error.code | startswith("FSNOW-"))' -- query run --profile no_such_profile_for_selftest --sql "select 1" --json
+  run_step selftest_multi_statement_refusal hard '.ok == false and .error.code == "FSNOW-3002"' -- query run --profile no_such_profile_for_selftest --sql "SELECT 1 AS X; SELECT 2 AS Y" --json
   # Planted canary: the scanner must catch a secret value written into the run
   # dir. The `fail` event this produces is the planted negative, not a defect.
   log "planting a canary secret; the next secret_scan MUST report a hit"
@@ -294,7 +321,12 @@ if [ "$SELFTEST" -eq 1 ]; then
   rm -f "$RUN_DIR/planted.txt"
   HARD_FAILURES=0
   if secret_scan FRANKEN_SNOWFLAKE_SELFTEST; then
-    log "selftest PASSED: gate, runner, and canary scanner behave; events at $EVENTS"
+    write_live_proof_state "$RUN_DIR/selftest_live_proof_state.json" "2026-10-14"
+    if ! jq -e '.schema == "franken_snowflake.live_proof_state.v1" and .last_pass_date == "2026-10-14" and .steps.selftest_capabilities.status == "pass"' "$RUN_DIR/selftest_live_proof_state.json" >/dev/null 2>&1; then
+      log "selftest FAILED: write_live_proof_state did not produce valid state JSON"
+      exit 1
+    fi
+    log "selftest PASSED: gate, runner, canary scanner, and state writer behave; events at $EVENTS"
     exit 0
   fi
   log "selftest FAILED: the scanner reported a leak after the canary was removed"
@@ -356,6 +388,7 @@ guard_probe sql_guard_backslash_escape "SELECT 'don\\'t; stop' AS E"
 guard_probe sql_guard_quoted_identifier 'SELECT "w;c" FROM (SELECT 1 AS "w;c")'
 guard_probe sql_guard_trailing_semicolon "SELECT 1 AS X;"
 guard_probe sql_guard_trailing_semicolon_comment "SELECT 1 AS X; -- trailing comment"
+run_step sql_guard_two_statements_refused_without_flag hard '.ok == false and .error.code == "FSNOW-3002"' -- query run --profile "$PROFILE" --sql "SELECT 1 AS X; SELECT 2 AS Y" --limit 1 --json
 guard_probe sql_guard_two_statements "SELECT 1 AS X; SELECT 2 AS Y" --allow-multiple-statements
 
 if [ -n "$HANDLE" ] && [ "$HANDLE" != "null" ]; then
@@ -408,6 +441,27 @@ else
   event export_file fail 0 0 "export.csv missing or empty"
 fi
 
+run_step export_run_parquet hard '.ok == true and .data_source == "live"' -- export run --profile "$PROFILE" --sql "$SMALL_SQL" --format parquet --out "$RUN_DIR/export.parquet" --json
+if [ -s "$RUN_DIR/export.parquet" ] && [ "$(head -c 4 "$RUN_DIR/export.parquet" 2>/dev/null)" = "PAR1" ]; then
+  event export_parquet_file pass 0 0 "export.parquet written with valid PAR1 magic ($(wc -c <"$RUN_DIR/export.parquet") bytes)"
+else
+  HARD_FAILURES=$((HARD_FAILURES + 1))
+  event export_parquet_file fail 0 0 "export.parquet missing or invalid PAR1 header"
+fi
+
+if [ "${FRANKEN_SNOWFLAKE_LIVE_ALLOW_WRITES:-0}" = "1" ]; then
+  WRITE_SQL="CREATE TEMPORARY TABLE FSNOW_LIVE_WRITE_${STAMP} (ID INT)"
+  run_step write_refused_without_confirm hard '.ok == false and (.error.code | startswith("FSNOW-300"))' -- query write --profile "$PROFILE" --sql "$WRITE_SQL" --json
+  run_step write_dry_run_ddl hard '.ok == true and (.data.confirmation_token | length) > 0' -- query write --profile "$PROFILE" --sql "$WRITE_SQL" --dry-run --allow-ddl --json
+  CONFIRM_TOKEN=$(field write_dry_run_ddl '.data.confirmation_token // empty')
+  if [ -n "$CONFIRM_TOKEN" ]; then
+    run_step write_confirm_ddl hard '.ok == true and .data_source == "live" and (.receipt_hash | length) == 64' -- query write --profile "$PROFILE" --sql "$WRITE_SQL" --confirm "$CONFIRM_TOKEN" --allow-ddl --idempotency-key "fsnow-live-ddl-${STAMP}" --json
+    run_step write_idempotency_replay hard '.ok == true and .data_source == "cache"' -- query write --profile "$PROFILE" --sql "$WRITE_SQL" --confirm "$CONFIRM_TOKEN" --allow-ddl --idempotency-key "fsnow-live-ddl-${STAMP}" --json
+  fi
+else
+  event write_lanes skip 0 0 "FRANKEN_SNOWFLAKE_LIVE_ALLOW_WRITES=1 not set; mutating write-ladder steps skipped by default"
+fi
+
 # Correctness against the incumbent (bead oj0.22): the same type-matrix SELECT
 # through the official Snowflake Python connector, live in this run, compared
 # cell by cell with fsnow's typed rows. A mismatch is a finding to file (see
@@ -439,5 +493,9 @@ write_summary
 log "summary: $(jq -c '{passed,failed,findings,skipped}' "$RUN_DIR/summary.json") -> $RUN_DIR/summary.json"
 if [ "$HARD_FAILURES" -gt 0 ]; then
   exit 1
+fi
+if [ "${FRANKEN_SNOWFLAKE_WRITE_LIVE_PROOF_STATE:-1}" = "1" ] && [ "$BIN_STALE" != "true" ]; then
+  write_live_proof_state
+  log "updated live_proof_state: ${FRANKEN_SNOWFLAKE_LIVE_PROOF_STATE:-$REPO_ROOT/docs/live_proof_state.json}"
 fi
 exit 0
