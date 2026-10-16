@@ -241,14 +241,23 @@ fn build_query_executor(profile: String) -> franken_snowflake_tui::QueryExecutor
             };
             let cancel = hooks.cancel;
             let progress = std::sync::Mutex::new(hooks.progress);
+            let polls_used = std::sync::atomic::AtomicU32::new(0);
             let mut outcome = crate::live::with_external_cancel(
                 std::sync::Arc::new(move || cancel.load(std::sync::atomic::Ordering::SeqCst)),
                 || {
                     crate::live::with_progress_sink(
                         std::sync::Arc::new(move |event| {
-                            if let (Some(tick), Ok(progress)) =
-                                (progress_tick(event), progress.lock())
+                            if let franken_snowflake_sqlapi::driver::DriverEvent::Polled { polls } =
+                                event
                             {
+                                polls_used.store(*polls, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            let current_polls =
+                                polls_used.load(std::sync::atomic::Ordering::SeqCst);
+                            if let (Some(tick), Ok(progress)) = (
+                                progress_tick_with_polls(event, current_polls),
+                                progress.lock(),
+                            ) {
                                 let _ = progress.send(tick);
                             }
                         }),
@@ -270,32 +279,48 @@ fn build_query_executor(profile: String) -> franken_snowflake_tui::QueryExecutor
 }
 
 /// A driver event as a progress-pane tick: the handle once submitted, a
-/// partition and its rows as each is fetched, the partition total at the end.
+/// poll budget countdown as statement status is polled, a partition and its
+/// rows as each is fetched, and the partition total at the end.
 #[cfg(feature = "live")]
 fn progress_tick(
     event: &franken_snowflake_sqlapi::driver::DriverEvent,
 ) -> Option<franken_snowflake_tui::ProgressTick> {
+    let polls_used = match event {
+        franken_snowflake_sqlapi::driver::DriverEvent::Polled { polls } => *polls,
+        _ => 0,
+    };
+    progress_tick_with_polls(event, polls_used)
+}
+
+#[cfg(feature = "live")]
+fn progress_tick_with_polls(
+    event: &franken_snowflake_sqlapi::driver::DriverEvent,
+    polls_used: u32,
+) -> Option<franken_snowflake_tui::ProgressTick> {
     use franken_snowflake_sqlapi::driver::DriverEvent;
+    let base_budget = franken_snowflake_sqlapi::lifecycle::PollPlan::default().to_query_budget(None);
     let tick = |statement_handle, partitions_total, partitions_fetched_delta, rows_delta| {
+        let mut budget = base_budget;
+        budget.poll_quota = budget.poll_quota.saturating_sub(polls_used);
+        if let Some(cost) = budget.cost_quota {
+            budget.cost_quota = Some(cost.saturating_sub(u64::from(polls_used)));
+        }
         franken_snowflake_tui::ProgressTick {
             statement_handle,
             partitions_total,
             partitions_fetched_delta,
             rows_delta,
-            // The live root budget is not configurable yet (reality-check
-            // bead E3): the pane shows the ambient budget as it is.
-            budget: franken_snowflake_tui::ProgressBudget::from_budget(
-                &franken_snowflake_core::budget::Budget::new(),
-            ),
+            budget: franken_snowflake_tui::ProgressBudget::from_budget(&budget),
         }
     };
     match event {
         DriverEvent::Submitted {
             statement_handle, ..
         } => Some(tick(statement_handle.clone(), None, 0, 0)),
+        DriverEvent::Polled { .. } => Some(tick(None, None, 0, 0)),
         DriverEvent::PartitionFetched { rows, .. } => Some(tick(None, None, 1, *rows)),
         DriverEvent::Completed { partitions, .. } => Some(tick(None, Some(*partitions), 0, 0)),
-        DriverEvent::Polled { .. } | DriverEvent::RemoteCancel { .. } => None,
+        DriverEvent::RemoteCancel { .. } => None,
     }
 }
 
@@ -320,20 +345,40 @@ fn render_outcome_lines(outcome: &mut Outcome) -> Vec<ExecutorLine> {
         .get("ok")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let get_str = |key: &str| {
+    let data = value.get("data").unwrap_or(&value);
+    let error = value.get("error").unwrap_or(&value);
+    let get_top_str = |key: &str| {
         value
             .get(key)
+            .or_else(|| data.get(key))
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
     };
-    let get_u64 = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+    let get_err_str = |key: &str| {
+        error
+            .get(key)
+            .or_else(|| value.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let get_data_u64 = |key: &str| {
+        data.get(key)
+            .or_else(|| value.get(key))
+            .and_then(serde_json::Value::as_u64)
+    };
+    let get_data_bool = |key: &str| {
+        data.get(key)
+            .or_else(|| value.get(key))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
 
     let mut lines = vec![ExecutorLine {
         outcome: if ok { "ok" } else { "error" }.to_owned(),
         message: format!(
             "query run exit={} data_source={}",
             status,
-            get_str("data_source").unwrap_or_else(|| "unspecified".to_owned())
+            get_top_str("data_source").unwrap_or_else(|| "unspecified".to_owned())
         ),
     }];
     if !ok {
@@ -341,19 +386,19 @@ fn render_outcome_lines(outcome: &mut Outcome) -> Vec<ExecutorLine> {
             outcome: "error".to_owned(),
             message: format!(
                 "{}: {}",
-                get_str("code").unwrap_or_else(|| "unknown".to_owned()),
-                get_str("message").unwrap_or_else(|| "no detail".to_owned())
+                get_err_str("code").unwrap_or_else(|| "unknown".to_owned()),
+                get_err_str("message").unwrap_or_else(|| "no detail".to_owned())
             ),
         });
         return lines;
     }
-    if let Some(handle) = get_str("statement_handle") {
+    if let Some(handle) = get_top_str("statement_handle") {
         lines.push(ExecutorLine {
             outcome: "ok".to_owned(),
             message: format!("statement handle {handle}"),
         });
     }
-    if let Some(receipt) = get_str("receipt_hash") {
+    if let Some(receipt) = get_top_str("receipt_hash") {
         lines.push(ExecutorLine {
             outcome: "ok".to_owned(),
             message: format!("receipt {receipt} (fsnow receipt show {receipt})"),
@@ -363,21 +408,23 @@ fn render_outcome_lines(outcome: &mut Outcome) -> Vec<ExecutorLine> {
         outcome: "ok".to_owned(),
         message: format!(
             "rows returned={} of {} total{} partitions={}",
-            get_u64("returned_rows").map_or("?".to_owned(), |n| n.to_string()),
-            get_u64("result_row_count").map_or("?".to_owned(), |n| n.to_string()),
-            if value
-                .get("truncated")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-            {
+            get_data_u64("returned_rows").map_or("?".to_owned(), |n| n.to_string()),
+            get_data_u64("row_count")
+                .or_else(|| get_data_u64("result_row_count"))
+                .map_or("?".to_owned(), |n| n.to_string()),
+            if get_data_bool("truncated") {
                 " (truncated)"
             } else {
                 ""
             },
-            get_u64("partition_count").map_or("?".to_owned(), |n| n.to_string()),
+            get_data_u64("partition_count").map_or("?".to_owned(), |n| n.to_string()),
         ),
     });
-    if let Some(rows) = value.get("rows").and_then(serde_json::Value::as_array) {
+    if let Some(rows) = data
+        .get("rows")
+        .or_else(|| value.get("rows"))
+        .and_then(serde_json::Value::as_array)
+    {
         for (index, row) in rows.iter().take(10).enumerate() {
             let cells = row
                 .as_array()
@@ -403,34 +450,143 @@ mod tests {
     use super::*;
     use franken_snowflake_cache::{CatalogSnapshotRecord, ContentAddress, VerifiedPayload};
 
-    /// Bead w0i.11: driver events become progress-pane ticks.
+    /// Bead w0i.11 + 2yqv: driver events become progress-pane ticks with
+    /// poll-bounded budget countdown on `DriverEvent::Polled`.
     #[cfg(feature = "live")]
     #[test]
     fn driver_events_become_progress_ticks() {
         use franken_snowflake_sqlapi::driver::DriverEvent;
+        let max_polls = franken_snowflake_sqlapi::lifecycle::PollPlan::default().max_polls;
         let submitted = progress_tick(&DriverEvent::Submitted {
             statement_handle: Some("01b2-handle".to_owned()),
             running: true,
         });
         assert_eq!(
-            submitted.and_then(|tick| tick.statement_handle).as_deref(),
+            submitted
+                .as_ref()
+                .and_then(|tick| tick.statement_handle.as_deref()),
             Some("01b2-handle")
         );
-        let fetched = progress_tick(&DriverEvent::PartitionFetched {
-            index: 2,
-            rows: 40,
-            bytes: 900,
-        });
         assert_eq!(
-            fetched.map(|tick| (tick.partitions_fetched_delta, tick.rows_delta)),
-            Some((1, 40))
+            submitted.map(|tick| tick.budget.poll_quota),
+            Some(max_polls)
         );
-        let done = progress_tick(&DriverEvent::Completed {
-            rows: 41,
-            partitions: 3,
-        });
+        let polled = progress_tick(&DriverEvent::Polled { polls: 4 });
+        assert_eq!(
+            polled.as_ref().map(|tick| tick.budget.poll_quota),
+            Some(max_polls.saturating_sub(4))
+        );
+        assert_eq!(
+            polled.and_then(|tick| tick.budget.cost_quota),
+            Some(u64::from(max_polls.saturating_sub(4)))
+        );
+        let fetched = progress_tick_with_polls(
+            &DriverEvent::PartitionFetched {
+                index: 2,
+                rows: 40,
+                bytes: 900,
+            },
+            4,
+        );
+        assert_eq!(
+            fetched.map(|tick| (
+                tick.partitions_fetched_delta,
+                tick.rows_delta,
+                tick.budget.poll_quota
+            )),
+            Some((1, 40, max_polls.saturating_sub(4)))
+        );
+        let done = progress_tick_with_polls(
+            &DriverEvent::Completed {
+                rows: 41,
+                partitions: 3,
+            },
+            4,
+        );
         assert_eq!(done.and_then(|tick| tick.partitions_total), Some(3));
-        assert_eq!(progress_tick(&DriverEvent::Polled { polls: 4 }), None);
+        assert_eq!(
+            progress_tick(&DriverEvent::RemoteCancel {
+                statement_handle: "01b2-handle".to_owned(),
+                acknowledged: true,
+                detail: "cancelled".to_owned(),
+            }),
+            None
+        );
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn render_outcome_lines_reads_envelope_data_and_error_fields() {
+        let mut envelope = base_envelope(
+            true,
+            "success",
+            "query.run",
+            "fsnow.query.run.v2",
+            "req-tui-render-ok".to_owned(),
+            json_object(vec![
+                ("returned_rows", Json::Number(2)),
+                ("row_count", Json::Number(5)),
+                ("truncated", Json::Bool(true)),
+                ("partition_count", Json::Number(2)),
+                (
+                    "rows",
+                    Json::Array(vec![
+                        Json::Array(vec![json_string("1"), json_string("alpha")]),
+                        Json::Array(vec![json_string("2"), json_string("beta")]),
+                    ]),
+                ),
+            ]),
+        );
+        envelope.data_source = "live";
+        envelope.profile_id = Some("prod".to_owned());
+        envelope.statement_handle = Some("01b2-9999".to_owned());
+        envelope.receipt_hash = Some("blake3:deadbeef".to_owned());
+        let mut ok_outcome = Outcome {
+            status: CoreExitCode::Success,
+            body: Body::Envelope {
+                envelope,
+                format: OutputFormat::Json,
+            },
+        };
+        let ok_lines = render_outcome_lines(&mut ok_outcome);
+        assert_eq!(
+            ok_lines[0].message,
+            "query run exit=0 data_source=live",
+            "{ok_lines:?}"
+        );
+        assert_eq!(ok_lines[1].message, "statement handle 01b2-9999");
+        assert_eq!(
+            ok_lines[2].message,
+            "receipt blake3:deadbeef (fsnow receipt show blake3:deadbeef)"
+        );
+        assert_eq!(
+            ok_lines[3].message,
+            "rows returned=2 of 5 total (truncated) partitions=2"
+        );
+        assert_eq!(ok_lines[4].message, "row   1 | \"1\" | \"alpha\"");
+        assert_eq!(ok_lines[5].message, "row   2 | \"2\" | \"beta\"");
+
+        let mut err_outcome = typed_error(
+            OutputFormat::Json,
+            "query.run",
+            "fsnow.query.run.v2",
+            "req-tui-render-err".to_owned(),
+            Some("prod".to_owned()),
+            SnowflakeErrorCode::CredentialExpired,
+            "PAT rejected by Snowflake".to_owned(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let err_lines = render_outcome_lines(&mut err_outcome);
+        assert_eq!(err_lines.len(), 2, "{err_lines:?}");
+        assert_eq!(err_lines[1].outcome, "error");
+        assert!(
+            err_lines[1].message.contains("FSNOW-2004")
+                && err_lines[1].message.contains("PAT rejected by Snowflake"),
+            "{err_lines:?}"
+        );
     }
     use franken_snowflake_catalog::model::{DataSourceClass, Provenance, ProvenanceSource};
 
