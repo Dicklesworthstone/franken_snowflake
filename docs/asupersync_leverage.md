@@ -43,13 +43,26 @@ This is the target contract; not every line below is wired yet.
   so the guard sends it from a thread and runtime of its own. A process killed
   with SIGKILL still leaves the statement to `STATEMENT_TIMEOUT_IN_SECONDS`.
   The driver's execution deadline (statement timeout + 5 s) and an advisory
-  credit cap (`MAX_CREDITS`, cancel kind `CostBudget`) are enforced by the
-  driver, not by `Budget`'s cost quota.
-- Not wired yet: capability rows (the types exist in
-  `franken-snowflake-core::capabilities`, but no call path narrows its `Cx`);
-  `web::request_region` itself (an MCP-over-HTTP call whose client hangs up is
-  cancelled by the HTTP front's own hang-up watch instead); `cli::progress`
-  events; the declared `PoolConfig`; backup requests.
+  credit cap (`MAX_CREDITS`, cancel kind `CostBudget`) are backed by
+  `franken-snowflake-core::budget::Budget::with_cost_quota` (`PollPlan::to_query_budget`),
+  debited via `Budget::consume_cost` on every poll/partition boundary.
+- Wired since 2026-10-14:
+  - **Capability rows (`PlannerCx`, `TransportCx`, `WriteCx`)**: pure dataset and
+    raw-SQL planners run under `PlannerCx` (`CapSet<false, false, false, false, false>`,
+    zero capabilities including no IO); read statement execution (`run_read_statement_with_transport_cx`)
+    and MCP read tools (`ReadTool::call`) narrow `Cx` to `TransportCx` (`SPAWN + TIME + IO`,
+    stripping `RANDOM` and `REMOTE` at both the type level and runtime capability mask);
+    only an authorized `WriteAuthorization::enter_write_cx` mints `WriteCx` for
+    `run_write_statement_with_write_cx`.
+  - **CrashPack failure forensics (`asupersync::trace::crashpack`)**: terminal
+    failure receipts (`error`, `timeout`, `cancelled`) build and persist a
+    deterministic `CrashPack` (`crashpack-v1`) under `<store>/crashpacks/`,
+    embed its `fingerprint`, `replay_command`, and `artifact_path` in the receipt's
+    `error.crashpack` object, and index an `OfflineReplayBundleRecord` (`crashpack:<receipt_id>`)
+    in the local store.
+- Not wired yet: `web::request_region` itself (an MCP-over-HTTP call whose client
+  hangs up is cancelled by the HTTP front's own hang-up watch instead);
+  `cli::progress` events; the declared `PoolConfig`; backup requests.
 - The LabRuntime/DPOR suite (testkit `race`) explores a model of the driver's
   cancel and retry interleavings and, since 2026-09-26, the production driver
   itself: `run_statement_hooked` over `SnowflakeHttpClient`, each request a
