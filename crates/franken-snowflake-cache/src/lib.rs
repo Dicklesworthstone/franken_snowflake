@@ -583,6 +583,42 @@ pub trait CacheBackend {
 
     fn append_audit_event(&self, record: AuditEventRecord) -> CacheResult<()>;
     fn audit_events(&self) -> CacheResult<Vec<AuditEventRecord>>;
+
+    /// Number of unreadable log lines skipped when loading a file-backed store (0 for SQLite/memory).
+    fn skipped_lines(&self) -> u64 {
+        0
+    }
+
+    /// Compact superseded upsert records on disk while preserving append-only audit logs.
+    fn compact(&self) -> CacheResult<CompactionReport> {
+        Ok(CompactionReport::default())
+    }
+
+    /// Apply bounded retention to receipts and catalog snapshots while preserving the append-only audit log.
+    fn apply_retention(&self, _policy: &RetentionPolicy) -> CacheResult<u64> {
+        Ok(0)
+    }
+}
+
+/// Summary of an on-disk store compaction pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionReport {
+    /// Total lines across compacted tables before compaction.
+    pub lines_before: u64,
+    /// Total canonical lines across compacted tables after compaction.
+    pub lines_after: u64,
+    /// Number of table files rewritten atomically.
+    pub tables_rewritten: u32,
+}
+
+/// Bounded retention policy for query receipts and catalog snapshots.
+/// Never touches `query_audit_log`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionPolicy {
+    /// Maximum query receipts kept per profile (newest `created_at_ms` retained).
+    pub max_receipts_per_profile: Option<usize>,
+    /// Maximum catalog snapshots kept per `(profile_id, database_name, schema_name)` scope.
+    pub max_snapshots_per_scope: Option<usize>,
 }
 
 /// Dependency-light in-memory backend for unit tests and offline harnesses.
@@ -625,11 +661,99 @@ impl InMemoryCache {
             audit_events: RefCell::new(BTreeMap::new()),
         }
     }
+
+    pub(crate) fn all_dataset_manifests(&self) -> Vec<DatasetManifestRecord> {
+        self.dataset_manifests.borrow().values().cloned().collect()
+    }
+
+    pub(crate) fn all_query_plans(&self) -> Vec<QueryPlanRecord> {
+        self.query_plans.borrow().values().cloned().collect()
+    }
+
+    pub(crate) fn all_catalog_snapshots(&self) -> Vec<CatalogSnapshotRecord> {
+        self.catalog_snapshots.borrow().values().cloned().collect()
+    }
+
+    pub(crate) fn all_query_receipts(&self) -> Vec<QueryReceiptRecord> {
+        self.query_receipts.borrow().values().cloned().collect()
+    }
+
+    pub(crate) fn all_partition_metadata(&self) -> Vec<PartitionMetadataRecord> {
+        self.partition_metadata.borrow().values().cloned().collect()
+    }
+
+    pub(crate) fn apply_retention_in_memory(&self, policy: &RetentionPolicy) -> u64 {
+        let mut evicted = 0_u64;
+        if let Some(max_receipts) = policy.max_receipts_per_profile {
+            let mut by_profile: BTreeMap<String, Vec<(u64, String)>> = BTreeMap::new();
+            for receipt in self.query_receipts.borrow().values() {
+                by_profile
+                    .entry(receipt.profile_id.clone())
+                    .or_default()
+                    .push((receipt.created_at_ms, receipt.receipt_id.clone()));
+            }
+            let mut drop_ids = Vec::new();
+            for records in by_profile.values_mut() {
+                records.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+                if records.len() > max_receipts {
+                    for (_, id) in records.drain(max_receipts..) {
+                        drop_ids.push(id);
+                    }
+                }
+            }
+            if !drop_ids.is_empty() {
+                let mut receipts = self.query_receipts.borrow_mut();
+                let mut partitions = self.partition_metadata.borrow_mut();
+                for id in drop_ids {
+                    if receipts.remove(&id).is_some() {
+                        evicted += 1;
+                        partitions.retain(|(r_id, _), _| r_id != &id);
+                    }
+                }
+            }
+        }
+        if let Some(max_snapshots) = policy.max_snapshots_per_scope {
+            type ScopeKey = (String, Option<String>, Option<String>);
+            let mut by_scope: BTreeMap<ScopeKey, Vec<(u64, String)>> = BTreeMap::new();
+            for snap in self.catalog_snapshots.borrow().values() {
+                by_scope
+                    .entry((
+                        snap.profile_id.clone(),
+                        snap.database_name.clone(),
+                        snap.schema_name.clone(),
+                    ))
+                    .or_default()
+                    .push((snap.captured_at_ms, snap.snapshot_id.clone()));
+            }
+            let mut drop_ids = Vec::new();
+            for records in by_scope.values_mut() {
+                records.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+                if records.len() > max_snapshots {
+                    for (_, id) in records.drain(max_snapshots..) {
+                        drop_ids.push(id);
+                    }
+                }
+            }
+            if !drop_ids.is_empty() {
+                let mut snapshots = self.catalog_snapshots.borrow_mut();
+                for id in drop_ids {
+                    if snapshots.remove(&id).is_some() {
+                        evicted += 1;
+                    }
+                }
+            }
+        }
+        evicted
+    }
 }
 
 impl CacheBackend for InMemoryCache {
     fn schema_version(&self) -> SchemaVersion {
         self.schema_version
+    }
+
+    fn apply_retention(&self, policy: &RetentionPolicy) -> CacheResult<u64> {
+        Ok(self.apply_retention_in_memory(policy))
     }
 
     fn upsert_profile(&self, record: ProfileRecord) -> CacheResult<()> {
@@ -1422,6 +1546,69 @@ impl CacheBackend for FrankenSqliteCache {
         .iter()
         .map(row_audit_event)
         .collect()
+    }
+
+    fn apply_retention(&self, policy: &RetentionPolicy) -> CacheResult<u64> {
+        let mut evicted = 0_u64;
+        if let Some(max_receipts) = policy.max_receipts_per_profile {
+            let rows = self.query(
+                "SELECT profile_id, receipt_id FROM query_receipts \
+                 ORDER BY profile_id ASC, created_at_ms DESC, receipt_id DESC",
+                &[],
+            )?;
+            let mut by_profile: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for row in &rows {
+                let profile_id = row_text(row, 0, "profile_id")?;
+                let receipt_id = row_text(row, 1, "receipt_id")?;
+                by_profile.entry(profile_id).or_default().push(receipt_id);
+            }
+            for ids in by_profile.values() {
+                if ids.len() > max_receipts {
+                    for id in &ids[max_receipts..] {
+                        self.execute(
+                            "DELETE FROM partition_metadata WHERE receipt_id = ?1",
+                            &[Value::Text(id.clone())],
+                        )?;
+                        self.execute(
+                            "DELETE FROM query_receipts WHERE receipt_id = ?1",
+                            &[Value::Text(id.clone())],
+                        )?;
+                        evicted += 1;
+                    }
+                }
+            }
+        }
+        if let Some(max_snapshots) = policy.max_snapshots_per_scope {
+            let rows = self.query(
+                "SELECT profile_id, database_name, schema_name, snapshot_id FROM catalog_snapshots \
+                 ORDER BY profile_id ASC, captured_at_ms DESC, snapshot_id DESC",
+                &[],
+            )?;
+            type ScopeKey = (String, Option<String>, Option<String>);
+            let mut by_scope: BTreeMap<ScopeKey, Vec<String>> = BTreeMap::new();
+            for row in &rows {
+                let profile_id = row_text(row, 0, "profile_id")?;
+                let database_name = row_opt_text(row, 1, "database_name")?;
+                let schema_name = row_opt_text(row, 2, "schema_name")?;
+                let snapshot_id = row_text(row, 3, "snapshot_id")?;
+                by_scope
+                    .entry((profile_id, database_name, schema_name))
+                    .or_default()
+                    .push(snapshot_id);
+            }
+            for ids in by_scope.values() {
+                if ids.len() > max_snapshots {
+                    for id in &ids[max_snapshots..] {
+                        self.execute(
+                            "DELETE FROM catalog_snapshots WHERE snapshot_id = ?1",
+                            &[Value::Text(id.clone())],
+                        )?;
+                        evicted += 1;
+                    }
+                }
+            }
+        }
+        Ok(evicted)
     }
 }
 
