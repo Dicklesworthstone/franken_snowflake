@@ -110,6 +110,7 @@ pub fn doctor_data() -> Json {
                 "not compiled into this binary; rebuild with --features frankensearch for text indexing",
             )
         },
+        live_proof_check(),
     ];
     let status = readiness_status(&checks);
     checks.shrink_to_fit();
@@ -183,7 +184,7 @@ fn local_store_check() -> Json {
                 .audit_events()
                 .map(|events| events.len())
                 .unwrap_or(0);
-            let skipped = store.skipped_lines;
+            let skipped = store.skipped_lines();
             check_json_owned(
                 "local_store",
                 if skipped == 0 { "pass" } else { "warn" },
@@ -239,6 +240,172 @@ fn default_profile_check() -> Json {
             ),
         )
     }
+}
+
+/// Environment variable pointing to a `live_proof_state.json` file to enforce
+/// the 14-day freshness and binary `git_sha` gate in `doctor --json`.
+pub const LIVE_PROOF_STATE_ENV: &str = "FRANKEN_SNOWFLAKE_LIVE_PROOF_STATE";
+
+/// Maximum age in days for a credentialed live proof before `doctor --json`
+/// warns when the live proof state gate is active.
+pub const LIVE_PROOF_MAX_AGE_DAYS: i64 = 14;
+
+const COMPILED_LIVE_PROOF_STATE: &str = include_str!("../../../docs/live_proof_state.json");
+
+fn live_proof_check() -> Json {
+    let today_days = local_store::now_unix_seconds().div_euclid(86_400);
+    if let Some(explicit_path) = std::env::var(LIVE_PROOF_STATE_ENV)
+        .ok()
+        .map(|val| val.trim().to_owned())
+        .filter(|val| !val.is_empty())
+    {
+        return match fs::read_to_string(&explicit_path) {
+            Ok(raw) => evaluate_live_proof_state(&raw, today_days, crate::BUILD_GIT_SHA, true),
+            Err(error) => check_json_owned(
+                "live_proof",
+                "fail",
+                format!("{LIVE_PROOF_STATE_ENV}=`{explicit_path}` could not be read: {error}"),
+            ),
+        };
+    }
+    if let Some(dir) = local_store::data_dir() {
+        let local_state = dir.join("live_proof_state.json");
+        if local_state.exists() {
+            return match fs::read_to_string(&local_state) {
+                Ok(raw) => evaluate_live_proof_state(&raw, today_days, crate::BUILD_GIT_SHA, true),
+                Err(error) => check_json_owned(
+                    "live_proof",
+                    "fail",
+                    format!("{} could not be read: {error}", local_state.display()),
+                ),
+            };
+        }
+    }
+    evaluate_live_proof_state(
+        COMPILED_LIVE_PROOF_STATE,
+        today_days,
+        crate::BUILD_GIT_SHA,
+        false,
+    )
+}
+
+/// Evaluate a `franken_snowflake.live_proof_state.v1` JSON payload against
+/// `today_epoch_days` and `binary_git_sha`. When `enforce_gate` is true,
+/// staleness (`> 14` days) or a binary `git_sha` mismatch yields `"warn"`;
+/// when false (default offline environment without an explicit state override),
+/// an unverified/older baseline reports `"not_checked"` with the committed run
+/// metadata so offline `doctor --json` remains a clean local health gate.
+pub fn evaluate_live_proof_state(
+    raw_json: &str,
+    today_epoch_days: i64,
+    binary_git_sha: &str,
+    enforce_gate: bool,
+) -> Json {
+    let parsed: serde_json::Value = match serde_json::from_str(raw_json) {
+        Ok(val) => val,
+        Err(error) => {
+            return check_json_owned(
+                "live_proof",
+                "fail",
+                format!("live_proof_state JSON is malformed: {error}"),
+            );
+        }
+    };
+    let last_pass_date = parsed
+        .get("last_pass_date")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let last_pass_sha = parsed
+        .get("last_pass_sha")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .trim();
+    let max_age_days = parsed
+        .get("max_age_days")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|&days| days > 0)
+        .unwrap_or(LIVE_PROOF_MAX_AGE_DAYS);
+    let step_count = parsed
+        .get("steps")
+        .and_then(serde_json::Value::as_object)
+        .map_or(0, serde_json::Map::len);
+    let Some(pass_days) = parse_ymd_epoch_days(last_pass_date) else {
+        return check_json_owned(
+            "live_proof",
+            "fail",
+            format!("live_proof_state has invalid or missing last_pass_date `{last_pass_date}`"),
+        );
+    };
+    let age_days = today_epoch_days.saturating_sub(pass_days);
+    let stale_age = age_days > max_age_days || age_days < 0;
+    let sha_mismatch = !binary_git_sha.is_empty()
+        && binary_git_sha != "unknown"
+        && !last_pass_sha.is_empty()
+        && last_pass_sha != "unknown"
+        && !binary_git_sha.starts_with(last_pass_sha)
+        && !last_pass_sha.starts_with(binary_git_sha);
+
+    if !stale_age && !sha_mismatch {
+        return check_json_owned(
+            "live_proof",
+            "pass",
+            format!(
+                "live proof passed on {last_pass_date} ({age_days}d ago <= {max_age_days}d window; sha={last_pass_sha}; {step_count} steps recorded)"
+            ),
+        );
+    }
+
+    let mut reasons = Vec::new();
+    if stale_age {
+        reasons.push(format!(
+            "age {age_days}d exceeds {max_age_days}d freshness window (last_pass_date={last_pass_date})"
+        ));
+    }
+    if sha_mismatch {
+        reasons.push(format!(
+            "recorded sha `{last_pass_sha}` differs from running binary sha `{binary_git_sha}`"
+        ));
+    }
+    let reason_str = reasons.join("; ");
+    if enforce_gate {
+        check_json_owned(
+            "live_proof",
+            "warn",
+            format!(
+                "live proof state requires refresh ({reason_str}; {step_count} steps recorded)"
+            ),
+        )
+    } else {
+        check_json_owned(
+            "live_proof",
+            "not_checked",
+            format!(
+                "committed live proof baseline from {last_pass_date} (sha={last_pass_sha}, {step_count} steps; {reason_str}); set {LIVE_PROOF_STATE_ENV}=docs/live_proof_state.json to enforce the freshness gate"
+            ),
+        )
+    }
+}
+
+fn parse_ymd_epoch_days(ymd: &str) -> Option<i64> {
+    let mut parts = ymd.split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day))
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// `selftest --json` payload: executed contract fixtures.
@@ -862,5 +1029,54 @@ mod tests {
         assert!(missing.contains("\"status\":\"fail\""), "{missing}");
         let present = crate::render_json(&super::text_provenance_check("receipt-123"));
         assert!(present.contains("\"status\":\"pass\""), "{present}");
+    }
+
+    /// Bead oj0.24: `evaluate_live_proof_state` passes on a fresh state with
+    /// matching sha, warns when older than 14 days (negative case) or when the
+    /// sha differs from the running binary, and fails on malformed JSON.
+    #[test]
+    fn live_proof_state_check_warns_on_stale_date_or_sha_mismatch() {
+        let Some(today) = super::parse_ymd_epoch_days("2026-10-14") else {
+            return;
+        };
+        let fresh_state = r#"{"schema":"franken_snowflake.live_proof_state.v1","last_pass_date":"2026-10-10","last_pass_sha":"bcc10fe","max_age_days":14,"steps":{"query_run_small":{"date":"2026-10-10","sha":"bcc10fe","status":"pass"}}}"#;
+        let pass = crate::render_json(&super::evaluate_live_proof_state(
+            fresh_state,
+            today,
+            "bcc10fe",
+            true,
+        ));
+        assert!(pass.contains("\"status\":\"pass\""), "{pass}");
+        assert!(pass.contains("4d ago"), "{pass}");
+
+        let stale_state = r#"{"schema":"franken_snowflake.live_proof_state.v1","last_pass_date":"2026-09-28","last_pass_sha":"bcc10fe","max_age_days":14,"steps":{"query_run_small":{"date":"2026-09-28","sha":"bcc10fe","status":"pass"}}}"#;
+        let warn_stale = crate::render_json(&super::evaluate_live_proof_state(
+            stale_state,
+            today,
+            "bcc10fe",
+            true,
+        ));
+        assert!(warn_stale.contains("\"status\":\"warn\""), "{warn_stale}");
+        assert!(warn_stale.contains("exceeds 14d"), "{warn_stale}");
+
+        let warn_sha = crate::render_json(&super::evaluate_live_proof_state(
+            fresh_state,
+            today,
+            "deadbeef",
+            true,
+        ));
+        assert!(warn_sha.contains("\"status\":\"warn\""), "{warn_sha}");
+        assert!(
+            warn_sha.contains("differs from running binary sha"),
+            "{warn_sha}"
+        );
+
+        let bad_json = crate::render_json(&super::evaluate_live_proof_state(
+            "{not json",
+            today,
+            "bcc10fe",
+            true,
+        ));
+        assert!(bad_json.contains("\"status\":\"fail\""), "{bad_json}");
     }
 }

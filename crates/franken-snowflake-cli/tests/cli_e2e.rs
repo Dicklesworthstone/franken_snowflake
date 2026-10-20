@@ -1401,3 +1401,75 @@ fn write_ladder_gates_unsupported_procedure_and_external_statements() {
     assert_eq!(bad_list.code(), "FSNOW-2002", "{}", bad_list.stdout);
     assert!(bad_list.stdout.contains("upsert"), "{}", bad_list.stdout);
 }
+
+#[test]
+fn doctor_live_proof_check_warns_on_stale_state_or_sha_mismatch() {
+    let h = Harness::new("doctor-live-proof");
+    let caps = h.run(&["capabilities", "--json"]).json();
+    let git_sha = caps["data"]["build"]["git_sha"]
+        .as_str()
+        .unwrap_or("unknown");
+    let today_ymd = caps["started_at"]
+        .as_str()
+        .and_then(|ts| ts.get(..10))
+        .expect("YYYY-MM-DD prefix from started_at");
+
+    // 1. Fresh state matching the running binary's git_sha passes (exit 0).
+    let fresh_path = h.data_dir.join("fresh_live_proof_state.json");
+    fs::write(
+        &fresh_path,
+        format!(
+            r#"{{"schema":"franken_snowflake.live_proof_state.v1","last_pass_date":"{today_ymd}","last_pass_sha":"{git_sha}","max_age_days":14,"steps":{{"query_run_small":{{"date":"{today_ymd}","sha":"{git_sha}","status":"pass"}}}}}}"#
+        ),
+    )
+    .expect("write fresh state");
+    let fresh_run = h.run_with(
+        &["doctor", "--json"],
+        &[(
+            "FRANKEN_SNOWFLAKE_LIVE_PROOF_STATE",
+            fresh_path.to_str().unwrap(),
+        )],
+    );
+    assert_eq!(fresh_run.exit, 0, "{}", fresh_run.stdout);
+    let fresh_json = fresh_run.json();
+    let fresh_check = fresh_json["data"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "live_proof")
+        .expect("live_proof check");
+    assert_eq!(fresh_check["status"], "pass", "{fresh_check}");
+
+    // 2. Deliberately stale state (> 14 days old) makes doctor warn (exit 1).
+    let stale_path = h.data_dir.join("stale_live_proof_state.json");
+    fs::write(
+        &stale_path,
+        format!(
+            r#"{{"schema":"franken_snowflake.live_proof_state.v1","last_pass_date":"2020-01-01","last_pass_sha":"{git_sha}","max_age_days":14,"steps":{{}}}}"#
+        ),
+    )
+    .expect("write stale state");
+    let stale_run = h.run_with(
+        &["doctor", "--json"],
+        &[(
+            "FRANKEN_SNOWFLAKE_LIVE_PROOF_STATE",
+            stale_path.to_str().unwrap(),
+        )],
+    );
+    assert_eq!(stale_run.exit, 1, "{}", stale_run.stdout);
+    let stale_json = stale_run.json();
+    let stale_check = stale_json["data"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "live_proof")
+        .expect("live_proof check");
+    assert_eq!(stale_check["status"], "warn", "{stale_check}");
+    assert!(
+        stale_check["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("exceeds 14d"),
+        "{stale_check}"
+    );
+}

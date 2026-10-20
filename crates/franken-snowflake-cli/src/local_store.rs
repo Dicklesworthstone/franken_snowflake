@@ -54,6 +54,31 @@ impl StoreBackend {
         }
     }
 
+    /// Resolve the backend for `dir`: honours an explicit `FRANKEN_SNOWFLAKE_STORE`
+    /// setting, or when unset in a `sqlite-store` build, automatically selects
+    /// `Sqlite` if `store.sqlite3` is already present in `dir`.
+    ///
+    /// # Errors
+    /// An invalid `FRANKEN_SNOWFLAKE_STORE` value.
+    pub fn resolve_for_dir(value: Option<&str>, dir: &Path) -> Result<Self, StoreError> {
+        match value.map(str::trim).filter(|value| !value.is_empty()) {
+            Some("file") => Ok(Self::File),
+            Some("sqlite") => Ok(Self::Sqlite),
+            None => {
+                #[cfg(feature = "sqlite-store")]
+                if dir.join(SQLITE_STORE_FILE).exists() {
+                    return Ok(Self::Sqlite);
+                }
+                #[cfg(not(feature = "sqlite-store"))]
+                let _ = dir;
+                Ok(Self::File)
+            }
+            Some(other) => Err(StoreError::Open(format!(
+                "{STORE_ENV} must be file or sqlite (got {other})"
+            ))),
+        }
+    }
+
     /// The setting's spelling.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -70,10 +95,19 @@ pub struct Store {
     pub cache: Box<dyn CacheBackend>,
     /// Which backend is open.
     pub backend: StoreBackend,
-    /// Log lines the file store could not read on open (0 for SQLite).
+    /// Cached skipped-line count if pre-computed (prefer [`Store::skipped_lines`]).
     pub skipped_lines: u64,
     /// Resolved data directory.
     pub dir: PathBuf,
+}
+
+impl Store {
+    /// Number of unreadable log lines skipped when loading the store (scans all
+    /// table logs on demand for `FileCache`; `0` for `FrankenSqliteCache`).
+    #[must_use]
+    pub fn skipped_lines(&self) -> u64 {
+        self.cache.skipped_lines().max(self.skipped_lines)
+    }
 }
 
 /// Why the local store could not be opened.
@@ -113,10 +147,11 @@ pub fn data_dir() -> Option<PathBuf> {
 }
 
 /// Open the local store at the resolved data directory, with the backend
-/// `FRANKEN_SNOWFLAKE_STORE` names.
+/// `FRANKEN_SNOWFLAKE_STORE` names (or `Sqlite` if `store.sqlite3` exists in a
+/// `sqlite-store` build).
 pub fn open_store() -> Result<Store, StoreError> {
     let dir = data_dir().ok_or(StoreError::NoDataDir)?;
-    let backend = StoreBackend::from_setting(std::env::var(STORE_ENV).ok().as_deref())?;
+    let backend = StoreBackend::resolve_for_dir(std::env::var(STORE_ENV).ok().as_deref(), &dir)?;
     open_store_at(&dir, backend)
 }
 
@@ -126,7 +161,7 @@ pub fn open_store_at(dir: &Path, backend: StoreBackend) -> Result<Store, StoreEr
         StoreBackend::File => {
             let cache = FileCache::open(dir).map_err(open_error)?;
             Ok(Store {
-                skipped_lines: cache.skipped_lines(),
+                skipped_lines: 0,
                 cache: Box::new(cache),
                 backend,
                 dir: dir.to_path_buf(),
@@ -442,15 +477,36 @@ pub fn record_execution(store: &Store, facts: &ExecutionFacts<'_>) -> Result<Str
     });
     // Only failure receipts carry `error`, so a completed statement's canonical
     // form (and hash) is unchanged.
+    let mut crashpack_pointer = None;
     if let (Some(failure), Some(body)) = (facts.terminal_failure, receipt.as_object_mut()) {
+        let crashpack_dir = store.dir.join("crashpacks");
+        let pointer = franken_snowflake_core::outcome::build_and_write_failure_crashpack(
+            Some(crashpack_dir.as_path()),
+            facts.command_id,
+            facts.profile,
+            facts.trace_id,
+            failure.outcome_kind,
+            failure.error_code,
+            failure.message,
+            failure.cancel_kind,
+            created_at_ms,
+            vec![
+                "receipt".to_owned(),
+                "show".to_owned(),
+                format!("--trace-id={}", facts.trace_id),
+                "--json".to_owned(),
+            ],
+        );
         body.insert(
             "error".to_owned(),
             serde_json::json!({
                 "code": failure.error_code,
                 "message": failure.message,
                 "cancel_kind": failure.cancel_kind,
+                "crashpack": &pointer,
             }),
         );
+        crashpack_pointer = Some((failure, pointer));
     }
     let canonical = serde_json::to_string(&receipt).map_err(|error| CacheError::InvalidRow {
         field: "query_receipt",
@@ -483,6 +539,36 @@ pub fn record_execution(store: &Store, facts: &ExecutionFacts<'_>) -> Result<Str
         receipt: VerifiedPayload { canonical, address },
         created_at_ms,
     })?;
+    if let Some((failure, pointer)) = crashpack_pointer {
+        use franken_snowflake_cache::OfflineReplayBundleRecord;
+        let bundle_json = serde_json::to_string(&serde_json::json!({
+            "schema_version": "fsnow.crashpack_bundle.v1",
+            "receipt_id": &receipt_id,
+            "command_id": facts.command_id,
+            "profile_id": facts.profile,
+            "trace_id": facts.trace_id,
+            "outcome_kind": failure.outcome_kind,
+            "error_code": failure.error_code,
+            "crashpack": &pointer,
+            "created_at_ms": created_at_ms,
+        }))
+        .map_err(|error| CacheError::InvalidRow {
+            field: "replay_bundle",
+            message: error.to_string(),
+        })?;
+        let bundle_address = ContentAddress::blake3(bundle_json.as_bytes());
+        let _ = store.cache.append_replay_bundle(OfflineReplayBundleRecord {
+            bundle_id: format!("crashpack:{receipt_id}"),
+            source_receipt_id: Some(receipt_id.clone()),
+            snapshot_id: None,
+            artifact_dir: store.dir.join("crashpacks").display().to_string(),
+            manifest: VerifiedPayload {
+                canonical: bundle_json,
+                address: bundle_address,
+            },
+            created_at_ms,
+        });
+    }
     for (index, rows, compressed, uncompressed) in facts.partitions {
         store
             .cache
@@ -822,6 +908,25 @@ mod tests {
         assert_eq!(body["outcome_kind"], "timeout");
         assert_eq!(body["error"]["code"], "FSNOW-5004");
         assert_eq!(body["error"]["cancel_kind"], "Deadline");
+        let crashpack = &body["error"]["crashpack"];
+        assert_eq!(crashpack["schema_version"], 1);
+        assert_eq!(
+            crashpack["fingerprint"].as_str().map(str::len),
+            Some(16),
+            "crashpack fingerprint must be 16 hex chars: {crashpack}"
+        );
+        let crashpack_path = crashpack["artifact_path"]
+            .as_str()
+            .ok_or("crashpack artifact_path present")?;
+        assert!(
+            std::path::Path::new(crashpack_path).exists(),
+            "crashpack artifact should exist on disk at {crashpack_path}"
+        );
+        let replay_bundles_log = std::fs::read_to_string(dir.join("replay_bundles.jsonl"))?;
+        assert!(
+            replay_bundles_log.contains(&format!("crashpack:{failed}")),
+            "crashpack replay bundle persisted in replay_bundles.jsonl: {replay_bundles_log}"
+        );
         // The completed receipt carries no `error` key at all.
         let completed = store
             .cache
