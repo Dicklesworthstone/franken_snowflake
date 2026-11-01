@@ -1,5 +1,18 @@
 # AGENTS.md - franken_snowflake
 
+## Standing Policy: DSR Only — Never GitHub Actions
+
+GitHub Actions must NEVER be used for ANY purpose in this project, including CI,
+tests, builds, releases, publishing, scheduled jobs, and automation. This prohibition
+includes both GitHub-hosted runners and self-hosted runners registered with Actions.
+Use [dsr (Doodlestein Self-Releaser)](https://github.com/Dicklesworthstone/doodlestein_self_releaser)
+directly instead. Do not enable, dispatch, rerun, fund, or rely on Actions, even as
+a fallback. If DSR cannot run a required workload, report the exact blocker rather
+than switching to Actions. Local workflow YAML executed by dsr/act is allowed;
+preserve those definitions and their checks without invoking the GitHub Actions
+service. Historical Actions references below are reference material only, not
+permission to use it. This permanent policy overrides any older Actions guidance.
+
 ## RULE 0.5 - SUITE-WIDE RULES LIVE IN /data/projects/AGENTS.md
 
 The suite-wide rules in **`/data/projects/AGENTS.md`** bind you here too. Read it. Two sections
