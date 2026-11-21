@@ -28,7 +28,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.6"
+version = "0.0.7"
 edition = "2024"
 rust-version = "1.95"
 license-file = "LICENSE"
@@ -64,6 +64,13 @@ dbg_macro = "deny"
 
 [workspace.dependencies]
 asupersync = { version = "=0.5.0", default-features = false, features = ["proc-macros", "tls", "tls-native-roots", "compression"] }
+
+# Performance-optimized release binaries (opt-level = 3, never size-optimized "s"/"z").
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
 
 # Local FrankenSuite candidate graph. These patches do not admit a crate into
 # the production feature graph; they only force one local checkout per crate

@@ -679,9 +679,9 @@ fn confirm_key(store: &Store) -> Result<Vec<u8>, String> {
 /// # Errors
 /// The key could not be created or read.
 pub fn keyed_sql_digest(store: &Store, profile: &str, sql: &str) -> Result<String, String> {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     let key = confirm_key(store)?;
-    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&key)
+    let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(&key)
         .map_err(|error| format!("bad confirmation key: {error}"))?;
     mac.update(profile.as_bytes());
     mac.update(&[0x1f]);

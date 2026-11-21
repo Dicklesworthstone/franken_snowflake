@@ -6532,10 +6532,19 @@ fn build_identity_json(exe_hash: bool) -> Json {
 pub(crate) const BUILD_GIT_SHA: &str = env!("FSNOW_BUILD_GIT_SHA");
 
 fn current_exe_sha256() -> std::io::Result<String> {
+    use std::io::Read as _;
+
     use sha2::{Digest, Sha256};
     let mut file = std::fs::File::open(std::env::current_exe()?)?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)?;
+    let mut buf = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
     Ok(hasher
         .finalize()
         .iter()

@@ -31,7 +31,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use rsa::pkcs1::EncodeRsaPrivateKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePublicKey};
 use rsa::traits::PublicKeyParts;
-use rsa::{RsaPrivateKey, RsaPublicKey};
+use rsa::{PrivateKey, PublicKey};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -736,14 +736,14 @@ impl KeyPairJwtSigner {
         private_key_passphrase: Option<&str>,
     ) -> Result<Self, AuthError> {
         let private_key = match private_key_passphrase {
-            Some(passphrase) => RsaPrivateKey::from_pkcs8_encrypted_pem(
+            Some(passphrase) => PrivateKey::from_pkcs8_encrypted_pem(
                 private_key_pem.as_ref(),
                 passphrase.as_bytes(),
             )
             .map_err(|source| AuthError::InvalidPrivateKey {
                 reason: source.to_string(),
             })?,
-            None => RsaPrivateKey::from_pkcs8_pem(private_key_pem.as_ref()).map_err(|source| {
+            None => PrivateKey::from_pkcs8_pem(private_key_pem.as_ref()).map_err(|source| {
                 AuthError::InvalidPrivateKey {
                     reason: source.to_string(),
                 }
@@ -759,7 +759,7 @@ impl KeyPairJwtSigner {
         user: impl AsRef<str>,
         private_key_der: &[u8],
     ) -> Result<Self, AuthError> {
-        let private_key = RsaPrivateKey::from_pkcs8_der(private_key_der).map_err(|source| {
+        let private_key = PrivateKey::from_pkcs8_der(private_key_der).map_err(|source| {
             AuthError::InvalidPrivateKey {
                 reason: source.to_string(),
             }
@@ -770,12 +770,12 @@ impl KeyPairJwtSigner {
     fn from_private_key(
         account: impl AsRef<str>,
         user: impl AsRef<str>,
-        private_key: RsaPrivateKey,
+        private_key: PrivateKey,
     ) -> Result<Self, AuthError> {
         let account = normalize_account_for_jwt(account.as_ref())?;
         let user = normalize_user_for_jwt(user.as_ref())?;
-        let public_key = RsaPublicKey::from(&private_key);
-        let bits = public_key.n().bits();
+        let public_key = PublicKey::from(&private_key);
+        let bits = usize::try_from(public_key.n().bit_width()).unwrap_or(usize::MAX);
         if bits < 2_048 {
             return Err(AuthError::RsaKeyTooSmall { bits });
         }
@@ -1860,15 +1860,14 @@ mod tests {
     use std::cell::Cell;
 
     use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
-    use rand::rngs::OsRng;
-    use rsa::RsaPrivateKey;
+    use rsa::PrivateKey;
     use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 
     use super::*;
 
     fn test_key_pair_pems() -> Result<(String, String), Box<dyn std::error::Error>> {
-        let private_key = RsaPrivateKey::new(&mut OsRng, 2_048)?;
-        let public_key = RsaPublicKey::from(&private_key);
+        let private_key = PrivateKey::new(&mut rand::rng(), 2_048)?;
+        let public_key = PublicKey::from(&private_key);
         Ok((
             private_key.to_pkcs8_pem(LineEnding::LF)?.to_string(),
             public_key.to_public_key_pem(LineEnding::LF)?,
@@ -2406,12 +2405,9 @@ mod tests {
     #[test]
     fn supports_encrypted_pkcs8_pem_loading() -> Result<(), Box<dyn std::error::Error>> {
         let private_key_pem = test_private_key_pem()?;
-        let private_key = RsaPrivateKey::from_pkcs8_pem(&private_key_pem)?;
-        let encrypted = private_key.to_pkcs8_encrypted_pem(
-            &mut OsRng,
-            "correct horse battery staple",
-            LineEnding::LF,
-        )?;
+        let private_key = PrivateKey::from_pkcs8_pem(&private_key_pem)?;
+        let encrypted =
+            private_key.to_pkcs8_encrypted_pem("correct horse battery staple", LineEnding::LF)?;
         let signer = KeyPairJwtSigner::from_pkcs8_pem(
             "org.account",
             "svc_user",

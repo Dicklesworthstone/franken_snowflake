@@ -625,8 +625,10 @@ fn operator_schema_fixture() -> Json {
 }
 
 fn local_store_fixture() -> Json {
+    static SELFTEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SELFTEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "fsnow-selftest-{}-{}",
+        "fsnow-selftest-{}-{}-{seq}",
         std::process::id(),
         local_store::now_unix_ms()
     ));

@@ -2183,7 +2183,7 @@ fn a_confirmed_write_submits_its_dry_run_id_and_is_single_use() {
 fn a_401_on_submit_re_signs_the_jwt_once() {
     use rsa::pkcs8::{EncodePrivateKey, LineEnding};
     const HANDLE: &str = "01b2c3d4-0000-0000-0000-00000000f112";
-    let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2_048).expect("RSA key");
+    let key = rsa::PrivateKey::new(&mut rand::rng(), 2_048).expect("RSA key");
     let pem = key
         .to_pkcs8_pem(LineEnding::LF)
         .expect("PKCS#8 PEM")

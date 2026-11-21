@@ -8,8 +8,8 @@
 id = "no-hidden-runtime"
 heading = "Why franken_snowflake?"
 text = "production crates forbid Tokio, reqwest, hyper, axum, tower, sqlx, diesel, sea-orm"
-evidence = ["manual:python3 scripts/check-dependency-admissibility.py (64 lanes scanned, 0 skipped, 0 forbidden-crate or single-version violations; previously dsr quality 20260925T023047-3245208)"]
-date = "2026-10-14"
+evidence = ["manual:python3 scripts/check-dependency-admissibility.py (64 lanes scanned, 0 skipped, 0 forbidden-crate or single-version violations; verified for v0.0.7 release prep)"]
+date = "2026-11-21"
 max_age_days = 30
 
 [[claim]]

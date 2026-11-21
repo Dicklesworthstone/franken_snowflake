@@ -361,6 +361,10 @@ Both binary names install from the same crate: `franken-snowflake` is canonical
 and `fsnow` is the short alias. The whole stack requires a nightly Rust
 toolchain (edition 2024), inherited from the FrankenSQLite, sqlmodel, and
 Asupersync dependency set; the pinned toolchain lives in `rust-toolchain.toml`.
+The workspace manifest declares `rust-version = "1.95"` for default/non-MCP
+lanes; enabling `--features mcp` (including the prebuilt `--features live,mcp`
+release binaries) pulls `fastmcp-rust`/`fastmcp-server 0.13.0`, which require
+Rust `>= 1.100` (provided by the pinned `rust-toolchain.toml` toolchain).
 
 ---
 

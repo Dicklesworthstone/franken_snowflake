@@ -281,7 +281,7 @@ fn build_query_executor(profile: String) -> franken_snowflake_tui::QueryExecutor
 /// A driver event as a progress-pane tick: the handle once submitted, a
 /// poll budget countdown as statement status is polled, a partition and its
 /// rows as each is fetched, and the partition total at the end.
-#[cfg(feature = "live")]
+#[cfg(all(test, feature = "live"))]
 fn progress_tick(
     event: &franken_snowflake_sqlapi::driver::DriverEvent,
 ) -> Option<franken_snowflake_tui::ProgressTick> {
@@ -298,7 +298,8 @@ fn progress_tick_with_polls(
     polls_used: u32,
 ) -> Option<franken_snowflake_tui::ProgressTick> {
     use franken_snowflake_sqlapi::driver::DriverEvent;
-    let base_budget = franken_snowflake_sqlapi::lifecycle::PollPlan::default().to_query_budget(None);
+    let base_budget =
+        franken_snowflake_sqlapi::lifecycle::PollPlan::default().to_query_budget(None);
     let tick = |statement_handle, partitions_total, partitions_fetched_delta, rows_delta| {
         let mut budget = base_budget;
         budget.poll_quota = budget.poll_quota.saturating_sub(polls_used);
@@ -550,8 +551,7 @@ mod tests {
         };
         let ok_lines = render_outcome_lines(&mut ok_outcome);
         assert_eq!(
-            ok_lines[0].message,
-            "query run exit=0 data_source=live",
+            ok_lines[0].message, "query run exit=0 data_source=live",
             "{ok_lines:?}"
         );
         assert_eq!(ok_lines[1].message, "statement handle 01b2-9999");

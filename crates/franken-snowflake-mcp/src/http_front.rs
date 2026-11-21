@@ -8,7 +8,7 @@
 //! with whatever live Snowflake credentials the serving shell had exported.
 //!
 //! This module owns the socket instead and only then dispatches into the same
-//! fastmcp `Server` through its public `dispatch_request_concurrent`, so the
+//! fastmcp `Server` through its public `dispatch_request`, so the
 //! tools, handlers and envelopes are unchanged. Policy, decided per request:
 //!
 //! - `Authorization: Bearer <token>` is required (constant-time compare); the
@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use asupersync::runtime::RuntimeHandle;
+use asupersync::runtime::Runtime;
 use fastmcp_rust::bidirectional::TransportSendFn;
 use fastmcp_rust::http::{HttpMethod, HttpRequest, HttpResponse, HttpStatus, HttpTransport};
 use fastmcp_rust::{
@@ -322,6 +322,7 @@ impl Drop for HangUpWatch {
 /// Handle one authorized JSON-RPC body.
 fn dispatch_body(
     server: &Server,
+    runtime: &Runtime,
     cx: &Cx,
     session: &Arc<Mutex<Session>>,
     policy: &HttpPolicy,
@@ -363,7 +364,18 @@ fn dispatch_body(
                 ));
             })
         });
-    let answer = server.dispatch_request_concurrent(cx, session, request, &notify, &request_sender);
+    let answer = {
+        let mut session_guard = session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        runtime.block_on(server.dispatch_request(
+            cx,
+            &mut session_guard,
+            request,
+            &notify,
+            &request_sender,
+        ))
+    };
     if let Some(watch) = watch {
         drop(watch);
         crate::fastmcp_surface::forget_http_cancellation(&json_rpc_id);
@@ -383,7 +395,7 @@ fn serve_connection(
     server: &Server,
     session: &Arc<Mutex<Session>>,
     policy: &HttpPolicy,
-    requests: &RuntimeHandle,
+    runtime: &Runtime,
 ) {
     let Ok(reader_stream) = stream.try_clone() else {
         return;
@@ -396,9 +408,10 @@ fn serve_connection(
     let (response, dispatched) = match policy.decide(&request) {
         Decision::Respond(response) => (response, false),
         Decision::Dispatch { cors_origin } => {
-            let cx: Cx = requests.request_cx_with_budget(Budget::INFINITE);
+            let cx: Cx = runtime.handle().request_cx_with_budget(Budget::INFINITE);
             let response = dispatch_body(
                 server,
+                runtime,
                 &cx,
                 session,
                 policy,
@@ -508,9 +521,8 @@ pub fn run_secure_http(server: Server, options: &HttpServeOptions, read_only_too
         server.capabilities().clone(),
     )));
     let server = Arc::new(server);
-    // Kept alive for the server's lifetime; each request's Cx comes from it.
-    let runtime = crate::fastmcp_surface::mcp_runtime();
-    let requests = runtime.handle();
+    // Kept alive for the server's lifetime; each request's Cx and block_on come from it.
+    let runtime = Arc::new(crate::fastmcp_surface::mcp_runtime());
     eprintln!(
         "franken-snowflake MCP HTTP server listening on http://{local}{MCP_PATH} (bearer token from {MCP_TOKEN_ENV}; tools: {})",
         policy
@@ -525,8 +537,8 @@ pub fn run_secure_http(server: Server, options: &HttpServeOptions, read_only_too
         let server = Arc::clone(&server);
         let session = Arc::clone(&session);
         let policy = Arc::clone(&policy);
-        let requests = requests.clone();
-        std::thread::spawn(move || serve_connection(stream, &server, &session, &policy, &requests));
+        let runtime = Arc::clone(&runtime);
+        std::thread::spawn(move || serve_connection(stream, &server, &session, &policy, &runtime));
     }
     std::process::exit(0)
 }

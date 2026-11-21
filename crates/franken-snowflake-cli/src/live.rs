@@ -6327,11 +6327,16 @@ mod tests {
         ));
         assert_eq!(inspect["ok"], true, "{inspect}");
         assert!(inspect["data"]["overlay"].as_str().is_some(), "{inspect}");
-        let fields = inspect["data"]["manifest"]["fields"].to_string();
+        let fields = inspect["data"]["manifest"]["fields"]
+            .as_array()
+            .expect("manifest fields array");
         assert!(
-            fields.contains(r#""column":"ACCOUNT_REF","role":"entity_key""#)
-                && fields.contains(r#""role_confidence":"overlay""#),
-            "{fields}"
+            fields.iter().any(|field| {
+                field["column"] == "ACCOUNT_REF"
+                    && field["role"] == "entity_key"
+                    && field["role_confidence"] == "overlay"
+            }),
+            "{fields:?}"
         );
 
         // A column the dataset does not have: refused, with a suggestion.

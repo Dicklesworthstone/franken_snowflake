@@ -1,3 +1,7 @@
+# `franken-snowflake-mcp` inherits the workspace `rust-version = "1.95"` for its
+# default (no-MCP) adapter traits. Enabling `--features mcp` (including shipping
+# `live,mcp` CLI builds) activates `fastmcp-rust`/`fastmcp-server 0.13.0`, which
+# declare `rust-version = "1.100"` (satisfied by `rust-toolchain.toml`).
 [package]
 name = "franken-snowflake-mcp"
 version.workspace = true
@@ -23,12 +27,12 @@ mcp = [
 workspace = true
 
 [dependencies]
-franken-snowflake-core = { path = "../franken-snowflake-core", version = "0.0.6" }
+franken-snowflake-core = { path = "../franken-snowflake-core", version = "0.0.7" }
 # The runtime whose `request_cx_with_budget` mints the server's request contexts
 # (the facade re-exports Asupersync only under its `testing-lab` feature).
 asupersync = { workspace = true, optional = true }
-fastmcp-rust = { version = "0.10.0", optional = true }
-# `Server` (with `dispatch_request_concurrent`, which the secured HTTP front
-# drives) is no longer re-exported by the facade in 0.10.
-fastmcp-server = { version = "0.10.0", optional = true }
+fastmcp-rust = { version = "0.13.0", optional = true }
+# `Server` (with `dispatch_request`, which the secured HTTP front drives)
+# is no longer re-exported by the facade in 0.10+.
+fastmcp-server = { version = "0.13.0", optional = true }
 serde_json = { version = "1", optional = true }

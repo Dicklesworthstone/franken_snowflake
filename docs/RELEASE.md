@@ -6,15 +6,64 @@ requiring live Snowflake credentials.
 
 ## Current Release State
 
-- Package version: `0.0.6` (GitHub Release 2026-10-02, tag `v0.0.6` at
-  `f3de199`). Built by `dsr` on all six targets with `--features live,mcp`;
-  shipped as a 20-asset signed bundle (six archives, six `.sha256` sidecars, six
-  detached `.minisig` signatures, `SHA256SUMS`, and `SHA256SUMS.minisig`) verified
-  by `scripts/verify-published-bundle.py`. See "v0.0.6 release record" below.
-- Publish state: all 14 crates are published on crates.io at `0.0.6` (first
+- Package version: `0.0.7` (GitHub Release 2026-11-21, tag `v0.0.7`). Built
+  without GitHub Actions on all six targets with `--features live,mcp` using
+  `[profile.release]` (`opt-level = 3`, `lto = "thin"`, `codegen-units = 1`,
+  `strip = "symbols"`); shipped as a 20-asset signed bundle (six archives, six
+  `.sha256` sidecars, six detached `.minisig` signatures, `SHA256SUMS`, and
+  `SHA256SUMS.minisig`) verified by `scripts/verify-published-bundle.py`. See
+  "v0.0.7 release record" below.
+- Publish state: all 14 crates are published on crates.io at `0.0.7` (first
   published 2026-09-12); they configure `publish = ["crates-io"]` and declare
   version requirements across internal path dependencies (sqlapi's testkit
   dev-dependency is path-only: testkit depends on sqlapi).
+- Toolchain contract: workspace `rust-version = "1.95"` covers default/non-MCP
+  lanes; `--features mcp` (including the shipping `--features live,mcp` CLI
+  release binaries) activates `fastmcp-rust`/`fastmcp-server 0.13.0`, which
+  require Rust `>= 1.100` (satisfied by `rust-toolchain.toml`
+  `nightly-2026-08-31`).
+
+### v0.0.7 release record (2026-11-21)
+
+- Source: tag `v0.0.7` (release wave 2026-11-21; built without GitHub Actions).
+- Security & dependencies: `cargo audit` 0 vulnerabilities and 0 yanked crates
+  (upgraded `rustls 0.23.46`, `rustls-webpki 0.103.17`, `webpki-roots 1.0.12`,
+  `ctutils 0.4.8`, `chacha20 0.10.2`, `yoke-derive 0.8.4`, `zstd*`,
+  `jsonwebtoken 12`, `rsa 0.10.0`, `sha2 0.11`, `hmac 0.13`, `base64 0.23`,
+  `getrandom 0.4`, `fastmcp-rust`/`fastmcp-server 0.13.0`, `frankensearch 0.7.1`,
+  `sqlmodel-* 0.5.1` / `fsqlite 0.4.13`, `fnx-* 0.4.1`, `ftui 0.10.0`, `tru 0.3.0`).
+- Claims ledger: `python3 scripts/check-claims.py --self-test` and
+  `python3 scripts/check-claims.py` verified passing across all tagged README
+  claims and release-docs consistency.
+- Local & feature proof: `cargo fmt --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+  `scripts/check-feature-lanes.sh` (all 23 feature lanes),
+  `scripts/check-dependency-admissibility.py` (64/64 lanes, 0 violations),
+  `scripts/check-asupersync-single-version.sh` (`asupersync = 0.5.0`),
+  `scripts/check-golden-lf.py`, `cargo test --workspace --locked`, external
+  Parquet conformance (`pyarrow` + `duckdb`, 8/8 passing), and all optional
+  feature lanes (`live,mcp,testkit-endpoint`, `tui`, `frankenpandas`,
+  `frankensearch`, `frankensqlite`, `export`, `graph`, `compression`) verified
+  passing; Rust 1.99.0 verified for default/non-MCP crates while `--features mcp`
+  is explicitly rejected below `1.100`; macOS test suite verified on native Apple
+  Silicon.
+- Socket e2e: `scripts/e2e/socket_e2e.sh` 31/31 scenarios passing, including
+  `sigint_mid_submit_cancels_a_read_without_waiting_for_the_answer`, MCP HTTP
+  security/cancellation tests (3/3), and MCP stdio handshake/parity tests.
+- Live battery: not re-run on `v0.0.7` (no live Snowflake trial credentials
+  provisioned; latest live proof remains 2026-09-28 in `docs/live_proof.md`, and
+  README carries no unverified `live:` claims).
+- Build & release bundle: six target archives built with `--features live,mcp`
+  (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`,
+  `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`),
+  published to GitHub Release `v0.0.7` with `.sha256` sidecars, `SHA256SUMS`,
+  and detached Minisign `.minisig` signatures (20 assets total), verified by
+  `scripts/verify-published-bundle.py`; all 14 crates published leaf-first to
+  crates.io at `0.0.7`.
+- Cross-platform runtime notes: Linux x86_64/aarch64 (native/QEMU) and macOS
+  arm64/x86_64 (native/Rosetta) executed and verified; Windows x86_64 and
+  aarch64 cross-linked via `cargo-xwin` (`PE32+` architecture verified; not
+  executed natively on Windows hardware). Known open issues: `#1`, `#2`, `#4`
+  (`#3` resolved).
 
 ### v0.0.6 release record (2026-10-02)
 

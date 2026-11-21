@@ -78,24 +78,24 @@ testkit-endpoint = ["live", "franken-snowflake-http/testkit-endpoint"]
 
 [build-dependencies]
 # Source digest for the build identity (build.rs); already in the graph.
-sha2 = "0.10"
+sha2 = "0.11"
 
 [dependencies]
-franken-snowflake-core = { path = "../franken-snowflake-core", version = "0.0.6" }
+franken-snowflake-core = { path = "../franken-snowflake-core", version = "0.0.7" }
 # The finished library crates the CLI surfaces are built on: catalog discovery
 # + manifests + planner, the local store (receipts/audit/snapshots), the lineage
 # graph renderer, and COPY INTO / local export planning. All offline-capable.
-franken-snowflake-catalog = { path = "../franken-snowflake-catalog", version = "0.0.6" }
-franken-snowflake-cache = { path = "../franken-snowflake-cache", version = "0.0.6" }
-franken-snowflake-graph = { path = "../franken-snowflake-graph", version = "0.0.6" }
-franken-snowflake-export = { path = "../franken-snowflake-export", features = ["export"], version = "0.0.6" }
-franken-snowflake-frame = { path = "../franken-snowflake-frame", optional = true, version = "0.0.6" }
-franken-snowflake-text-indexing = { path = "../franken-snowflake-text-indexing", optional = true, version = "0.0.6" }
-franken-snowflake-mcp = { path = "../franken-snowflake-mcp", optional = true, version = "0.0.6" }
-franken-snowflake-tui = { path = "../franken-snowflake-tui", optional = true, version = "0.0.6" }
-franken-snowflake-sqlapi = { path = "../franken-snowflake-sqlapi", optional = true, version = "0.0.6" }
-franken-snowflake-http = { path = "../franken-snowflake-http", optional = true, version = "0.0.6" }
-franken-snowflake-auth = { path = "../franken-snowflake-auth", optional = true, version = "0.0.6" }
+franken-snowflake-catalog = { path = "../franken-snowflake-catalog", version = "0.0.7" }
+franken-snowflake-cache = { path = "../franken-snowflake-cache", version = "0.0.7" }
+franken-snowflake-graph = { path = "../franken-snowflake-graph", version = "0.0.7" }
+franken-snowflake-export = { path = "../franken-snowflake-export", features = ["export"], version = "0.0.7" }
+franken-snowflake-frame = { path = "../franken-snowflake-frame", optional = true, version = "0.0.7" }
+franken-snowflake-text-indexing = { path = "../franken-snowflake-text-indexing", optional = true, version = "0.0.7" }
+franken-snowflake-mcp = { path = "../franken-snowflake-mcp", optional = true, version = "0.0.7" }
+franken-snowflake-tui = { path = "../franken-snowflake-tui", optional = true, version = "0.0.7" }
+franken-snowflake-sqlapi = { path = "../franken-snowflake-sqlapi", optional = true, version = "0.0.7" }
+franken-snowflake-http = { path = "../franken-snowflake-http", optional = true, version = "0.0.7" }
+franken-snowflake-auth = { path = "../franken-snowflake-auth", optional = true, version = "0.0.7" }
 asupersync = { workspace = true, optional = true }
 # SIGINT/SIGTERM handling for in-flight live statements (bead E1), through the
 # safe flag API; already in the graph through asupersync.
@@ -104,12 +104,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # SHA-256 of the running executable for `capabilities --with-exe-hash` (bead H1);
 # already in the graph through franken-snowflake-auth.
-sha2 = "0.10"
+sha2 = "0.11"
 # Random confirmation ids and the keyed statement digest of the write ladder
 # (bead B4); both already in the graph.
-getrandom = "0.3"
-hmac = "0.12"
-toon = { package = "tru", version = "0.2.3", default-features = false, optional = true }
+getrandom = "0.4"
+hmac = "0.13"
+toon = { package = "tru", version = "0.3.0", default-features = false, optional = true }
 
 [dev-dependencies]
 # The socket e2e mints a throwaway CA per run (pure Rust, ring backend; ring is
@@ -119,8 +119,8 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem
 franken-snowflake-testkit = { path = "../franken-snowflake-testkit" }
 # A throwaway RSA key for the key-pair JWT re-sign scenario (both already in
 # the graph through franken-snowflake-auth).
-rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
-rand = "0.8"
+rsa = { version = "0.10", default-features = false, features = ["std", "encoding"] }
+rand = "0.10"
 # Validates typed rows against docs/protocol/typed_rows.v1.schema.json. No
 # default features: no HTTP/file schema resolution, so no reqwest or Tokio.
-jsonschema = { version = "0.56", default-features = false }
+jsonschema = { version = "0.61", default-features = false }

@@ -3,10 +3,35 @@
 All notable changes to `franken_snowflake` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at the
-workspace version (`0.0.6`). All 14 crates are published on crates.io (first
+workspace version (`0.0.7`). All 14 crates are published on crates.io (first
 published 2026-09-12).
 
 ## [Unreleased]
+
+---
+
+## [v0.0.7](https://github.com/Dicklesworthstone/franken_snowflake/releases/tag/v0.0.7) — 2026-11-21
+
+### Security & Dependencies
+
+- **Cleared all 14 RustSec vulnerabilities and 2 yanked crates (`cargo audit`: 0 vulnerabilities, 0 yanked crates, resolving [#3](https://github.com/Dicklesworthstone/franken_snowflake/issues/3)):**
+  - Upgraded `rustls` `0.23.44 -> 0.23.46` (RUSTSEC-2026-0285, 0346, 0347, 0348, 0349), `rustls-webpki` `0.103.15 -> 0.103.17` (RUSTSEC-2026-0382), `webpki-roots` `1.0.9 -> 1.0.12` (RUSTSEC-2026-0381), `ctutils` `0.4.2 -> 0.4.8` (RUSTSEC-2026-0385), `zstd` / `zstd-safe` / `zstd-sys` (RUSTSEC-2026-0391, 0398, 0403, 0410), and `faster-hex` `0.10.0 -> 0.10.1` (RUSTSEC-2026-0306).
+  - Replaced yanked `chacha20 0.10.1 -> 0.10.2` and `yoke-derive 0.8.3 -> 0.8.4`.
+  - Upgraded auth crypto stack: `jsonwebtoken 10 -> 12`, `rsa 0.9.10 -> 0.10.0` (resolving RUSTSEC-2023-0071 Marvin Attack and `crypto-bigint 0.5.5 -> 0.7.11` RUSTSEC-2026-0387), `sha2 0.10 -> 0.11`, `hmac 0.12 -> 0.13`, `base64 0.22 -> 0.23`, `getrandom 0.3 -> 0.4`, and dev-dep `rand 0.8 -> 0.10`.
+- **FrankenSuite & ecosystem dependency refresh (preserving single-version `asupersync = "=0.5.0"` and 64/64 forbidden-dependency admissibility lanes):**
+  - Upgraded `fastmcp-rust` / `fastmcp-server` `0.10.0 -> 0.13.0` (migrating the secured HTTP front in `franken-snowflake-mcp` from removed `dispatch_request_concurrent` to async `dispatch_request` driven through Asupersync's `Runtime::block_on`).
+  - Upgraded `frankensearch` `0.6.0 -> 0.7.1` (compatible `asupersync ^0.5.0` and `rustix =1.1.5` matching `fastmcp 0.13`), `sqlmodel-core` / `sqlmodel-frankensqlite` `0.5.0 -> 0.5.1` (`fsqlite 0.4.4 -> 0.4.13`), `fnx-algorithms` / `fnx-classes` `0.2.0 -> 0.4.1`, `ftui` `0.4.0 -> 0.10.0`, `tru` `0.2.3 -> 0.3.0`, `toml` `1.1.6 -> 1.1.8+spec-1.1.0`, and dev-dep `jsonschema` `0.56 -> 0.61.2`.
+  - Retained `fp-columnar` / `fp-types` at `0.1.2` after same-host A/B benchmarking showed `0.6.0` was ~3% slower and changed public `DType::Datetime64` from `Copy`.
+- **Explicit performance-optimized release profile & MSRV documentation:**
+  - Added explicit `[profile.release]` (`opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`) to workspace `Cargo.toml`.
+  - Documented the explicit toolchain split between default/non-MCP crates (`rust-version = "1.95"`) and `--features mcp` / shipping `live,mcp` binaries (`fastmcp 0.13.0` requires Rust `>= 1.100`, provided by `rust-toolchain.toml`) regarding [#4](https://github.com/Dicklesworthstone/franken_snowflake/issues/4).
+  - Known open items carried into `v0.0.7`: [#1](https://github.com/Dicklesworthstone/franken_snowflake/issues/1) (owner design decision pending on remote cleanup obligation when handle recovery fails; feature-enabled Clippy and all 31 `socket_e2e` scenarios are verified passing) and [#2](https://github.com/Dicklesworthstone/franken_snowflake/issues/2) (multi-OS incumbent-safe atomic installer locking/publication).
+
+### Fixed
+
+- **Concurrent `selftest` temp-directory race (`franken-snowflake-cli`):** Added a monotonic atomic counter to `local_store_fixture()` (`fsnow-selftest-<pid>-<unix_ms>-<seq>`) so concurrent `selftest` invocations within the same millisecond cannot collide on and delete each other's temporary store directory.
+- **Feature-lane Clippy clean build (`live,mcp,tui`):** Scoped test-only helper `progress_tick` in `tui_surface.rs` with `#[cfg(all(test, feature = "live"))]` so all 23 feature lanes in `scripts/check-feature-lanes.sh` pass `cargo clippy -D warnings` with zero warnings, and fixed a formatting drift in `tui_surface.rs`.
+- **Order-independent JSON field assertion (`franken-snowflake-cli`):** Updated `live::tests::a_manifest_overlay_reassigns_roles_at_read_time` to assert on parsed JSON field properties rather than relying on transitive `serde_json/preserve_order` key ordering.
 
 ### Added
 
@@ -170,12 +195,13 @@ implementation first and the test/hardening pass follows in a later wave. The
 
 ## Version state
 
-- Package version: `0.0.6` across the workspace; all 14 crates are published on
-  crates.io at `0.0.6`.
+- Package version: `0.0.7` across the workspace; all 14 crates are published on
+  crates.io at `0.0.7`.
 - Tags/releases: `v0.0.0` (tag only, 2026-06-29), `v0.0.1` (GitHub Release,
   2026-06-30), `v0.0.2` (GitHub Release, 2026-08-24), `v0.0.3`
   (GitHub Release, 2026-09-04), `v0.0.4` (GitHub Release, 2026-09-11), `v0.0.5`
-  (GitHub Release, 2026-09-25), and `v0.0.6` (GitHub Release, 2026-10-02).
+  (GitHub Release, 2026-09-25), `v0.0.6` (GitHub Release, 2026-10-02), and
+  `v0.0.7` (GitHub Release, 2026-11-21).
 - Live Snowflake transport is enabled with the `live` feature (default-off) and
   is gated at runtime by credential availability. Reads (`query run`,
   `catalog scan`, `profile doctor --online`) and writes (`query write`) both run
