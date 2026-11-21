@@ -250,7 +250,10 @@ pub const LIVE_PROOF_STATE_ENV: &str = "FRANKEN_SNOWFLAKE_LIVE_PROOF_STATE";
 /// warns when the live proof state gate is active.
 pub const LIVE_PROOF_MAX_AGE_DAYS: i64 = 14;
 
-const COMPILED_LIVE_PROOF_STATE: &str = include_str!("../../../docs/live_proof_state.json");
+// Kept inside the crate directory so standalone `.crate` packages published to
+// crates.io stay self-contained; tested against `docs/live_proof_state.json`
+// in-workspace so the two copies never drift.
+const COMPILED_LIVE_PROOF_STATE: &str = include_str!("../assets/live_proof_state.json");
 
 fn live_proof_check() -> Json {
     let today_days = local_store::now_unix_seconds().div_euclid(86_400);
@@ -1080,5 +1083,18 @@ mod tests {
             true,
         ));
         assert!(bad_json.contains("\"status\":\"fail\""), "{bad_json}");
+    }
+
+    #[test]
+    fn packaged_live_proof_state_matches_workspace_docs() {
+        let workspace_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/live_proof_state.json");
+        if let Ok(workspace_copy) = std::fs::read_to_string(&workspace_path) {
+            assert_eq!(
+                super::COMPILED_LIVE_PROOF_STATE,
+                workspace_copy,
+                "crates/franken-snowflake-cli/assets/live_proof_state.json drifted from docs/live_proof_state.json"
+            );
+        }
     }
 }

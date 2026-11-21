@@ -1,0 +1,144 @@
+{
+  "schema": "franken_snowflake.live_proof_state.v1",
+  "last_pass_date": "2026-09-28",
+  "last_pass_sha": "bcc10fe",
+  "source_digest": "3edc59aa",
+  "max_age_days": 14,
+  "steps": {
+    "binary_identity": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "catalog_graph_mermaid": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "catalog_scan": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "catalog_scan_tags": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "credential_gate": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "export_file": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "export_plan": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "export_run_csv": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "partition_early_stop": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "profile_doctor_online": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "profile_validate": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "python_connector_differential": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "query_cancel_completed_handle": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "query_run_partitioned": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "query_run_small": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "receipt_show": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "secret_scan": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "sql_guard_backslash_escape": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "sql_guard_dollar_quote": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "sql_guard_quoted_identifier": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "sql_guard_semicolon_in_block_comment": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "sql_guard_semicolon_in_dash_comment": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "sql_guard_semicolon_in_slash_comment": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "sql_guard_semicolon_in_string": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "sql_guard_trailing_semicolon": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "sql_guard_trailing_semicolon_comment": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    },
+    "sql_guard_two_statements": {
+      "date": "2026-09-28",
+      "sha": "bcc10fe",
+      "status": "pass"
+    }
+  }
+}
